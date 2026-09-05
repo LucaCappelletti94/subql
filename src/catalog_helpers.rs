@@ -395,7 +395,7 @@ pub(crate) fn classify_scalar_kind<B: crate::backend::Backend>(
         // The family is upstream's coarse answer; the refinements the
         // declaration fixes are the backend's, because the spellings differ
         // per engine.
-        return Some(ScalarKind::Builtin(B::refine_builtin(
+        return Some(ScalarKind::Builtin(B::refine_declared_type(
             family,
             declared_type,
         )));
@@ -458,7 +458,7 @@ pub fn total_rule<B: crate::backend::Backend, DB: DatabaseLike>(
         .map_or(crate::backend::SumRule::Double, |column| {
             column_scalar_kind::<B, DB>(database, table_id, column)
                 .as_ref()
-                .and_then(crate::backend::ScalarKind::builtin)
+                .and_then(crate::backend::ScalarKind::declared_type)
                 .map_or(crate::backend::SumRule::Double, B::sum_rule)
         });
     // The accumulator's width belongs to the aggregate, not only to the
@@ -476,11 +476,11 @@ pub fn total_rule<B: crate::backend::Backend, DB: DatabaseLike>(
 }
 
 #[must_use]
-pub fn column_builtin_kind<DB: DatabaseLike>(
+pub fn column_scalar_family<DB: DatabaseLike>(
     database: &DB,
     table_id: TableId,
     column_id: ColumnId,
-) -> Option<crate::backend::BuiltinKind> {
+) -> Option<crate::backend::ScalarFamily> {
     let table = database.table_by_id(table_id as usize)?;
     let column = table.column_by_id(column_id as usize, database).ok()??;
     scalar_family(&column.data_type(database))
@@ -513,7 +513,7 @@ pub fn table_has_rls<DB: DatabaseLike>(
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use crate::backend::{BuiltinKind, Postgres};
+    use crate::backend::{Postgres, ScalarFamily};
     use sql_traits::structs::ParserDB;
     use sqlparser::dialect::GenericDialect;
 
@@ -719,19 +719,19 @@ mod tests {
         let tid = table_id(&pg, "e").unwrap();
         assert_eq!(
             column_scalar_kind::<Postgres, _>(&pg, tid, 1),
-            Some(BuiltinKind::Timestamp.into())
+            Some(ScalarFamily::Timestamp.into())
         );
         assert_eq!(
             column_scalar_kind::<Postgres, _>(&pg, tid, 2),
-            Some(BuiltinKind::TimestampTz.into())
+            Some(ScalarFamily::TimestampTz.into())
         );
         assert_eq!(
             column_scalar_kind::<Postgres, _>(&pg, tid, 3),
-            Some(BuiltinKind::Date.into())
+            Some(ScalarFamily::Date.into())
         );
         assert_eq!(
             column_scalar_kind::<Postgres, _>(&pg, tid, 4),
-            Some(BuiltinKind::Time.into())
+            Some(ScalarFamily::Time.into())
         );
 
         // MySQL spellings, including `DATETIME` and `BIGINT UNSIGNED`.
@@ -744,23 +744,23 @@ mod tests {
         let tid = table_id(&my, "e").unwrap();
         assert_eq!(
             column_scalar_kind::<Postgres, _>(&my, tid, 1),
-            Some(BuiltinKind::Timestamp.into())
+            Some(ScalarFamily::Timestamp.into())
         );
         assert_eq!(
             column_scalar_kind::<Postgres, _>(&my, tid, 2),
-            Some(BuiltinKind::Timestamp.into())
+            Some(ScalarFamily::Timestamp.into())
         );
         assert_eq!(
             column_scalar_kind::<Postgres, _>(&my, tid, 3),
-            Some(BuiltinKind::Date.into())
+            Some(ScalarFamily::Date.into())
         );
         assert_eq!(
             column_scalar_kind::<Postgres, _>(&my, tid, 4),
-            Some(BuiltinKind::Time.into())
+            Some(ScalarFamily::Time.into())
         );
         assert_eq!(
             column_scalar_kind::<Postgres, _>(&my, tid, 5),
-            Some(BuiltinKind::Int.into())
+            Some(ScalarFamily::Int.into())
         );
     }
 
@@ -777,7 +777,7 @@ mod tests {
 
         let column: ColumnComparisonOf<Postgres> =
             column_comparison::<Postgres, _>(&db, table, 0).unwrap();
-        assert_eq!(column.kind, BuiltinKind::String.into());
+        assert_eq!(column.kind, ScalarFamily::String.into());
         assert_eq!(column.declared_type, "TEXT");
         let CollationFacts::Named {
             name,

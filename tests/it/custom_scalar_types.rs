@@ -14,7 +14,7 @@ use sqlparser::dialect::PostgreSqlDialect;
 use subql::backend::Pg18;
 use subql::backend::Postgres;
 use subql::backend::{
-    Backend, BuiltinKind, Carried, CustomScalars, ScalarKind, ScalarKindOf, Value,
+    Backend, Carried, CustomScalars, ScalarFamily, ScalarKind, ScalarKindOf, Value,
 };
 use subql::backend::{NumericWidening, TextOperation, TextRule, ValueKind, ValueKindOf};
 use subql::compiler::vm::arithmetic::checked_integer_binary;
@@ -66,10 +66,10 @@ impl CustomScalars for MyScalars {
         }
     }
 
-    fn carrier(kind: Self::Kind) -> BuiltinKind {
+    fn carrier(kind: Self::Kind) -> ScalarFamily {
         match kind {
-            MyKind::Mood => BuiltinKind::String,
-            MyKind::Build => BuiltinKind::Int,
+            MyKind::Mood => ScalarFamily::String,
+            MyKind::Build => ScalarFamily::Int,
         }
     }
 
@@ -133,7 +133,7 @@ impl Backend for Custom {
 
     /// No cross-kind numeric comparison: this backend's fixtures compare
     /// same-kind values only.
-    fn numeric_widening(_left: BuiltinKind, _right: BuiltinKind) -> Option<NumericWidening> {
+    fn numeric_widening(_left: ScalarFamily, _right: ScalarFamily) -> Option<NumericWidening> {
         None
     }
 
@@ -153,13 +153,13 @@ impl Backend for Custom {
 
     /// The fixtures sum like PostgreSQL: a narrow integer column totals
     /// into a 64-bit integer and everything exact totals into a decimal.
-    fn sum_rule(column: subql::backend::BuiltinType) -> subql::backend::SumRule {
+    fn sum_rule(column: subql::backend::DeclaredType) -> subql::backend::SumRule {
         match column {
-            subql::backend::BuiltinType::Int(subql::backend::IntWidth::UpToThirtyTwo) => {
+            subql::backend::DeclaredType::Int(subql::backend::IntWidth::UpToThirtyTwo) => {
                 subql::backend::SumRule::Integer
             }
-            subql::backend::BuiltinType::Int(subql::backend::IntWidth::SixtyFour)
-            | subql::backend::BuiltinType::Decimal => subql::backend::SumRule::Decimal {
+            subql::backend::DeclaredType::Int(subql::backend::IntWidth::SixtyFour)
+            | subql::backend::DeclaredType::Decimal => subql::backend::SumRule::Decimal {
                 integer_digits: Some(131_072),
             },
             _ => subql::backend::SumRule::Double,
@@ -208,11 +208,11 @@ impl Backend for Custom {
 
     /// The fixtures declare no fixed-width or single-width column, so the
     /// common refinements serve.
-    fn refine_builtin(
-        family: subql::backend::BuiltinKind,
+    fn refine_declared_type(
+        family: subql::backend::ScalarFamily,
         declared_type: &str,
-    ) -> subql::backend::BuiltinType {
-        subql::backend::refined_builtin(
+    ) -> subql::backend::DeclaredType {
+        subql::backend::declared_type_of(
             family,
             subql::backend::declares_sixty_four_bit_int(declared_type),
             subql::backend::FloatWidth::Double,
@@ -257,7 +257,7 @@ impl SqlLiteralParse for Custom {
         if let ValueKind::Custom(custom) = target {
             return subql::compiler::parse_custom_literal::<Self>(sql, custom);
         }
-        let builtin = target.as_builtin().expect("not custom, so builtin");
+        let builtin = target.family().expect("not custom, so builtin");
         Ok(widen(Postgres::<Pg18>::parse_literal(
             sql,
             ValueKind::from(builtin),
@@ -318,12 +318,12 @@ fn a_declared_custom_type_classifies_as_itself() {
     );
     assert_eq!(
         kind_of_column("note"),
-        Some(BuiltinKind::String.into()),
+        Some(ScalarFamily::String.into()),
         "a builtin declaration wins over the backend's classifier"
     );
     assert_eq!(
         kind_of_column("id"),
-        Some(ScalarKind::Builtin(subql::backend::BuiltinType::Int(
+        Some(ScalarKind::Builtin(subql::backend::DeclaredType::Int(
             subql::backend::IntWidth::UpToThirtyTwo
         ))),
         "and so does an integer, at the width its declaration fixes"
@@ -338,7 +338,7 @@ fn a_wire_cell_decodes_through_the_carrier_and_the_conversion() {
         subql::backend::decode_cell::<Custom, _>(0, ScalarKind::Custom(MyKind::Mood), |carrier| {
             assert_eq!(
                 carrier.family(),
-                BuiltinKind::String,
+                ScalarFamily::String,
                 "a mood travels as text"
             );
             Value::String("happy".to_owned())
@@ -349,7 +349,7 @@ fn a_wire_cell_decodes_through_the_carrier_and_the_conversion() {
         subql::backend::decode_cell::<Custom, _>(1, ScalarKind::Custom(MyKind::Build), |carrier| {
             assert_eq!(
                 carrier.family(),
-                BuiltinKind::Int,
+                ScalarFamily::Int,
                 "a build travels as an integer"
             );
             Value::Int(1234)
@@ -383,7 +383,7 @@ fn a_refused_conversion_is_reported_as_itself_not_as_a_bad_carrier() {
         malformed,
         Err(ValueError::Builtin {
             column: 9,
-            kind: BuiltinKind::Int
+            kind: ScalarFamily::Int
         }),
         "the carrier itself could not be read"
     );
@@ -441,11 +441,11 @@ fn keying_is_answered_per_custom_type() {
         "a mood refuses keying, and the engine must respect that"
     );
     assert!(
-        subql::term::kind_can_key::<Custom>(BuiltinKind::Int.into()),
+        subql::term::kind_can_key::<Custom>(ScalarFamily::Int.into()),
         "builtins keep their own rule"
     );
     assert!(!subql::term::kind_can_key::<Custom>(
-        BuiltinKind::Json.into()
+        ScalarFamily::Json.into()
     ));
 }
 

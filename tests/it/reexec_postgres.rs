@@ -28,7 +28,7 @@ use crate::common;
 use diesel::{sql_query, PgConnection, RunQueryDsl};
 use sql_traits::structs::ParserDB;
 use sqlparser::dialect::PostgreSqlDialect;
-use subql::backend::{BuiltinKind, Postgres, Value};
+use subql::backend::{Postgres, ScalarFamily, Value};
 use subql::reexec::{
     AutoResolvingEngine, Connector, PgDieselConnector, SessionSetup, SnapshotResult, SyncMode,
 };
@@ -164,7 +164,7 @@ fn scaffold_registers_both_subscription_kinds() {
         .connector()
         .execute_scalar(
             &subql::reexec::ReadQuery::without_binds("SELECT MIN(price) AS v FROM orders"),
-            subql::backend::BuiltinKind::Float,
+            subql::backend::ScalarFamily::Float,
             &(),
         )
         .expect("connector executes");
@@ -580,7 +580,7 @@ fn every_read_reports_a_position_taken_before_its_snapshot() {
         PgDieselConnector::new(common::pg_connect(port))
             .execute_scalar(
                 &subql::reexec::ReadQuery::without_binds(&sql),
-                BuiltinKind::Int,
+                ScalarFamily::Int,
                 &(),
             )
             .expect("scalar read")
@@ -616,7 +616,7 @@ fn every_read_reports_a_position_taken_before_its_snapshot() {
         PgDieselConnector::new(common::pg_connect(port))
             .execute_scalar_row(
                 &subql::reexec::ReadQuery::without_binds(&sql),
-                &[BuiltinKind::Int],
+                &[ScalarFamily::Int],
                 &(),
             )
             .expect("seed read")
@@ -660,7 +660,7 @@ fn session_setup_runs_inside_each_read_transaction_sync_pg() {
     let (value, _) = connector
         .execute_scalar(
             &subql::reexec::ReadQuery::without_binds(read_marker),
-            BuiltinKind::String,
+            ScalarFamily::String,
             &setup,
         )
         .expect("scalar read");
@@ -687,7 +687,7 @@ fn session_setup_runs_inside_each_read_transaction_sync_pg() {
     let (value, _) = plain
         .execute_scalar(
             &subql::reexec::ReadQuery::without_binds(read_marker),
-            BuiltinKind::String,
+            ScalarFamily::String,
             &(),
         )
         .expect("scalar read");

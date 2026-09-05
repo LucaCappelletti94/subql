@@ -510,7 +510,7 @@ fn literal_index_key<B: SqlLiteralParse, DB: DatabaseLike>(
     // or trailing-space-insensitive collation has the same problem. Such a
     // predicate stays unindexed and the comparator answers it, rather than
     // the probe pruning a row the comparator would have matched.
-    if kind.as_builtin() == Some(crate::backend::BuiltinKind::String) {
+    if kind.family() == Some(crate::backend::ScalarFamily::String) {
         let facts = catalog_helpers::column_comparison::<B, DB>(database, table_id, column_id)?;
         let rule = crate::backend::single_column_rule::<B>(&facts);
         if rule != Some(crate::backend::TextRule::EXACT) {

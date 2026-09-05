@@ -29,7 +29,7 @@ use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::AsyncMysqlConnection;
 use sql_traits::structs::ParserDB;
 use sqlparser::dialect::MySqlDialect;
-use subql::backend::{BuiltinKind, MySql, Value};
+use subql::backend::{MySql, ScalarFamily, Value};
 use subql::reexec::{
     AsyncConnector, AsyncMode, AutoResolvingEngine, MysqlAsyncDieselConnector, SessionSetup,
     SnapshotResult,
@@ -323,7 +323,7 @@ fn every_read_reports_a_position_taken_before_its_snapshot() {
             on.block_on(async move {
                 held.execute_scalar(
                     &subql::reexec::ReadQuery::without_binds(sql),
-                    BuiltinKind::Int,
+                    ScalarFamily::Int,
                     &(),
                 )
                 .await
@@ -348,7 +348,7 @@ fn every_read_reports_a_position_taken_before_its_snapshot() {
             on.block_on(async move {
                 held.execute_scalar_row(
                     &subql::reexec::ReadQuery::without_binds(sql),
-                    &[BuiltinKind::Int],
+                    &[ScalarFamily::Int],
                     &(),
                 )
                 .await

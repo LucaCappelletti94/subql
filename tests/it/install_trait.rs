@@ -4,7 +4,7 @@
 
 use sql_traits::structs::ParserDB;
 use sqlparser::dialect::PostgreSqlDialect;
-use subql::backend::{BuiltinKind, Postgres, Value};
+use subql::backend::{Postgres, ScalarFamily, Value};
 use subql::testing::TestEvent;
 use subql::{
     catalog_helpers, AggValue, AggregateSeedInstall, DefaultIds, Install, InstallError,
@@ -39,7 +39,7 @@ fn scalar_install_returns_the_typed_scalar_update() {
     assert!(matches!(
         registered.tier,
         Tier::Scalar {
-            column_kind: BuiltinKind::Float,
+            column_kind: ScalarFamily::Float,
             ..
         }
     ));

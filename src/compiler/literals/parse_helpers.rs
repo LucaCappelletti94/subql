@@ -1,6 +1,6 @@
 //! Shared SQL literal parsing helpers used by all backend impls.
 
-use crate::backend::{BuiltinKind, NoCustom, ValueKind};
+use crate::backend::{NoCustom, ScalarFamily, ValueKind};
 use crate::RegisterError;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
@@ -15,7 +15,7 @@ pub(super) fn err_shape<C: core::fmt::Debug + Copy>(
 
 pub(super) fn err_parse(
     sql: &SqlValue,
-    family: BuiltinKind,
+    family: ScalarFamily,
     msg: impl core::fmt::Display,
 ) -> RegisterError {
     err_parse_kind(sql, ValueKind::<NoCustom>::from(family), msg)
@@ -33,15 +33,15 @@ pub(super) fn err_parse_kind<C: core::fmt::Debug + Copy>(
 
 pub(super) fn parse_i64_literal(n: &str, sql: &SqlValue) -> Result<i64, RegisterError> {
     sql_scalar_text::parse_i64(n).ok_or_else(|| match n.parse::<i64>() {
-        Err(e) => err_parse(sql, BuiltinKind::Int, e),
-        Ok(_) => err_parse(sql, BuiltinKind::Int, "not an integer"),
+        Err(e) => err_parse(sql, ScalarFamily::Int, e),
+        Ok(_) => err_parse(sql, ScalarFamily::Int, "not an integer"),
     })
 }
 
 pub(super) fn parse_f64_literal(n: &str, sql: &SqlValue) -> Result<f64, RegisterError> {
     sql_scalar_text::parse_f64(n).ok_or_else(|| match n.parse::<f64>() {
-        Err(e) => err_parse(sql, BuiltinKind::Float, e),
-        Ok(_) => err_parse(sql, BuiltinKind::Float, "not a float"),
+        Err(e) => err_parse(sql, ScalarFamily::Float, e),
+        Ok(_) => err_parse(sql, ScalarFamily::Float, "not a float"),
     })
 }
 
@@ -50,24 +50,28 @@ pub(super) fn parse_decimal_literal(
     sql: &SqlValue,
 ) -> Result<bigdecimal::BigDecimal, RegisterError> {
     sql_scalar_text::parse_decimal(n).ok_or_else(|| match n.parse::<bigdecimal::BigDecimal>() {
-        Err(e) => err_parse(sql, BuiltinKind::Decimal, e),
-        Ok(_) => err_parse(sql, BuiltinKind::Decimal, "not a decimal"),
+        Err(e) => err_parse(sql, ScalarFamily::Decimal, e),
+        Ok(_) => err_parse(sql, ScalarFamily::Decimal, "not a decimal"),
     })
 }
 
 pub(super) fn parse_hex_bytes(s: &str, sql: &SqlValue) -> Result<Vec<u8>, RegisterError> {
     if !s.len().is_multiple_of(2) {
-        return Err(err_parse(sql, BuiltinKind::Bytes, "odd-length hex literal"));
+        return Err(err_parse(
+            sql,
+            ScalarFamily::Bytes,
+            "odd-length hex literal",
+        ));
     }
     let mut out = Vec::with_capacity(s.len() / 2);
     let bytes = s.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
         let hi = hex_nibble(bytes[i]).ok_or_else(|| {
-            err_parse(sql, BuiltinKind::Bytes, "non-hex character in hex literal")
+            err_parse(sql, ScalarFamily::Bytes, "non-hex character in hex literal")
         })?;
         let lo = hex_nibble(bytes[i + 1]).ok_or_else(|| {
-            err_parse(sql, BuiltinKind::Bytes, "non-hex character in hex literal")
+            err_parse(sql, ScalarFamily::Bytes, "non-hex character in hex literal")
         })?;
         out.push((hi << 4) | lo);
         i += 2;
@@ -100,13 +104,13 @@ pub fn hex_upper(bytes: &[u8]) -> String {
 }
 
 pub(super) fn parse_uuid(s: &str, sql: &SqlValue) -> Result<uuid::Uuid, RegisterError> {
-    uuid::Uuid::parse_str(s).map_err(|e| err_parse(sql, BuiltinKind::Uuid, e))
+    uuid::Uuid::parse_str(s).map_err(|e| err_parse(sql, ScalarFamily::Uuid, e))
 }
 
 pub(super) fn parse_uuid_as_string(s: &str, sql: &SqlValue) -> Result<String, RegisterError> {
     // Validate the shape before storing as a string so downstream matches
     // do not silently paper over a malformed UUID literal.
-    uuid::Uuid::parse_str(s).map_err(|e| err_parse(sql, BuiltinKind::Uuid, e))?;
+    uuid::Uuid::parse_str(s).map_err(|e| err_parse(sql, ScalarFamily::Uuid, e))?;
     Ok(s.to_string())
 }
 
@@ -115,7 +119,7 @@ pub(super) fn parse_timestamp_literal(
     sql: &SqlValue,
 ) -> Result<chrono::NaiveDateTime, RegisterError> {
     sql_scalar_text::parse_timestamp(s)
-        .ok_or_else(|| err_parse(sql, BuiltinKind::Timestamp, "not a timestamp"))
+        .ok_or_else(|| err_parse(sql, ScalarFamily::Timestamp, "not a timestamp"))
 }
 
 pub(super) fn parse_timestamp_tz_literal(
@@ -125,7 +129,7 @@ pub(super) fn parse_timestamp_tz_literal(
     sql_scalar_text::parse_timestamp_tz(s).ok_or_else(|| {
         err_parse(
             sql,
-            BuiltinKind::TimestampTz,
+            ScalarFamily::TimestampTz,
             "not a timestamp with time zone",
         )
     })
@@ -135,18 +139,18 @@ pub(super) fn parse_date_literal(
     s: &str,
     sql: &SqlValue,
 ) -> Result<chrono::NaiveDate, RegisterError> {
-    sql_scalar_text::parse_date(s).ok_or_else(|| err_parse(sql, BuiltinKind::Date, "not a date"))
+    sql_scalar_text::parse_date(s).ok_or_else(|| err_parse(sql, ScalarFamily::Date, "not a date"))
 }
 
 pub(super) fn parse_time_literal(
     s: &str,
     sql: &SqlValue,
 ) -> Result<chrono::NaiveTime, RegisterError> {
-    sql_scalar_text::parse_time(s).ok_or_else(|| err_parse(sql, BuiltinKind::Time, "not a time"))
+    sql_scalar_text::parse_time(s).ok_or_else(|| err_parse(sql, ScalarFamily::Time, "not a time"))
 }
 
 pub(super) fn parse_json(s: &str, sql: &SqlValue) -> Result<serde_json::Value, RegisterError> {
-    serde_json::from_str(s).map_err(|e| err_parse(sql, BuiltinKind::Json, e))
+    serde_json::from_str(s).map_err(|e| err_parse(sql, ScalarFamily::Json, e))
 }
 
 /// Extract a string payload from a sqlparser quoted-string variant.

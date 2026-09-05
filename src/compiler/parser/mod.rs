@@ -16,7 +16,7 @@ use super::{
     prefilter::build_prefilter_plan,
     sql_shape, BytecodeProgram, Instruction, PredicateHash, PrefilterPlan,
 };
-use crate::backend::{Backend, BuiltinKind, Value};
+use crate::backend::{Backend, ScalarFamily, Value};
 use crate::compiler::bytecode::ComparisonRef;
 use crate::compiler::sql_shape::{AggSpec, QueryProjection};
 use crate::table_resolution::{resolve_table_reference, TableResolutionError};
@@ -151,20 +151,20 @@ impl<B: Backend> Compiling<B> {
             else {
                 continue;
             };
-            let kind = crate::catalog_helpers::column_builtin_kind(database, table_id, column);
+            let kind = crate::catalog_helpers::column_scalar_family(database, table_id, column);
             columns.push((column, kind));
             match kind {
-                Some(crate::backend::BuiltinKind::Jsonb)
+                Some(crate::backend::ScalarFamily::Jsonb)
                     if operation == TextOperation::Ordering =>
                 {
                     return Err(RegisterError::NotServedInProcess(
                         crate::errors::Refusal::OrderNotReproducible {
                             column,
-                            kind: crate::backend::BuiltinKind::Jsonb,
+                            kind: crate::backend::ScalarFamily::Jsonb,
                         },
                     ));
                 }
-                Some(crate::backend::BuiltinKind::String) => text_column = Some(column),
+                Some(crate::backend::ScalarFamily::String) => text_column = Some(column),
                 _ => {}
             }
         }
@@ -434,7 +434,7 @@ where
             // so the VM sees a Tri-typed result at TOS.
             let mut instructions = alloc::vec![Instruction::PushLiteral(B::parse_literal(
                 &SqlValue::Boolean(true),
-                BuiltinKind::Bool.into(),
+                ScalarFamily::Bool.into(),
             )?)];
             wrap_bare_value_as_tri::<B>(&mut instructions, ComparisonRef::NONE)?;
             (BytecodeProgram::new(instructions), Vec::new())
@@ -521,7 +521,7 @@ where
         // so the VM sees a Tri-typed result at TOS.
         let mut instructions = alloc::vec![Instruction::PushLiteral(B::parse_literal(
             &SqlValue::Boolean(true),
-            BuiltinKind::Bool.into(),
+            ScalarFamily::Bool.into(),
         )?)];
         wrap_bare_value_as_tri::<B>(&mut instructions, ComparisonRef::NONE)?;
         BytecodeProgram::new(instructions)
@@ -833,7 +833,7 @@ mod tests {
     //! here yet. These pin the `Value::Bytes` placeholder path added
     //! alongside the existing `SqlLiteralParse::parse_literal` decode leg.
     use super::{value_to_sql_value, SqlLiteralParse};
-    use crate::backend::{Backend, BuiltinKind, MySql, Postgres, SQLite, Value};
+    use crate::backend::{Backend, MySql, Postgres, SQLite, ScalarFamily, Value};
     use crate::RegisterError;
     use alloc::vec::Vec;
     use sqlparser::ast::Value as SqlValue;
@@ -849,7 +849,7 @@ mod tests {
         let value = Value::<B>::Bytes(B::Bytes::from(bytes.clone()));
         let sql = value_to_sql_value(&value).unwrap();
         assert!(matches!(sql, SqlValue::HexStringLiteral(_)));
-        let decoded = B::parse_literal(&sql, BuiltinKind::Bytes.into()).unwrap();
+        let decoded = B::parse_literal(&sql, ScalarFamily::Bytes.into()).unwrap();
         assert_eq!(decoded, Value::<B>::Bytes(B::Bytes::from(bytes)));
     }
 

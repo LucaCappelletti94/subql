@@ -55,7 +55,7 @@ use sql_scalar_text::{parse_date, parse_time, parse_timestamp, parse_timestamp_t
 use sql_traits::prelude::{ColumnLike, DatabaseLike, DialectLike, TypeMatchLike};
 use sqlite_diff_rs::{Adapter, Binder, DefaultBinder, Value};
 
-use crate::backend::{BuiltinKind, ScalarKindOf};
+use crate::backend::{ScalarFamily, ScalarKindOf};
 use crate::patchset::columns::{unknown_column_error, ColumnIndex};
 
 pub(crate) mod binders;
@@ -199,43 +199,43 @@ where
         // are handled above, and everything else falls to DefaultBinder.
         match self
             .scalar_kind_at(table_name, column_index)
-            .and_then(|kind| kind.as_builtin())
+            .and_then(|kind| kind.family())
         {
-            Some(BuiltinKind::Decimal) => {
+            Some(ScalarFamily::Decimal) => {
                 text_scalar_bind(col_name, value, "decimal TEXT or NULL", |s| {
                     Some(Box::new(DecimalBinder(sql_scalar_text::parse_decimal(s)?))
                         as Box<dyn Binder<Pg> + Send + 'a>)
                 })
             }
-            Some(BuiltinKind::Timestamp) => {
+            Some(ScalarFamily::Timestamp) => {
                 text_scalar_bind(col_name, value, "timestamp TEXT or NULL", |s| {
                     Some(Box::new(TimestampBinder(parse_timestamp(s)?))
                         as Box<dyn Binder<Pg> + Send + 'a>)
                 })
             }
-            Some(BuiltinKind::TimestampTz) => {
+            Some(ScalarFamily::TimestampTz) => {
                 text_scalar_bind(col_name, value, "timestamptz TEXT or NULL", |s| {
                     Some(Box::new(TimestampTzBinder(parse_timestamp_tz(s)?))
                         as Box<dyn Binder<Pg> + Send + 'a>)
                 })
             }
-            Some(BuiltinKind::Date) => {
+            Some(ScalarFamily::Date) => {
                 text_scalar_bind(col_name, value, "date TEXT or NULL", |s| {
                     Some(Box::new(DateBinder(parse_date(s)?)) as Box<dyn Binder<Pg> + Send + 'a>)
                 })
             }
-            Some(BuiltinKind::Time) => {
+            Some(ScalarFamily::Time) => {
                 text_scalar_bind(col_name, value, "time TEXT or NULL", |s| {
                     Some(Box::new(TimeBinder(parse_time(s)?)) as Box<dyn Binder<Pg> + Send + 'a>)
                 })
             }
-            Some(BuiltinKind::Json) => {
+            Some(ScalarFamily::Json) => {
                 text_scalar_bind(col_name, value, "json TEXT or NULL", |s| {
                     Some(Box::new(JsonBinder(serde_json::from_str(s).ok()?))
                         as Box<dyn Binder<Pg> + Send + 'a>)
                 })
             }
-            Some(BuiltinKind::Jsonb) => {
+            Some(ScalarFamily::Jsonb) => {
                 text_scalar_bind(col_name, value, "jsonb TEXT or NULL", |s| {
                     Some(Box::new(JsonbBinder(serde_json::from_str(s).ok()?))
                         as Box<dyn Binder<Pg> + Send + 'a>)

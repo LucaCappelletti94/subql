@@ -204,7 +204,7 @@ fn bytea_sql_text(bytes: &[u8]) -> String {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
-    use crate::backend::{BuiltinKind, ScalarKind};
+    use crate::backend::{ScalarFamily, ScalarKind};
     use alloc::vec;
 
     use rls2fga::translator::TranslatorBuilder;
@@ -589,23 +589,23 @@ CREATE POLICY docs_owner ON docs USING (owner = current_user);";
     #[test]
     fn the_setup_gate_matches_what_render_text_spells() {
         let epoch = chrono::DateTime::from_timestamp(0, 0).expect("epoch is a valid instant");
-        let cases: [(BuiltinKind, Value<Postgres>); 13] = [
-            (BuiltinKind::Bool, Value::Bool(true)),
-            (BuiltinKind::Int, Value::Int(1)),
-            (BuiltinKind::Float, Value::Float(1.0)),
-            (BuiltinKind::String, Value::String("x".into())),
-            (BuiltinKind::Bytes, Value::Bytes(vec![1])),
-            (BuiltinKind::Uuid, Value::Uuid(uuid::Uuid::nil())),
-            (BuiltinKind::Timestamp, Value::Timestamp(epoch.naive_utc())),
-            (BuiltinKind::TimestampTz, Value::TimestampTz(epoch)),
-            (BuiltinKind::Date, Value::Date(epoch.date_naive())),
-            (BuiltinKind::Time, Value::Time(epoch.time())),
+        let cases: [(ScalarFamily, Value<Postgres>); 13] = [
+            (ScalarFamily::Bool, Value::Bool(true)),
+            (ScalarFamily::Int, Value::Int(1)),
+            (ScalarFamily::Float, Value::Float(1.0)),
+            (ScalarFamily::String, Value::String("x".into())),
+            (ScalarFamily::Bytes, Value::Bytes(vec![1])),
+            (ScalarFamily::Uuid, Value::Uuid(uuid::Uuid::nil())),
+            (ScalarFamily::Timestamp, Value::Timestamp(epoch.naive_utc())),
+            (ScalarFamily::TimestampTz, Value::TimestampTz(epoch)),
+            (ScalarFamily::Date, Value::Date(epoch.date_naive())),
+            (ScalarFamily::Time, Value::Time(epoch.time())),
             (
-                BuiltinKind::Decimal,
+                ScalarFamily::Decimal,
                 Value::Decimal(bigdecimal::BigDecimal::from(1)),
             ),
-            (BuiltinKind::Json, Value::Json(serde_json::Value::Null)),
-            (BuiltinKind::Jsonb, Value::Jsonb(serde_json::Value::Null)),
+            (ScalarFamily::Json, Value::Json(serde_json::Value::Null)),
+            (ScalarFamily::Jsonb, Value::Jsonb(serde_json::Value::Null)),
         ];
         for (kind, value) in cases {
             assert_eq!(

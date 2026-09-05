@@ -17,7 +17,7 @@
 
 use sql_traits::structs::ParserDB;
 use sqlparser::dialect::PostgreSqlDialect;
-use subql::backend::{BuiltinKind, Postgres, Value};
+use subql::backend::{Postgres, ScalarFamily, Value};
 use subql::testing::TestEvent;
 use subql::{
     catalog_helpers, ColumnId, DefaultIds, NotServed, RegisterError, SubscriptionEngine,
@@ -59,7 +59,7 @@ fn jsonb_ordering_is_classified_not_served() {
         registered.not_served_because,
         Some(NotServed::OrderNotReproducible {
             column,
-            kind: BuiltinKind::Jsonb.into(),
+            kind: ScalarFamily::Jsonb.into(),
         }),
         "the cause is the reason the caller and the engine both read"
     );
@@ -84,7 +84,7 @@ fn jsonb_between_is_classified_too() {
         registered.not_served_because,
         Some(NotServed::OrderNotReproducible {
             column,
-            kind: BuiltinKind::Jsonb.into(),
+            kind: ScalarFamily::Jsonb.into(),
         }),
     );
 }

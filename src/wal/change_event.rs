@@ -177,7 +177,7 @@ impl WireEvent for ChangeEvent {
                         // so they are reported against the kind the column
                         // declares, custom or not.
                         let Ok(text) = core::str::from_utf8(bytes) else {
-                            return Err(kind.as_builtin().map_or_else(
+                            return Err(kind.family().map_or_else(
                                 || crate::ValueError::Custom {
                                     column: col,
                                     custom: alloc::format!("{kind:?}"),

@@ -415,12 +415,12 @@ fn resolve_numeric_agg_column<DB: DatabaseLike>(
     let display = func.to_uppercase();
     let column = resolve_single_column_arg(&display, f, table_id, database)?;
 
-    if let Some(kind) = catalog_helpers::column_builtin_kind(database, table_id, column) {
+    if let Some(kind) = catalog_helpers::column_scalar_family(database, table_id, column) {
         match kind {
             // Numeric scalars: SUM/AVG/variance/stddev accept these.
-            crate::backend::BuiltinKind::Int
-            | crate::backend::BuiltinKind::Float
-            | crate::backend::BuiltinKind::Decimal => {}
+            crate::backend::ScalarFamily::Int
+            | crate::backend::ScalarFamily::Float
+            | crate::backend::ScalarFamily::Decimal => {}
             // Everything else is rejected. Give the caller the concrete
             // kind in the error so the message matches the aggregate's
             // requirement.
@@ -1284,7 +1284,7 @@ pub(crate) fn render_aggregate_bootstrap<B: crate::backend::Backend, DB: Databas
             Expr::Identifier(super::quoted_ident(dialect, &name)),
             slot,
         ));
-        group_kinds.push(catalog_helpers::column_builtin_kind(
+        group_kinds.push(catalog_helpers::column_scalar_family(
             database, table_id, *column,
         )?);
     }
@@ -1331,8 +1331,8 @@ pub(crate) fn render_aggregate_bootstrap<B: crate::backend::Backend, DB: Databas
             bootstrap_total_kind(crate::catalog_helpers::total_rule::<B, DB>(
                 spec, database, table_id,
             )),
-            crate::backend::BuiltinKind::Float,
-            crate::backend::BuiltinKind::Int,
+            crate::backend::ScalarFamily::Float,
+            crate::backend::ScalarFamily::Int,
         ]);
     } else {
         kinds.extend(aggregate_bootstrap_kinds(
@@ -1341,7 +1341,7 @@ pub(crate) fn render_aggregate_bootstrap<B: crate::backend::Backend, DB: Databas
         ));
     }
     if !groups.is_empty() {
-        kinds.push(crate::backend::BuiltinKind::Int);
+        kinds.push(crate::backend::ScalarFamily::Int);
     }
     Some(crate::AggregateBootstrap {
         query: crate::reexec::BoundQuery::new(stmt.to_string(), binds.to_vec()),
@@ -1354,7 +1354,7 @@ pub(crate) fn render_aggregate_bootstrap<B: crate::backend::Backend, DB: Databas
 /// order.
 ///
 /// `COUNT` components are exact integers
-/// ([`crate::backend::BuiltinKind::Int`]). A `SUM` component decodes in the
+/// ([`crate::backend::ScalarFamily::Int`]). A `SUM` component decodes in the
 /// type its engine sums into, so that the seed and the fold hold the same
 /// number: PostgreSQL answers `bigint` for an `int` column and `numeric`
 /// for a `bigint` one, MySQL answers a decimal for both, and SQLite an
@@ -1363,7 +1363,7 @@ pub(crate) fn render_aggregate_bootstrap<B: crate::backend::Backend, DB: Databas
 pub(crate) fn aggregate_bootstrap_kinds(
     spec: &AggSpec,
     rule: crate::backend::SumRule,
-) -> Vec<crate::backend::BuiltinKind> {
+) -> Vec<crate::backend::ScalarFamily> {
     aggregate_bootstrap_kinds_with_total(spec, bootstrap_total_kind(rule))
 }
 
@@ -1374,31 +1374,31 @@ pub(crate) fn aggregate_bootstrap_kinds(
 /// component, and a widened seed's whatever it projects. Asking the
 /// aggregate instead of the rule is what gave a widened `COUNT` an `Int`
 /// where PostgreSQL answers `numeric`.
-const fn bootstrap_total_kind(rule: crate::backend::SumRule) -> crate::backend::BuiltinKind {
+const fn bootstrap_total_kind(rule: crate::backend::SumRule) -> crate::backend::ScalarFamily {
     match rule {
         crate::backend::SumRule::Integer | crate::backend::SumRule::IntegerPromotingToDouble => {
-            crate::backend::BuiltinKind::Int
+            crate::backend::ScalarFamily::Int
         }
-        crate::backend::SumRule::Decimal { .. } => crate::backend::BuiltinKind::Decimal,
+        crate::backend::SumRule::Decimal { .. } => crate::backend::ScalarFamily::Decimal,
         // A `real` total still decodes as a float cell: the width is the
         // accumulator's, and `SUM(real)` comes back as a floating value
         // either way.
         crate::backend::SumRule::Single | crate::backend::SumRule::Double => {
-            crate::backend::BuiltinKind::Float
+            crate::backend::ScalarFamily::Float
         }
     }
 }
 
 fn aggregate_bootstrap_kinds_with_total(
     spec: &AggSpec,
-    total: crate::backend::BuiltinKind,
-) -> Vec<crate::backend::BuiltinKind> {
+    total: crate::backend::ScalarFamily,
+) -> Vec<crate::backend::ScalarFamily> {
     match spec {
         AggSpec::CountStar | AggSpec::CountColumn { .. } => {
-            alloc::vec![crate::backend::BuiltinKind::Int]
+            alloc::vec![crate::backend::ScalarFamily::Int]
         }
         AggSpec::Sum { .. } | AggSpec::Avg { .. } => {
-            alloc::vec![total, crate::backend::BuiltinKind::Int]
+            alloc::vec![total, crate::backend::ScalarFamily::Int]
         }
         // The leading component is `SUM(arg)` here too, so it decodes in
         // the type the engine sums into. The middle one is the sum of
@@ -1408,8 +1408,8 @@ fn aggregate_bootstrap_kinds_with_total(
         | AggSpec::StddevPop { .. }
         | AggSpec::StddevSamp { .. } => alloc::vec![
             total,
-            crate::backend::BuiltinKind::Float,
-            crate::backend::BuiltinKind::Int,
+            crate::backend::ScalarFamily::Float,
+            crate::backend::ScalarFamily::Int,
         ],
     }
 }

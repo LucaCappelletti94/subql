@@ -32,7 +32,7 @@
 
 use sql_traits::structs::ParserDB;
 use sqlparser::dialect::{MySqlDialect, PostgreSqlDialect, SQLiteDialect};
-use subql::backend::{BuiltinKind, MySql, Postgres, SQLite, Value};
+use subql::backend::{MySql, Postgres, SQLite, ScalarFamily, Value};
 use subql::testing::TestEvent;
 use subql::{catalog_helpers, DefaultIds, NotServed, SubscriptionEngine, SubscriptionRequest};
 
@@ -250,9 +250,9 @@ fn non_numeric_cross_kind_is_not_served_in_process() {
         registered.not_served_because,
         Some(NotServed::CrossKindComparison {
             left: qty,
-            left_kind: BuiltinKind::Int.into(),
+            left_kind: ScalarFamily::Int.into(),
             right: label,
-            right_kind: BuiltinKind::String.into(),
+            right_kind: ScalarFamily::String.into(),
         }),
         "the cause names both operands and both kinds"
     );

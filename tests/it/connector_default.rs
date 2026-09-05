@@ -6,7 +6,7 @@
 
 #![allow(clippy::unwrap_used)]
 
-use subql::backend::{BuiltinKind, Postgres, Value};
+use subql::backend::{Postgres, ScalarFamily, Value};
 use subql::reexec::{Connector, ReadQuery, RowPage, ScalarRowError, Snapshot};
 use subql::NoCheckpoint;
 
@@ -23,7 +23,7 @@ impl Connector for MinimalConnector {
     fn execute_scalar(
         &self,
         _query: &ReadQuery<'_, Postgres>,
-        _kind: BuiltinKind,
+        _kind: ScalarFamily,
         _auth: &(),
     ) -> Result<(Value<Postgres>, Option<NoCheckpoint>), String> {
         Ok((Value::Int(0), None))
@@ -60,7 +60,7 @@ fn default_execute_scalar_row_is_unsupported() {
         &subql::reexec::ReadQuery::without_binds(
             "SELECT SUM(amount) AS c0, COUNT(amount) AS c1 FROM t",
         ),
-        &[BuiltinKind::Float, BuiltinKind::Int],
+        &[ScalarFamily::Float, ScalarFamily::Int],
         &(),
     );
     assert!(matches!(result, Err(ScalarRowError::Unsupported)));
@@ -73,7 +73,7 @@ fn execute_scalar_still_works_without_overriding_the_row_method() {
     let (value, checkpoint) = connector
         .execute_scalar(
             &subql::reexec::ReadQuery::without_binds("SELECT COUNT(*) AS v FROM t"),
-            BuiltinKind::Int,
+            ScalarFamily::Int,
             &(),
         )
         .unwrap();

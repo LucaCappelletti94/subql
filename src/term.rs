@@ -20,7 +20,7 @@ use core::mem::discriminant;
 use sql_traits::prelude::DatabaseLike;
 use sqlparser::ast::Expr;
 
-use crate::backend::{Backend, BuiltinKind, CustomScalars, ScalarKind, ScalarKindOf, Value};
+use crate::backend::{Backend, CustomScalars, ScalarFamily, ScalarKind, ScalarKindOf, Value};
 use crate::{catalog_helpers, ColumnId, RegisterError, TableId};
 
 /// The values one membership term compares, in the filter's column order.
@@ -138,7 +138,7 @@ pub struct MembershipTermDescription {
     /// [`TermKey`] keys a string and a UUID under different variants, so an
     /// identity supplied at another kind matches no membership row and admits
     /// nobody in silence.
-    pub subject_kind: BuiltinKind,
+    pub subject_kind: ScalarFamily,
     /// The custom type [`subject_kind`](Self::subject_kind) carries, when the
     /// compared column is one, as it prints.
     ///
@@ -173,7 +173,7 @@ pub struct TermColumnPair {
     pub member_key: String,
     /// The kind the seed column decodes as, which is also the kind
     /// [`column`](Self::column) holds.
-    pub kind: BuiltinKind,
+    pub kind: ScalarFamily,
     /// The custom type [`kind`](Self::kind) carries, when the column is one,
     /// as it prints.
     pub custom: Option<String>,
@@ -187,7 +187,7 @@ pub struct CallerTermDescription {
     /// The kind to build the subscriber at. One built at another kind is
     /// refused at registration, since the lookup matches by kind before
     /// value and a mismatched identity would serve the subscription dead.
-    pub kind: BuiltinKind,
+    pub kind: ScalarFamily,
     /// The custom type [`kind`](Self::kind) carries, when the compared
     /// column is one, as it prints.
     pub custom: Option<String>,
@@ -295,9 +295,9 @@ fn name<DB: DatabaseLike>(
 ///
 /// What a caller reads out of the database and supplies back, since the
 /// conversion into a custom value is subql's to run.
-fn carrier_of<B: Backend>(kind: ScalarKindOf<B>) -> BuiltinKind {
-    kind.as_builtin().unwrap_or_else(|| {
-        kind.custom().map_or(BuiltinKind::String, |custom| {
+fn carrier_of<B: Backend>(kind: ScalarKindOf<B>) -> ScalarFamily {
+    kind.family().unwrap_or_else(|| {
+        kind.custom().map_or(ScalarFamily::String, |custom| {
             <B::Custom as CustomScalars>::carrier(*custom)
         })
     })
@@ -446,16 +446,16 @@ impl<B: Backend> TermKey<B> {
             Self::Custom(value) => {
                 crate::backend::ValueKind::Custom(<B::Custom as CustomScalars>::kind_of(value))
             }
-            Self::Bool(_) => crate::backend::ValueKind::Builtin(BuiltinKind::Bool),
-            Self::Int(_) => crate::backend::ValueKind::Builtin(BuiltinKind::Int),
-            Self::String(_) => crate::backend::ValueKind::Builtin(BuiltinKind::String),
-            Self::Bytes(_) => crate::backend::ValueKind::Builtin(BuiltinKind::Bytes),
-            Self::Uuid(_) => crate::backend::ValueKind::Builtin(BuiltinKind::Uuid),
-            Self::Timestamp(_) => crate::backend::ValueKind::Builtin(BuiltinKind::Timestamp),
-            Self::TimestampTz(_) => crate::backend::ValueKind::Builtin(BuiltinKind::TimestampTz),
-            Self::Date(_) => crate::backend::ValueKind::Builtin(BuiltinKind::Date),
-            Self::Time(_) => crate::backend::ValueKind::Builtin(BuiltinKind::Time),
-            Self::Decimal(_) => crate::backend::ValueKind::Builtin(BuiltinKind::Decimal),
+            Self::Bool(_) => crate::backend::ValueKind::Builtin(ScalarFamily::Bool),
+            Self::Int(_) => crate::backend::ValueKind::Builtin(ScalarFamily::Int),
+            Self::String(_) => crate::backend::ValueKind::Builtin(ScalarFamily::String),
+            Self::Bytes(_) => crate::backend::ValueKind::Builtin(ScalarFamily::Bytes),
+            Self::Uuid(_) => crate::backend::ValueKind::Builtin(ScalarFamily::Uuid),
+            Self::Timestamp(_) => crate::backend::ValueKind::Builtin(ScalarFamily::Timestamp),
+            Self::TimestampTz(_) => crate::backend::ValueKind::Builtin(ScalarFamily::TimestampTz),
+            Self::Date(_) => crate::backend::ValueKind::Builtin(ScalarFamily::Date),
+            Self::Time(_) => crate::backend::ValueKind::Builtin(ScalarFamily::Time),
+            Self::Decimal(_) => crate::backend::ValueKind::Builtin(ScalarFamily::Decimal),
         }
     }
 }
@@ -558,17 +558,17 @@ pub fn kind_can_key<B: Backend>(kind: ScalarKindOf<B>) -> bool {
         // reflexivity the builtin rule demands is already promised.
         ScalarKind::Custom(custom) => <B::Custom as CustomScalars>::can_key(custom),
         ScalarKind::Builtin(builtin) => match builtin.family() {
-            BuiltinKind::Bool
-            | BuiltinKind::Int
-            | BuiltinKind::String
-            | BuiltinKind::Bytes
-            | BuiltinKind::Uuid
-            | BuiltinKind::Timestamp
-            | BuiltinKind::TimestampTz
-            | BuiltinKind::Date
-            | BuiltinKind::Time
-            | BuiltinKind::Decimal => true,
-            BuiltinKind::Float | BuiltinKind::Json | BuiltinKind::Jsonb => false,
+            ScalarFamily::Bool
+            | ScalarFamily::Int
+            | ScalarFamily::String
+            | ScalarFamily::Bytes
+            | ScalarFamily::Uuid
+            | ScalarFamily::Timestamp
+            | ScalarFamily::TimestampTz
+            | ScalarFamily::Date
+            | ScalarFamily::Time
+            | ScalarFamily::Decimal => true,
+            ScalarFamily::Float | ScalarFamily::Json | ScalarFamily::Jsonb => false,
         },
     }
 }
@@ -576,7 +576,7 @@ pub fn kind_can_key<B: Backend>(kind: ScalarKindOf<B>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{kind_can_key, TermKey, TermLookup};
-    use crate::backend::{Backend, BuiltinKind, MySql, Postgres, Value};
+    use crate::backend::{Backend, MySql, Postgres, ScalarFamily, Value};
     use hashbrown::HashMap;
 
     /// Both keys must go through the *same* hasher. `DefaultHashBuilder` is
@@ -666,22 +666,22 @@ mod tests {
     fn the_registration_gate_matches_what_the_conversion_accepts() {
         let epoch = chrono::DateTime::from_timestamp(0, 0).expect("epoch is a valid instant");
         let cases = [
-            (BuiltinKind::Bool, Value::<Postgres>::Bool(true)),
-            (BuiltinKind::Int, Value::Int(1)),
-            (BuiltinKind::Float, Value::Float(1.0)),
-            (BuiltinKind::String, Value::String("x".to_string())),
-            (BuiltinKind::Bytes, Value::Bytes(vec![1])),
-            (BuiltinKind::Uuid, Value::Uuid(uuid::Uuid::nil())),
-            (BuiltinKind::Timestamp, Value::Timestamp(epoch.naive_utc())),
-            (BuiltinKind::TimestampTz, Value::TimestampTz(epoch)),
-            (BuiltinKind::Date, Value::Date(epoch.date_naive())),
-            (BuiltinKind::Time, Value::Time(epoch.time())),
+            (ScalarFamily::Bool, Value::<Postgres>::Bool(true)),
+            (ScalarFamily::Int, Value::Int(1)),
+            (ScalarFamily::Float, Value::Float(1.0)),
+            (ScalarFamily::String, Value::String("x".to_string())),
+            (ScalarFamily::Bytes, Value::Bytes(vec![1])),
+            (ScalarFamily::Uuid, Value::Uuid(uuid::Uuid::nil())),
+            (ScalarFamily::Timestamp, Value::Timestamp(epoch.naive_utc())),
+            (ScalarFamily::TimestampTz, Value::TimestampTz(epoch)),
+            (ScalarFamily::Date, Value::Date(epoch.date_naive())),
+            (ScalarFamily::Time, Value::Time(epoch.time())),
             (
-                BuiltinKind::Decimal,
+                ScalarFamily::Decimal,
                 Value::Decimal(bigdecimal::BigDecimal::from(1)),
             ),
-            (BuiltinKind::Json, Value::Json(serde_json::Value::Null)),
-            (BuiltinKind::Jsonb, Value::Jsonb(serde_json::Value::Null)),
+            (ScalarFamily::Json, Value::Json(serde_json::Value::Null)),
+            (ScalarFamily::Jsonb, Value::Jsonb(serde_json::Value::Null)),
         ];
         assert_eq!(cases.len(), 13, "every builtin kind must appear here");
         for (kind, value) in cases {

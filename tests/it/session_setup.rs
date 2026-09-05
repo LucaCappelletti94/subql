@@ -14,7 +14,7 @@ use diesel::connection::{Instrumentation, InstrumentationEvent};
 use diesel::{sql_query, Connection, RunQueryDsl, SqliteConnection};
 use parking_lot::Mutex;
 use std::sync::Arc;
-use subql::backend::{BuiltinKind, Postgres};
+use subql::backend::{Postgres, ScalarFamily};
 use subql::reexec::{Connector, DieselConnector, SessionSetup};
 
 /// Records the ordered statement and transaction events a connection sees.
@@ -82,7 +82,7 @@ fn setup_statements_run_inside_the_read_transaction() {
     connector
         .execute_scalar(
             &subql::reexec::ReadQuery::without_binds(SCALAR_SQL),
-            BuiltinKind::Int,
+            ScalarFamily::Int,
             &setup,
         )
         .unwrap();
@@ -115,7 +115,7 @@ fn an_empty_setup_changes_nothing() {
     connector
         .execute_scalar(
             &subql::reexec::ReadQuery::without_binds(SCALAR_SQL),
-            BuiltinKind::Int,
+            ScalarFamily::Int,
             &(),
         )
         .unwrap();
@@ -147,7 +147,7 @@ fn a_transaction_free_path_with_setup_opens_a_transaction() {
         ("execute_scalar", |c, setup| {
             c.execute_scalar(
                 &subql::reexec::ReadQuery::without_binds(SCALAR_SQL),
-                BuiltinKind::Int,
+                ScalarFamily::Int,
                 setup,
             )
             .unwrap();

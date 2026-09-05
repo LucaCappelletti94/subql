@@ -105,7 +105,7 @@ enum ResolveJob<B: Backend> {
     /// A scalar the connector reads in one call.
     Scalar {
         query: super::BoundQuery<B>,
-        column_kind: crate::backend::BuiltinKind,
+        column_kind: crate::backend::ScalarFamily,
     },
     /// One grouped extreme and its source-row count.
     GroupedScalar {
@@ -1020,7 +1020,7 @@ mod tests {
         catalog, delete_event, insert_event, row, update_status_only,
     };
     use super::*;
-    use crate::backend::{BuiltinKind, Postgres};
+    use crate::backend::{Postgres, ScalarFamily};
     use crate::testing::TestEvent;
     use crate::{
         DefaultIds, NoCheckpoint, Registered, SubscriptionEngine, SubscriptionRequest, TableId,
@@ -1147,7 +1147,7 @@ mod tests {
         fn execute_scalar(
             &self,
             query: &super::super::ReadQuery<'_, Postgres>,
-            _kind: BuiltinKind,
+            _kind: ScalarFamily,
             _auth: &(),
         ) -> impl Future<Output = Result<(Value<Postgres>, Option<Self::Checkpoint>), Self::Error>> + Send
         {
@@ -2096,12 +2096,12 @@ mod tests {
         let first = super::super::ReExecutionRead::GroupedScalar {
             group: vec![1],
             query: super::super::BoundQuery::new(String::new(), Vec::new()),
-            column_kinds: [BuiltinKind::Int, BuiltinKind::Int],
+            column_kinds: [ScalarFamily::Int, ScalarFamily::Int],
         };
         let second = super::super::ReExecutionRead::GroupedScalar {
             group: vec![2],
             query: super::super::BoundQuery::new(String::new(), Vec::new()),
-            column_kinds: [BuiltinKind::Int, BuiltinKind::Int],
+            column_kinds: [ScalarFamily::Int, ScalarFamily::Int],
         };
         engine.stamp_reexec(7, &first);
         assert!(engine.debounce_skip(7, &first));

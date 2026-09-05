@@ -13,8 +13,8 @@ use diesel::prelude::*;
 use sql_traits::traits::MySqlCollationPadding;
 use std::str::FromStr;
 use subql::backend::{
-    Backend, BuiltinKind, CollationFacts, CollationName, ColumnComparison, MySql, NoCustom,
-    Postgres, SQLite, SqliteJson, Value,
+    Backend, CollationFacts, CollationName, ColumnComparison, MySql, NoCustom, Postgres, SQLite,
+    ScalarFamily, SqliteJson, Value,
 };
 #[cfg(feature = "executor-diesel-mysql")]
 use subql::reexec::MysqlDieselConnector;
@@ -64,7 +64,7 @@ struct CountRow {
 }
 
 fn column(
-    kind: subql::backend::BuiltinKind,
+    kind: subql::backend::ScalarFamily,
     collation: CollationFacts,
 ) -> ColumnComparison<NoCustom> {
     ColumnComparison {
@@ -230,7 +230,7 @@ fn postgres_keys_match_group_by_equality() {
         .unwrap();
     assert_eq!(float_groups.len(), 2);
     let float_encoder = Postgres::<Pg18>::group_key_encoder(vec![column(
-        BuiltinKind::Float,
+        ScalarFamily::Float,
         CollationFacts::DatabaseDefault,
     )])
     .unwrap();
@@ -250,7 +250,7 @@ fn postgres_keys_match_group_by_equality() {
         .unwrap();
     assert_eq!(text_groups.len(), 6);
     assert!(Postgres::<Pg18>::group_key_encoder(vec![column(
-        BuiltinKind::String,
+        ScalarFamily::String,
         named("ci", Some(false), None),
     )])
     .is_none());
@@ -262,7 +262,7 @@ fn postgres_keys_match_group_by_equality() {
         .unwrap();
     assert_eq!(exact_groups.len(), 12);
     assert!(Postgres::<Pg18>::group_key_encoder(vec![column(
-        BuiltinKind::String,
+        ScalarFamily::String,
         named("C", Some(true), None),
     )])
     .is_some());
@@ -274,7 +274,7 @@ fn postgres_keys_match_group_by_equality() {
         .unwrap();
     assert_eq!(jsonb_groups.len(), 7);
     let jsonb_encoder = Postgres::<Pg18>::group_key_encoder(vec![column(
-        BuiltinKind::Jsonb,
+        ScalarFamily::Jsonb,
         CollationFacts::DatabaseDefault,
     )])
     .unwrap();
@@ -373,7 +373,7 @@ fn mysql_keys_match_binary_collations_and_decimal_equality() {
         .unwrap();
     assert_eq!(padded_groups.len(), 1);
     let padded_encoder = MySql::group_key_encoder(vec![column(
-        BuiltinKind::String,
+        ScalarFamily::String,
         named("utf8mb4_bin", None, Some(MySqlCollationPadding::PadSpace)),
     )])
     .unwrap();
@@ -409,7 +409,7 @@ fn mysql_keys_match_binary_collations_and_decimal_equality() {
         .unwrap();
     assert_eq!(single_groups.len(), 2);
     assert!(MySql::group_key_encoder(vec![column(
-        BuiltinKind::Float,
+        ScalarFamily::Float,
         CollationFacts::DatabaseDefault,
     )])
     .is_none());
@@ -480,7 +480,7 @@ fn sqlite_keys_match_builtin_collations_and_dynamic_numeric_equality() {
         .unwrap();
     assert_eq!(nocase_groups.len(), 2);
     let nocase_encoder = SQLite::group_key_encoder(vec![column(
-        BuiltinKind::String,
+        ScalarFamily::String,
         named("NOCASE", None, None),
     )])
     .unwrap();
@@ -511,7 +511,7 @@ fn sqlite_keys_match_builtin_collations_and_dynamic_numeric_equality() {
     .unwrap();
     assert_eq!(groups.count, 1);
     let json_encoder = SQLite::group_key_encoder(vec![column(
-        BuiltinKind::Json,
+        ScalarFamily::Json,
         CollationFacts::DatabaseDefault,
     )])
     .unwrap();

@@ -887,7 +887,7 @@ CREATE TABLE readings(tenant_id INTEGER, reading_id INTEGER, starts_at TIMESTAMP
                 }
                 Err(ValueError::Builtin {
                     column: col,
-                    kind: crate::backend::BuiltinKind::String,
+                    kind: crate::backend::ScalarFamily::String,
                 })
             }
         }
@@ -942,7 +942,7 @@ CREATE TABLE readings(tenant_id INTEGER, reading_id INTEGER, starts_at TIMESTAMP
             ) -> Result<Value<Postgres>, ValueError> {
                 Err(ValueError::Builtin {
                     column: col,
-                    kind: crate::backend::BuiltinKind::Int,
+                    kind: crate::backend::ScalarFamily::Int,
                 })
             }
         }

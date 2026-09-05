@@ -1,7 +1,7 @@
 //! Expression compilation helpers split out of the parser.
 
 use super::{Compiling, MAX_TERMS_PER_FILTER};
-use crate::backend::{Backend, BuiltinKind, Value, ValueKindOf};
+use crate::backend::{Backend, ScalarFamily, Value, ValueKindOf};
 use crate::compiler::bytecode::{ComparisonRef, FloatResult};
 use crate::compiler::literals::{resolve_column_ref, SqlLiteralParse};
 use crate::compiler::{canonicalize, sql_shape, BytecodeProgram, Instruction};
@@ -84,10 +84,10 @@ fn quotient_kind<B: Backend>(
     {
         return operand;
     }
-    if operand == Some(BuiltinKind::Float.into()) {
+    if operand == Some(ScalarFamily::Float.into()) {
         return operand;
     }
-    Some(BuiltinKind::Decimal.into())
+    Some(ScalarFamily::Decimal.into())
 }
 
 /// Return `true` if `instr` produces a [`crate::compiler::Tri`] on the
@@ -133,7 +133,7 @@ where
         Some(_) => {
             instructions.push(Instruction::PushLiteral(B::parse_literal(
                 &SqlValue::Boolean(true),
-                BuiltinKind::Bool.into(),
+                ScalarFamily::Bool.into(),
             )?));
             instructions.push(Instruction::Equal(comparison));
             Ok(())
@@ -172,7 +172,7 @@ where
         database,
         &mut compiling,
         0,
-        BuiltinKind::String.into(),
+        ScalarFamily::String.into(),
     )?;
     let bare = ComparisonRef::new(compiling.intern_comparison(expr, table_id, database), None);
     wrap_bare_value_as_tri::<B>(&mut compiling.out, bare)?;
@@ -251,8 +251,8 @@ fn float_result_width<B: Backend, DB: DatabaseLike>(
 ) -> FloatResult {
     if let Some(column) = resolve_column_ref(expr, table_id, database) {
         return crate::catalog_helpers::column_comparison::<B, DB>(database, table_id, column)
-            .and_then(|facts| facts.kind.builtin())
-            .and_then(crate::backend::BuiltinType::float_width);
+            .and_then(|facts| facts.kind.declared_type())
+            .and_then(crate::backend::DeclaredType::float_width);
     }
     if depth >= sql_shape::MAX_EXPR_DEPTH {
         return None;
@@ -316,7 +316,7 @@ where
                         database,
                         out,
                         depth + 1,
-                        BuiltinKind::String.into(),
+                        ScalarFamily::String.into(),
                     )?;
 
                     let jump_idx = out.len();
@@ -329,7 +329,7 @@ where
                         database,
                         out,
                         depth + 1,
-                        BuiltinKind::String.into(),
+                        ScalarFamily::String.into(),
                     )?;
                     out.push(Instruction::And);
 
@@ -343,7 +343,7 @@ where
                         database,
                         out,
                         depth + 1,
-                        BuiltinKind::String.into(),
+                        ScalarFamily::String.into(),
                     )?;
 
                     let jump_idx = out.len();
@@ -356,7 +356,7 @@ where
                         database,
                         out,
                         depth + 1,
-                        BuiltinKind::String.into(),
+                        ScalarFamily::String.into(),
                     )?;
                     out.push(Instruction::Or);
 
@@ -395,7 +395,7 @@ where
                             .or_else(|| {
                                 nested_column_scalar_of::<B, DB>(right, table_id, database, depth)
                             })
-                            .unwrap_or_else(|| BuiltinKind::String.into());
+                            .unwrap_or_else(|| ScalarFamily::String.into());
                     compile_expr_recursive::<B, DB>(
                         left,
                         table_id,
@@ -555,7 +555,7 @@ where
             // Derive target from the tested expression if it's a column
             // reference; fall back to String otherwise (best-effort).
             let list_target = column_scalar_of::<B, DB>(expr, table_id, database)
-                .unwrap_or_else(|| BuiltinKind::String.into());
+                .unwrap_or_else(|| ScalarFamily::String.into());
 
             compile_expr_recursive::<B, DB>(expr, table_id, database, out, depth + 1, list_target)?;
 
@@ -653,7 +653,7 @@ where
             negated,
         } => {
             let range_target = column_scalar_of::<B, DB>(expr, table_id, database)
-                .unwrap_or_else(|| BuiltinKind::String.into());
+                .unwrap_or_else(|| ScalarFamily::String.into());
 
             // Stack order: value, lower, upper.
             compile_expr_recursive::<B, DB>(
@@ -718,7 +718,7 @@ where
                 database,
                 out,
                 depth + 1,
-                BuiltinKind::String.into(),
+                ScalarFamily::String.into(),
             )?;
             out.push(Instruction::IsNull);
         }
@@ -730,7 +730,7 @@ where
                 database,
                 out,
                 depth + 1,
-                BuiltinKind::String.into(),
+                ScalarFamily::String.into(),
             )?;
             out.push(Instruction::IsNotNull);
         }
@@ -798,7 +798,7 @@ where
                 database,
                 out,
                 depth + 1,
-                BuiltinKind::String.into(),
+                ScalarFamily::String.into(),
             )?;
             compile_expr_recursive::<B, DB>(
                 pattern,
@@ -806,7 +806,7 @@ where
                 database,
                 out,
                 depth + 1,
-                BuiltinKind::String.into(),
+                ScalarFamily::String.into(),
             )?;
 
             let cmp = out.comparison_for(
@@ -842,7 +842,7 @@ where
                 database,
                 out,
                 depth + 1,
-                BuiltinKind::String.into(),
+                ScalarFamily::String.into(),
             )?;
             compile_expr_recursive::<B, DB>(
                 pattern,
@@ -850,7 +850,7 @@ where
                 database,
                 out,
                 depth + 1,
-                BuiltinKind::String.into(),
+                ScalarFamily::String.into(),
             )?;
 
             let cmp = out.comparison_for(

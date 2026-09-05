@@ -468,7 +468,7 @@ mod refusals {
 
 mod describe_terms {
     use super::{engine, refusal, subscribe, CALLER};
-    use subql::backend::{BuiltinKind, Postgres, Value};
+    use subql::backend::{Postgres, ScalarFamily, Value};
     use subql::{DefaultIds, SubscriptionRequest};
 
     /// A caller comparison needs nothing seeded, but the subscriber has to be
@@ -485,7 +485,7 @@ mod describe_terms {
         assert_eq!(caller.column, "owner", "the compared column");
         assert_eq!(
             caller.kind,
-            BuiltinKind::String,
+            ScalarFamily::String,
             "owner is TEXT, the kind the subscriber must be built at"
         );
         assert_eq!(caller.custom, None);
@@ -538,7 +538,7 @@ mod describe_terms {
             })
             .expect("the caller comparison is described with its kind");
         assert_eq!(caller.column, "owner");
-        assert_eq!(caller.kind, BuiltinKind::String);
+        assert_eq!(caller.kind, ScalarFamily::String);
     }
 
     /// Describing and registering the same request refuse alike for the caller

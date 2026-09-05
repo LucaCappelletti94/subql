@@ -14,7 +14,7 @@ use bigdecimal::BigDecimal;
 use core::str::FromStr as _;
 use sql_traits::structs::ParserDB;
 use sqlparser::dialect::{MySqlDialect, PostgreSqlDialect};
-use subql::backend::{BuiltinKind, MySql, Postgres, Value};
+use subql::backend::{MySql, Postgres, ScalarFamily, Value};
 use subql::testing::TestEvent;
 use subql::{
     AggValue, AggregateBootstrap, DefaultIds, NumericValue, SubscriptionEngine, SubscriptionRequest,
@@ -154,10 +154,10 @@ fn aggregate_bootstrap_carries_registration_binds() {
 /// up one-to-one with the seed SQL columns.
 #[test]
 fn bootstrap_kinds_per_aggspec() {
-    let int = BuiltinKind::Int;
-    let float = BuiltinKind::Float;
-    let decimal = BuiltinKind::Decimal;
-    let cases: [(&str, Vec<BuiltinKind>); 10] = [
+    let int = ScalarFamily::Int;
+    let float = ScalarFamily::Float;
+    let decimal = ScalarFamily::Decimal;
+    let cases: [(&str, Vec<ScalarFamily>); 10] = [
         ("SELECT COUNT(*) FROM t", vec![int]),
         ("SELECT COUNT(amount) FROM t", vec![int]),
         // `amount` is an `INT`, whose sum is a `bigint` on Postgres, so the
@@ -459,10 +459,10 @@ fn a_group_column_carrying_a_backtick_still_seeds_on_mysql() {
 /// is what separates the total's kind from the count's own `Int`.
 #[test]
 fn a_widened_seed_declares_the_kind_its_total_decodes_in() {
-    let string = BuiltinKind::String;
-    let int = BuiltinKind::Int;
-    let float = BuiltinKind::Float;
-    let decimal = BuiltinKind::Decimal;
+    let string = ScalarFamily::String;
+    let int = ScalarFamily::Int;
+    let float = ScalarFamily::Float;
+    let decimal = ScalarFamily::Decimal;
 
     for (sql, expected) in [
         (
@@ -522,8 +522,8 @@ fn a_widened_group_passes_its_having_on_the_seeded_total() {
         .enumerate()
         .map(|(slot, kind)| match (slot, kind) {
             (0, _) => Value::String("open".to_string()),
-            (1, BuiltinKind::Int) => Value::Int(100),
-            (1, BuiltinKind::Decimal) => {
+            (1, ScalarFamily::Int) => Value::Int(100),
+            (1, ScalarFamily::Decimal) => {
                 Value::Decimal(BigDecimal::from_str("100").expect("100 parses"))
             }
             (1, _) => Value::Float(100.0),

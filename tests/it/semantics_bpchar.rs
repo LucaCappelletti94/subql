@@ -24,8 +24,8 @@
 use sql_traits::structs::ParserDB;
 use sqlparser::dialect::{MySqlDialect, PostgreSqlDialect, SQLiteDialect};
 use subql::backend::{
-    Backend, BuiltinKind, CollationFacts, CollationName, ColumnComparison, ComparisonContext,
-    MySql, Postgres, SQLite, TextOperation, Value,
+    Backend, CollationFacts, CollationName, ColumnComparison, ComparisonContext, MySql, Postgres,
+    SQLite, ScalarFamily, TextOperation, Value,
 };
 use subql::testing::TestEvent;
 use subql::{catalog_helpers, DefaultIds, SubscriptionEngine, SubscriptionRequest};
@@ -197,7 +197,7 @@ fn char_against_varchar_pads_but_against_text_strips() {
 #[test]
 fn mysql_binary_collation_padding_is_per_collation() {
     let facts = |collation: &str| ColumnComparison {
-        kind: BuiltinKind::String.into(),
+        kind: ScalarFamily::String.into(),
         declared_type: "CHAR".to_string(),
         collation: CollationFacts::Named {
             name: CollationName {
@@ -308,7 +308,7 @@ fn sqlite_char_keeps_trailing_spaces() {
 #[test]
 fn a_pattern_keeps_trailing_spaces_whatever_the_collation_pads() {
     let facts = |collation: &str| ColumnComparison {
-        kind: BuiltinKind::String.into(),
+        kind: ScalarFamily::String.into(),
         declared_type: "VARCHAR".to_string(),
         collation: CollationFacts::Named {
             name: CollationName {
@@ -347,7 +347,7 @@ fn a_pattern_keeps_trailing_spaces_whatever_the_collation_pads() {
 
     let sqlite_rule = |collation: &str, operation| {
         let facts = ColumnComparison {
-            kind: BuiltinKind::String.into(),
+            kind: ScalarFamily::String.into(),
             declared_type: "TEXT".to_string(),
             collation: CollationFacts::Named {
                 name: CollationName {

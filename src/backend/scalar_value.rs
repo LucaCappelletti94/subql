@@ -7,21 +7,25 @@ use alloc::string::ToString;
 /// Runtime tag naming either one builtin SQL type or one custom type.
 ///
 /// `C` names the embedder's own scalar types. The builtin position carries
-/// subql's own [`BuiltinType`], not the family sql-traits classifies into:
+/// subql's own [`DeclaredType`], not the family sql-traits classifies into:
 /// a family is what three engines share, while a type is what one column
 /// declares, and the difference between them is where answers diverge.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum ScalarKind<C> {
     /// One builtin SQL type, refinements included.
-    Builtin(#[serde(with = "builtin_type_serde")] BuiltinType),
+    Builtin(#[serde(with = "declared_type_serde")] DeclaredType),
     /// One of the embedder's own types.
     Custom(C),
 }
 
-/// Builtin scalar *families* are classified and owned by sql-traits. They
-/// are the coarse question ("is this column numeric at all"), and an exact
-/// type answers it through [`BuiltinType::family`].
-pub type BuiltinKind = sql_traits::utils::scalar_family::ScalarFamily;
+/// Scalar *families* are classified and owned by sql-traits. They answer
+/// the coarse question, whether a column is numeric at all, and an exact
+/// type answers it through [`DeclaredType::family`].
+///
+/// Re-exported rather than aliased, so a call site names whose concept
+/// it is using. An alias reads as this crate's own type, and a reader who
+/// takes it for one cannot be corrected by the compiler.
+pub use sql_traits::utils::scalar_family::ScalarFamily;
 
 /// The width a declared floating-point type fixes.
 ///
@@ -75,7 +79,7 @@ pub enum TextWidth {
 /// forgotten by a new match arm, which is what a width read out of a
 /// declared-type string per layer could not promise.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum BuiltinType {
+pub enum DeclaredType {
     /// Boolean.
     Bool,
     /// Signed or unsigned integer, at the width the declaration fixes.
@@ -104,25 +108,25 @@ pub enum BuiltinType {
     Jsonb,
 }
 
-impl BuiltinType {
+impl DeclaredType {
     /// The family this type belongs to, for the questions that are genuinely
     /// coarse: whether a column can be folded, which wire type it emits.
     #[must_use]
-    pub const fn family(self) -> BuiltinKind {
+    pub const fn family(self) -> ScalarFamily {
         match self {
-            Self::Bool => BuiltinKind::Bool,
-            Self::Int(_) => BuiltinKind::Int,
-            Self::Float(_) => BuiltinKind::Float,
-            Self::Decimal => BuiltinKind::Decimal,
-            Self::Text(_) => BuiltinKind::String,
-            Self::Bytes => BuiltinKind::Bytes,
-            Self::Uuid => BuiltinKind::Uuid,
-            Self::Date => BuiltinKind::Date,
-            Self::Time => BuiltinKind::Time,
-            Self::Timestamp => BuiltinKind::Timestamp,
-            Self::TimestampTz => BuiltinKind::TimestampTz,
-            Self::Json => BuiltinKind::Json,
-            Self::Jsonb => BuiltinKind::Jsonb,
+            Self::Bool => ScalarFamily::Bool,
+            Self::Int(_) => ScalarFamily::Int,
+            Self::Float(_) => ScalarFamily::Float,
+            Self::Decimal => ScalarFamily::Decimal,
+            Self::Text(_) => ScalarFamily::String,
+            Self::Bytes => ScalarFamily::Bytes,
+            Self::Uuid => ScalarFamily::Uuid,
+            Self::Date => ScalarFamily::Date,
+            Self::Time => ScalarFamily::Time,
+            Self::Timestamp => ScalarFamily::Timestamp,
+            Self::TimestampTz => ScalarFamily::TimestampTz,
+            Self::Json => ScalarFamily::Json,
+            Self::Jsonb => ScalarFamily::Jsonb,
         }
     }
 
@@ -173,29 +177,29 @@ pub fn declares_sixty_four_bit_int(declared_type: &str) -> IntWidth {
 /// The exact type a family names, given the refinements the caller resolved
 /// from the declared type.
 ///
-/// The mechanism every backend's [`Backend::refine_builtin`] shares: only
+/// The mechanism every backend's [`Backend::refine_declared_type`] shares: only
 /// the two refinements differ per engine, never the mapping.
 #[must_use]
-pub const fn refined_builtin(
-    family: BuiltinKind,
+pub const fn declared_type_of(
+    family: ScalarFamily,
     int: IntWidth,
     float: FloatWidth,
     text: TextWidth,
-) -> BuiltinType {
+) -> DeclaredType {
     match family {
-        BuiltinKind::Bool => BuiltinType::Bool,
-        BuiltinKind::Int => BuiltinType::Int(int),
-        BuiltinKind::Float => BuiltinType::Float(float),
-        BuiltinKind::Decimal => BuiltinType::Decimal,
-        BuiltinKind::String => BuiltinType::Text(text),
-        BuiltinKind::Bytes => BuiltinType::Bytes,
-        BuiltinKind::Uuid => BuiltinType::Uuid,
-        BuiltinKind::Date => BuiltinType::Date,
-        BuiltinKind::Time => BuiltinType::Time,
-        BuiltinKind::Timestamp => BuiltinType::Timestamp,
-        BuiltinKind::TimestampTz => BuiltinType::TimestampTz,
-        BuiltinKind::Json => BuiltinType::Json,
-        BuiltinKind::Jsonb => BuiltinType::Jsonb,
+        ScalarFamily::Bool => DeclaredType::Bool,
+        ScalarFamily::Int => DeclaredType::Int(int),
+        ScalarFamily::Float => DeclaredType::Float(float),
+        ScalarFamily::Decimal => DeclaredType::Decimal,
+        ScalarFamily::String => DeclaredType::Text(text),
+        ScalarFamily::Bytes => DeclaredType::Bytes,
+        ScalarFamily::Uuid => DeclaredType::Uuid,
+        ScalarFamily::Date => DeclaredType::Date,
+        ScalarFamily::Time => DeclaredType::Time,
+        ScalarFamily::Timestamp => DeclaredType::Timestamp,
+        ScalarFamily::TimestampTz => DeclaredType::TimestampTz,
+        ScalarFamily::Json => DeclaredType::Json,
+        ScalarFamily::Jsonb => DeclaredType::Jsonb,
     }
 }
 
@@ -237,7 +241,7 @@ pub fn declares_fixed_width_text(declared_type: &str) -> TextWidth {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ValueKind<C> {
     /// One builtin family.
-    Builtin(BuiltinKind),
+    Builtin(ScalarFamily),
     /// One of the embedder's own types.
     Custom(C),
 }
@@ -245,7 +249,7 @@ pub enum ValueKind<C> {
 impl<C> ValueKind<C> {
     /// The family this value belongs to, or `None` when it is custom.
     #[must_use]
-    pub const fn as_builtin(&self) -> Option<BuiltinKind> {
+    pub const fn family(&self) -> Option<ScalarFamily> {
         match self {
             Self::Builtin(family) => Some(*family),
             Self::Custom(_) => None,
@@ -253,8 +257,8 @@ impl<C> ValueKind<C> {
     }
 }
 
-impl<C> From<BuiltinKind> for ValueKind<C> {
-    fn from(family: BuiltinKind) -> Self {
+impl<C> From<ScalarFamily> for ValueKind<C> {
+    fn from(family: ScalarFamily) -> Self {
         Self::Builtin(family)
     }
 }
@@ -265,8 +269,8 @@ pub type ScalarKindOf<B> = ScalarKind<<<B as Backend>::Custom as CustomScalars>:
 /// What a value of backend `B` is, custom position included.
 pub type ValueKindOf<B> = ValueKind<<<B as Backend>::Custom as CustomScalars>::Kind>;
 
-mod builtin_type_serde {
-    use super::{BuiltinType, FloatWidth, IntWidth, TextWidth};
+mod declared_type_serde {
+    use super::{DeclaredType, FloatWidth, IntWidth, TextWidth};
 
     /// One byte per type, refinements included.
     ///
@@ -275,45 +279,45 @@ mod builtin_type_serde {
     /// before, and the refinement that used to be implicit keeps the old tag
     /// (a float was read as float8, a text type as varying). The exact cases
     /// the old format could not express take new tags.
-    const fn tag(kind: BuiltinType) -> u8 {
+    const fn tag(kind: DeclaredType) -> u8 {
         match kind {
-            BuiltinType::Bool => 0,
-            BuiltinType::Int(IntWidth::SixtyFour) => 1,
-            BuiltinType::Float(FloatWidth::Double) => 2,
-            BuiltinType::Decimal => 3,
-            BuiltinType::Text(TextWidth::Varying) => 4,
-            BuiltinType::Bytes => 5,
-            BuiltinType::Uuid => 6,
-            BuiltinType::Date => 7,
-            BuiltinType::Time => 8,
-            BuiltinType::Timestamp => 9,
-            BuiltinType::TimestampTz => 10,
-            BuiltinType::Json => 11,
-            BuiltinType::Jsonb => 12,
-            BuiltinType::Float(FloatWidth::Single) => 13,
-            BuiltinType::Text(TextWidth::Fixed) => 14,
-            BuiltinType::Int(IntWidth::UpToThirtyTwo) => 15,
+            DeclaredType::Bool => 0,
+            DeclaredType::Int(IntWidth::SixtyFour) => 1,
+            DeclaredType::Float(FloatWidth::Double) => 2,
+            DeclaredType::Decimal => 3,
+            DeclaredType::Text(TextWidth::Varying) => 4,
+            DeclaredType::Bytes => 5,
+            DeclaredType::Uuid => 6,
+            DeclaredType::Date => 7,
+            DeclaredType::Time => 8,
+            DeclaredType::Timestamp => 9,
+            DeclaredType::TimestampTz => 10,
+            DeclaredType::Json => 11,
+            DeclaredType::Jsonb => 12,
+            DeclaredType::Float(FloatWidth::Single) => 13,
+            DeclaredType::Text(TextWidth::Fixed) => 14,
+            DeclaredType::Int(IntWidth::UpToThirtyTwo) => 15,
         }
     }
 
-    const fn untag(tag: u8) -> Option<BuiltinType> {
+    const fn untag(tag: u8) -> Option<DeclaredType> {
         Some(match tag {
-            0 => BuiltinType::Bool,
-            1 => BuiltinType::Int(IntWidth::SixtyFour),
-            2 => BuiltinType::Float(FloatWidth::Double),
-            3 => BuiltinType::Decimal,
-            4 => BuiltinType::Text(TextWidth::Varying),
-            5 => BuiltinType::Bytes,
-            6 => BuiltinType::Uuid,
-            7 => BuiltinType::Date,
-            8 => BuiltinType::Time,
-            9 => BuiltinType::Timestamp,
-            10 => BuiltinType::TimestampTz,
-            11 => BuiltinType::Json,
-            12 => BuiltinType::Jsonb,
-            13 => BuiltinType::Float(FloatWidth::Single),
-            14 => BuiltinType::Text(TextWidth::Fixed),
-            15 => BuiltinType::Int(IntWidth::UpToThirtyTwo),
+            0 => DeclaredType::Bool,
+            1 => DeclaredType::Int(IntWidth::SixtyFour),
+            2 => DeclaredType::Float(FloatWidth::Double),
+            3 => DeclaredType::Decimal,
+            4 => DeclaredType::Text(TextWidth::Varying),
+            5 => DeclaredType::Bytes,
+            6 => DeclaredType::Uuid,
+            7 => DeclaredType::Date,
+            8 => DeclaredType::Time,
+            9 => DeclaredType::Timestamp,
+            10 => DeclaredType::TimestampTz,
+            11 => DeclaredType::Json,
+            12 => DeclaredType::Jsonb,
+            13 => DeclaredType::Float(FloatWidth::Single),
+            14 => DeclaredType::Text(TextWidth::Fixed),
+            15 => DeclaredType::Int(IntWidth::UpToThirtyTwo),
             _ => return None,
         })
     }
@@ -321,14 +325,14 @@ mod builtin_type_serde {
     // serde's `serialize_with` fixes the signature, so the one-byte type
     // arrives by reference whatever clippy would prefer.
     #[allow(clippy::trivially_copy_pass_by_ref)]
-    pub fn serialize<S>(kind: &BuiltinType, serializer: S) -> Result<S::Ok, S::Error>
+    pub fn serialize<S>(kind: &DeclaredType, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: serde::Serializer,
     {
         serializer.serialize_u8(tag(*kind))
     }
 
-    pub fn deserialize<'de, D>(deserializer: D) -> Result<BuiltinType, D::Error>
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<DeclaredType, D::Error>
     where
         D: serde::Deserializer<'de>,
     {
@@ -345,7 +349,7 @@ mod builtin_type_serde {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod scalar_kind_serde_tests {
-    use super::{BuiltinKind, ScalarKind};
+    use super::{ScalarFamily, ScalarKind};
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
     enum TestCustom {
@@ -355,19 +359,19 @@ mod scalar_kind_serde_tests {
     #[test]
     fn builtin_and_custom_kinds_round_trip_with_stable_tags() {
         let families = [
-            BuiltinKind::Bool,
-            BuiltinKind::Int,
-            BuiltinKind::Float,
-            BuiltinKind::Decimal,
-            BuiltinKind::String,
-            BuiltinKind::Bytes,
-            BuiltinKind::Uuid,
-            BuiltinKind::Date,
-            BuiltinKind::Time,
-            BuiltinKind::Timestamp,
-            BuiltinKind::TimestampTz,
-            BuiltinKind::Json,
-            BuiltinKind::Jsonb,
+            ScalarFamily::Bool,
+            ScalarFamily::Int,
+            ScalarFamily::Float,
+            ScalarFamily::Decimal,
+            ScalarFamily::String,
+            ScalarFamily::Bytes,
+            ScalarFamily::Uuid,
+            ScalarFamily::Date,
+            ScalarFamily::Time,
+            ScalarFamily::Timestamp,
+            ScalarFamily::TimestampTz,
+            ScalarFamily::Json,
+            ScalarFamily::Jsonb,
         ];
         for (tag, family) in (0_u8..).zip(families) {
             let kind = ScalarKind::<TestCustom>::from(family);
@@ -393,13 +397,13 @@ mod scalar_kind_serde_tests {
     /// stored `real` reloads as float4 rather than as float8.
     #[test]
     fn refined_types_have_their_own_stable_tags() {
-        use super::{BuiltinType, FloatWidth, TextWidth};
+        use super::{DeclaredType, FloatWidth, TextWidth};
 
         for (tag, kind) in [
-            (2_u8, BuiltinType::Float(FloatWidth::Double)),
-            (4, BuiltinType::Text(TextWidth::Varying)),
-            (13, BuiltinType::Float(FloatWidth::Single)),
-            (14, BuiltinType::Text(TextWidth::Fixed)),
+            (2_u8, DeclaredType::Float(FloatWidth::Double)),
+            (4, DeclaredType::Text(TextWidth::Varying)),
+            (13, DeclaredType::Float(FloatWidth::Single)),
+            (14, DeclaredType::Text(TextWidth::Fixed)),
         ] {
             let stored = ScalarKind::<TestCustom>::Builtin(kind);
             let encoded = postcard::to_allocvec(&stored).unwrap();
@@ -499,8 +503,8 @@ impl<C> ColumnComparison<C> {
     #[must_use]
     pub fn declares_char_type(&self) -> bool {
         self.kind
-            .builtin()
-            .is_some_and(BuiltinType::is_fixed_width_text)
+            .declared_type()
+            .is_some_and(DeclaredType::is_fixed_width_text)
     }
 
     /// Whether the column's collation declares that comparisons ignore
@@ -1220,28 +1224,28 @@ fn encode_exact_component<B: Backend>(
     if let (ScalarKind::Custom(kind), Value::Custom(custom)) = (&column.kind, value) {
         return *kind == <B::Custom as CustomScalars>::kind_of(custom) && tagged!(14, custom);
     }
-    match (column.kind.as_builtin(), value) {
+    match (column.kind.family(), value) {
         (_, Value::Null) => {
             output.push(0);
             true
         }
-        (Some(BuiltinKind::Bool), Value::Bool(value)) => tagged!(1, value),
-        (Some(BuiltinKind::Int), Value::Int(value)) => tagged!(2, value),
-        (Some(BuiltinKind::Float), Value::Float(value)) => tagged!(3, value),
-        (Some(BuiltinKind::String), Value::String(value)) => tagged!(4, value),
-        (Some(BuiltinKind::Bytes), Value::Bytes(value)) => tagged!(5, value),
-        (Some(BuiltinKind::Uuid), Value::Uuid(value)) => tagged!(6, value),
-        (Some(BuiltinKind::Timestamp), Value::Timestamp(value)) => {
+        (Some(ScalarFamily::Bool), Value::Bool(value)) => tagged!(1, value),
+        (Some(ScalarFamily::Int), Value::Int(value)) => tagged!(2, value),
+        (Some(ScalarFamily::Float), Value::Float(value)) => tagged!(3, value),
+        (Some(ScalarFamily::String), Value::String(value)) => tagged!(4, value),
+        (Some(ScalarFamily::Bytes), Value::Bytes(value)) => tagged!(5, value),
+        (Some(ScalarFamily::Uuid), Value::Uuid(value)) => tagged!(6, value),
+        (Some(ScalarFamily::Timestamp), Value::Timestamp(value)) => {
             tagged!(7, value)
         }
-        (Some(BuiltinKind::TimestampTz), Value::TimestampTz(value)) => {
+        (Some(ScalarFamily::TimestampTz), Value::TimestampTz(value)) => {
             tagged!(8, value)
         }
-        (Some(BuiltinKind::Date), Value::Date(value)) => tagged!(9, value),
-        (Some(BuiltinKind::Time), Value::Time(value)) => tagged!(10, value),
-        (Some(BuiltinKind::Decimal), Value::Decimal(value)) => tagged!(11, value),
-        (Some(BuiltinKind::Json), Value::Json(value)) => tagged!(12, value),
-        (Some(BuiltinKind::Jsonb), Value::Jsonb(value)) => tagged!(13, value),
+        (Some(ScalarFamily::Date), Value::Date(value)) => tagged!(9, value),
+        (Some(ScalarFamily::Time), Value::Time(value)) => tagged!(10, value),
+        (Some(ScalarFamily::Decimal), Value::Decimal(value)) => tagged!(11, value),
+        (Some(ScalarFamily::Json), Value::Json(value)) => tagged!(12, value),
+        (Some(ScalarFamily::Jsonb), Value::Jsonb(value)) => tagged!(13, value),
         _ => false,
     }
 }
@@ -1251,15 +1255,15 @@ pub(super) fn default_group_key_encoder<B: Backend>(
 ) -> Option<GroupKeyEncoder<B>> {
     let supported = columns.iter().all(|column| {
         matches!(
-            column.kind.as_builtin(),
+            column.kind.family(),
             Some(
-                BuiltinKind::Int
-                    | BuiltinKind::Bool
-                    | BuiltinKind::Bytes
-                    | BuiltinKind::Timestamp
-                    | BuiltinKind::TimestampTz
-                    | BuiltinKind::Date
-                    | BuiltinKind::Time
+                ScalarFamily::Int
+                    | ScalarFamily::Bool
+                    | ScalarFamily::Bytes
+                    | ScalarFamily::Timestamp
+                    | ScalarFamily::TimestampTz
+                    | ScalarFamily::Date
+                    | ScalarFamily::Time
             )
         )
     });
@@ -1457,13 +1461,15 @@ pub(super) fn encode_postgres_component<V: postgres_jsonb_canonical::PgVersion +
     value: &Value<Postgres<V>>,
     output: &mut alloc::vec::Vec<u8>,
 ) -> bool {
-    match (column.kind.as_builtin(), value) {
-        (Some(BuiltinKind::Float), Value::Float(value)) => {
+    match (column.kind.family(), value) {
+        (Some(ScalarFamily::Float), Value::Float(value)) => {
             append_tagged(output, 3, &canonical_f64(*value))
         }
-        (Some(BuiltinKind::String), Value::String(value)) => single_column_rule::<Postgres>(column)
-            .is_some_and(|rule| append_text(output, 4, value, rule)),
-        (Some(BuiltinKind::Jsonb), Value::Jsonb(value)) => {
+        (Some(ScalarFamily::String), Value::String(value)) => {
+            single_column_rule::<Postgres>(column)
+                .is_some_and(|rule| append_text(output, 4, value, rule))
+        }
+        (Some(ScalarFamily::Jsonb), Value::Jsonb(value)) => {
             output.push(13);
             // Restores `output` itself on refusal, so a rejected value leaves no partial
             // component behind in the group key.
@@ -1478,15 +1484,15 @@ pub(super) fn encode_mysql_component(
     value: &Value<MySql>,
     output: &mut alloc::vec::Vec<u8>,
 ) -> bool {
-    match (column.kind.as_builtin(), value) {
-        (Some(BuiltinKind::Float), Value::Float(value)) => {
+    match (column.kind.family(), value) {
+        (Some(ScalarFamily::Float), Value::Float(value)) => {
             append_tagged(output, 3, &canonical_f64(*value))
         }
-        (Some(BuiltinKind::String), Value::String(value)) => single_column_rule::<MySql>(column)
+        (Some(ScalarFamily::String), Value::String(value)) => single_column_rule::<MySql>(column)
             .is_some_and(|rule| append_text(output, 4, value, rule)),
-        (Some(BuiltinKind::Uuid), Value::Uuid(value)) => single_column_rule::<MySql>(column)
+        (Some(ScalarFamily::Uuid), Value::Uuid(value)) => single_column_rule::<MySql>(column)
             .is_some_and(|rule| append_text(output, 6, value, rule)),
-        (Some(BuiltinKind::Decimal), Value::Decimal(value)) => {
+        (Some(ScalarFamily::Decimal), Value::Decimal(value)) => {
             append_tagged(output, 11, &value.normalized())
         }
         _ => encode_exact_component(column, value, output),
@@ -1520,20 +1526,20 @@ pub(super) fn encode_sqlite_component(
     value: &Value<SQLite>,
     output: &mut alloc::vec::Vec<u8>,
 ) -> bool {
-    match (column.kind.as_builtin(), value) {
+    match (column.kind.family(), value) {
         // SQLite stores NaN as SQL NULL, so only synthetic values reach this arm.
-        (Some(BuiltinKind::Float), Value::Float(value)) => {
+        (Some(ScalarFamily::Float), Value::Float(value)) => {
             append_tagged(output, 3, &canonical_f64(*value))
         }
-        (Some(BuiltinKind::String), Value::String(value)) => single_column_rule::<SQLite>(column)
+        (Some(ScalarFamily::String), Value::String(value)) => single_column_rule::<SQLite>(column)
             .is_some_and(|rule| append_text(output, 4, value, rule)),
-        (Some(BuiltinKind::Uuid), Value::Uuid(value)) => single_column_rule::<SQLite>(column)
+        (Some(ScalarFamily::Uuid), Value::Uuid(value)) => single_column_rule::<SQLite>(column)
             .is_some_and(|rule| append_text(output, 6, value, rule)),
-        (Some(BuiltinKind::Json), Value::Json(value)) => {
+        (Some(ScalarFamily::Json), Value::Json(value)) => {
             output.push(12);
             append_sqlite_json(column, value, output)
         }
-        (Some(BuiltinKind::Jsonb), Value::Jsonb(value)) => {
+        (Some(ScalarFamily::Jsonb), Value::Jsonb(value)) => {
             output.push(13);
             append_sqlite_json(column, value, output)
         }
@@ -1546,8 +1552,8 @@ pub(super) fn encode_sqlite_component(
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum NoCustom {}
 
-impl<C> From<BuiltinType> for ScalarKind<C> {
-    fn from(builtin: BuiltinType) -> Self {
+impl<C> From<DeclaredType> for ScalarKind<C> {
+    fn from(builtin: DeclaredType) -> Self {
         Self::Builtin(builtin)
     }
 }
@@ -1556,12 +1562,12 @@ impl<C> From<BuiltinType> for ScalarKind<C> {
 /// 64-bit integer, float8, and varying text.
 ///
 /// For fixtures only. Production code classifies through
-/// [`Backend::refine_builtin`], because choosing a refinement without
+/// [`Backend::refine_declared_type`], because choosing a refinement without
 /// reading the declaration is the erasure this type removes.
 #[cfg(any(test, feature = "testing"))]
-impl<C> From<BuiltinKind> for ScalarKind<C> {
-    fn from(family: BuiltinKind) -> Self {
-        Self::Builtin(refined_builtin(
+impl<C> From<ScalarFamily> for ScalarKind<C> {
+    fn from(family: ScalarFamily) -> Self {
+        Self::Builtin(declared_type_of(
             family,
             IntWidth::SixtyFour,
             FloatWidth::Double,
@@ -1573,7 +1579,7 @@ impl<C> From<BuiltinKind> for ScalarKind<C> {
 impl<C> ScalarKind<C> {
     /// This kind as a builtin family, or `None` for a custom type.
     #[must_use]
-    pub const fn as_builtin(&self) -> Option<BuiltinKind> {
+    pub const fn family(&self) -> Option<ScalarFamily> {
         match self {
             Self::Builtin(builtin) => Some(builtin.family()),
             Self::Custom(_) => None,
@@ -1598,7 +1604,7 @@ impl<C> ScalarKind<C> {
     /// For the questions a family cannot answer: which width a float
     /// declares, whether a text type is fixed width.
     #[must_use]
-    pub const fn builtin(&self) -> Option<BuiltinType> {
+    pub const fn declared_type(&self) -> Option<DeclaredType> {
         match self {
             Self::Builtin(builtin) => Some(*builtin),
             Self::Custom(_) => None,
@@ -1670,7 +1676,7 @@ pub trait CustomScalars: 'static {
     fn classify(declared_type: &str) -> Option<Self::Kind>;
 
     /// The builtin shape `kind` travels as on the wire.
-    fn carrier(kind: Self::Kind) -> BuiltinKind;
+    fn carrier(kind: Self::Kind) -> ScalarFamily;
 
     /// Turn a wire or literal value of `kind`'s carrier shape into a custom
     /// value, or refuse it.
@@ -1718,7 +1724,7 @@ impl<B: Backend> CustomScalars for NoCustomScalars<B> {
         None
     }
 
-    fn carrier(kind: Self::Kind) -> BuiltinKind {
+    fn carrier(kind: Self::Kind) -> ScalarFamily {
         match kind {}
     }
 
@@ -1832,19 +1838,19 @@ impl<B: Backend> Value<B> {
     pub fn scalar_kind(&self) -> Option<ValueKindOf<B>> {
         Some(match self {
             Self::Missing | Self::Null => return None,
-            Self::Bool(_) => ValueKind::Builtin(BuiltinKind::Bool),
-            Self::Int(_) => ValueKind::Builtin(BuiltinKind::Int),
-            Self::Float(_) => ValueKind::Builtin(BuiltinKind::Float),
-            Self::String(_) => ValueKind::Builtin(BuiltinKind::String),
-            Self::Bytes(_) => ValueKind::Builtin(BuiltinKind::Bytes),
-            Self::Uuid(_) => ValueKind::Builtin(BuiltinKind::Uuid),
-            Self::Timestamp(_) => ValueKind::Builtin(BuiltinKind::Timestamp),
-            Self::TimestampTz(_) => ValueKind::Builtin(BuiltinKind::TimestampTz),
-            Self::Date(_) => ValueKind::Builtin(BuiltinKind::Date),
-            Self::Time(_) => ValueKind::Builtin(BuiltinKind::Time),
-            Self::Decimal(_) => ValueKind::Builtin(BuiltinKind::Decimal),
-            Self::Json(_) => ValueKind::Builtin(BuiltinKind::Json),
-            Self::Jsonb(_) => ValueKind::Builtin(BuiltinKind::Jsonb),
+            Self::Bool(_) => ValueKind::Builtin(ScalarFamily::Bool),
+            Self::Int(_) => ValueKind::Builtin(ScalarFamily::Int),
+            Self::Float(_) => ValueKind::Builtin(ScalarFamily::Float),
+            Self::String(_) => ValueKind::Builtin(ScalarFamily::String),
+            Self::Bytes(_) => ValueKind::Builtin(ScalarFamily::Bytes),
+            Self::Uuid(_) => ValueKind::Builtin(ScalarFamily::Uuid),
+            Self::Timestamp(_) => ValueKind::Builtin(ScalarFamily::Timestamp),
+            Self::TimestampTz(_) => ValueKind::Builtin(ScalarFamily::TimestampTz),
+            Self::Date(_) => ValueKind::Builtin(ScalarFamily::Date),
+            Self::Time(_) => ValueKind::Builtin(ScalarFamily::Time),
+            Self::Decimal(_) => ValueKind::Builtin(ScalarFamily::Decimal),
+            Self::Json(_) => ValueKind::Builtin(ScalarFamily::Json),
+            Self::Jsonb(_) => ValueKind::Builtin(ScalarFamily::Jsonb),
             Self::Custom(value) => ValueKind::Custom(<B::Custom as CustomScalars>::kind_of(value)),
         })
     }

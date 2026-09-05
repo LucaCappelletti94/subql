@@ -329,13 +329,15 @@ pub fn decode_cell<B, F>(
 ) -> Result<Value<B>, crate::ValueError>
 where
     B: Backend,
-    F: FnOnce(crate::backend::BuiltinType) -> Value<B>,
+    F: FnOnce(crate::backend::DeclaredType) -> Value<B>,
 {
     let Some(custom) = kind.custom().copied() else {
         // Total: `custom()` answered `None`, so `builtin` answers `Some`.
-        let builtin = kind.builtin().unwrap_or(crate::backend::BuiltinType::Text(
-            crate::backend::TextWidth::Varying,
-        ));
+        let builtin = kind
+            .declared_type()
+            .unwrap_or(crate::backend::DeclaredType::Text(
+                crate::backend::TextWidth::Varying,
+            ));
         let decoded = decode(builtin);
         return if decoded.is_missing() {
             Err(crate::ValueError::Builtin {
@@ -350,7 +352,7 @@ where
     let carrier = <B::Custom as CustomScalars>::carrier(custom);
     // A carrier is a family: a custom type declares no width, so the decode
     // reads the common case rather than inventing a refinement.
-    let raw = decode(crate::backend::refined_builtin(
+    let raw = decode(crate::backend::declared_type_of(
         carrier,
         crate::backend::IntWidth::SixtyFour,
         crate::backend::FloatWidth::Double,
@@ -461,7 +463,7 @@ mod cell_presence_tests {
             ) -> Result<Value<Self::Backend>, crate::ValueError> {
                 Err(crate::ValueError::Builtin {
                     column: col,
-                    kind: crate::backend::BuiltinKind::Int,
+                    kind: crate::backend::ScalarFamily::Int,
                 })
             }
         }
@@ -566,18 +568,18 @@ mod value_key_tests {
 #[allow(clippy::unwrap_used)]
 mod canonical_group_key_tests {
     use crate::backend::{
-        Backend, BuiltinKind, CollationFacts, CollationName, ColumnComparison, MySql, NoCustom,
-        Pg18, Postgres, SQLite, SqliteJson, Value,
+        Backend, CollationFacts, CollationName, ColumnComparison, MySql, NoCustom, Pg18, Postgres,
+        SQLite, ScalarFamily, SqliteJson, Value,
     };
     use alloc::{string::String, vec};
     use sql_traits::traits::MySqlCollationPadding;
 
-    fn column(kind: BuiltinKind) -> ColumnComparison<NoCustom> {
+    fn column(kind: ScalarFamily) -> ColumnComparison<NoCustom> {
         column_with_collation(kind, CollationFacts::DatabaseDefault)
     }
 
     fn column_with_collation(
-        kind: BuiltinKind,
+        kind: ScalarFamily,
         collation: CollationFacts,
     ) -> ColumnComparison<NoCustom> {
         ColumnComparison {
@@ -606,7 +608,7 @@ mod canonical_group_key_tests {
 
     #[test]
     fn canonical_key_has_one_versioned_tuple_format() {
-        let encoder = Postgres::<Pg18>::group_key_encoder(vec![column(BuiltinKind::Int)])
+        let encoder = Postgres::<Pg18>::group_key_encoder(vec![column(ScalarFamily::Int)])
             .expect("integer groups have a canonical encoder");
         let key = encoder
             .encode(&[Value::Int(42)])
@@ -620,7 +622,7 @@ mod canonical_group_key_tests {
 
     #[test]
     fn canonical_key_rejects_values_outside_the_selected_domain() {
-        let encoder = Postgres::<Pg18>::group_key_encoder(vec![column(BuiltinKind::Int)])
+        let encoder = Postgres::<Pg18>::group_key_encoder(vec![column(ScalarFamily::Int)])
             .expect("integer groups have a canonical encoder");
 
         assert!(encoder.encode(&[]).is_none());
@@ -637,7 +639,7 @@ mod canonical_group_key_tests {
 
     #[test]
     fn postgres_float_keys_follow_grouping_equality() {
-        let encoder = Postgres::<Pg18>::group_key_encoder(vec![column(BuiltinKind::Float)])
+        let encoder = Postgres::<Pg18>::group_key_encoder(vec![column(ScalarFamily::Float)])
             .expect("Postgres float grouping is canonical");
 
         let zero = encoder.encode(&[Value::Float(0.0)]).unwrap();
@@ -655,26 +657,26 @@ mod canonical_group_key_tests {
     #[test]
     fn postgres_text_requires_deterministic_comparison() {
         assert!(
-            Postgres::<Pg18>::group_key_encoder(vec![column(BuiltinKind::String)]).is_some(),
+            Postgres::<Pg18>::group_key_encoder(vec![column(ScalarFamily::String)]).is_some(),
             "the database default is deterministic"
         );
         assert!(
             Postgres::<Pg18>::group_key_encoder(vec![column_with_collation(
-                BuiltinKind::String,
+                ScalarFamily::String,
                 named_collation("unicode", Some(true), None),
             )])
             .is_some()
         );
         assert!(
             Postgres::<Pg18>::group_key_encoder(vec![column_with_collation(
-                BuiltinKind::String,
+                ScalarFamily::String,
                 named_collation("ci", Some(false), None),
             )])
             .is_none()
         );
         assert!(
             Postgres::<Pg18>::group_key_encoder(vec![column_with_collation(
-                BuiltinKind::String,
+                ScalarFamily::String,
                 CollationFacts::Unknown,
             )])
             .is_none()
@@ -684,7 +686,7 @@ mod canonical_group_key_tests {
     #[test]
     fn sqlite_builtin_collations_have_exact_canonical_forms() {
         let nocase = SQLite::group_key_encoder(vec![column_with_collation(
-            BuiltinKind::String,
+            ScalarFamily::String,
             named_collation("NOCASE", None, None),
         )])
         .unwrap();
@@ -702,7 +704,7 @@ mod canonical_group_key_tests {
         );
 
         let rtrim = SQLite::group_key_encoder(vec![column_with_collation(
-            BuiltinKind::String,
+            ScalarFamily::String,
             named_collation("RTRIM", None, None),
         )])
         .unwrap();
@@ -714,10 +716,10 @@ mod canonical_group_key_tests {
 
     #[test]
     fn mysql_binary_collations_apply_their_padding_rule() {
-        assert!(MySql::group_key_encoder(vec![column(BuiltinKind::String)]).is_none());
+        assert!(MySql::group_key_encoder(vec![column(ScalarFamily::String)]).is_none());
 
         let pad = MySql::group_key_encoder(vec![column_with_collation(
-            BuiltinKind::String,
+            ScalarFamily::String,
             named_collation("utf8mb4_bin", None, Some(MySqlCollationPadding::PadSpace)),
         )])
         .unwrap();
@@ -727,7 +729,7 @@ mod canonical_group_key_tests {
         );
 
         let no_pad = MySql::group_key_encoder(vec![column_with_collation(
-            BuiltinKind::String,
+            ScalarFamily::String,
             named_collation("utf8mb4_0900_bin", None, Some(MySqlCollationPadding::NoPad)),
         )])
         .unwrap();
@@ -739,7 +741,7 @@ mod canonical_group_key_tests {
 
     #[test]
     fn mysql_decimal_keys_ignore_scale_spelling() {
-        let encoder = MySql::group_key_encoder(vec![column(BuiltinKind::Decimal)]).unwrap();
+        let encoder = MySql::group_key_encoder(vec![column(ScalarFamily::Decimal)]).unwrap();
         assert_eq!(
             encoder.encode(&[Value::Decimal("1.0".parse().unwrap())]),
             encoder.encode(&[Value::Decimal("1.00".parse().unwrap())])
@@ -749,7 +751,7 @@ mod canonical_group_key_tests {
     #[test]
     fn postgres_jsonb_keys_follow_structural_equality() {
         let encoder =
-            Postgres::<Pg18>::group_key_encoder(vec![column(BuiltinKind::Jsonb)]).unwrap();
+            Postgres::<Pg18>::group_key_encoder(vec![column(ScalarFamily::Jsonb)]).unwrap();
         let left: serde_json::Value =
             serde_json::from_str(r#"{"a": 1.0, "b": [true, null]}"#).unwrap();
         let right: serde_json::Value =
@@ -763,7 +765,7 @@ mod canonical_group_key_tests {
 
     #[test]
     fn sqlite_json_keys_preserve_storage_equality() {
-        let encoder = SQLite::group_key_encoder(vec![column(BuiltinKind::Json)]).unwrap();
+        let encoder = SQLite::group_key_encoder(vec![column(ScalarFamily::Json)]).unwrap();
         assert_eq!(
             encoder.encode(&[Value::Json(SqliteJson::integer(1))]),
             encoder.encode(&[Value::Json(SqliteJson::real(1.0))])
@@ -782,7 +784,7 @@ mod canonical_group_key_tests {
         #[test]
         fn sqlite_nocase_folds_every_ascii_case_pair(value in "[A-Za-z0-9]{0,64}") {
             let encoder = SQLite::group_key_encoder(vec![column_with_collation(
-                BuiltinKind::String,
+                ScalarFamily::String,
                 named_collation("NOCASE", None, None),
             )])
             .unwrap();
@@ -796,7 +798,7 @@ mod canonical_group_key_tests {
         fn postgres_float_collapses_every_nan_payload(bits in proptest::prelude::any::<u64>()) {
             let value = f64::from_bits(bits);
             if value.is_nan() {
-                let encoder = Postgres::<Pg18>::group_key_encoder(vec![column(BuiltinKind::Float)]).unwrap();
+                let encoder = Postgres::<Pg18>::group_key_encoder(vec![column(ScalarFamily::Float)]).unwrap();
                 proptest::prop_assert_eq!(
                     encoder.encode(&[Value::Float(value)]),
                     encoder.encode(&[Value::Float(f64::NAN)])

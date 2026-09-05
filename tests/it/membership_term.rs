@@ -924,7 +924,7 @@ mod describe_terms {
     use super::{engine, rows_of, subscribe, translator, Engine, TERM};
     use sql_traits::structs::ParserDB;
     use sqlparser::dialect::PostgreSqlDialect;
-    use subql::backend::{BuiltinKind, Value};
+    use subql::backend::{ScalarFamily, Value};
     use subql::testing::TestEvent;
     use subql::{catalog_helpers, RegisterError, SubscriptionEngine, SubscriptionRequest, Tier};
 
@@ -950,12 +950,12 @@ mod describe_terms {
         assert_eq!(term.member_subject, "user_id");
         assert_eq!(
             term.subject_kind,
-            BuiltinKind::String,
+            ScalarFamily::String,
             "user_id is TEXT, and a subscriber built at another kind admits nobody"
         );
         assert_eq!(
             pair.kind,
-            BuiltinKind::Int,
+            ScalarFamily::Int,
             "project_id is INTEGER, which is what the seed rows decode as"
         );
         assert_eq!(

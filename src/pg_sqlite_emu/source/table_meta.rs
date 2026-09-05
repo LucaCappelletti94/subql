@@ -10,7 +10,7 @@ use sqlite_diff_rs::pg_walstream_reverse::Oid;
 
 use super::super::error::PgSqliteEmuError;
 use super::{ColumnMeta, TableMeta};
-use crate::backend::BuiltinKind;
+use crate::backend::ScalarFamily;
 use crate::{catalog_helpers, TableId};
 
 /// Build the per-table metadata map from the Postgres catalog.
@@ -59,7 +59,8 @@ pub(super) fn build_table_meta(
                 ))
             })?;
             let column_name = column.column_name().to_string();
-            let scalar_kind = catalog_helpers::column_builtin_kind(pg_catalog, table_id, column_id);
+            let scalar_kind =
+                catalog_helpers::column_scalar_family(pg_catalog, table_id, column_id);
             let pg_type_oid = pg_type_oid_for_kind(scalar_kind);
             let is_pk = pk_cols.contains(&column_id);
             if is_pk {
@@ -92,24 +93,24 @@ const fn synth_oid(table_id: TableId) -> Oid {
     1_000 + table_id
 }
 
-/// Map subql's [`BuiltinKind`] to a PostgreSQL type OID for the encoded
+/// Map subql's [`ScalarFamily`] to a PostgreSQL type OID for the encoded
 /// `pgoutput` relation message. The OID labels the column on the wire,
 /// while the engine decodes each cell against the catalog scalar kind.
 /// Unknown or composite columns fall back to `TEXT` (25).
-const fn pg_type_oid_for_kind(kind: Option<BuiltinKind>) -> Oid {
+const fn pg_type_oid_for_kind(kind: Option<ScalarFamily>) -> Oid {
     match kind {
-        Some(BuiltinKind::Bool) => 16,
-        Some(BuiltinKind::Int) => 20,
-        Some(BuiltinKind::Float) => 701,
-        Some(BuiltinKind::Bytes) => 17,
-        Some(BuiltinKind::Uuid) => 2950,
-        Some(BuiltinKind::Timestamp) => 1114,
-        Some(BuiltinKind::TimestampTz) => 1184,
-        Some(BuiltinKind::Date) => 1082,
-        Some(BuiltinKind::Time) => 1083,
-        Some(BuiltinKind::Decimal) => 1700,
-        Some(BuiltinKind::Json) => 114,
-        Some(BuiltinKind::Jsonb) => 3802,
-        Some(BuiltinKind::String) | None => 25,
+        Some(ScalarFamily::Bool) => 16,
+        Some(ScalarFamily::Int) => 20,
+        Some(ScalarFamily::Float) => 701,
+        Some(ScalarFamily::Bytes) => 17,
+        Some(ScalarFamily::Uuid) => 2950,
+        Some(ScalarFamily::Timestamp) => 1114,
+        Some(ScalarFamily::TimestampTz) => 1184,
+        Some(ScalarFamily::Date) => 1082,
+        Some(ScalarFamily::Time) => 1083,
+        Some(ScalarFamily::Decimal) => 1700,
+        Some(ScalarFamily::Json) => 114,
+        Some(ScalarFamily::Jsonb) => 3802,
+        Some(ScalarFamily::String) | None => 25,
     }
 }

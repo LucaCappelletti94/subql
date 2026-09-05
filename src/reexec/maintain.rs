@@ -330,7 +330,7 @@ enum ObservedRow<B: Backend> {
 pub struct GroupedRead<B: Backend, C: Checkpoint> {
     pub group: Vec<u8>,
     pub query: crate::reexec::BoundQuery<B>,
-    pub column_kinds: [crate::backend::BuiltinKind; 2],
+    pub column_kinds: [crate::backend::ScalarFamily; 2],
     pub checkpoint: Option<C>,
 }
 
@@ -625,7 +625,7 @@ impl<B: Backend + SqlLiteralParse, C: Checkpoint> GroupedMinMaxQuery<B, C> {
             output.reads.push(GroupedRead {
                 group: key,
                 query,
-                column_kinds: [self.plan.agg_kind, crate::backend::BuiltinKind::Int],
+                column_kinds: [self.plan.agg_kind, crate::backend::ScalarFamily::Int],
                 checkpoint: checkpoint.cloned(),
             });
         }

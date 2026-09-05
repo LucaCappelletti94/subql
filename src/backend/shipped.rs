@@ -7,7 +7,7 @@ use super::scalar_value::{
     sqlite_text_rule, widen_i64_to_f64,
 };
 use super::{
-    Backend, BuiltinKind, ColumnComparisonOf, GroupKeyEncoder, NoCustomScalars, NumericWidening,
+    Backend, ColumnComparisonOf, GroupKeyEncoder, NoCustomScalars, NumericWidening, ScalarFamily,
     SqliteJson, TextRule, Value,
 };
 use alloc::string::ToString;
@@ -86,10 +86,10 @@ impl<V: postgres_jsonb_canonical::PgVersion + 'static> Backend for Postgres<V> {
 
     /// Measured: `real` and `float4` are float4, `double precision` and
     /// `float8` are float8.
-    fn refine_builtin(
-        family: super::scalar_value::BuiltinKind,
+    fn refine_declared_type(
+        family: super::scalar_value::ScalarFamily,
         declared_type: &str,
-    ) -> super::scalar_value::BuiltinType {
+    ) -> super::scalar_value::DeclaredType {
         let declared = declared_type.trim();
         let float = if ["real", "float4"]
             .iter()
@@ -99,7 +99,7 @@ impl<V: postgres_jsonb_canonical::PgVersion + 'static> Backend for Postgres<V> {
         } else {
             super::scalar_value::FloatWidth::Double
         };
-        super::scalar_value::refined_builtin(
+        super::scalar_value::declared_type_of(
             family,
             super::scalar_value::declares_sixty_four_bit_int(declared),
             float,
@@ -137,18 +137,18 @@ impl<V: postgres_jsonb_canonical::PgVersion + 'static> Backend for Postgres<V> {
     /// Measured: `sum(smallint)` and `sum(int)` are `bigint`, `sum(bigint)`
     /// and `sum(numeric)` are `numeric`, and `sum(double precision)` is a
     /// double. `numeric` stops at 131072 integer digits.
-    fn sum_rule(column: super::scalar_value::BuiltinType) -> super::scalar_value::SumRule {
-        use super::scalar_value::{BuiltinType, IntWidth, SumRule};
+    fn sum_rule(column: super::scalar_value::DeclaredType) -> super::scalar_value::SumRule {
+        use super::scalar_value::{DeclaredType, IntWidth, SumRule};
 
         match column {
-            BuiltinType::Int(IntWidth::UpToThirtyTwo) => SumRule::Integer,
-            BuiltinType::Int(IntWidth::SixtyFour) | BuiltinType::Decimal => SumRule::Decimal {
+            DeclaredType::Int(IntWidth::UpToThirtyTwo) => SumRule::Integer,
+            DeclaredType::Int(IntWidth::SixtyFour) | DeclaredType::Decimal => SumRule::Decimal {
                 integer_digits: Some(131_072),
             },
             // `sum(real)` is a `real` aggregate here, unlike on the other
             // two engines, so the width the column declares is the width
             // the total accumulates in.
-            BuiltinType::Float(super::scalar_value::FloatWidth::Single) => SumRule::Single,
+            DeclaredType::Float(super::scalar_value::FloatWidth::Single) => SumRule::Single,
             _ => SumRule::Double,
         }
     }
@@ -272,15 +272,14 @@ impl<V: postgres_jsonb_canonical::PgVersion + 'static> Backend for Postgres<V> {
 
     /// Measured: a float operand puts the comparison at `double precision`
     /// width, and an integer against a decimal is exact.
-    fn numeric_widening(left: BuiltinKind, right: BuiltinKind) -> Option<NumericWidening> {
+    fn numeric_widening(left: ScalarFamily, right: ScalarFamily) -> Option<NumericWidening> {
         match (left, right) {
-            (BuiltinKind::Float, BuiltinKind::Int | BuiltinKind::Decimal)
-            | (BuiltinKind::Int | BuiltinKind::Decimal, BuiltinKind::Float) => {
+            (ScalarFamily::Float, ScalarFamily::Int | ScalarFamily::Decimal)
+            | (ScalarFamily::Int | ScalarFamily::Decimal, ScalarFamily::Float) => {
                 Some(NumericWidening::AtFloatWidth)
             }
-            (BuiltinKind::Int, BuiltinKind::Decimal) | (BuiltinKind::Decimal, BuiltinKind::Int) => {
-                Some(NumericWidening::Exact)
-            }
+            (ScalarFamily::Int, ScalarFamily::Decimal)
+            | (ScalarFamily::Decimal, ScalarFamily::Int) => Some(NumericWidening::Exact),
             _ => None,
         }
     }
@@ -337,22 +336,22 @@ impl<V: postgres_jsonb_canonical::PgVersion + 'static> Backend for Postgres<V> {
     fn group_key_encoder(
         columns: alloc::vec::Vec<ColumnComparisonOf<Self>>,
     ) -> Option<GroupKeyEncoder<Self>> {
-        let supported = columns.iter().all(|column| match column.kind.as_builtin() {
+        let supported = columns.iter().all(|column| match column.kind.family() {
             Some(
-                BuiltinKind::Int
-                | BuiltinKind::Bool
-                | BuiltinKind::Bytes
-                | BuiltinKind::Uuid
-                | BuiltinKind::Timestamp
-                | BuiltinKind::TimestampTz
-                | BuiltinKind::Date
-                | BuiltinKind::Time
-                | BuiltinKind::Float
-                | BuiltinKind::Jsonb,
+                ScalarFamily::Int
+                | ScalarFamily::Bool
+                | ScalarFamily::Bytes
+                | ScalarFamily::Uuid
+                | ScalarFamily::Timestamp
+                | ScalarFamily::TimestampTz
+                | ScalarFamily::Date
+                | ScalarFamily::Time
+                | ScalarFamily::Float
+                | ScalarFamily::Jsonb,
             ) => true,
-            Some(BuiltinKind::String) => single_column_rule::<Self>(column).is_some(),
+            Some(ScalarFamily::String) => single_column_rule::<Self>(column).is_some(),
             // PostgreSQL numeric waits on Diesel #5168 for infinity support.
-            Some(BuiltinKind::Decimal | BuiltinKind::Json) | None => false,
+            Some(ScalarFamily::Decimal | ScalarFamily::Json) | None => false,
         });
         supported.then(|| GroupKeyEncoder::new(columns, encode_postgres_component))
     }
@@ -361,11 +360,11 @@ impl<V: postgres_jsonb_canonical::PgVersion + 'static> Backend for Postgres<V> {
         kind: super::scalar_value::ValueKindOf<Self>,
         value: Value<Self>,
     ) -> Option<Value<Self>> {
-        match (kind.as_builtin(), value) {
-            (Some(BuiltinKind::Float), Value::Int(value)) => {
+        match (kind.family(), value) {
+            (Some(ScalarFamily::Float), Value::Int(value)) => {
                 Some(Value::Float(widen_i64_to_f64(value)))
             }
-            (Some(BuiltinKind::Float), Value::Decimal(value)) => {
+            (Some(ScalarFamily::Float), Value::Decimal(value)) => {
                 value.to_string().parse().ok().map(Value::Float)
             }
             (_, value) => (!value.is_missing()).then_some(value),
@@ -408,17 +407,17 @@ impl Backend for MySql {
     }
 
     /// Measured: MySQL's `FLOAT` is float4 and its `DOUBLE` is float8.
-    fn refine_builtin(
-        family: super::scalar_value::BuiltinKind,
+    fn refine_declared_type(
+        family: super::scalar_value::ScalarFamily,
         declared_type: &str,
-    ) -> super::scalar_value::BuiltinType {
+    ) -> super::scalar_value::DeclaredType {
         let declared = declared_type.trim();
         let float = if declared.eq_ignore_ascii_case("float") {
             super::scalar_value::FloatWidth::Single
         } else {
             super::scalar_value::FloatWidth::Double
         };
-        super::scalar_value::refined_builtin(
+        super::scalar_value::declared_type_of(
             family,
             super::scalar_value::declares_sixty_four_bit_int(declared),
             float,
@@ -468,11 +467,11 @@ impl Backend for MySql {
     /// `decimal(32,0)` for an `int` column and `decimal(41,0)` for a
     /// `bigint` one, and a floating column sums into a double. No bound is
     /// reachable in a `SELECT`.
-    fn sum_rule(column: super::scalar_value::BuiltinType) -> super::scalar_value::SumRule {
-        use super::scalar_value::{BuiltinType, SumRule};
+    fn sum_rule(column: super::scalar_value::DeclaredType) -> super::scalar_value::SumRule {
+        use super::scalar_value::{DeclaredType, SumRule};
 
         match column {
-            BuiltinType::Int(_) | BuiltinType::Decimal => SumRule::Decimal {
+            DeclaredType::Int(_) | DeclaredType::Decimal => SumRule::Decimal {
                 integer_digits: None,
             },
             _ => SumRule::Double,
@@ -545,15 +544,14 @@ impl Backend for MySql {
 
     /// Measured: a float operand puts the comparison at `double precision`
     /// width, and an integer against a decimal is exact.
-    fn numeric_widening(left: BuiltinKind, right: BuiltinKind) -> Option<NumericWidening> {
+    fn numeric_widening(left: ScalarFamily, right: ScalarFamily) -> Option<NumericWidening> {
         match (left, right) {
-            (BuiltinKind::Float, BuiltinKind::Int | BuiltinKind::Decimal)
-            | (BuiltinKind::Int | BuiltinKind::Decimal, BuiltinKind::Float) => {
+            (ScalarFamily::Float, ScalarFamily::Int | ScalarFamily::Decimal)
+            | (ScalarFamily::Int | ScalarFamily::Decimal, ScalarFamily::Float) => {
                 Some(NumericWidening::AtFloatWidth)
             }
-            (BuiltinKind::Int, BuiltinKind::Decimal) | (BuiltinKind::Decimal, BuiltinKind::Int) => {
-                Some(NumericWidening::Exact)
-            }
+            (ScalarFamily::Int, ScalarFamily::Decimal)
+            | (ScalarFamily::Decimal, ScalarFamily::Int) => Some(NumericWidening::Exact),
             _ => None,
         }
     }
@@ -625,22 +623,22 @@ impl Backend for MySql {
     fn group_key_encoder(
         columns: alloc::vec::Vec<ColumnComparisonOf<Self>>,
     ) -> Option<GroupKeyEncoder<Self>> {
-        let supported = columns.iter().all(|column| match column.kind.as_builtin() {
+        let supported = columns.iter().all(|column| match column.kind.family() {
             Some(
-                BuiltinKind::Int
-                | BuiltinKind::Bool
-                | BuiltinKind::Bytes
-                | BuiltinKind::Timestamp
-                | BuiltinKind::TimestampTz
-                | BuiltinKind::Date
-                | BuiltinKind::Time
-                | BuiltinKind::Decimal,
+                ScalarFamily::Int
+                | ScalarFamily::Bool
+                | ScalarFamily::Bytes
+                | ScalarFamily::Timestamp
+                | ScalarFamily::TimestampTz
+                | ScalarFamily::Date
+                | ScalarFamily::Time
+                | ScalarFamily::Decimal,
             ) => true,
-            Some(BuiltinKind::String | BuiltinKind::Uuid) => {
+            Some(ScalarFamily::String | ScalarFamily::Uuid) => {
                 single_column_rule::<Self>(column).is_some()
             }
             // MySQL 8.0 groups persisted signed zero into two groups.
-            Some(BuiltinKind::Float | BuiltinKind::Json | BuiltinKind::Jsonb) | None => false,
+            Some(ScalarFamily::Float | ScalarFamily::Json | ScalarFamily::Jsonb) | None => false,
         });
         supported.then(|| GroupKeyEncoder::new(columns, encode_mysql_component))
     }
@@ -649,11 +647,11 @@ impl Backend for MySql {
         kind: super::scalar_value::ValueKindOf<Self>,
         value: Value<Self>,
     ) -> Option<Value<Self>> {
-        match (kind.as_builtin(), value) {
-            (Some(BuiltinKind::Float), Value::Int(value)) => {
+        match (kind.family(), value) {
+            (Some(ScalarFamily::Float), Value::Int(value)) => {
                 Some(Value::Float(widen_i64_to_f64(value)))
             }
-            (Some(BuiltinKind::Float), Value::Decimal(value)) => {
+            (Some(ScalarFamily::Float), Value::Decimal(value)) => {
                 value.to_string().parse().ok().map(Value::Float)
             }
             (_, value) => (!value.is_missing()).then_some(value),
@@ -704,13 +702,13 @@ impl Backend for SQLite {
     /// SQLite has one floating type, `REAL`, and it is float8. Its
     /// `CHAR(n)` is advisory, stored as given, so no text type is fixed
     /// width here.
-    fn refine_builtin(
-        family: super::scalar_value::BuiltinKind,
+    fn refine_declared_type(
+        family: super::scalar_value::ScalarFamily,
         _declared_type: &str,
-    ) -> super::scalar_value::BuiltinType {
+    ) -> super::scalar_value::DeclaredType {
         // SQLite's one integer is 64 bits wide, whatever a column
         // declares, so every integer column resolves the same way.
-        super::scalar_value::refined_builtin(
+        super::scalar_value::declared_type_of(
             family,
             super::scalar_value::IntWidth::SixtyFour,
             super::scalar_value::FloatWidth::Double,
@@ -748,11 +746,11 @@ impl Backend for SQLite {
     /// overflow` past it, and the total turns real as soon as a
     /// non-integer joins. SQLite has no decimal type, so a column
     /// declaring one carries integers or reals and follows the same rule.
-    fn sum_rule(column: super::scalar_value::BuiltinType) -> super::scalar_value::SumRule {
-        use super::scalar_value::{BuiltinType, SumRule};
+    fn sum_rule(column: super::scalar_value::DeclaredType) -> super::scalar_value::SumRule {
+        use super::scalar_value::{DeclaredType, SumRule};
 
         match column {
-            BuiltinType::Int(_) => SumRule::IntegerPromotingToDouble,
+            DeclaredType::Int(_) => SumRule::IntegerPromotingToDouble,
             _ => SumRule::Double,
         }
     }
@@ -820,9 +818,9 @@ impl Backend for SQLite {
     /// measured: `9007199254740993 = 9007199254740992.0` is 0 where the
     /// other two engines answer 1. It has no decimal type, so a decimal
     /// operand has no measured rule and is not served.
-    fn numeric_widening(left: BuiltinKind, right: BuiltinKind) -> Option<NumericWidening> {
+    fn numeric_widening(left: ScalarFamily, right: ScalarFamily) -> Option<NumericWidening> {
         match (left, right) {
-            (BuiltinKind::Int, BuiltinKind::Float) | (BuiltinKind::Float, BuiltinKind::Int) => {
+            (ScalarFamily::Int, ScalarFamily::Float) | (ScalarFamily::Float, ScalarFamily::Int) => {
                 Some(NumericWidening::Exact)
             }
             _ => None,
@@ -892,23 +890,23 @@ impl Backend for SQLite {
     fn group_key_encoder(
         columns: alloc::vec::Vec<ColumnComparisonOf<Self>>,
     ) -> Option<GroupKeyEncoder<Self>> {
-        let supported = columns.iter().all(|column| match column.kind.as_builtin() {
+        let supported = columns.iter().all(|column| match column.kind.family() {
             Some(
-                BuiltinKind::Int
-                | BuiltinKind::Bool
-                | BuiltinKind::Bytes
-                | BuiltinKind::Timestamp
-                | BuiltinKind::TimestampTz
-                | BuiltinKind::Date
-                | BuiltinKind::Time
-                | BuiltinKind::Float
-                | BuiltinKind::Json
-                | BuiltinKind::Jsonb,
+                ScalarFamily::Int
+                | ScalarFamily::Bool
+                | ScalarFamily::Bytes
+                | ScalarFamily::Timestamp
+                | ScalarFamily::TimestampTz
+                | ScalarFamily::Date
+                | ScalarFamily::Time
+                | ScalarFamily::Float
+                | ScalarFamily::Json
+                | ScalarFamily::Jsonb,
             ) => true,
-            Some(BuiltinKind::String | BuiltinKind::Uuid) => {
+            Some(ScalarFamily::String | ScalarFamily::Uuid) => {
                 single_column_rule::<Self>(column).is_some()
             }
-            Some(BuiltinKind::Decimal) | None => false,
+            Some(ScalarFamily::Decimal) | None => false,
         });
         supported.then(|| GroupKeyEncoder::new(columns, encode_sqlite_component))
     }
@@ -937,55 +935,55 @@ impl Backend for SQLite {
         kind: super::scalar_value::ValueKindOf<Self>,
         value: Value<Self>,
     ) -> Option<Value<Self>> {
-        match (kind.as_builtin(), value) {
-            (Some(BuiltinKind::Bool), Value::Int(value)) => Some(Value::Bool(value)),
-            (Some(BuiltinKind::Uuid), Value::String(value)) => Some(Value::Uuid(value)),
-            (Some(BuiltinKind::Timestamp), Value::String(value)) => {
+        match (kind.family(), value) {
+            (Some(ScalarFamily::Bool), Value::Int(value)) => Some(Value::Bool(value)),
+            (Some(ScalarFamily::Uuid), Value::String(value)) => Some(Value::Uuid(value)),
+            (Some(ScalarFamily::Timestamp), Value::String(value)) => {
                 sql_scalar_text::parse_timestamp(&value).map(Value::Timestamp)
             }
-            (Some(BuiltinKind::TimestampTz), Value::String(value)) => {
+            (Some(ScalarFamily::TimestampTz), Value::String(value)) => {
                 sql_scalar_text::parse_timestamp_tz(&value).map(Value::TimestampTz)
             }
-            (Some(BuiltinKind::Date), Value::String(value)) => {
+            (Some(ScalarFamily::Date), Value::String(value)) => {
                 sql_scalar_text::parse_date(&value).map(Value::Date)
             }
-            (Some(BuiltinKind::Time), Value::String(value)) => {
+            (Some(ScalarFamily::Time), Value::String(value)) => {
                 sql_scalar_text::parse_time(&value).map(Value::Time)
             }
-            (Some(BuiltinKind::Decimal), Value::String(value)) => {
+            (Some(ScalarFamily::Decimal), Value::String(value)) => {
                 sql_scalar_text::parse_decimal(&value).map(Value::Decimal)
             }
-            (Some(BuiltinKind::Float), Value::Int(value)) => {
+            (Some(ScalarFamily::Float), Value::Int(value)) => {
                 Some(Value::Float(widen_i64_to_f64(value)))
             }
-            (Some(BuiltinKind::Decimal), Value::Int(value)) => {
+            (Some(ScalarFamily::Decimal), Value::Int(value)) => {
                 Some(Value::Decimal(bigdecimal::BigDecimal::from(value)))
             }
-            (Some(BuiltinKind::Decimal), Value::Float(value)) => {
+            (Some(ScalarFamily::Decimal), Value::Float(value)) => {
                 value.to_string().parse().ok().map(Value::Decimal)
             }
-            (Some(BuiltinKind::Json), Value::String(value)) => {
+            (Some(ScalarFamily::Json), Value::String(value)) => {
                 Some(Value::Json(SqliteJson::text(value)))
             }
-            (Some(BuiltinKind::Json), Value::Int(value)) => {
+            (Some(ScalarFamily::Json), Value::Int(value)) => {
                 Some(Value::Json(SqliteJson::integer(value)))
             }
-            (Some(BuiltinKind::Json), Value::Float(value)) => {
+            (Some(ScalarFamily::Json), Value::Float(value)) => {
                 Some(Value::Json(SqliteJson::real(value)))
             }
-            (Some(BuiltinKind::Json), Value::Bytes(value)) => {
+            (Some(ScalarFamily::Json), Value::Bytes(value)) => {
                 Some(Value::Json(SqliteJson::blob(value)))
             }
-            (Some(BuiltinKind::Jsonb), Value::String(value)) => {
+            (Some(ScalarFamily::Jsonb), Value::String(value)) => {
                 Some(Value::Jsonb(SqliteJson::text(value)))
             }
-            (Some(BuiltinKind::Jsonb), Value::Int(value)) => {
+            (Some(ScalarFamily::Jsonb), Value::Int(value)) => {
                 Some(Value::Jsonb(SqliteJson::integer(value)))
             }
-            (Some(BuiltinKind::Jsonb), Value::Float(value)) => {
+            (Some(ScalarFamily::Jsonb), Value::Float(value)) => {
                 Some(Value::Jsonb(SqliteJson::real(value)))
             }
-            (Some(BuiltinKind::Jsonb), Value::Bytes(value)) => {
+            (Some(ScalarFamily::Jsonb), Value::Bytes(value)) => {
                 Some(Value::Jsonb(SqliteJson::blob(value)))
             }
             (_, value) => decode_exact_group_value(kind, value),

@@ -139,11 +139,11 @@ pub fn structural_ordering<B: Backend>(
 
 /// The builtin kind a runtime numeric scalar carries, or `None` when the
 /// value is not numeric.
-const fn numeric_kind<B: Backend>(value: &Value<B>) -> Option<crate::backend::BuiltinKind> {
+const fn numeric_kind<B: Backend>(value: &Value<B>) -> Option<crate::backend::ScalarFamily> {
     match value {
-        Value::Int(_) => Some(crate::backend::BuiltinKind::Int),
-        Value::Float(_) => Some(crate::backend::BuiltinKind::Float),
-        Value::Decimal(_) => Some(crate::backend::BuiltinKind::Decimal),
+        Value::Int(_) => Some(crate::backend::ScalarFamily::Int),
+        Value::Float(_) => Some(crate::backend::ScalarFamily::Float),
+        Value::Decimal(_) => Some(crate::backend::ScalarFamily::Decimal),
         _ => None,
     }
 }
@@ -320,7 +320,7 @@ mod comparison_descriptor_tests {
     /// wrong value.
     #[test]
     fn a_declared_float_type_carries_its_width() {
-        use crate::backend::{BuiltinType, FloatWidth};
+        use crate::backend::{DeclaredType, FloatWidth};
 
         for (ddl, width) in [
             ("CREATE TABLE t (v REAL);", FloatWidth::Single),
@@ -329,8 +329,8 @@ mod comparison_descriptor_tests {
             ("CREATE TABLE t (v FLOAT8);", FloatWidth::Double),
         ] {
             assert_eq!(
-                comparison(ddl, "v").kind.builtin(),
-                Some(BuiltinType::Float(width)),
+                comparison(ddl, "v").kind.declared_type(),
+                Some(DeclaredType::Float(width)),
                 "the type carries the width the declaration fixes: {ddl}"
             );
         }
@@ -341,19 +341,19 @@ mod comparison_descriptor_tests {
     /// of matching the declared spelling itself.
     #[test]
     fn a_declared_char_type_is_fixed_width() {
-        use crate::backend::{BuiltinType, TextWidth};
+        use crate::backend::{DeclaredType, TextWidth};
 
         assert_eq!(
             comparison("CREATE TABLE t (code CHAR(5));", "code")
                 .kind
-                .builtin(),
-            Some(BuiltinType::Text(TextWidth::Fixed))
+                .declared_type(),
+            Some(DeclaredType::Text(TextWidth::Fixed))
         );
         assert_eq!(
             comparison("CREATE TABLE t (code TEXT);", "code")
                 .kind
-                .builtin(),
-            Some(BuiltinType::Text(TextWidth::Varying))
+                .declared_type(),
+            Some(DeclaredType::Text(TextWidth::Varying))
         );
     }
 
@@ -362,14 +362,14 @@ mod comparison_descriptor_tests {
     /// reloads as float8 would answer differently after a restart.
     #[test]
     fn a_persisted_kind_round_trips_its_refinements() {
-        use crate::backend::{BuiltinType, FloatWidth, ScalarKindOf, TextWidth};
+        use crate::backend::{DeclaredType, FloatWidth, ScalarKindOf, TextWidth};
 
         for kind in [
-            BuiltinType::Float(FloatWidth::Single),
-            BuiltinType::Float(FloatWidth::Double),
-            BuiltinType::Text(TextWidth::Fixed),
-            BuiltinType::Text(TextWidth::Varying),
-            BuiltinType::Int(crate::backend::IntWidth::SixtyFour),
+            DeclaredType::Float(FloatWidth::Single),
+            DeclaredType::Float(FloatWidth::Double),
+            DeclaredType::Text(TextWidth::Fixed),
+            DeclaredType::Text(TextWidth::Varying),
+            DeclaredType::Int(crate::backend::IntWidth::SixtyFour),
         ] {
             let stored: ScalarKindOf<Postgres> = kind.into();
             let bytes = postcard::to_allocvec(&stored).expect("the kind serializes");

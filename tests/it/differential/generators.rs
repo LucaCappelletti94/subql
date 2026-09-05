@@ -40,7 +40,7 @@
 use bigdecimal::BigDecimal;
 use core::str::FromStr as _;
 use proptest::prelude::*;
-use subql::backend::{Backend, BuiltinKind, Value};
+use subql::backend::{Backend, ScalarFamily, Value};
 
 use super::oracle::Engine;
 
@@ -52,7 +52,7 @@ use super::oracle::Engine;
 /// SQLite has neither those nor a distinct temporal one.
 pub struct ColumnSpec {
     pub name: &'static str,
-    pub kind: BuiltinKind,
+    pub kind: ScalarFamily,
     pub postgres: Option<&'static str>,
     pub mysql: Option<&'static str>,
     pub sqlite: Option<&'static str>,
@@ -72,124 +72,124 @@ impl ColumnSpec {
 }
 
 /// Every column the harness generates, covering every
-/// [`BuiltinKind`] and, for text, every declared type a comparison reads
+/// [`ScalarFamily`] and, for text, every declared type a comparison reads
 /// differently: `char(n)` pads, `varchar` and `text` do not.
 pub const COLUMNS: &[ColumnSpec] = &[
     ColumnSpec {
         name: "flag",
-        kind: BuiltinKind::Bool,
+        kind: ScalarFamily::Bool,
         postgres: Some("BOOLEAN"),
         mysql: Some("BOOLEAN"),
         sqlite: Some("BOOLEAN"),
     },
     ColumnSpec {
         name: "narrow",
-        kind: BuiltinKind::Int,
+        kind: ScalarFamily::Int,
         postgres: Some("INT"),
         mysql: Some("INT"),
         sqlite: Some("INTEGER"),
     },
     ColumnSpec {
         name: "wide",
-        kind: BuiltinKind::Int,
+        kind: ScalarFamily::Int,
         postgres: Some("BIGINT"),
         mysql: Some("BIGINT"),
         sqlite: Some("INTEGER"),
     },
     ColumnSpec {
         name: "single",
-        kind: BuiltinKind::Float,
+        kind: ScalarFamily::Float,
         postgres: Some("REAL"),
         mysql: Some("FLOAT"),
         sqlite: Some("REAL"),
     },
     ColumnSpec {
         name: "twice",
-        kind: BuiltinKind::Float,
+        kind: ScalarFamily::Float,
         postgres: Some("DOUBLE PRECISION"),
         mysql: Some("DOUBLE"),
         sqlite: Some("REAL"),
     },
     ColumnSpec {
         name: "exact",
-        kind: BuiltinKind::Decimal,
+        kind: ScalarFamily::Decimal,
         postgres: Some("NUMERIC"),
         mysql: Some("DECIMAL(20,4)"),
         sqlite: None,
     },
     ColumnSpec {
         name: "unbounded",
-        kind: BuiltinKind::String,
+        kind: ScalarFamily::String,
         postgres: Some("TEXT"),
         mysql: Some("TEXT"),
         sqlite: Some("TEXT"),
     },
     ColumnSpec {
         name: "varying",
-        kind: BuiltinKind::String,
+        kind: ScalarFamily::String,
         postgres: Some("VARCHAR(16)"),
         mysql: Some("VARCHAR(16)"),
         sqlite: Some("VARCHAR(16)"),
     },
     ColumnSpec {
         name: "padded",
-        kind: BuiltinKind::String,
+        kind: ScalarFamily::String,
         postgres: Some("CHAR(5)"),
         mysql: Some("CHAR(5)"),
         sqlite: Some("CHAR(5)"),
     },
     ColumnSpec {
         name: "raw",
-        kind: BuiltinKind::Bytes,
+        kind: ScalarFamily::Bytes,
         postgres: Some("BYTEA"),
         mysql: Some("VARBINARY(32)"),
         sqlite: Some("BLOB"),
     },
     ColumnSpec {
         name: "identifier",
-        kind: BuiltinKind::Uuid,
+        kind: ScalarFamily::Uuid,
         postgres: Some("UUID"),
         mysql: None,
         sqlite: None,
     },
     ColumnSpec {
         name: "day",
-        kind: BuiltinKind::Date,
+        kind: ScalarFamily::Date,
         postgres: Some("DATE"),
         mysql: Some("DATE"),
         sqlite: None,
     },
     ColumnSpec {
         name: "clock",
-        kind: BuiltinKind::Time,
+        kind: ScalarFamily::Time,
         postgres: Some("TIME"),
         mysql: Some("TIME"),
         sqlite: None,
     },
     ColumnSpec {
         name: "stamp",
-        kind: BuiltinKind::Timestamp,
+        kind: ScalarFamily::Timestamp,
         postgres: Some("TIMESTAMP"),
         mysql: Some("DATETIME"),
         sqlite: None,
     },
     ColumnSpec {
         name: "zoned",
-        kind: BuiltinKind::TimestampTz,
+        kind: ScalarFamily::TimestampTz,
         postgres: Some("TIMESTAMPTZ"),
         mysql: Some("TIMESTAMP"),
         sqlite: None,
     },
     ColumnSpec {
         name: "document",
-        kind: BuiltinKind::Json,
+        kind: ScalarFamily::Json,
         postgres: Some("JSON"),
         mysql: Some("JSON"),
         sqlite: None,
     },
     ColumnSpec {
         name: "binary_document",
-        kind: BuiltinKind::Jsonb,
+        kind: ScalarFamily::Jsonb,
         postgres: Some("JSONB"),
         mysql: None,
         sqlite: None,
@@ -314,7 +314,7 @@ pub fn schema_ddl(engine: Engine) -> String {
         let Some(declared) = column.declared(engine) else {
             continue;
         };
-        if column.kind == BuiltinKind::String {
+        if column.kind == ScalarFamily::String {
             for variant in CollationVariant::ALL {
                 let Some(clause) = variant.clause(engine) else {
                     continue;
@@ -517,7 +517,7 @@ pub fn row_strategy(engine: Engine) -> impl Strategy<Value = Row> {
         let Some(strategy) = cell_strategy(column.kind, declared, engine) else {
             continue;
         };
-        if column.kind == BuiltinKind::String {
+        if column.kind == ScalarFamily::String {
             for variant in CollationVariant::ALL {
                 if variant.clause(engine).is_none() {
                     continue;
@@ -701,12 +701,12 @@ pub fn text_strategy() -> impl Strategy<Value = Cell> {
 /// A cell for a column of `kind`, or `None` for a kind whose carrier this
 /// generator does not build.
 pub fn cell_strategy(
-    kind: BuiltinKind,
+    kind: ScalarFamily,
     declared: &str,
     engine: Engine,
 ) -> Option<BoxedStrategy<Cell>> {
     match kind {
-        BuiltinKind::Bool => Some(
+        ScalarFamily::Bool => Some(
             prop_oneof![
                 Just(Cell::Bool(true)),
                 Just(Cell::Bool(false)),
@@ -714,11 +714,11 @@ pub fn cell_strategy(
             ]
             .boxed(),
         ),
-        BuiltinKind::Int => Some(integer_strategy_for(declared)),
-        BuiltinKind::Float => Some(float_strategy(engine).boxed()),
-        BuiltinKind::Decimal => Some(decimal_strategy_for(declared)),
-        BuiltinKind::String => Some(text_strategy().boxed()),
-        BuiltinKind::Bytes => Some(
+        ScalarFamily::Int => Some(integer_strategy_for(declared)),
+        ScalarFamily::Float => Some(float_strategy(engine).boxed()),
+        ScalarFamily::Decimal => Some(decimal_strategy_for(declared)),
+        ScalarFamily::String => Some(text_strategy().boxed()),
+        ScalarFamily::Bytes => Some(
             prop_oneof![
                 Just(Cell::Bytes(vec![0x00, 0xff])),
                 Just(Cell::Bytes(Vec::new())),
@@ -726,13 +726,13 @@ pub fn cell_strategy(
             ]
             .boxed(),
         ),
-        BuiltinKind::Uuid
-        | BuiltinKind::Date
-        | BuiltinKind::Time
-        | BuiltinKind::Timestamp
-        | BuiltinKind::TimestampTz
-        | BuiltinKind::Json
-        | BuiltinKind::Jsonb => None,
+        ScalarFamily::Uuid
+        | ScalarFamily::Date
+        | ScalarFamily::Time
+        | ScalarFamily::Timestamp
+        | ScalarFamily::TimestampTz
+        | ScalarFamily::Json
+        | ScalarFamily::Jsonb => None,
     }
 }
 
@@ -815,7 +815,7 @@ mod tests {
     use crate::differential::oracle::Engine;
     use proptest::prelude::*;
     use sql_traits::structs::ParserDB;
-    use subql::backend::{Backend, BuiltinKind, MySql, Postgres, SQLite};
+    use subql::backend::{Backend, MySql, Postgres, SQLite, ScalarFamily};
     use subql::compiler::SqlLiteralParse;
     use subql::testing::TestEvent;
     use subql::{DefaultIds, RegisterError, SubscriptionEngine, SubscriptionRequest};
@@ -823,21 +823,21 @@ mod tests {
     /// Every builtin kind is generated, checked exhaustively so that a new
     /// kind fails to compile here rather than going quietly ungenerated.
     #[test]
-    fn schema_strategy_covers_every_builtin_kind() {
+    fn schema_strategy_covers_every_scalar_family() {
         for kind in [
-            BuiltinKind::Bool,
-            BuiltinKind::Int,
-            BuiltinKind::Float,
-            BuiltinKind::Decimal,
-            BuiltinKind::String,
-            BuiltinKind::Bytes,
-            BuiltinKind::Uuid,
-            BuiltinKind::Date,
-            BuiltinKind::Time,
-            BuiltinKind::Timestamp,
-            BuiltinKind::TimestampTz,
-            BuiltinKind::Json,
-            BuiltinKind::Jsonb,
+            ScalarFamily::Bool,
+            ScalarFamily::Int,
+            ScalarFamily::Float,
+            ScalarFamily::Decimal,
+            ScalarFamily::String,
+            ScalarFamily::Bytes,
+            ScalarFamily::Uuid,
+            ScalarFamily::Date,
+            ScalarFamily::Time,
+            ScalarFamily::Timestamp,
+            ScalarFamily::TimestampTz,
+            ScalarFamily::Json,
+            ScalarFamily::Jsonb,
         ] {
             assert!(
                 COLUMNS.iter().any(|column| column.kind == kind),
@@ -846,25 +846,25 @@ mod tests {
             // The exhaustive arm: a kind added upstream lands here as a
             // non-exhaustive match rather than as silent absence.
             match kind {
-                BuiltinKind::Bool
-                | BuiltinKind::Int
-                | BuiltinKind::Float
-                | BuiltinKind::Decimal
-                | BuiltinKind::String
-                | BuiltinKind::Bytes
-                | BuiltinKind::Uuid
-                | BuiltinKind::Date
-                | BuiltinKind::Time
-                | BuiltinKind::Timestamp
-                | BuiltinKind::TimestampTz
-                | BuiltinKind::Json
-                | BuiltinKind::Jsonb => {}
+                ScalarFamily::Bool
+                | ScalarFamily::Int
+                | ScalarFamily::Float
+                | ScalarFamily::Decimal
+                | ScalarFamily::String
+                | ScalarFamily::Bytes
+                | ScalarFamily::Uuid
+                | ScalarFamily::Date
+                | ScalarFamily::Time
+                | ScalarFamily::Timestamp
+                | ScalarFamily::TimestampTz
+                | ScalarFamily::Json
+                | ScalarFamily::Jsonb => {}
             }
         }
         assert!(
             COLUMNS
                 .iter()
-                .all(|column| column.postgres.is_some() || column.kind == BuiltinKind::Bool),
+                .all(|column| column.postgres.is_some() || column.kind == ScalarFamily::Bool),
             "PostgreSQL spells every kind, so a missing spelling is a gap rather than a fact"
         );
     }
@@ -893,8 +893,8 @@ mod tests {
         assert!(
             comparison
                 .kind
-                .builtin()
-                .is_some_and(subql::backend::BuiltinType::is_fixed_width_text),
+                .declared_type()
+                .is_some_and(subql::backend::DeclaredType::is_fixed_width_text),
             "a `char(n)` column has to be generated as fixed width, got {:?}",
             comparison.kind
         );
@@ -1149,12 +1149,12 @@ mod tests {
     #[test]
     fn a_cell_is_generated_for_every_standard_carrier() {
         for kind in [
-            BuiltinKind::Bool,
-            BuiltinKind::Int,
-            BuiltinKind::Float,
-            BuiltinKind::Decimal,
-            BuiltinKind::String,
-            BuiltinKind::Bytes,
+            ScalarFamily::Bool,
+            ScalarFamily::Int,
+            ScalarFamily::Float,
+            ScalarFamily::Decimal,
+            ScalarFamily::String,
+            ScalarFamily::Bytes,
         ] {
             assert!(
                 cell_strategy(kind, "INT", Engine::Postgres).is_some(),
@@ -1162,10 +1162,10 @@ mod tests {
             );
         }
         for kind in [
-            BuiltinKind::Uuid,
-            BuiltinKind::Date,
-            BuiltinKind::Json,
-            BuiltinKind::Jsonb,
+            ScalarFamily::Uuid,
+            ScalarFamily::Date,
+            ScalarFamily::Json,
+            ScalarFamily::Jsonb,
         ] {
             assert!(
                 cell_strategy(kind, "INT", Engine::Postgres).is_none(),

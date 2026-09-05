@@ -318,10 +318,10 @@ pub trait Backend: 'static {
     /// SQLite's one `REAL` is double. Guessing a width is the defect this
     /// replaces, so each backend states its own.
     #[must_use]
-    fn refine_builtin(
-        family: super::scalar_value::BuiltinKind,
+    fn refine_declared_type(
+        family: super::scalar_value::ScalarFamily,
         declared_type: &str,
-    ) -> super::scalar_value::BuiltinType
+    ) -> super::scalar_value::DeclaredType
     where
         Self: Sized;
 
@@ -360,8 +360,8 @@ pub trait Backend: 'static {
     /// two cannot disagree.
     #[must_use]
     fn numeric_widening(
-        left: super::scalar_value::BuiltinKind,
-        right: super::scalar_value::BuiltinKind,
+        left: super::scalar_value::ScalarFamily,
+        right: super::scalar_value::ScalarFamily,
     ) -> Option<super::scalar_value::NumericWidening>
     where
         Self: Sized;
@@ -448,7 +448,7 @@ pub trait Backend: 'static {
     /// SQLite keeps a 64-bit integer that can overflow. See
     /// [`SumRule`](super::scalar_value::SumRule).
     #[must_use]
-    fn sum_rule(column: super::scalar_value::BuiltinType) -> super::scalar_value::SumRule;
+    fn sum_rule(column: super::scalar_value::DeclaredType) -> super::scalar_value::SumRule;
 
     /// Two decimals divided at the scale this backend's
     /// [`Backend::DIVISION`] computes it to.

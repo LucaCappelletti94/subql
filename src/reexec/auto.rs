@@ -11,7 +11,7 @@
 
 use super::connector::{Connector, ReExecError};
 use super::engine::{ReExecNotifications, RowDelta, RowsUpdate};
-use crate::backend::{Backend, BuiltinKind, CdcEvent, Value};
+use crate::backend::{Backend, CdcEvent, ScalarFamily, Value};
 use crate::clock::{duration_between, ClockHandle};
 use crate::compiler::literals::SqlLiteralParse;
 #[cfg(test)]
@@ -113,7 +113,7 @@ pub(super) struct ResolveContext<I: IdTypes, B: Backend, A> {
     pub(super) query: super::BoundQuery<B>,
     /// Decode kind for the scalar result. Meaningless for a whole re-read,
     /// which has no single column.
-    pub(super) column_kind: BuiltinKind,
+    pub(super) column_kind: ScalarFamily,
     /// Initial grouped extreme read, present only for that tier.
     pub(super) grouped_bootstrap: Option<crate::AggregateBootstrap<B>>,
     /// Whether resolving means reading one scalar or re-reading every row.
@@ -410,21 +410,21 @@ where
                         .kinds
                         .get(bootstrap.group_columns)
                         .copied()
-                        .unwrap_or(BuiltinKind::String);
+                        .unwrap_or(ScalarFamily::String);
                     context.grouped_bootstrap = Some(bootstrap.clone());
                     context.whole_result = false;
                     context.keyed = false;
                 }
                 Tier::KeyedRows { query, .. } => {
                     context.query = query.clone();
-                    context.column_kind = BuiltinKind::String;
+                    context.column_kind = ScalarFamily::String;
                     context.whole_result = false;
                     context.keyed = true;
                     context.grouped_bootstrap = None;
                 }
                 Tier::WholeRows { query, .. } => {
                     context.query = query.clone();
-                    context.column_kind = BuiltinKind::String;
+                    context.column_kind = ScalarFamily::String;
                     context.whole_result = true;
                     context.keyed = false;
                     context.grouped_bootstrap = None;
@@ -668,7 +668,7 @@ where
                             .kinds
                             .get(bootstrap.group_columns)
                             .copied()
-                            .unwrap_or(BuiltinKind::String),
+                            .unwrap_or(ScalarFamily::String),
                         grouped_bootstrap: Some(bootstrap.clone()),
                         whole_result: false,
                         keyed: false,
@@ -686,7 +686,7 @@ where
                         query: query.clone(),
                         // No single column to decode: the rows carry their own
                         // shape, which is why `RowPage` reports column names.
-                        column_kind: BuiltinKind::String,
+                        column_kind: ScalarFamily::String,
                         grouped_bootstrap: None,
                         // The tier decides which read serves a change, so it
                         // comes from the registration rather than a default.
@@ -728,7 +728,7 @@ where
                     result.subscription_id,
                     ResolveContext {
                         query,
-                        column_kind: BuiltinKind::String,
+                        column_kind: ScalarFamily::String,
                         grouped_bootstrap: None,
                         whole_result,
                         keyed: false,
@@ -1314,7 +1314,7 @@ where
         subscription_id: SubscriptionId,
         group: &[u8],
         query: &super::BoundQuery<E::Backend>,
-        _column_kinds: [BuiltinKind; 2],
+        _column_kinds: [ScalarFamily; 2],
         checkpoint: Option<E::Checkpoint>,
     ) -> Result<
         crate::AggregateMaintenanceOutput<I, E::Backend, E::Checkpoint>,
@@ -1560,7 +1560,7 @@ pub(super) fn one_grouped_row<B: Backend, Err>(
 
 pub(super) fn decode_grouped_seed_rows<B: Backend>(
     rows: &mut [Vec<Value<B>>],
-    kinds: &[BuiltinKind],
+    kinds: &[ScalarFamily],
 ) {
     for row in rows {
         for (value, kind) in row.iter_mut().zip(kinds) {
@@ -1872,7 +1872,7 @@ mod tests {
     /// modeled by leaving the queue empty when `panic_on_empty` is false.
     struct MockConnector {
         values: RefCell<alloc::vec::Vec<Value<Postgres>>>,
-        calls: RefCell<alloc::vec::Vec<(String, BuiltinKind)>>,
+        calls: RefCell<alloc::vec::Vec<(String, ScalarFamily)>>,
         scalar_queries: RefCell<alloc::vec::Vec<super::super::ReadQuery<'static, Postgres>>>,
         page_queries: RefCell<alloc::vec::Vec<super::super::ReadQuery<'static, Postgres>>>,
         cursor_queries: RefCell<alloc::vec::Vec<super::super::ReadQuery<'static, Postgres>>>,
@@ -1934,7 +1934,7 @@ mod tests {
         fn execute_scalar(
             &self,
             query: &super::super::ReadQuery<'_, Postgres>,
-            column_kind: BuiltinKind,
+            column_kind: ScalarFamily,
             _auth: &(),
         ) -> Result<(Value<Postgres>, Option<Self::Checkpoint>), Self::Error> {
             self.calls
@@ -2101,7 +2101,7 @@ mod tests {
         assert_eq!(e.connector().call_count(), 1);
         let (sql, kind) = e.connector().calls.borrow()[0].clone();
         assert!(sql.contains("MIN"));
-        assert_eq!(kind, BuiltinKind::Float);
+        assert_eq!(kind, ScalarFamily::Float);
     }
 
     #[test]
@@ -2941,12 +2941,12 @@ mod tests {
         let first = super::super::ReExecutionRead::GroupedScalar {
             group: vec![1],
             query: super::super::BoundQuery::new(String::new(), Vec::new()),
-            column_kinds: [BuiltinKind::Int, BuiltinKind::Int],
+            column_kinds: [ScalarFamily::Int, ScalarFamily::Int],
         };
         let second = super::super::ReExecutionRead::GroupedScalar {
             group: vec![2],
             query: super::super::BoundQuery::new(String::new(), Vec::new()),
-            column_kinds: [BuiltinKind::Int, BuiltinKind::Int],
+            column_kinds: [ScalarFamily::Int, ScalarFamily::Int],
         };
         engine.stamp_reexec(7, &first);
         assert!(engine.debounce_skip(7, &first));

@@ -21,7 +21,7 @@
 use core::future::Future;
 use sql_traits::structs::ParserDB;
 use sqlparser::dialect::PostgreSqlDialect;
-use subql::backend::{BuiltinKind, Postgres, Value};
+use subql::backend::{Postgres, ScalarFamily, Value};
 use subql::reexec::{
     AsyncConnector, AsyncMode, AutoResolvingEngine, Connector, ReadQuery, RowPage, Snapshot,
     SyncMode,
@@ -54,7 +54,7 @@ impl Connector for Refusing {
     fn execute_scalar(
         &self,
         _query: &ReadQuery<'_, Postgres>,
-        _kind: BuiltinKind,
+        _kind: ScalarFamily,
         _auth: &(),
     ) -> Result<(Value<Postgres>, Option<NoCheckpoint>), RefusingError> {
         Err(RefusingError::ReadIssued)
@@ -80,7 +80,7 @@ impl AsyncConnector for Refusing {
     fn execute_scalar(
         &self,
         _query: &ReadQuery<'_, Postgres>,
-        _kind: BuiltinKind,
+        _kind: ScalarFamily,
         _auth: &(),
     ) -> impl Future<Output = Result<(Value<Postgres>, Option<NoCheckpoint>), RefusingError>> + Send
     {

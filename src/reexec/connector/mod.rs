@@ -33,7 +33,7 @@
 //! expected to retry the batch. Retry policy lives in the Connector impl
 //! (or above the engine), never inside subql.
 
-use crate::backend::{Backend, BuiltinKind, Value};
+use crate::backend::{Backend, ScalarFamily, Value};
 use crate::{Checkpoint, DispatchError};
 use thiserror::Error;
 
@@ -371,7 +371,7 @@ pub trait Connector {
     /// Subql backend whose [`Value`] shape this connector produces.
     type Backend: Backend;
 
-    /// Run the SQL and decode one scalar using the expected [`BuiltinKind`].
+    /// Run the SQL and decode one scalar using the expected [`ScalarFamily`].
     ///
     /// `sql` is exactly the string the plan rendered for re-execution and
     /// returned via [`Tier::Scalar`](crate::Tier::Scalar) at
@@ -389,7 +389,7 @@ pub trait Connector {
     fn execute_scalar(
         &self,
         query: &ReadQuery<'_, Self::Backend>,
-        kind: BuiltinKind,
+        kind: ScalarFamily,
         auth: &Self::AuthContext,
     ) -> Result<(Value<Self::Backend>, Option<Self::Checkpoint>), Self::Error>;
 
@@ -475,7 +475,7 @@ pub trait Connector {
     }
 
     /// Run one bound multi-column scalar seed query and decode each column by
-    /// its [`BuiltinKind`].
+    /// its [`ScalarFamily`].
     ///
     /// Bootstraps or re-seeds an in-process aggregate accumulator from
     /// [`Served::aggregate_bootstrap`](crate::Served::aggregate_bootstrap):
@@ -496,7 +496,7 @@ pub trait Connector {
     fn execute_scalar_row(
         &self,
         query: &ReadQuery<'_, Self::Backend>,
-        kinds: &[BuiltinKind],
+        kinds: &[ScalarFamily],
         auth: &Self::AuthContext,
     ) -> Result<
         (

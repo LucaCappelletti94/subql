@@ -2,7 +2,7 @@
 
 use super::domain_id_types::{ColumnId, TableId};
 use super::generic_id_types::{IdTypes, SubscriptionId, SubscriptionScope};
-use crate::backend::{Backend, BuiltinKind, Value, ValueKind, ValueKindOf};
+use crate::backend::{Backend, ScalarFamily, Value, ValueKind, ValueKindOf};
 use crate::checkpoint::{Checkpoint, NoCheckpoint};
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -622,8 +622,8 @@ impl<'a, I: IdTypes> IntoIterator for &'a SubscriptionsView<'_, I> {
 /// consumes them, and
 /// [`kinds`](Self::kinds) gives the decode kind for every column in that same
 /// order. `COUNT` components are
-/// [`BuiltinKind::Int`](crate::backend::BuiltinKind::Int); `SUM` and `SUM(x*x)`
-/// components are [`BuiltinKind::Float`](crate::backend::BuiltinKind::Float),
+/// [`ScalarFamily::Int`](crate::backend::ScalarFamily::Int); `SUM` and `SUM(x*x)`
+/// components are [`ScalarFamily::Float`](crate::backend::ScalarFamily::Float),
 /// decoded as double to match the `f64` accumulator (since `SUM` promotes to
 /// `bigint`/`numeric`/`DECIMAL` depending on the backend).
 ///
@@ -635,7 +635,7 @@ pub struct AggregateBootstrap<B: Backend = crate::backend::Postgres> {
     /// Runnable seed query with positionally-aliased component columns.
     pub query: crate::reexec::BoundQuery<B>,
     /// Per-column decode kinds, in column order, group columns included.
-    pub kinds: Vec<BuiltinKind>,
+    pub kinds: Vec<ScalarFamily>,
     /// How many leading columns of each row are group values.
     ///
     /// Zero for an ungrouped aggregate, in which case every column is a
@@ -661,7 +661,7 @@ impl<B: Backend> Clone for AggregateBootstrap<B> {
 /// types" is a query fix, and the two used to arrive as the same `String`.
 ///
 /// Generic over the backend because a cause names a column's scalar kind, and
-/// a custom backend kind is not a [`BuiltinKind`].
+/// a custom backend kind is not a [`ScalarFamily`].
 ///
 /// [`Display`](core::fmt::Display) renders the sentence a caller logs today,
 /// so migrating is a match arm rather than a message change.
@@ -865,7 +865,7 @@ pub enum Tier<B: Backend = crate::backend::Postgres> {
         /// Bound query for the initial value and later triggers.
         query: crate::reexec::BoundQuery<B>,
         /// Decode hint for the scalar result.
-        column_kind: BuiltinKind,
+        column_kind: ScalarFamily,
     },
     /// Grouped extrema seeded together and re-read one displaced group at a time.
     GroupedScalar {

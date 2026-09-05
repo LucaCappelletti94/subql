@@ -5,7 +5,7 @@
 
 use sql_traits::structs::ParserDB;
 use sqlparser::dialect::PostgreSqlDialect;
-use subql::backend::{BuiltinKind, Postgres, Value};
+use subql::backend::{Postgres, ScalarFamily, Value};
 use subql::testing::TestEvent;
 use subql::{
     catalog_helpers, AggValue, AggregateSeedInstall, AggregateValueChange, DefaultIds, Install,
@@ -163,12 +163,12 @@ mod registration {
         assert_eq!(
             bootstrap.kinds,
             vec![
-                BuiltinKind::String,
+                ScalarFamily::String,
                 // `amount` is an `INT`, whose sum is a `bigint`, so the
                 // total component decodes exactly rather than as a double.
-                BuiltinKind::Int,
-                BuiltinKind::Int,
-                BuiltinKind::Int
+                ScalarFamily::Int,
+                ScalarFamily::Int,
+                ScalarFamily::Int
             ],
             "COUNT(*) uses the grouped row count without widening the component set"
         );

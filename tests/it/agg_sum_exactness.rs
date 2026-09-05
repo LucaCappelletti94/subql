@@ -410,8 +410,8 @@ fn a_decimal_seed_decodes_exactly() {
     assert_eq!(
         bootstrap.kinds,
         vec![
-            subql::backend::BuiltinKind::Decimal,
-            subql::backend::BuiltinKind::Int
+            subql::backend::ScalarFamily::Decimal,
+            subql::backend::ScalarFamily::Int
         ],
         "a numeric total is read back as a decimal, not as a double"
     );

@@ -7,7 +7,7 @@ use super::diesel_backend::{boxed_read_query, DieselBackend};
 use super::{
     run_setup_statements, Connector, ReadQuery, RowPage, ScalarRowError, SessionSetup, Snapshot,
 };
-use crate::backend::{BuiltinKind, Value};
+use crate::backend::{ScalarFamily, Value};
 use alloc::boxed::Box;
 use alloc::string::String;
 use core::cell::RefCell;
@@ -110,7 +110,7 @@ pub struct TextRow {
 /// Route the projected column through the `Nullable<BigInt|Double|Text>`
 /// row shape that matches `kind`, then lift into [`Value<B>`].
 ///
-/// Aggregate-only column kinds ([`BuiltinKind::Int`] / [`BuiltinKind::Float`])
+/// Aggregate-only column kinds ([`ScalarFamily::Int`] / [`ScalarFamily::Float`])
 /// map to the numeric rows; every other kind reads through the `Text`
 /// row. Decimals are carried as text through this path so precision is
 /// not lost through `f64`.
@@ -118,7 +118,7 @@ pub struct TextRow {
 pub(super) fn load_scalar<C, B>(
     conn: &mut C,
     query: &ReadQuery<'_, B>,
-    kind: BuiltinKind,
+    kind: ScalarFamily,
 ) -> QueryResult<Value<B>>
 where
     C: Connection,
@@ -148,7 +148,7 @@ where
         LoadQuery<'q, C, IntRow> + LoadQuery<'q, C, FloatRow> + LoadQuery<'q, C, TextRow>,
 {
     let value = match kind {
-        BuiltinKind::Int => {
+        ScalarFamily::Int => {
             let widened = alloc::format!(
                 "SELECT CAST(({}) AS {cast}) AS v",
                 query.sql(),
@@ -161,21 +161,21 @@ where
                 .map_or(Value::Null, B::value_from_i64);
             value
         }
-        BuiltinKind::Float => boxed_read_query::<C::Backend, B>(query)?
+        ScalarFamily::Float => boxed_read_query::<C::Backend, B>(query)?
             .get_result::<FloatRow>(conn)?
             .v
             .map_or(Value::Null, B::value_from_f64),
-        BuiltinKind::Bool
-        | BuiltinKind::String
-        | BuiltinKind::Bytes
-        | BuiltinKind::Uuid
-        | BuiltinKind::Timestamp
-        | BuiltinKind::TimestampTz
-        | BuiltinKind::Date
-        | BuiltinKind::Time
-        | BuiltinKind::Decimal
-        | BuiltinKind::Json
-        | BuiltinKind::Jsonb => boxed_read_query::<C::Backend, B>(query)?
+        ScalarFamily::Bool
+        | ScalarFamily::String
+        | ScalarFamily::Bytes
+        | ScalarFamily::Uuid
+        | ScalarFamily::Timestamp
+        | ScalarFamily::TimestampTz
+        | ScalarFamily::Date
+        | ScalarFamily::Time
+        | ScalarFamily::Decimal
+        | ScalarFamily::Json
+        | ScalarFamily::Jsonb => boxed_read_query::<C::Backend, B>(query)?
             .get_result::<TextRow>(conn)?
             .v
             .map_or(Value::Null, B::value_from_string),
@@ -191,7 +191,7 @@ where
 pub(super) fn load_scalar_row<C, B>(
     conn: &mut C,
     query: &ReadQuery<'_, B>,
-    kinds: &[BuiltinKind],
+    kinds: &[ScalarFamily],
 ) -> QueryResult<alloc::vec::Vec<Value<B>>>
 where
     C: Connection,
@@ -296,7 +296,7 @@ where
     fn execute_scalar(
         &self,
         query: &ReadQuery<'_, B>,
-        kind: BuiltinKind,
+        kind: ScalarFamily,
         auth: &S,
     ) -> Result<(Value<B>, Option<Self::Checkpoint>), Self::Error> {
         let mut conn = self.conn.borrow_mut();
@@ -342,7 +342,7 @@ where
     fn execute_scalar_row(
         &self,
         query: &ReadQuery<'_, B>,
-        kinds: &[BuiltinKind],
+        kinds: &[ScalarFamily],
         auth: &S,
     ) -> Result<(alloc::vec::Vec<Value<B>>, Option<Self::Checkpoint>), ScalarRowError<Self::Error>>
     {

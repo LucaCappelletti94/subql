@@ -82,7 +82,7 @@ pub enum Refusal {
         /// The aggregated column.
         column: crate::ColumnId,
         /// The column's builtin kind, which is what the fold checked.
-        kind: crate::backend::BuiltinKind,
+        kind: crate::backend::ScalarFamily,
         /// The aggregate function, as the statement spelled it.
         function: String,
     },
@@ -95,7 +95,7 @@ pub enum Refusal {
         /// The compared column.
         column: crate::ColumnId,
         /// The column's builtin kind, which is what carries no order here.
-        kind: crate::backend::BuiltinKind,
+        kind: crate::backend::ScalarFamily,
     },
     /// The operands' collations describe a text comparison this build does
     /// not reproduce.
@@ -123,11 +123,11 @@ pub enum Refusal {
         /// Left operand column.
         left: crate::ColumnId,
         /// Left operand's builtin kind.
-        left_kind: crate::backend::BuiltinKind,
+        left_kind: crate::backend::ScalarFamily,
         /// Right operand column.
         right: crate::ColumnId,
         /// Right operand's builtin kind.
-        right_kind: crate::backend::BuiltinKind,
+        right_kind: crate::backend::ScalarFamily,
     },
     /// A form with no structured cause, carrying the compiler's own words.
     #[error("{0}")]
@@ -291,7 +291,7 @@ pub enum ValueError {
         /// Column ordinal whose carried cell failed to decode.
         column: crate::ColumnId,
         /// The catalog scalar kind subql tried to decode the cell into.
-        kind: crate::backend::BuiltinKind,
+        kind: crate::backend::ScalarFamily,
     },
     /// A custom type's conversion refused the value its carrier delivered.
     ///

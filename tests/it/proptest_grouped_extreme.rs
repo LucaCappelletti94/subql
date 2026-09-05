@@ -8,7 +8,7 @@ use proptest::prelude::*;
 use sql_traits::structs::ParserDB;
 use sqlparser::dialect::PostgreSqlDialect;
 use subql::backend::{
-    Backend, BuiltinKind, CollationFacts, ColumnComparison, NoCustom, Postgres, Value,
+    Backend, CollationFacts, ColumnComparison, NoCustom, Postgres, ScalarFamily, Value,
 };
 use subql::reexec::ReExecutionRead;
 use subql::testing::TestEvent;
@@ -34,7 +34,7 @@ fn identity_group_name(identity: &GroupIdentity<Postgres>) -> &str {
 
 fn text_group_key(name: &str) -> Vec<u8> {
     let encoder = Postgres::<Pg18>::group_key_encoder(vec![ColumnComparison::<NoCustom> {
-        kind: BuiltinKind::String.into(),
+        kind: ScalarFamily::String.into(),
         declared_type: String::from("TEXT"),
         collation: CollationFacts::DatabaseDefault,
     }])

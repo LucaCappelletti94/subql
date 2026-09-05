@@ -78,7 +78,7 @@ fn every_shape_reports_the_tier_that_maintains_it() {
     match scalar {
         Tier::Scalar { column_kind, .. } => assert_eq!(
             column_kind,
-            subql::backend::BuiltinKind::Float,
+            subql::backend::ScalarFamily::Float,
             "the extreme is re-read and decoded as its column's kind"
         ),
         other => panic!("expected a scalar re-read, got {other:?}"),
@@ -254,7 +254,7 @@ fn not_served_because_carries_structured_operands() {
         reason,
         &subql::NotServed::UnfoldableAggregate {
             column: status,
-            kind: subql::backend::BuiltinKind::String.into(),
+            kind: subql::backend::ScalarFamily::String.into(),
             function: "SUM".to_string(),
         },
         "the cause names its column and that column's kind"

@@ -22,7 +22,7 @@ use crate::common;
 use diesel::{sql_query, MysqlConnection, RunQueryDsl};
 use sql_traits::structs::ParserDB;
 use sqlparser::dialect::MySqlDialect;
-use subql::backend::{BuiltinKind, MySql, Value};
+use subql::backend::{MySql, ScalarFamily, Value};
 use subql::reexec::{
     AutoResolvingEngine, Connector, MysqlDieselConnector, SessionSetup, SnapshotResult, SyncMode,
 };
@@ -146,7 +146,7 @@ fn scaffold_registers_both_and_executes_scalar() {
         .connector()
         .execute_scalar(
             &subql::reexec::ReadQuery::without_binds("SELECT MIN(price) AS v FROM orders"),
-            BuiltinKind::Float,
+            ScalarFamily::Float,
             &(),
         )
         .expect("connector executes");
@@ -361,7 +361,7 @@ fn every_read_reports_a_position_taken_before_its_snapshot() {
             MysqlDieselConnector::new(common::mysql_connect(port))
                 .execute_scalar(
                     &subql::reexec::ReadQuery::without_binds(sql),
-                    BuiltinKind::Int,
+                    ScalarFamily::Int,
                     &(),
                 )
                 .expect("scalar read")
@@ -401,7 +401,7 @@ fn every_read_reports_a_position_taken_before_its_snapshot() {
             MysqlDieselConnector::new(common::mysql_connect(port))
                 .execute_scalar_row(
                     &subql::reexec::ReadQuery::without_binds(sql),
-                    &[BuiltinKind::Int],
+                    &[ScalarFamily::Int],
                     &(),
                 )
                 .expect("seed read")
@@ -445,7 +445,7 @@ fn session_setup_runs_on_each_read_sync_mysql() {
     let (value, _) = connector
         .execute_scalar(
             &subql::reexec::ReadQuery::without_binds(read_marker),
-            BuiltinKind::Int,
+            ScalarFamily::Int,
             &setup,
         )
         .expect("scalar read");
@@ -472,7 +472,7 @@ fn session_setup_runs_on_each_read_sync_mysql() {
     let (value, _) = plain
         .execute_scalar(
             &subql::reexec::ReadQuery::without_binds(read_marker),
-            BuiltinKind::Int,
+            ScalarFamily::Int,
             &(),
         )
         .expect("scalar read");
