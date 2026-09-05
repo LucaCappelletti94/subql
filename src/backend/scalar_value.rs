@@ -578,10 +578,22 @@ pub enum TextOperation {
     Equality,
     /// `<`, `<=`, `>`, `>=`, `BETWEEN`, and extreme maintenance.
     Ordering,
-    /// `LIKE` and `ILIKE`. A separate operation because the engines do not
-    /// answer it like equality: PostgreSQL's `LIKE` reads a `char(n)`
-    /// column's padding where its `=` ignores it.
+    /// `LIKE`. A separate operation because the engines do not answer it
+    /// like equality: PostgreSQL's `LIKE` reads a `char(n)` column's
+    /// padding where its `=` ignores it. Case handling is the engine's
+    /// too: measured, PostgreSQL and MySQL under a binary collation
+    /// answer `'ABC' LIKE 'abc'` false while SQLite answers it true.
     Pattern,
+    /// `ILIKE`, which only PostgreSQL has: MySQL answers a syntax error
+    /// and SQLite has no such keyword.
+    ///
+    /// Its folding is the locale's, and reproducible only where that
+    /// folding is ASCII-only. Measured on a `en_US.utf8` database,
+    /// `lower('İ')` is the single character `i`, so a fold that produced
+    /// two characters would let `_` match one the server never emitted,
+    /// and `'ΣΟΦΟΣ' ILIKE 'σοφος'` is false there where a final-sigma
+    /// aware fold answers true.
+    CaseInsensitivePattern,
 }
 
 /// How one text comparison is answered in process, resolved once at
@@ -1159,6 +1171,12 @@ pub fn single_column_rule<B: Backend>(column: &ColumnComparisonOf<B>) -> Option<
 /// is the locale's, and measured, byte order does not reproduce it: the
 /// server answers `'a' < 'B'` true where bytes answer false. Only `C` and
 /// `POSIX` order by byte.
+///
+/// A case-insensitive pattern is the locale's too, and worse: measured on
+/// a `en_US.utf8` database, `lower('İ')` is the single character `i`,
+/// where Rust's folding gives two, and `'ΣΟΦΟΣ' ILIKE 'σοφος'` is false
+/// where a final-sigma aware fold answers true. Only `C` and `POSIX` fold
+/// ASCII alone, and only there is `ILIKE` reproducible.
 pub(super) fn postgres_reproduces(
     column: &ColumnComparisonOf<Postgres>,
     operation: TextOperation,
@@ -1171,8 +1189,9 @@ pub(super) fn postgres_reproduces(
     match (&column.collation, operation) {
         // A byte-ordered collation reproduces every operation.
         (CollationFacts::Named { name, .. }, _) if byte_ordered(name) => true,
-        // Ordering under any other collation is the locale's.
-        (_, TextOperation::Ordering) => false,
+        // Ordering and case folding under any other collation are the
+        // locale's.
+        (_, TextOperation::Ordering | TextOperation::CaseInsensitivePattern) => false,
         (CollationFacts::DatabaseDefault, _) => true,
         (
             CollationFacts::Named {

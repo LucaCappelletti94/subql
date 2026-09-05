@@ -800,10 +800,7 @@ where
                 database,
                 crate::backend::TextOperation::Pattern,
             )?;
-            out.push(Instruction::Like {
-                case_sensitive: true,
-                comparison: cmp,
-            });
+            out.push(Instruction::Like { comparison: cmp });
 
             if *negated {
                 out.push(Instruction::Not);
@@ -845,12 +842,9 @@ where
                 pattern,
                 table_id,
                 database,
-                crate::backend::TextOperation::Pattern,
+                crate::backend::TextOperation::CaseInsensitivePattern,
             )?;
-            out.push(Instruction::Like {
-                case_sensitive: false,
-                comparison: cmp,
-            });
+            out.push(Instruction::Like { comparison: cmp });
 
             if *negated {
                 out.push(Instruction::Not);

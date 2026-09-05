@@ -303,10 +303,15 @@ pub enum Instruction<B: Backend> {
     ///
     /// Stack: `[..., string, pattern] -> [..., Tri]`.
     Like {
-        /// When `false`, both operands are lowercased before matching.
-        case_sensitive: bool,
-        /// The string and pattern operands' facts. A pattern can be a
-        /// column, so this side is not always `None`.
+        /// The string and pattern operands' facts, including how this
+        /// engine folds case for the operator that was written. A pattern
+        /// can be a column, so this side is not always `None`.
+        ///
+        /// `LIKE` and `ILIKE` compile to the same instruction because the
+        /// only difference between them is that rule: measured,
+        /// PostgreSQL's `LIKE` is case-sensitive under every collation and
+        /// its `ILIKE` folds ASCII under `C`, while SQLite's `LIKE` folds
+        /// ASCII and has no `ILIKE` at all.
         comparison: ComparisonRef,
     },
 
@@ -514,11 +519,7 @@ impl<B: Backend> Clone for Instruction<B> {
                 lower: *lower,
                 upper: *upper,
             },
-            Self::Like {
-                case_sensitive,
-                comparison,
-            } => Self::Like {
-                case_sensitive: *case_sensitive,
+            Self::Like { comparison } => Self::Like {
                 comparison: *comparison,
             },
             Self::JumpIfFalse(offset) => Self::JumpIfFalse(*offset),
@@ -567,12 +568,8 @@ impl<B: Backend> core::fmt::Debug for Instruction<B> {
                 .field("lower", lower)
                 .field("upper", upper)
                 .finish(),
-            Self::Like {
-                case_sensitive,
-                comparison,
-            } => f
+            Self::Like { comparison } => f
                 .debug_struct("Like")
-                .field("case_sensitive", case_sensitive)
                 .field("comparison", comparison)
                 .finish(),
             Self::JumpIfFalse(offset) => f.debug_tuple("JumpIfFalse").field(offset).finish(),
@@ -592,7 +589,8 @@ impl<B: Backend> PartialEq for Instruction<B> {
             | (Self::LessThan(a), Self::LessThan(b))
             | (Self::LessThanOrEqual(a), Self::LessThanOrEqual(b))
             | (Self::GreaterThan(a), Self::GreaterThan(b))
-            | (Self::GreaterThanOrEqual(a), Self::GreaterThanOrEqual(b)) => a == b,
+            | (Self::GreaterThanOrEqual(a), Self::GreaterThanOrEqual(b))
+            | (Self::Like { comparison: a }, Self::Like { comparison: b }) => a == b,
             (Self::IsNull, Self::IsNull)
             | (Self::IsNotNull, Self::IsNotNull)
             | (Self::And, Self::And)
@@ -623,16 +621,6 @@ impl<B: Backend> PartialEq for Instruction<B> {
                 },
                 Self::In {
                     literals: b,
-                    comparison: br,
-                },
-            ) => a == b && ar == br,
-            (
-                Self::Like {
-                    case_sensitive: a,
-                    comparison: ar,
-                },
-                Self::Like {
-                    case_sensitive: b,
                     comparison: br,
                 },
             ) => a == b && ar == br,

@@ -465,10 +465,13 @@ impl<B: Backend> Vm<B> {
                 self.stack.push(StackValue::Tri(result));
             }
 
-            Instruction::Like {
-                case_sensitive,
-                comparison: _,
-            } => {
+            Instruction::Like { comparison } => {
+                // The rule travels on the instruction, resolved at
+                // registration from both operands and from which of
+                // `LIKE` or `ILIKE` was written.
+                let case = comparison
+                    .text
+                    .map_or(crate::backend::TextCase::Exact, |rule| rule.case);
                 let pattern = self.pop_value()?;
                 let string = self.pop_value()?;
 
@@ -490,11 +493,7 @@ impl<B: Backend> Vm<B> {
                     };
 
                 let escape = B::LIKE_ESCAPE.map(|escape| escape.character);
-                let walk = if *case_sensitive {
-                    simple_like(str_val, pat_val, escape)
-                } else {
-                    simple_like(&str_val.to_lowercase(), &pat_val.to_lowercase(), escape)
-                };
+                let walk = simple_like(str_val, pat_val, escape, case);
                 // The walk reports a dangling escape only where the engine
                 // refuses it, which is where the matcher reached it with
                 // input left. What that means is the engine's: PostgreSQL
@@ -781,7 +780,12 @@ fn compile_pattern(pattern: &str, escape: Option<char>) -> Vec<PatternAtom> {
 /// Supports `%` (zero or more characters), `_` (exactly one character) and
 /// the default escape. An explicit `ESCAPE` clause is refused before
 /// reaching here.
-fn simple_like(string: &str, pattern: &str, escape: Option<char>) -> Result<bool, PatternError> {
+fn simple_like(
+    string: &str,
+    pattern: &str,
+    escape: Option<char>,
+    case: crate::backend::TextCase,
+) -> Result<bool, PatternError> {
     let s: Vec<char> = string.chars().collect();
     let p = compile_pattern(pattern, escape);
     let pn = p.len();
@@ -816,7 +820,7 @@ fn simple_like(string: &str, pattern: &str, escape: Option<char>) -> Result<bool
                     }
                 }
                 PatternAtom::Literal(ch) => {
-                    if dp[j] && sc == ch {
+                    if dp[j] && same_character(sc, ch, case) {
                         new_dp[j + 1] = true;
                     }
                 }
@@ -831,6 +835,24 @@ fn simple_like(string: &str, pattern: &str, escape: Option<char>) -> Result<bool
     }
 
     Ok(dp[pn])
+}
+
+/// Whether two pattern characters match under this engine's case rule.
+///
+/// Folded per character as the walk reaches it, rather than by lowercasing
+/// either operand: a lowercased copy is an allocation per row, and a full
+/// Unicode fold is also the wrong answer. Measured on PostgreSQL,
+/// `lower('İ')` is one character where Rust's fold gives two, so folding
+/// the whole string can change its length and let `_` match a character
+/// the server never produced.
+///
+/// ASCII folding needs no such copy, because it maps each character to
+/// exactly one character.
+const fn same_character(left: char, right: char, case: crate::backend::TextCase) -> bool {
+    match case {
+        crate::backend::TextCase::Exact => left == right,
+        crate::backend::TextCase::AsciiNoCase => left.eq_ignore_ascii_case(&right),
+    }
 }
 
 #[cfg(test)]
@@ -1081,7 +1103,6 @@ mod tests {
             Instruction::LoadColumn(0),
             Instruction::PushLiteral(Value::String("h%".into())),
             Instruction::Like {
-                case_sensitive: true,
                 comparison: ComparisonRef::NONE,
             },
         ]);
@@ -1263,17 +1284,17 @@ mod tests {
     #[test]
     fn a_trailing_escape_is_reported_when_the_walk_reaches_it() {
         assert_eq!(
-            simple_like("ab", r"a\", Some('\\')),
+            simple_like("ab", r"a\", Some('\\'), crate::backend::TextCase::Exact),
             Err(PatternError::TrailingEscape),
             "input remains when the matcher arrives, which is what PostgreSQL refuses"
         );
         assert_eq!(
-            simple_like("a", r"a\", Some('\\')),
+            simple_like("a", r"a\", Some('\\'), crate::backend::TextCase::Exact),
             Ok(false),
             "the input ran out first, and PostgreSQL answers false rather than raising"
         );
         assert_eq!(
-            simple_like("axb", r"a%\", Some('\\')),
+            simple_like("axb", r"a%\", Some('\\'), crate::backend::TextCase::Exact),
             Err(PatternError::TrailingEscape),
             "a wildcard ahead of it does not hide the dangling escape"
         );
@@ -1283,15 +1304,37 @@ mod tests {
     /// backslash is an ordinary character to be matched.
     #[test]
     fn a_trailing_backslash_is_ordinary_without_an_escape() {
-        assert_eq!(simple_like(r"a\", r"a\", None), Ok(true));
-        assert_eq!(simple_like("ab", r"a\", None), Ok(false));
+        assert_eq!(
+            simple_like(r"a\", r"a\", None, crate::backend::TextCase::Exact),
+            Ok(true)
+        );
+        assert_eq!(
+            simple_like("ab", r"a\", None, crate::backend::TextCase::Exact),
+            Ok(false)
+        );
     }
 
     /// The escape only escapes; it does not change what the wildcards mean
     /// elsewhere in the pattern.
     #[test]
     fn escaping_one_wildcard_leaves_the_others_alone() {
-        assert_eq!(simple_like("a%xb", r"a\%%b", Some('\\')), Ok(true));
-        assert_eq!(simple_like("axxb", r"a\%%b", Some('\\')), Ok(false));
+        assert_eq!(
+            simple_like(
+                "a%xb",
+                r"a\%%b",
+                Some('\\'),
+                crate::backend::TextCase::Exact
+            ),
+            Ok(true)
+        );
+        assert_eq!(
+            simple_like(
+                "axxb",
+                r"a\%%b",
+                Some('\\'),
+                crate::backend::TextCase::Exact
+            ),
+            Ok(false)
+        );
     }
 }

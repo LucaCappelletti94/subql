@@ -349,6 +349,8 @@ mod semantics_div_zero;
 
 mod semantics_division;
 
+mod semantics_ilike;
+
 mod semantics_missing_cell;
 
 mod semantics_float_width;

@@ -26,6 +26,11 @@ use subql::{
 
 const DDL: &str = "CREATE TABLE names (id INT PRIMARY KEY, name TEXT)";
 
+/// `ILIKE` folds by collation, and only an ASCII-only folding is
+/// reproducible, so the case-insensitive escape is asserted on a `C`
+/// column. Phase D5 records the measurements behind that.
+const PG_FOLDING_DDL: &str = "CREATE TABLE names (id INT PRIMARY KEY, name TEXT COLLATE \"C\")";
+
 /// MySQL matches `LIKE` under the column's collation, and its server
 /// default folds case, which no in-process comparison reproduces. A binary
 /// collation is reproducible, so that is where the escape rule is asserted.
@@ -52,6 +57,11 @@ macro_rules! notifies {
 
 fn pg_notifies(predicate: &str, name: &str) -> bool {
     notifies!(Postgres, PostgreSqlDialect, DDL, predicate, name)
+}
+
+/// As [`pg_notifies`], on a column whose collation folds ASCII only.
+fn pg_folding_notifies(predicate: &str, name: &str) -> bool {
+    notifies!(Postgres, PostgreSqlDialect, PG_FOLDING_DDL, predicate, name)
 }
 
 fn mysql_notifies(predicate: &str, name: &str) -> bool {
@@ -119,11 +129,11 @@ fn the_escape_applies_to_any_following_character() {
 #[test]
 fn case_insensitive_like_honours_the_escape() {
     assert!(
-        pg_notifies(r"SELECT * FROM names WHERE name ILIKE 'a\%b'", "A%B"),
+        pg_folding_notifies(r"SELECT * FROM names WHERE name ILIKE 'a\%b'", "A%B"),
         "ILIKE folds case and still escapes the wildcard"
     );
     assert!(
-        !pg_notifies(r"SELECT * FROM names WHERE name ILIKE 'a\%b'", "AxxB"),
+        !pg_folding_notifies(r"SELECT * FROM names WHERE name ILIKE 'a\%b'", "AxxB"),
         "folding case does not restore the wildcard"
     );
 }

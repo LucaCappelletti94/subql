@@ -141,7 +141,6 @@ pub fn arb_instruction(u: &mut Unstructured<'_>) -> arbitrary::Result<Instructio
             upper: arb_comparison_ref(u)?,
         }),
         21 => Ok(Instruction::Like {
-            case_sensitive: bool::arbitrary(u)?,
             comparison: arb_comparison_ref(u)?,
         }),
         // Jump instructions with bounded offsets (0..=31 to stay within any reasonable program)

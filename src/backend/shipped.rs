@@ -204,6 +204,12 @@ impl<V: postgres_jsonb_canonical::PgVersion + 'static> Backend for Postgres<V> {
             // `LIKE` reads the stored value, padding included: measured,
             // a `char(5)` holding `ab` does not match the pattern `ab`.
             TextOperation::Pattern => rule,
+            // `ILIKE` folds, and `postgres_reproduces` has already
+            // refused every collation whose folding is not ASCII-only.
+            TextOperation::CaseInsensitivePattern => TextRule {
+                case: crate::backend::TextCase::AsciiNoCase,
+                ..rule
+            },
             TextOperation::Equality | TextOperation::Ordering => {
                 rule.with_spaces(postgres_trailing_spaces(comparison))
             }
@@ -533,10 +539,18 @@ impl Backend for MySql {
     /// unnamed database default, is a database read.
     fn text_rule(
         comparison: &super::scalar_value::ComparisonContext<'_, Self>,
-        _operation: crate::backend::TextOperation,
+        operation: crate::backend::TextOperation,
     ) -> Option<crate::backend::TextRule> {
         use crate::backend::TextRule;
 
+        // Measured: `a ILIKE 'x'` is a syntax error on 8.4.11, so there is
+        // no answer to reproduce and none is offered.
+        if matches!(
+            operation,
+            crate::backend::TextOperation::CaseInsensitivePattern
+        ) {
+            return None;
+        }
         for side in [comparison.left, comparison.right] {
             let Some(facts) = side else { continue };
             mysql_binary_text_rule(facts)?;
@@ -759,18 +773,31 @@ impl Backend for SQLite {
         crate::backend::cross_kind_numeric_ordering(left, right)
     }
 
-    /// SQLite's three built-in collations are all exactly reproducible,
-    /// and the same rule serves every operation: `BINARY` compares bytes,
-    /// `NOCASE` folds ASCII case only, measured as leaving a ligature
-    /// alone, and `RTRIM` ignores trailing spaces.
+    /// SQLite's three built-in collations are all exactly reproducible:
+    /// `BINARY` compares bytes, `NOCASE` folds ASCII case only, measured
+    /// as leaving a ligature alone, and `RTRIM` ignores trailing spaces.
+    ///
+    /// `LIKE` is the one operation that does not take the column's
+    /// collation: measured, `'ABC' LIKE 'abc'` is `1` and `'Ä' LIKE 'ä'`
+    /// is `0`, so it folds ASCII case whatever the column says. And there
+    /// is no `ILIKE` keyword, so no case-insensitive pattern is offered.
     fn text_rule(
         comparison: &super::scalar_value::ComparisonContext<'_, Self>,
-        _operation: crate::backend::TextOperation,
+        operation: crate::backend::TextOperation,
     ) -> Option<crate::backend::TextRule> {
+        if matches!(
+            operation,
+            crate::backend::TextOperation::CaseInsensitivePattern
+        ) {
+            return None;
+        }
         let mut rule = crate::backend::TextRule::EXACT;
         for side in [comparison.left, comparison.right] {
             let Some(facts) = side else { continue };
             rule = sqlite_text_rule(facts)?;
+        }
+        if matches!(operation, crate::backend::TextOperation::Pattern) {
+            rule.case = crate::backend::TextCase::AsciiNoCase;
         }
         Some(rule)
     }
