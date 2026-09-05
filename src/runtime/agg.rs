@@ -22,8 +22,9 @@ pub enum AggCellRead {
     Integer(i64),
     /// An exact decimal cell.
     Decimal(bigdecimal::BigDecimal),
-    /// A finite floating cell. `NaN` and `Inf` are `NonNumeric` until
-    /// Phase D3.
+    /// A floating cell, `Infinity` and `NaN` included, because the
+    /// engines answer with them: measured, PostgreSQL sums `1.0` and
+    /// `Infinity` to `Infinity`.
     Real(f64),
     /// The cell is present but does not participate in numeric aggregates
     /// (Bool, String, non-finite Float, etc.).

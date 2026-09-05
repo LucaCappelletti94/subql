@@ -139,7 +139,7 @@ assert_eq!(
 |-----|--------------------|-------|
 | `SELECT COUNT(*) FROM t WHERE ...` | `Count(i64)` | +/-1 per matching row |
 | `SELECT COUNT(col) FROM t WHERE ...` | `Count(i64)` | skips `NULL` cells |
-| `SELECT SUM(col) FROM t WHERE ...` | `Sum(Option<NumericValue>)` | exact, in the type the engine sums into: `bigint`, `numeric`/`DECIMAL`, `integer` or double. `None` when no row contributes, which is what every engine answers |
+| `SELECT SUM(col) FROM t WHERE ...` | `Sum(Option<NumericValue>)` | exact, in the type the engine sums into: `bigint`, `numeric`/`DECIMAL`, `integer` or double. `Infinity` and `NaN` fold as the engine folds them. `None` when no row contributes, which is what every engine answers |
 | `SELECT AVG(col) FROM t WHERE ...` | `Avg(Option<NumericValue>)` | the engine's own division of the exact total by the count: `numeric` on PostgreSQL, `DECIMAL` on MySQL, a real on SQLite. `None` when no row contributes |
 
 ### Type validation
