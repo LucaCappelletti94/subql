@@ -15,4 +15,5 @@
 //! [`OracleVerdict`] keeps them apart and the comparison refuses to treat
 //! a refusal as unknown.
 
+pub mod generators;
 pub mod oracle;

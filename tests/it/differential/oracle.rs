@@ -88,7 +88,7 @@ pub trait Oracle {
     fn answer(&mut self, case: &OracleCase<'_>) -> OracleVerdict;
 
     /// The same, for a case spelled inline.
-    fn answer_case(&mut self, ddl: &str, insert: &str, predicate: &str) -> OracleVerdict {
+    fn answer_case(&mut self, ddl: &[&str], insert: &str, predicate: &str) -> OracleVerdict {
         self.answer(&OracleCase {
             ddl,
             insert,
@@ -116,7 +116,12 @@ fn engine_of<B: Backend + 'static>() -> Engine {
 
 /// One case: a schema, a row, and a predicate over it.
 pub struct OracleCase<'a> {
-    pub ddl: &'a str,
+    /// The statements that build the schema, in order.
+    ///
+    /// A list rather than one string because PostgreSQL refuses two
+    /// commands in one prepared statement, measured while building the
+    /// generated schema, whose collation has to be declared first.
+    pub ddl: &'a [&'a str],
     pub insert: &'a str,
     pub predicate: &'a str,
 }
@@ -124,8 +129,17 @@ pub struct OracleCase<'a> {
 impl OracleCase<'_> {
     /// The statements that put the row in place, in order. Dropping
     /// first is what lets one connection serve every case in a run.
-    const fn setup(&self) -> [&str; 3] {
-        ["DROP TABLE IF EXISTS t", self.ddl, self.insert]
+    fn setup(&self) -> Vec<&str> {
+        let mut statements = vec!["DROP TABLE IF EXISTS t"];
+        statements.extend(self.ddl.iter().copied());
+        statements.push(self.insert);
+        statements
+    }
+
+    /// The schema as one text, for `ParserDB`, which reads several
+    /// statements at once.
+    fn catalog_ddl(&self) -> String {
+        self.ddl.join(";\n")
     }
 
     /// The statement the oracle evaluates, which is the predicate read as
@@ -153,8 +167,8 @@ impl OracleCase<'_> {
             O::ENGINE,
             "an oracle judges only the backend that targets its engine"
         );
-        let database =
-            ParserDB::parse::<<O::Backend as Backend>::Dialect>(self.ddl).expect("DDL parses");
+        let database = ParserDB::parse::<<O::Backend as Backend>::Dialect>(&self.catalog_ddl())
+            .expect("DDL parses");
         let mut engine: SubscriptionEngine<TestEvent<O::Backend>, DefaultIds, ParserDB> =
             SubscriptionEngine::new(database, O::dialect());
         engine
@@ -300,17 +314,17 @@ mod tests {
     /// tri-state, asked of each engine in turn.
     fn assert_tri_state<O: Oracle>(oracle: &mut O, ddl: &str) {
         assert_eq!(
-            oracle.answer_case(ddl, INSERT, "amount = 7"),
+            oracle.answer_case(&[ddl], INSERT, "amount = 7"),
             OracleVerdict::Answered(Tri::True),
             "a true predicate answers TRUE"
         );
         assert_eq!(
-            oracle.answer_case(ddl, INSERT, "amount = 8"),
+            oracle.answer_case(&[ddl], INSERT, "amount = 8"),
             OracleVerdict::Answered(Tri::False),
             "a false predicate answers FALSE"
         );
         assert_eq!(
-            oracle.answer_case(ddl, NULL_INSERT, "amount = 7"),
+            oracle.answer_case(&[ddl], NULL_INSERT, "amount = 7"),
             OracleVerdict::Answered(Tri::Unknown),
             "a comparison against NULL answers NULL, which is unknown"
         );
@@ -355,7 +369,7 @@ mod tests {
     fn an_oracle_error_is_not_unknown() {
         let mut sqlite = SqliteOracle::open();
         let divide_by_zero = sqlite.answer_case(
-            SQLITE_DDL,
+            &[SQLITE_DDL],
             "INSERT INTO t VALUES (1, 0, 'abc')",
             "1 / amount > 0",
         );
@@ -389,7 +403,7 @@ mod tests {
             connection: crate::common::pg_connect(port),
         };
         let verdict = oracle.answer_case(
-            PG_DDL,
+            &[PG_DDL],
             "INSERT INTO t (id, amount, label) VALUES (1, 0, 'abc')",
             "1 / amount > 0",
         );
@@ -432,7 +446,7 @@ mod tests {
     #[should_panic(expected = "an oracle judges only the backend that targets its engine")]
     fn a_mispaired_oracle_is_refused_before_it_answers() {
         let case = OracleCase {
-            ddl: PG_DDL,
+            ddl: &[PG_DDL],
             insert: INSERT,
             predicate: "amount = 7",
         };
@@ -447,7 +461,7 @@ mod tests {
         assert_eq!(PgOracle::ENGINE, Engine::Postgres);
         assert_eq!(MySqlOracle::ENGINE, Engine::MySql);
         let case = OracleCase {
-            ddl: SQLITE_DDL,
+            ddl: &[SQLITE_DDL],
             insert: INSERT,
             predicate: "amount = 7",
         };
