@@ -188,15 +188,17 @@ fn execute_scalar_row_decodes_components() {
         .execute_scalar_row(&b.query.as_read_query(), &b.kinds, &())
         .unwrap();
     assert_eq!(row, vec![Value::Int(12), Value::Int(3)]);
-    // VAR_POP: (sum, sum_sq, count) = (12, 56, 3).
+    // VAR_POP: (sum, sum_sq, count) = (12, 56, 3), and the sum decodes as
+    // an integer because that is what SQLite answers: measured,
+    // `typeof(SUM(v))` over an INTEGER column is `integer`. The leading
+    // component of a variance seed is `SUM(amount)`, so it decodes in the
+    // type the engine sums into, exactly as `SUM`'s and `AVG`'s do just
+    // above. Only the sum of squares is a double.
     let b = bootstrap("SELECT VAR_POP(amount) FROM t");
     let (row, _) = connector
         .execute_scalar_row(&b.query.as_read_query(), &b.kinds, &())
         .unwrap();
-    assert_eq!(
-        row,
-        vec![Value::Float(12.0), Value::Float(56.0), Value::Int(3)]
-    );
+    assert_eq!(row, vec![Value::Int(12), Value::Float(56.0), Value::Int(3)]);
 }
 
 #[test]

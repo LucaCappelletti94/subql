@@ -484,10 +484,7 @@ fn execute_scalar_row_decodes_integer_aggregate_seed() {
     let (row, checkpoint) = connector
         .execute_scalar_row(&bundle.query.as_read_query(), &bundle.kinds, &())
         .expect("execute_scalar_row");
-    assert_eq!(
-        row,
-        vec![Value::Float(12.0), Value::Float(8.0), Value::Int(3)]
-    );
+    assert_eq!(row, vec![Value::Int(12), Value::Float(8.0), Value::Int(3)]);
     // The read is LSN-anchored like execute_scalar.
     assert!(checkpoint.is_some());
 }

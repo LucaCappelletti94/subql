@@ -358,10 +358,7 @@ fn execute_scalar_row_decodes_integer_aggregate_seed_async() {
         // (sum, squared deviations, count) = (12, 8, 3). Eight because
         // the seed reads the engine's own `VAR_POP(amount) * COUNT(amount)`
         // rather than a sum of squares, which would be 56.
-        assert_eq!(
-            row,
-            vec![Value::Float(12.0), Value::Float(8.0), Value::Int(3)]
-        );
+        assert_eq!(row, vec![Value::Int(12), Value::Float(8.0), Value::Int(3)]);
         assert!(checkpoint.is_some());
     });
 }

@@ -280,7 +280,11 @@ fn execute_scalar_row_decodes_integer_aggregate_seed_async() {
         // rather than a sum of squares, which would be 56.
         assert_eq!(
             row,
-            vec![Value::Float(12.0), Value::Float(8.0), Value::Int(3)]
+            vec![
+                Value::Decimal(bigdecimal::BigDecimal::from(12)),
+                Value::Float(8.0),
+                Value::Int(3)
+            ]
         );
     });
 }

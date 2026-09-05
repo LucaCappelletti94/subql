@@ -20,7 +20,8 @@ use subql::{
     AggValue, AggregateBootstrap, DefaultIds, NumericValue, SubscriptionEngine, SubscriptionRequest,
 };
 
-const DDL: &str = "CREATE TABLE t (id INT PRIMARY KEY, amount INT, status TEXT);";
+const DDL: &str = "CREATE TABLE t (id INT PRIMARY KEY, amount INT, status TEXT, \
+                   big BIGINT);";
 
 type Engine = SubscriptionEngine<TestEvent<Postgres>, DefaultIds, ParserDB>;
 
@@ -155,7 +156,8 @@ fn aggregate_bootstrap_carries_registration_binds() {
 fn bootstrap_kinds_per_aggspec() {
     let int = BuiltinKind::Int;
     let float = BuiltinKind::Float;
-    let cases: [(&str, Vec<BuiltinKind>); 8] = [
+    let decimal = BuiltinKind::Decimal;
+    let cases: [(&str, Vec<BuiltinKind>); 10] = [
         ("SELECT COUNT(*) FROM t", vec![int]),
         ("SELECT COUNT(amount) FROM t", vec![int]),
         // `amount` is an `INT`, whose sum is a `bigint` on Postgres, so the
@@ -164,10 +166,18 @@ fn bootstrap_kinds_per_aggspec() {
         // `AVG` holds the same exact total `SUM` does, so its total
         // component decodes exactly too.
         ("SELECT AVG(amount) FROM t", vec![int, int]),
-        ("SELECT VAR_POP(amount) FROM t", vec![float, float, int]),
-        ("SELECT VAR_SAMP(amount) FROM t", vec![float, float, int]),
-        ("SELECT STDDEV_POP(amount) FROM t", vec![float, float, int]),
-        ("SELECT STDDEV_SAMP(amount) FROM t", vec![float, float, int]),
+        // The variance family's first component is `SUM(amount)` too, so
+        // it decodes in the type the engine sums into, exactly as `SUM`'s
+        // own does. Only the middle component, the sum of squared
+        // deviations, is nobody's exact answer and stays a double.
+        ("SELECT VAR_POP(amount) FROM t", vec![int, float, int]),
+        ("SELECT VAR_SAMP(amount) FROM t", vec![int, float, int]),
+        ("SELECT STDDEV_POP(amount) FROM t", vec![int, float, int]),
+        ("SELECT STDDEV_SAMP(amount) FROM t", vec![int, float, int]),
+        // `big` is a `BIGINT`, whose sum PostgreSQL answers as `numeric`,
+        // so the total decodes as a decimal rather than an integer.
+        ("SELECT SUM(big) FROM t", vec![decimal, int]),
+        ("SELECT VAR_POP(big) FROM t", vec![decimal, float, int]),
     ];
     for (sql, expected) in cases {
         let bundle = bootstrap_of(sql).expect("aggregate registration has a bootstrap");
@@ -431,5 +441,111 @@ fn a_group_column_carrying_a_backtick_still_seeds_on_mysql() {
         "a`b",
         "seed SQL was `{}`",
         bootstrap.query.sql()
+    );
+}
+
+/// A widened seed's first component is `SUM(arg)` whatever the projected
+/// function is, so its declared kind is the total's and not the spec's.
+///
+/// A sibling `HAVING` that reads what the projected function does not
+/// maintain widens the seed to `[SUM(arg), squared deviations,
+/// COUNT(arg)]` for every spec. The declared kinds were taken from the
+/// first entry of the *spec's* own list, which is `Int` for a `COUNT` and
+/// `Float` for the variance family, so a widened seed asked the database
+/// for the wrong type and then handed the cell to an accumulator that
+/// ignores it.
+///
+/// `big` is a `BIGINT`, whose sum PostgreSQL answers as `numeric`, which
+/// is what separates the total's kind from the count's own `Int`.
+#[test]
+fn a_widened_seed_declares_the_kind_its_total_decodes_in() {
+    let string = BuiltinKind::String;
+    let int = BuiltinKind::Int;
+    let float = BuiltinKind::Float;
+    let decimal = BuiltinKind::Decimal;
+
+    for (sql, expected) in [
+        (
+            "SELECT status, COUNT(big) FROM t GROUP BY status HAVING SUM(big) > 10",
+            vec![string, decimal, float, int, int],
+        ),
+        (
+            "SELECT status, VAR_POP(amount) FROM t GROUP BY status HAVING SUM(amount) > 10",
+            vec![string, int, float, int, int],
+        ),
+        (
+            "SELECT status, COUNT(amount) FROM t GROUP BY status HAVING SUM(amount) > 10",
+            vec![string, int, float, int, int],
+        ),
+    ] {
+        let bundle = bootstrap_of(sql).expect("the widened aggregate has a bootstrap");
+        assert!(
+            bundle.query.sql().contains("SUM("),
+            "a widened seed reads a total: {}",
+            bundle.query.sql()
+        );
+        assert_eq!(bundle.kinds, expected, "kinds mismatch for `{sql}`");
+        assert_eq!(
+            bundle.kinds.len(),
+            bundle.query.sql().matches(" AS c").count(),
+            "one kind per seed column for `{sql}`"
+        );
+    }
+}
+
+/// And the kinds are load-bearing: a total seeded through the cell its
+/// declared kind describes holds the number the seed carried.
+///
+/// This is the silent zero. `Total::Integer::seed` matches only
+/// `Value::Int`, so a total declared as a float arrives as `Value::Float`,
+/// is ignored, and stays at zero. The `HAVING` then reads zero and the
+/// group never crosses into the result, with no error anywhere.
+#[test]
+fn a_widened_group_passes_its_having_on_the_seeded_total() {
+    let sql = "SELECT status, VAR_POP(amount) FROM t GROUP BY status HAVING SUM(amount) > 10";
+    let mut engine = engine();
+    let registered = engine
+        .register(SubscriptionRequest::<DefaultIds, Postgres>::new(1u64, sql))
+        .expect("the widened aggregate registers");
+    let bundle = registered
+        .served()
+        .expect("it is maintained in process")
+        .aggregate_bootstrap
+        .clone()
+        .expect("it has a bootstrap");
+
+    // The row a connector honouring those declared kinds would return for
+    // one group of two rows summing to 100.
+    let row: Vec<Value<Postgres>> = bundle
+        .kinds
+        .iter()
+        .enumerate()
+        .map(|(slot, kind)| match (slot, kind) {
+            (0, _) => Value::String("open".to_string()),
+            (1, BuiltinKind::Int) => Value::Int(100),
+            (1, BuiltinKind::Decimal) => {
+                Value::Decimal(BigDecimal::from_str("100").expect("100 parses"))
+            }
+            (1, _) => Value::Float(100.0),
+            (2, _) => Value::Float(50.0),
+            _ => Value::Int(2),
+        })
+        .collect();
+
+    let updates = subql::Install::install(
+        &mut engine,
+        registered.subscription_id,
+        subql::AggregateSeedInstall {
+            rows: vec![row],
+            read_at: None,
+        },
+    )
+    .expect("the starting numbers land");
+
+    assert_eq!(
+        updates.len(),
+        1,
+        "the group sums to 100, so it passes `SUM(amount) > 10` and is reported; \
+         a total left at zero fails the condition and reports nothing"
     );
 }

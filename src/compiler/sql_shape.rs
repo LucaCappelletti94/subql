@@ -1300,17 +1300,16 @@ pub(crate) fn render_aggregate_bootstrap<B: crate::backend::Backend, DB: Databas
     *select_projection_mut(&mut stmt)? = items;
     let mut kinds = group_kinds;
     if widened {
-        // A widened seed still carries the projected function's own total
-        // first, so it decodes in the type that function sums into. Only
-        // the sum of squares is a double, being nobody's exact answer.
+        // A widened seed reads `SUM(arg)` first whatever the projected
+        // function is, so the kind is the total's own and not the spec's.
+        // Reading it off the spec's list gave a `COUNT` the count's `Int`
+        // and the variance family a `Float`, either of which a total that
+        // accumulates otherwise silently ignores. Only the middle
+        // component is a double, being nobody's exact answer.
         kinds.extend([
-            aggregate_bootstrap_kinds(
-                spec,
-                crate::catalog_helpers::total_rule::<B, DB>(spec, database, table_id),
-            )
-            .first()
-            .copied()
-            .unwrap_or(crate::backend::BuiltinKind::Float),
+            bootstrap_total_kind(crate::catalog_helpers::total_rule::<B, DB>(
+                spec, database, table_id,
+            )),
             crate::backend::BuiltinKind::Float,
             crate::backend::BuiltinKind::Int,
         ]);
@@ -1344,24 +1343,29 @@ pub(crate) fn aggregate_bootstrap_kinds(
     spec: &AggSpec,
     rule: crate::backend::SumRule,
 ) -> Vec<crate::backend::BuiltinKind> {
-    let total = match spec {
-        // `AVG` holds the same exact total `SUM` does, since a mean is
-        // that total divided by the count, so its seed component decodes
-        // in the same type.
-        AggSpec::Sum { .. } | AggSpec::Avg { .. } => match rule {
-            crate::backend::SumRule::Integer
-            | crate::backend::SumRule::IntegerPromotingToDouble => crate::backend::BuiltinKind::Int,
-            crate::backend::SumRule::Decimal { .. } => crate::backend::BuiltinKind::Decimal,
-            // A `real` total still decodes as a float cell: the width is
-            // the accumulator's, and `SUM(real)` comes back as a
-            // floating value either way.
-            crate::backend::SumRule::Single | crate::backend::SumRule::Double => {
-                crate::backend::BuiltinKind::Float
-            }
-        },
-        _ => crate::backend::BuiltinKind::Float,
-    };
-    aggregate_bootstrap_kinds_with_total(spec, total)
+    aggregate_bootstrap_kinds_with_total(spec, bootstrap_total_kind(rule))
+}
+
+/// The kind a `SUM` over a column accumulating under `rule` decodes in.
+///
+/// One function because every seed that reads a total reads the same
+/// column type: `SUM`'s, `AVG`'s, the variance family's leading
+/// component, and a widened seed's whatever it projects. Asking the
+/// aggregate instead of the rule is what gave a widened `COUNT` an `Int`
+/// where PostgreSQL answers `numeric`.
+const fn bootstrap_total_kind(rule: crate::backend::SumRule) -> crate::backend::BuiltinKind {
+    match rule {
+        crate::backend::SumRule::Integer | crate::backend::SumRule::IntegerPromotingToDouble => {
+            crate::backend::BuiltinKind::Int
+        }
+        crate::backend::SumRule::Decimal { .. } => crate::backend::BuiltinKind::Decimal,
+        // A `real` total still decodes as a float cell: the width is the
+        // accumulator's, and `SUM(real)` comes back as a floating value
+        // either way.
+        crate::backend::SumRule::Single | crate::backend::SumRule::Double => {
+            crate::backend::BuiltinKind::Float
+        }
+    }
 }
 
 fn aggregate_bootstrap_kinds_with_total(
@@ -1375,11 +1379,14 @@ fn aggregate_bootstrap_kinds_with_total(
         AggSpec::Sum { .. } | AggSpec::Avg { .. } => {
             alloc::vec![total, crate::backend::BuiltinKind::Int]
         }
+        // The leading component is `SUM(arg)` here too, so it decodes in
+        // the type the engine sums into. The middle one is the sum of
+        // squared deviations, which no engine answers exactly.
         AggSpec::VarPop { .. }
         | AggSpec::VarSamp { .. }
         | AggSpec::StddevPop { .. }
         | AggSpec::StddevSamp { .. } => alloc::vec![
-            crate::backend::BuiltinKind::Float,
+            total,
             crate::backend::BuiltinKind::Float,
             crate::backend::BuiltinKind::Int,
         ],

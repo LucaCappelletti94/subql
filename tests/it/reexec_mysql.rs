@@ -322,7 +322,11 @@ fn execute_scalar_row_decodes_integer_aggregate_seed() {
         .expect("execute_scalar_row");
     assert_eq!(
         row,
-        vec![Value::Float(12.0), Value::Float(8.0), Value::Int(3)]
+        vec![
+            Value::Decimal(bigdecimal::BigDecimal::from(12)),
+            Value::Float(8.0),
+            Value::Int(3)
+        ]
     );
 }
 
