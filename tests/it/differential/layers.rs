@@ -609,7 +609,7 @@ mod streamed_tests {
                 .await
                 .expect("the replication connection opens");
             sql_query(dml).execute(&mut writer).expect("the DML lands");
-            tokio::time::timeout(core::time::Duration::from_secs(10), source.next_event())
+            tokio::time::timeout(STREAM_HANG_GUARD, source.next_event())
                 .await
                 .expect("the server streams the event")
                 .expect("the stream does not error")
@@ -617,6 +617,21 @@ mod streamed_tests {
         });
         (container, setup, event)
     }
+    /// How long a replication read may take before the test gives up.
+    ///
+    /// A hang guard, not a latency budget. The suite asserts streaming
+    /// latency in `pg_streaming_e2e::next_event_delivers_insert_within_latency_budget`
+    /// and nowhere else; here the deadline exists only so a stalled slot
+    /// fails instead of hanging the run. Thirty seconds is what the rest of
+    /// the container suite uses for the same purpose, at
+    /// `cdc_equivalence::DRAIN_HANG_GUARD` and `cdc_cross_db.rs:351`.
+    ///
+    /// Ten seconds was enough on this workstation and not on CI, where the
+    /// job runs eight container-backed tests at once: it timed out there
+    /// while passing locally, which is the signature of a deadline standing
+    /// in for an assertion nobody meant to make.
+    const STREAM_HANG_GUARD: core::time::Duration = core::time::Duration::from_secs(30);
+
     /// The outer layer reads a real event off the replication slot, and
     /// what arrives is the INSERT that was issued.
     ///
@@ -816,7 +831,7 @@ mod streamed_tests {
             sql_query("UPDATE t SET wide = 2 WHERE id = 1")
                 .execute(&mut writer)
                 .expect("the update lands");
-            tokio::time::timeout(core::time::Duration::from_secs(10), source.next_event())
+            tokio::time::timeout(STREAM_HANG_GUARD, source.next_event())
                 .await
                 .expect("the server streams the event")
                 .expect("the stream does not error")
