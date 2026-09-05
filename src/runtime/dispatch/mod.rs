@@ -1094,7 +1094,7 @@ fn accumulate_aggregate_deltas<I, B>(
     consumers: &RoaringBitmap,
     predicate: PredicateId,
     group: Option<&crate::GroupIdentity<B>>,
-    delta: Option<AggDelta>,
+    delta: Option<&AggDelta>,
     rows: i64,
 ) where
     I: IdTypes,
@@ -1116,8 +1116,8 @@ fn accumulate_aggregate_deltas<I, B>(
             held.1 += rows;
             if let Some(delta) = delta {
                 match &mut held.0 {
-                    Some(existing) => existing.merge(&delta),
-                    slot @ None => *slot = Some(delta),
+                    Some(existing) => existing.merge(delta),
+                    slot @ None => *slot = Some(delta.clone()),
                 }
             }
         }
@@ -1295,7 +1295,7 @@ where
                     consumers,
                     pred.id,
                     group.as_ref(),
-                    maybe_delta,
+                    maybe_delta.as_ref(),
                     weight,
                 );
 

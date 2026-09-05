@@ -20,7 +20,7 @@ use hashbrown::HashMap;
 ///
 /// Internal: the engine holds the running value itself, so a delta never
 /// reaches a caller. [`AggValue`] is what a caller sees.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum AggDelta {
     /// COUNT(*) / COUNT(column) delta: always +/-1 per matching (non-NULL) row.
     Count(i64),
@@ -33,14 +33,75 @@ pub enum AggDelta {
     /// no contributing rows and `0` for a sum over one row worth zero, so
     /// a total alone cannot tell those apart. Which function reads the
     /// pair is [`AggAccumulator`]'s to know.
-    Totalled { sum_delta: f64, count_delta: i64 },
+    Totalled { value: TotalDelta, count_delta: i64 },
     /// VAR_POP / VAR_SAMP / STDDEV_POP / STDDEV_SAMP delta, carrying the three
     /// components all four derive their value from. See [`AggAccumulator`].
     Stats {
-        sum_delta: f64,
+        /// The exact contribution, because a widened seed still projects
+        /// the function's own total and a `SUM` beside a sibling `HAVING`
+        /// answers it exactly.
+        value: TotalDelta,
         sum_sq_delta: f64,
         count_delta: i64,
     },
+}
+
+/// One row's signed contribution to a running total, as exactly as the
+/// row carried it.
+///
+/// No engine sums in `f64`: measured, a single row of `9007199254740993`
+/// is itself on all three, where `f64` answers `9007199254740992`. So a
+/// delta keeps the cell's own kind and the accumulator decides what to add
+/// it into.
+#[derive(Clone, Debug, PartialEq)]
+pub enum TotalDelta {
+    /// An integer cell, widened to 128 bits so that merging a batch of
+    /// them cannot overflow before the accumulator applies its engine's
+    /// own boundary.
+    Integer(i128),
+    /// An exact decimal cell.
+    Decimal(bigdecimal::BigDecimal),
+    /// A floating cell, which no engine sums exactly.
+    Real(f64),
+}
+
+impl TotalDelta {
+    /// This change as `f64`, for the functions that still average or
+    /// square it. Lossy above `2^53`, which Phase D2 removes for `AVG`.
+    #[allow(clippy::cast_precision_loss)]
+    fn as_f64(&self) -> f64 {
+        match self {
+            Self::Integer(value) => *value as f64,
+            Self::Decimal(value) => {
+                <bigdecimal::BigDecimal as bigdecimal::ToPrimitive>::to_f64(value).unwrap_or(0.0)
+            }
+            Self::Real(value) => *value,
+        }
+    }
+
+    /// Add `other` into this change, keeping exactness where both sides
+    /// have it and falling back to `f64` only where one side never had
+    /// any.
+    fn merge(&mut self, other: &Self) {
+        match (&mut *self, other) {
+            (Self::Integer(a), Self::Integer(b)) => *a += b,
+            (Self::Decimal(a), Self::Decimal(b)) => *a += b,
+            (Self::Decimal(a), Self::Integer(b)) => *a += bigdecimal::BigDecimal::from(*b),
+            (Self::Integer(a), Self::Decimal(b)) => {
+                *self = Self::Decimal(bigdecimal::BigDecimal::from(*a) + b);
+            }
+            (left, right) => *left = Self::Real(left.as_f64() + right.as_f64()),
+        }
+    }
+
+    /// Whether this change moves nothing.
+    fn is_zero(&self) -> bool {
+        match self {
+            Self::Integer(value) => *value == 0,
+            Self::Decimal(value) => value == &bigdecimal::BigDecimal::from(0),
+            Self::Real(value) => *value == 0.0,
+        }
+    }
 }
 
 impl AggDelta {
@@ -50,31 +111,28 @@ impl AggDelta {
         match (self, other) {
             (Self::Count(a), Self::Count(b)) => *a += b,
             (
+                Self::Totalled { value, count_delta },
                 Self::Totalled {
-                    sum_delta,
-                    count_delta,
-                },
-                Self::Totalled {
-                    sum_delta: s,
+                    value: v,
                     count_delta: c,
                 },
             ) => {
-                *sum_delta += s;
+                value.merge(v);
                 *count_delta += c;
             }
             (
                 Self::Stats {
-                    sum_delta,
+                    value,
                     sum_sq_delta,
                     count_delta,
                 },
                 Self::Stats {
-                    sum_delta: s,
+                    value: v,
                     sum_sq_delta: sq,
                     count_delta: c,
                 },
             ) => {
-                *sum_delta += s;
+                value.merge(v);
                 *sum_sq_delta += sq;
                 *count_delta += c;
             }
@@ -90,15 +148,12 @@ impl AggDelta {
     pub fn is_zero(&self) -> bool {
         match self {
             Self::Count(n) => *n == 0,
-            Self::Totalled {
-                sum_delta,
-                count_delta,
-            } => *sum_delta == 0.0 && *count_delta == 0,
+            Self::Totalled { value, count_delta } => value.is_zero() && *count_delta == 0,
             Self::Stats {
-                sum_delta,
+                value,
                 sum_sq_delta,
                 count_delta,
-            } => *sum_delta == 0.0 && *sum_sq_delta == 0.0 && *count_delta == 0,
+            } => value.is_zero() && *sum_sq_delta == 0.0 && *count_delta == 0,
         }
     }
 }
@@ -114,6 +169,171 @@ enum AggKind {
     StddevSamp,
 }
 
+/// A running total, in the type its engine sums into.
+///
+/// Built from [`SumRule`], so the boundary each engine raises at travels
+/// with the number rather than being checked somewhere central.
+#[derive(Clone, Debug)]
+enum Total {
+    /// Exact in 64 bits. `promotes` is SQLite's rule: a non-integer value
+    /// joining turns the total into a double, where PostgreSQL's
+    /// `sum(int)` can never see one.
+    Integer { value: i64, promotes: bool },
+    /// Exact decimal, bounded by the engine's integer-digit ceiling when
+    /// it has a reachable one.
+    Decimal {
+        value: bigdecimal::BigDecimal,
+        integer_digits: Option<u32>,
+    },
+    /// A double.
+    Double(f64),
+}
+
+/// The total cannot be represented as this engine would represent it, so
+/// there is no answer to report.
+///
+/// Measured: SQLite answers `integer overflow` past 64 bits and
+/// PostgreSQL answers `value overflows numeric format` past 131072
+/// integer digits, both reachable from two rows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SumOutOfRange;
+
+impl Total {
+    /// An empty total under `rule`.
+    fn empty(rule: crate::backend::SumRule) -> Self {
+        match rule {
+            crate::backend::SumRule::Integer => Self::Integer {
+                value: 0,
+                promotes: false,
+            },
+            crate::backend::SumRule::IntegerPromotingToDouble => Self::Integer {
+                value: 0,
+                promotes: true,
+            },
+            crate::backend::SumRule::Decimal { integer_digits } => Self::Decimal {
+                value: bigdecimal::BigDecimal::from(0),
+                integer_digits,
+            },
+            crate::backend::SumRule::Double => Self::Double(0.0),
+        }
+    }
+
+    /// Add one row's contribution.
+    ///
+    /// # Errors
+    ///
+    /// [`SumOutOfRange`] where the engine itself would raise.
+    fn add(&mut self, delta: &TotalDelta) -> Result<(), SumOutOfRange> {
+        match self {
+            Self::Integer { value, promotes } => match delta {
+                TotalDelta::Integer(change) => {
+                    let total = i128::from(*value) + change;
+                    *value = i64::try_from(total).map_err(|_| SumOutOfRange)?;
+                    Ok(())
+                }
+                // A non-integer value joined. SQLite turns the total real
+                // here; an engine whose integer sum cannot see one has a
+                // catalog and a stream that disagree, and no answer to
+                // give.
+                _ if *promotes => {
+                    #[allow(clippy::cast_precision_loss)]
+                    let promoted = *value as f64;
+                    *self = Self::Double(promoted + delta.as_f64());
+                    Ok(())
+                }
+                _ => Err(SumOutOfRange),
+            },
+            Self::Decimal {
+                value,
+                integer_digits,
+            } => {
+                *value += match delta {
+                    TotalDelta::Integer(change) => bigdecimal::BigDecimal::from(*change),
+                    TotalDelta::Decimal(change) => change.clone(),
+                    TotalDelta::Real(change) => {
+                        <bigdecimal::BigDecimal as bigdecimal::FromPrimitive>::from_f64(*change)
+                            .ok_or(SumOutOfRange)?
+                    }
+                };
+                match integer_digits {
+                    Some(limit) if integer_digits_of(value) > u64::from(*limit) => {
+                        Err(SumOutOfRange)
+                    }
+                    _ => Ok(()),
+                }
+            }
+            Self::Double(value) => {
+                *value += delta.as_f64();
+                Ok(())
+            }
+        }
+    }
+
+    /// Seed this total from a decoded component cell.
+    fn seed<B: Backend>(&mut self, cell: &Value<B>) {
+        use core::any::Any;
+        match self {
+            Self::Integer { value, .. } => {
+                if let Value::Int(int) = cell {
+                    if let Some(int) = (int as &dyn Any).downcast_ref::<i64>() {
+                        *value = *int;
+                    }
+                }
+            }
+            Self::Decimal { value, .. } => match cell {
+                Value::Decimal(decimal) => {
+                    if let Some(decimal) =
+                        (decimal as &dyn Any).downcast_ref::<bigdecimal::BigDecimal>()
+                    {
+                        *value = decimal.clone();
+                    }
+                }
+                Value::Int(int) => {
+                    if let Some(int) = (int as &dyn Any).downcast_ref::<i64>() {
+                        *value = bigdecimal::BigDecimal::from(*int);
+                    }
+                }
+                _ => {}
+            },
+            Self::Double(value) => {
+                *value = AggAccumulator::seed_f64(cell).unwrap_or(0.0);
+            }
+        }
+    }
+
+    /// The total as a caller reads it.
+    fn value(&self) -> crate::SumValue {
+        match self {
+            Self::Integer { value, .. } => crate::SumValue::Integer(*value),
+            Self::Decimal { value, .. } => crate::SumValue::Decimal(value.clone()),
+            Self::Double(value) => crate::SumValue::Double(*value),
+        }
+    }
+}
+
+/// A reported total as `f64`, for the one comparison that still needs
+/// one. Lossy above `2^53`, which Phase D2 removes.
+#[allow(clippy::cast_precision_loss)]
+fn sum_as_f64(total: &crate::SumValue) -> Option<f64> {
+    match total {
+        crate::SumValue::Integer(value) => Some(*value as f64),
+        crate::SumValue::Decimal(value) => {
+            <bigdecimal::BigDecimal as bigdecimal::ToPrimitive>::to_f64(value)
+        }
+        crate::SumValue::Double(value) => Some(*value),
+    }
+}
+
+/// Digits `value` carries ahead of the decimal point.
+fn integer_digits_of(value: &bigdecimal::BigDecimal) -> u64 {
+    let (digits, scale) = value.as_bigint_and_exponent();
+    let spelled = <bigdecimal::num_bigint::BigInt as Clone>::clone(&digits)
+        .magnitude()
+        .to_string();
+    let length = i128::try_from(spelled.len()).unwrap_or(i128::MAX);
+    u64::try_from(length - i128::from(scale)).unwrap_or(0)
+}
+
 /// Running value of one aggregate subscription: three sums plus the function
 /// they are read through.
 ///
@@ -125,11 +345,17 @@ pub struct AggAccumulator {
     count: i64,
     sum: f64,
     sum_sq: f64,
+    /// `SUM`'s own running total, exact in the type its engine sums into.
+    /// `sum` above stays beside it because `AVG`, the variance family and
+    /// a widened `HAVING` read squares and means from it, which Phase D2
+    /// makes exact in turn.
+    total: Total,
 }
 
 impl AggAccumulator {
-    /// An empty accumulator for the aggregate described by `spec`.
-    pub const fn from_spec(spec: &AggSpec) -> Self {
+    /// An empty accumulator for the aggregate described by `spec`,
+    /// totalling under `rule`.
+    pub fn from_spec(spec: &AggSpec, rule: crate::backend::SumRule) -> Self {
         use AggSpec as S;
         let kind = match spec {
             S::CountStar | S::CountColumn { .. } => AggKind::Count,
@@ -145,6 +371,7 @@ impl AggAccumulator {
             count: 0,
             sum: 0.0,
             sum_sq: 0.0,
+            total: Total::empty(rule),
         }
     }
 
@@ -156,14 +383,21 @@ impl AggAccumulator {
     /// variance and stddev family. A zero-row result (COUNT `0`, NULL
     /// sum components) seeds the empty-aggregate state, matching the
     /// "set went empty" semantics of the re-execution family.
-    pub fn seed_from_row<B: Backend>(spec: &AggSpec, row: &[Value<B>]) -> Self {
+    pub fn seed_from_row<B: Backend>(
+        spec: &AggSpec,
+        rule: crate::backend::SumRule,
+        row: &[Value<B>],
+    ) -> Self {
         use AggSpec as S;
-        let mut acc = Self::from_spec(spec);
+        let mut acc = Self::from_spec(spec, rule);
         match spec {
             S::CountStar | S::CountColumn { .. } => {
                 acc.count = row.first().and_then(|v| Self::seed_i64(v)).unwrap_or(0);
             }
             S::Sum { .. } => {
+                if let Some(cell) = row.first() {
+                    acc.total.seed(cell);
+                }
                 acc.sum = row.first().and_then(|v| Self::seed_f64(v)).unwrap_or(0.0);
                 acc.count = row.get(1).and_then(|v| Self::seed_i64(v)).unwrap_or(0);
             }
@@ -183,8 +417,15 @@ impl AggAccumulator {
     /// Seed from the complete component layout (`sum`, `sum_sq`, `count`),
     /// used when a sibling `HAVING` widens the seed regardless of the
     /// projected function.
-    pub fn seed_stats_row<B: Backend>(spec: &AggSpec, row: &[Value<B>]) -> Self {
-        let mut acc = Self::from_spec(spec);
+    pub fn seed_stats_row<B: Backend>(
+        spec: &AggSpec,
+        rule: crate::backend::SumRule,
+        row: &[Value<B>],
+    ) -> Self {
+        let mut acc = Self::from_spec(spec, rule);
+        if let Some(cell) = row.first() {
+            acc.total.seed(cell);
+        }
         acc.sum = row.first().and_then(|v| Self::seed_f64(v)).unwrap_or(0.0);
         acc.sum_sq = row.get(1).and_then(|v| Self::seed_f64(v)).unwrap_or(0.0);
         acc.count = row.get(2).and_then(|v| Self::seed_i64(v)).unwrap_or(0);
@@ -232,41 +473,56 @@ impl AggAccumulator {
     }
 
     /// Fold one delta into the running value.
-    pub fn apply(&mut self, delta: &AggDelta) {
+    ///
+    /// # Errors
+    ///
+    /// [`SumOutOfRange`] when the total leaves what its engine can
+    /// represent, which is the point the engine itself raises.
+    pub fn apply(&mut self, delta: &AggDelta) -> Result<(), SumOutOfRange> {
         match delta {
             AggDelta::Count(d) => self.count += d,
-            AggDelta::Totalled {
-                sum_delta,
-                count_delta,
-            } => {
-                self.sum += sum_delta;
+            AggDelta::Totalled { value, count_delta } => {
+                self.total.add(value)?;
+                self.sum += value.as_f64();
                 self.count += count_delta;
             }
             AggDelta::Stats {
-                sum_delta,
+                value,
                 sum_sq_delta,
                 count_delta,
             } => {
-                self.sum += sum_delta;
+                self.total.add(value)?;
+                self.sum += value.as_f64();
                 self.sum_sq += sum_sq_delta;
                 self.count += count_delta;
             }
         }
+        Ok(())
     }
 
     /// Empty the running value, which is exactly the state a re-read of an
     /// emptied table would seed.
-    pub const fn clear(&mut self) {
+    pub fn clear(&mut self) {
         self.count = 0;
         self.sum = 0.0;
         self.sum_sq = 0.0;
+        self.total = Total::empty(match &self.total {
+            Total::Integer { promotes: true, .. } => {
+                crate::backend::SumRule::IntegerPromotingToDouble
+            }
+            Total::Integer { .. } => crate::backend::SumRule::Integer,
+            Total::Decimal { integer_digits, .. } => crate::backend::SumRule::Decimal {
+                integer_digits: *integer_digits,
+            },
+            Total::Double(_) => crate::backend::SumRule::Double,
+        });
     }
 
     /// Current aggregate value.
     pub fn value(&self) -> AggValue {
         match self.kind {
             AggKind::Count => AggValue::Count(self.count),
-            AggKind::Sum => AggValue::Sum(self.total()),
+            AggKind::Sum => AggValue::Sum(self.reported_total()),
             AggKind::Avg => AggValue::Real(self.mean()),
             AggKind::VarPop => AggValue::Real(self.var_pop()),
             AggKind::VarSamp => AggValue::Real(self.var_samp()),
@@ -275,18 +531,14 @@ impl AggAccumulator {
         }
     }
 
-    /// The sum, or `None` when no row contributes one.
+    /// The total, or `None` when no row contributes one.
     ///
     /// Measured on all three engines: `SUM` over no rows, and over rows
     /// whose value is NULL, answers NULL, while one row worth zero answers
     /// `0`. The count is what separates them, so the total is read through
     /// it rather than reported raw.
-    const fn total(&self) -> Option<f64> {
-        if self.count > 0 {
-            Some(self.sum)
-        } else {
-            None
-        }
+    fn reported_total(&self) -> Option<crate::SumValue> {
+        (self.count > 0).then(|| self.total.value())
     }
 
     #[allow(clippy::cast_precision_loss)]
@@ -300,7 +552,7 @@ impl AggAccumulator {
     pub fn value_as(&self, function: crate::HavingFunction) -> AggValue {
         match function {
             crate::HavingFunction::CountColumn => AggValue::Count(self.count),
-            crate::HavingFunction::Sum => AggValue::Sum(self.total()),
+            crate::HavingFunction::Sum => AggValue::Sum(self.reported_total()),
             crate::HavingFunction::Avg => AggValue::Real(self.mean()),
             crate::HavingFunction::VarPop => AggValue::Real(self.var_pop()),
             crate::HavingFunction::VarSamp => AggValue::Real(self.var_samp()),
@@ -341,7 +593,7 @@ pub const DEFAULT_MAX_GROUPS_PER_AGGREGATE: usize = 1024;
 
 /// What happened to a total at one stream position, held only until the
 /// starting numbers arrive.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 enum PendingChange {
     /// A matched row change, already folded to a delta.
     Fold(AggDelta),
@@ -370,10 +622,10 @@ impl<C: Checkpoint> Pending<C> {
     /// repeats so several changes inside one transaction cost one slot.
     fn push(&mut self, at: Option<&C>, change: PendingChange, cap: usize) {
         if let (Some((last_at, PendingChange::Fold(held))), PendingChange::Fold(delta)) =
-            (self.changes.last_mut(), change)
+            (self.changes.last_mut(), &change)
         {
             if last_at.is_some() && last_at.as_ref() == at {
-                held.merge(&delta);
+                held.merge(delta);
                 return;
             }
         }
@@ -392,17 +644,21 @@ pub struct AggregateTotal<I: IdTypes, C: Checkpoint> {
     /// Which function is maintained, needed to read the sums and to decode a
     /// seed row's components.
     spec: AggSpec,
+    /// What a total accumulates in on this engine, resolved from the
+    /// summed column at registration.
+    rule: crate::backend::SumRule,
     accumulator: AggAccumulator,
     /// `None` once the starting numbers have landed.
     pending: Option<Pending<C>>,
 }
 
 impl<I: IdTypes, C: Checkpoint> AggregateTotal<I, C> {
-    pub const fn new(consumer: I::ConsumerId, spec: AggSpec) -> Self {
+    pub fn new(consumer: I::ConsumerId, spec: AggSpec, rule: crate::backend::SumRule) -> Self {
         Self {
             consumer,
-            accumulator: AggAccumulator::from_spec(&spec),
+            accumulator: AggAccumulator::from_spec(&spec, rule),
             spec,
+            rule,
             pending: Some(Pending::new()),
         }
     }
@@ -420,13 +676,18 @@ impl<I: IdTypes, C: Checkpoint> AggregateTotal<I, C> {
     /// Fold one change. Answers with the new value when the total is seeded,
     /// and with nothing while it is not, since a total covering only the last
     /// few seconds is worse than silence.
-    pub fn fold(&mut self, delta: AggDelta, at: Option<&C>, cap: usize) -> Option<AggValue> {
+    pub fn fold(
+        &mut self,
+        delta: AggDelta,
+        at: Option<&C>,
+        cap: usize,
+    ) -> Result<Option<AggValue>, SumOutOfRange> {
         if let Some(pending) = &mut self.pending {
             pending.push(at, PendingChange::Fold(delta), cap);
-            return None;
+            return Ok(None);
         }
-        self.accumulator.apply(&delta);
-        Some(self.accumulator.value())
+        self.accumulator.apply(&delta)?;
+        Ok(Some(self.accumulator.value()))
     }
 
     /// Empty the total because the table was truncated. Answers with the new
@@ -478,13 +739,19 @@ impl<I: IdTypes, C: Checkpoint> AggregateTotal<I, C> {
             return Err(AggregateInstallError::PositionUnknown(subscription));
         }
 
-        let mut accumulator = AggAccumulator::seed_from_row(&self.spec, row);
+        let mut accumulator = AggAccumulator::seed_from_row(&self.spec, self.rule, row);
         for (at, change) in &pending.changes {
             if at.as_ref() <= read_at {
                 continue;
             }
             match change {
-                PendingChange::Fold(delta) => accumulator.apply(delta),
+                // A change held through the read window can put the total
+                // out of range exactly as a live one can, and the caller
+                // learns the same way: the install fails and the tier is
+                // re-read.
+                PendingChange::Fold(delta) => accumulator
+                    .apply(delta)
+                    .map_err(|_| AggregateInstallError::SumOutOfRange(subscription))?,
                 PendingChange::Emptied => accumulator.clear(),
             }
         }
@@ -545,7 +812,9 @@ impl GroupHaving {
             crate::HavingSubject::Aggregate(function) => {
                 match group.accumulator.value_as(function) {
                     AggValue::Count(count) => Some(count as f64),
-                    AggValue::Sum(sum) => sum,
+                    // A `HAVING` compares in `f64`, which Phase D2 makes
+                    // exact along with `AVG`.
+                    AggValue::Sum(sum) => sum.as_ref().and_then(sum_as_f64),
                     AggValue::Real(real) => real,
                 }
             }
@@ -607,7 +876,7 @@ impl<B: Backend, C: Checkpoint> PendingGroups<B, C> {
             if last_at.is_some() && last_at.as_ref() == at && held_key == key {
                 match (held_delta, delta) {
                     (Some(held), Some(delta)) => held.merge(delta),
-                    (held @ None, delta) => *held = *delta,
+                    (held @ None, delta) => held.clone_from(delta),
                     (_, None) => {}
                 }
                 *held_rows += rows;
@@ -632,7 +901,20 @@ pub enum GroupedFoldOutcome<B: Backend> {
     Change(crate::GroupIdentity<B>, crate::AggregateValueChange<B>),
     /// A new group would exceed the configured limit.
     GroupLimit,
+    /// One group's total left what its engine can represent.
+    SumOutOfRange,
 }
+
+/// What one grouped fold needs to know about its subscription, which is
+/// the same three facts however the fold was reached.
+struct GroupedFold<'a> {
+    spec: &'a AggSpec,
+    rule: crate::backend::SumRule,
+    having: Option<&'a GroupHaving>,
+}
+
+/// One group's write or removal, or nothing when its value did not move.
+type GroupChange<B> = Option<(crate::GroupIdentity<B>, crate::AggregateValueChange<B>)>;
 
 pub struct GroupedAggregateTotal<I: IdTypes, B: Backend, C: Checkpoint> {
     consumer: I::ConsumerId,
@@ -644,6 +926,9 @@ pub struct GroupedAggregateTotal<I: IdTypes, B: Backend, C: Checkpoint> {
     having: Option<GroupHaving>,
     /// Whether the seed carries components needed only by `HAVING`.
     widened: bool,
+    /// What a total accumulates in on this engine, resolved from the
+    /// summed column at registration and shared by every group.
+    rule: crate::backend::SumRule,
 }
 
 impl<I: IdTypes, B: Backend, C: Checkpoint> GroupedAggregateTotal<I, B, C> {
@@ -653,6 +938,7 @@ impl<I: IdTypes, B: Backend, C: Checkpoint> GroupedAggregateTotal<I, B, C> {
         group_columns: usize,
         having: Option<&crate::AggHaving>,
         group_key_encoder: crate::backend::GroupKeyEncoder<B>,
+        rule: crate::backend::SumRule,
     ) -> Self {
         let widened = having.is_some_and(|having| having.widens(&spec));
         debug_assert!(
@@ -669,6 +955,7 @@ impl<I: IdTypes, B: Backend, C: Checkpoint> GroupedAggregateTotal<I, B, C> {
         Self {
             consumer,
             spec,
+            rule,
             group_columns,
             group_key_encoder,
             groups: HashMap::new(),
@@ -719,31 +1006,35 @@ impl<I: IdTypes, B: Backend, C: Checkpoint> GroupedAggregateTotal<I, B, C> {
             return GroupedFoldOutcome::GroupLimit;
         }
         Self::apply_change(
-            &self.spec,
-            self.having.as_ref(),
+            &GroupedFold {
+                spec: &self.spec,
+                rule: self.rule,
+                having: self.having.as_ref(),
+            },
             &mut self.groups,
             &key,
             &values,
-            delta,
+            delta.as_ref(),
             rows,
         )
-        .map_or(GroupedFoldOutcome::Unchanged, |(identity, change)| {
-            GroupedFoldOutcome::Change(identity, change)
+        .map_or(GroupedFoldOutcome::SumOutOfRange, |change| {
+            change.map_or(GroupedFoldOutcome::Unchanged, |(identity, change)| {
+                GroupedFoldOutcome::Change(identity, change)
+            })
         })
     }
 
     fn apply_change(
-        spec: &AggSpec,
-        having: Option<&GroupHaving>,
+        fold: &GroupedFold<'_>,
         groups: &mut HashMap<Vec<u8>, GroupValue<B>>,
         key: &[u8],
         values: &[Value<B>],
-        delta: Option<AggDelta>,
+        delta: Option<&AggDelta>,
         rows: i64,
-    ) -> Option<(crate::GroupIdentity<B>, crate::AggregateValueChange<B>)> {
+    ) -> Result<GroupChange<B>, SumOutOfRange> {
         let group = groups.entry(key.to_vec()).or_insert_with(|| GroupValue {
             values: values.to_vec(),
-            accumulator: AggAccumulator::from_spec(spec),
+            accumulator: AggAccumulator::from_spec(fold.spec, fold.rule),
             rows: 0,
             announced: false,
         });
@@ -751,19 +1042,19 @@ impl<I: IdTypes, B: Backend, C: Checkpoint> GroupedAggregateTotal<I, B, C> {
         let before = group.accumulator.value();
         group.rows += rows;
         if let Some(delta) = delta {
-            group.accumulator.apply(&delta);
+            group.accumulator.apply(delta)?;
         }
         if group.rows <= 0 {
             let group = groups.remove(key).expect("the group was inserted above");
-            return was_announced.then(|| {
+            return Ok(was_announced.then(|| {
                 (
                     group.into_identity(key.to_vec()),
                     crate::AggregateValueChange::Remove,
                 )
-            });
+            }));
         }
         let after = group.accumulator.value();
-        let passes = having.is_none_or(|having| having.passes(group));
+        let passes = fold.having.is_none_or(|having| having.passes(group));
         group.announced = passes;
         let change = if passes && (!was_announced || before != after) {
             Some(crate::AggregateValueChange::Set(
@@ -772,7 +1063,7 @@ impl<I: IdTypes, B: Backend, C: Checkpoint> GroupedAggregateTotal<I, B, C> {
         } else {
             (was_announced && !passes).then_some(crate::AggregateValueChange::Remove)
         };
-        change.map(|change| (group.identity(key), change))
+        Ok(change.map(|change| (group.identity(key), change)))
     }
 
     /// Empty every group after `TRUNCATE`.
@@ -823,9 +1114,9 @@ impl<I: IdTypes, B: Backend, C: Checkpoint> GroupedAggregateTotal<I, B, C> {
             .ok_or(AggregateInstallError::GroupedRowCount(subscription))?;
         let components = &row[group_columns..row.len() - 1];
         let accumulator = if self.widened {
-            AggAccumulator::seed_stats_row(&self.spec, components)
+            AggAccumulator::seed_stats_row(&self.spec, self.rule, components)
         } else {
-            AggAccumulator::seed_from_row(&self.spec, components)
+            AggAccumulator::seed_from_row(&self.spec, self.rule, components)
         };
         Ok((
             key,
@@ -866,7 +1157,7 @@ impl<I: IdTypes, B: Backend, C: Checkpoint> GroupedAggregateTotal<I, B, C> {
         let components_len = if self.widened {
             3
         } else {
-            crate::compiler::sql_shape::aggregate_bootstrap_kinds(&self.spec).len()
+            crate::compiler::sql_shape::aggregate_bootstrap_kinds(&self.spec, self.rule).len()
         };
         let mut groups = HashMap::with_capacity(rows.len());
         for row in rows {
@@ -899,15 +1190,19 @@ impl<I: IdTypes, B: Backend, C: Checkpoint> GroupedAggregateTotal<I, B, C> {
                             limit: group_limit,
                         });
                     }
-                    let _ = Self::apply_change(
-                        &self.spec,
-                        self.having.as_ref(),
+                    Self::apply_change(
+                        &GroupedFold {
+                            spec: &self.spec,
+                            rule: self.rule,
+                            having: self.having.as_ref(),
+                        },
                         &mut groups,
                         key,
                         values,
-                        *delta,
+                        delta.as_ref(),
                         *rows,
-                    );
+                    )
+                    .map_err(|_| AggregateInstallError::SumOutOfRange(subscription))?;
                 }
                 PendingGroupChange::Emptied => groups.clear(),
             }

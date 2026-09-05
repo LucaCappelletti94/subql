@@ -137,6 +137,21 @@ impl Backend for Custom {
         None
     }
 
+    /// The fixtures sum like PostgreSQL: a narrow integer column totals
+    /// into a 64-bit integer and everything exact totals into a decimal.
+    fn sum_rule(column: subql::backend::BuiltinType) -> subql::backend::SumRule {
+        match column {
+            subql::backend::BuiltinType::Int(subql::backend::IntWidth::UpToThirtyTwo) => {
+                subql::backend::SumRule::Integer
+            }
+            subql::backend::BuiltinType::Int(subql::backend::IntWidth::SixtyFour)
+            | subql::backend::BuiltinType::Decimal => subql::backend::SumRule::Decimal {
+                integer_digits: Some(131_072),
+            },
+            _ => subql::backend::SumRule::Double,
+        }
+    }
+
     /// The fixtures divide like PostgreSQL: two integers truncate, and a
     /// decimal quotient takes the significant-digit scale.
     const DIVISION: subql::backend::DivisionRule = subql::backend::DivisionRule::IntegersTruncate;
@@ -181,10 +196,11 @@ impl Backend for Custom {
     /// common refinements serve.
     fn refine_builtin(
         family: subql::backend::BuiltinKind,
-        _declared_type: &str,
+        declared_type: &str,
     ) -> subql::backend::BuiltinType {
         subql::backend::refined_builtin(
             family,
+            subql::backend::declares_sixty_four_bit_int(declared_type),
             subql::backend::FloatWidth::Double,
             subql::backend::TextWidth::Varying,
         )
@@ -293,8 +309,10 @@ fn a_declared_custom_type_classifies_as_itself() {
     );
     assert_eq!(
         kind_of_column("id"),
-        Some(BuiltinKind::Int.into()),
-        "and so does an integer"
+        Some(ScalarKind::Builtin(subql::backend::BuiltinType::Int(
+            subql::backend::IntWidth::UpToThirtyTwo
+        ))),
+        "and so does an integer, at the width its declaration fixes"
     );
 }
 

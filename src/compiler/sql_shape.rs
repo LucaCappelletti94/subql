@@ -1298,13 +1298,25 @@ pub(crate) fn render_aggregate_bootstrap<B: crate::backend::Backend, DB: Databas
     *select_projection_mut(&mut stmt)? = items;
     let mut kinds = group_kinds;
     if widened {
+        // A widened seed still carries the projected function's own total
+        // first, so it decodes in the type that function sums into. Only
+        // the sum of squares is a double, being nobody's exact answer.
         kinds.extend([
-            crate::backend::BuiltinKind::Float,
+            aggregate_bootstrap_kinds(
+                spec,
+                crate::catalog_helpers::sum_rule::<B, DB>(spec, database, table_id),
+            )
+            .first()
+            .copied()
+            .unwrap_or(crate::backend::BuiltinKind::Float),
             crate::backend::BuiltinKind::Float,
             crate::backend::BuiltinKind::Int,
         ]);
     } else {
-        kinds.extend(aggregate_bootstrap_kinds(spec));
+        kinds.extend(aggregate_bootstrap_kinds(
+            spec,
+            crate::catalog_helpers::sum_rule::<B, DB>(spec, database, table_id),
+        ));
     }
     if !groups.is_empty() {
         kinds.push(crate::backend::BuiltinKind::Int);
@@ -1317,20 +1329,42 @@ pub(crate) fn render_aggregate_bootstrap<B: crate::backend::Backend, DB: Databas
 }
 
 /// Per-column decode kinds for an aggregate's seed components, in component
-/// order. `COUNT` components are exact integers
-/// ([`crate::backend::BuiltinKind::Int`]); `SUM` and `SUM(x*x)` components are
-/// decoded as double ([`crate::backend::BuiltinKind::Float`]) regardless of the
-/// source column type, matching the `f64` accumulator, since `SUM` promotes to
-/// `bigint`/`numeric`/`DECIMAL` depending on the backend.
-pub(crate) fn aggregate_bootstrap_kinds(spec: &AggSpec) -> Vec<crate::backend::BuiltinKind> {
+/// order.
+///
+/// `COUNT` components are exact integers
+/// ([`crate::backend::BuiltinKind::Int`]). A `SUM` component decodes in the
+/// type its engine sums into, so that the seed and the fold hold the same
+/// number: PostgreSQL answers `bigint` for an `int` column and `numeric`
+/// for a `bigint` one, MySQL answers a decimal for both, and SQLite an
+/// integer. `SUM(x*x)` and `AVG`'s total keep their double, which is what
+/// their `f64` components still are until Phase D2.
+pub(crate) fn aggregate_bootstrap_kinds(
+    spec: &AggSpec,
+    rule: crate::backend::SumRule,
+) -> Vec<crate::backend::BuiltinKind> {
+    let total = match spec {
+        AggSpec::Sum { .. } => match rule {
+            crate::backend::SumRule::Integer
+            | crate::backend::SumRule::IntegerPromotingToDouble => crate::backend::BuiltinKind::Int,
+            crate::backend::SumRule::Decimal { .. } => crate::backend::BuiltinKind::Decimal,
+            crate::backend::SumRule::Double => crate::backend::BuiltinKind::Float,
+        },
+        _ => crate::backend::BuiltinKind::Float,
+    };
+    aggregate_bootstrap_kinds_with_total(spec, total)
+}
+
+fn aggregate_bootstrap_kinds_with_total(
+    spec: &AggSpec,
+    total: crate::backend::BuiltinKind,
+) -> Vec<crate::backend::BuiltinKind> {
     match spec {
         AggSpec::CountStar | AggSpec::CountColumn { .. } => {
             alloc::vec![crate::backend::BuiltinKind::Int]
         }
-        AggSpec::Sum { .. } | AggSpec::Avg { .. } => alloc::vec![
-            crate::backend::BuiltinKind::Float,
-            crate::backend::BuiltinKind::Int,
-        ],
+        AggSpec::Sum { .. } | AggSpec::Avg { .. } => {
+            alloc::vec![total, crate::backend::BuiltinKind::Int]
+        }
         AggSpec::VarPop { .. }
         | AggSpec::VarSamp { .. }
         | AggSpec::StddevPop { .. }

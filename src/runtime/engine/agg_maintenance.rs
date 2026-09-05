@@ -24,6 +24,8 @@ struct AggregateStops {
     )>,
     /// Subscriptions that would exceed the configured group limit.
     group_limit: Vec<SubscriptionId>,
+    /// Subscriptions whose total left what the engine can represent.
+    sum_out_of_range: Vec<SubscriptionId>,
 }
 
 impl<E: CdcEvent, I: IdTypes, DB: DatabaseLike + 'static> SubscriptionEngine<E, I, DB>
@@ -114,6 +116,7 @@ where
             group_key_failed,
             evaluation_refused,
             mut group_limit,
+            mut sum_out_of_range,
         } = stops;
         for subscription in missing_old {
             self.push_aggregate_stop(
@@ -130,6 +133,16 @@ where
             self.push_aggregate_stop(
                 subscription,
                 crate::MaintenanceStopReason::GroupKeyUnencodable { table_id },
+                checkpoint,
+                output,
+            )?;
+        }
+        sum_out_of_range.sort_unstable();
+        sum_out_of_range.dedup();
+        for subscription in sum_out_of_range {
+            self.push_aggregate_stop(
+                subscription,
+                crate::MaintenanceStopReason::SumOutOfRange { table_id },
                 checkpoint,
                 output,
             )?;
@@ -277,6 +290,7 @@ where
         let mut output: crate::AggregateMaintenanceOutput<I, E::Backend, E::Checkpoint> =
             crate::AggregateMaintenanceOutput::empty();
         let mut group_limit = Vec::new();
+        let mut sum_out_of_range = Vec::new();
         for delta in computation.deltas {
             if let Some(group) = delta.group {
                 let Some(total) = self.grouped_aggregates.get_mut(&delta.subscription) else {
@@ -302,6 +316,9 @@ where
                     crate::runtime::aggregate::GroupedFoldOutcome::GroupLimit => {
                         group_limit.push(delta.subscription);
                     }
+                    crate::runtime::aggregate::GroupedFoldOutcome::SumOutOfRange => {
+                        sum_out_of_range.push(delta.subscription);
+                    }
                 }
                 continue;
             }
@@ -310,15 +327,22 @@ where
             else {
                 continue;
             };
-            if let Some(value) = total.fold(change, at.as_ref(), cap) {
-                output.updates.push(crate::AggregateValueUpdate {
+            match total.fold(change, at.as_ref(), cap) {
+                Ok(Some(value)) => output.updates.push(crate::AggregateValueUpdate {
                     subscription: delta.subscription,
                     consumer: total.consumer(),
                     group: None,
                     change: crate::AggregateValueChange::Set(crate::AggregateResultValue::Folded(
                         value,
                     )),
-                });
+                }),
+                Ok(None) => {}
+                // The total left what this engine can represent, which is
+                // where the engine itself raises, so the tier changes
+                // rather than the number drifting.
+                Err(crate::runtime::aggregate::SumOutOfRange) => {
+                    sum_out_of_range.push(delta.subscription);
+                }
             }
         }
 
@@ -329,6 +353,7 @@ where
                 group_key_failed: computation.group_key_failed,
                 evaluation_refused: computation.evaluation_refused,
                 group_limit,
+                sum_out_of_range,
             },
             at.as_ref(),
             &mut output,
@@ -379,7 +404,15 @@ where
             crate::compiler::sql_shape::QueryProjection::Aggregate(spec) => {
                 self.aggregates.insert(
                     subscription,
-                    crate::runtime::aggregate::AggregateTotal::new(consumer, spec.clone()),
+                    crate::runtime::aggregate::AggregateTotal::new(
+                        consumer,
+                        spec.clone(),
+                        crate::catalog_helpers::sum_rule::<E::Backend, _>(
+                            spec,
+                            &self.database,
+                            table_id,
+                        ),
+                    ),
                 );
                 true
             }
@@ -409,6 +442,11 @@ where
                         groups.len(),
                         having.as_ref(),
                         group_key_encoder,
+                        crate::catalog_helpers::sum_rule::<E::Backend, _>(
+                            agg,
+                            &self.database,
+                            table_id,
+                        ),
                     ),
                 );
                 true

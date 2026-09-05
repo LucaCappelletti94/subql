@@ -410,6 +410,33 @@ pub(crate) fn classify_scalar_kind<B: crate::backend::Backend>(
 /// column of a custom type answers `None`, which is the honest answer to
 /// "which builtin is this", and each caller refuses it in its own terms.
 /// Use [`column_scalar_kind`] where a custom column has to be served.
+/// What a `SUM` over `spec`'s column accumulates in on this backend.
+///
+/// Resolved once at registration, because it follows the column's declared
+/// type: measured, PostgreSQL sums an `int` column into `bigint` and a
+/// `bigint` column into `numeric`, so the same statement over two integer
+/// columns answers two different types.
+///
+/// A spec that sums nothing (`COUNT`) still needs an answer, and
+/// [`crate::backend::SumRule::Double`] is the one that carries no exact
+/// total to disagree about. A column the catalog cannot type takes it too,
+/// which is the same conservative reading `column_scalar_kind` gives every
+/// other caller.
+#[must_use]
+pub fn sum_rule<B: crate::backend::Backend, DB: DatabaseLike>(
+    spec: &crate::compiler::AggSpec,
+    database: &DB,
+    table_id: crate::TableId,
+) -> crate::backend::SumRule {
+    let Some(column) = spec.column() else {
+        return crate::backend::SumRule::Double;
+    };
+    column_scalar_kind::<B, DB>(database, table_id, column)
+        .as_ref()
+        .and_then(crate::backend::ScalarKind::builtin)
+        .map_or(crate::backend::SumRule::Double, B::sum_rule)
+}
+
 #[must_use]
 pub fn column_builtin_kind<DB: DatabaseLike>(
     database: &DB,

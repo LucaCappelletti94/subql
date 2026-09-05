@@ -288,6 +288,7 @@ mod tests {
     fn declared(family: BuiltinKind) -> BuiltinType {
         crate::backend::refined_builtin(
             family,
+            crate::backend::IntWidth::SixtyFour,
             crate::backend::FloatWidth::Double,
             crate::backend::TextWidth::Varying,
         )

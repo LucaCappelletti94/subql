@@ -348,7 +348,7 @@ mod comparison_descriptor_tests {
             BuiltinType::Float(FloatWidth::Double),
             BuiltinType::Text(TextWidth::Fixed),
             BuiltinType::Text(TextWidth::Varying),
-            BuiltinType::Int,
+            BuiltinType::Int(crate::backend::IntWidth::SixtyFour),
         ] {
             let stored: ScalarKindOf<Postgres> = kind.into();
             let bytes = postcard::to_allocvec(&stored).expect("the kind serializes");

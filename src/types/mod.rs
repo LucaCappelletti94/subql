@@ -22,7 +22,7 @@ pub use trait_definitions::{
     AggregateValueChange, AggregateValueUpdate, AsyncSubscriptionDispatch, ConsumerNotifications,
     ConsumerNotificationsIter, DispatchOutput, EvaluationFailure, GroupIdentity,
     MaintenanceStopReason, MaintenanceTransition, SubscriptionDispatch, SubscriptionRegistration,
-    SubscriptionUnregistration, TermNarrowing, UnansweredCell,
+    SubscriptionUnregistration, SumValue, TermNarrowing, UnansweredCell,
 };
 #[cfg(feature = "std")]
 pub use trait_definitions::{DurableShardMerge, DurableShardStore};

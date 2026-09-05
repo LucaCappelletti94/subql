@@ -352,6 +352,7 @@ where
     // reads the common case rather than inventing a refinement.
     let raw = decode(crate::backend::refined_builtin(
         carrier,
+        crate::backend::IntWidth::SixtyFour,
         crate::backend::FloatWidth::Double,
         crate::backend::TextWidth::Varying,
     ));

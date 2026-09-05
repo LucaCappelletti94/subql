@@ -38,6 +38,24 @@ pub enum FloatWidth {
     Double,
 }
 
+/// How wide a declared integer type is.
+///
+/// It decides what a sum of that column answers, measured on PostgreSQL
+/// 16.15: `sum(smallint)` and `sum(int)` are `bigint`, so an exact total
+/// fits a 64-bit integer and overflows past it, while `sum(bigint)` is
+/// `numeric`, which has no 64-bit boundary at all. MySQL sums every width
+/// into a decimal and SQLite has one 64-bit integer, so only one engine
+/// reads this, and it reads it for every integer column.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum IntWidth {
+    /// `smallint`, `integer`, and every narrower spelling: at most 32
+    /// bits, so a wider accumulator can hold any total of them exactly.
+    UpToThirtyTwo,
+    /// `bigint`: 64 bits, so no fixed-width integer accumulator can
+    /// promise to hold a total of them.
+    SixtyFour,
+}
+
 /// Whether a declared character type is fixed width.
 ///
 /// A fixed-width column is padded out to its width on write, which decides
@@ -60,8 +78,8 @@ pub enum TextWidth {
 pub enum BuiltinType {
     /// Boolean.
     Bool,
-    /// Signed or unsigned integer.
-    Int,
+    /// Signed or unsigned integer, at the width the declaration fixes.
+    Int(IntWidth),
     /// Floating point, at the width the declaration fixes.
     Float(FloatWidth),
     /// Exact decimal.
@@ -93,7 +111,7 @@ impl BuiltinType {
     pub const fn family(self) -> BuiltinKind {
         match self {
             Self::Bool => BuiltinKind::Bool,
-            Self::Int => BuiltinKind::Int,
+            Self::Int(_) => BuiltinKind::Int,
             Self::Float(_) => BuiltinKind::Float,
             Self::Decimal => BuiltinKind::Decimal,
             Self::Text(_) => BuiltinKind::String,
@@ -117,10 +135,38 @@ impl BuiltinType {
         }
     }
 
+    /// The integer width this type fixes, or `None` when it is not an
+    /// integer.
+    #[must_use]
+    pub const fn int_width(self) -> Option<IntWidth> {
+        match self {
+            Self::Int(width) => Some(width),
+            _ => None,
+        }
+    }
+
     /// Whether this type is a fixed-width character type.
     #[must_use]
     pub const fn is_fixed_width_text(self) -> bool {
         matches!(self, Self::Text(TextWidth::Fixed))
+    }
+}
+
+/// Whether a declared integer type is 64 bits wide.
+///
+/// Shared because the spelling is nearly the same everywhere: PostgreSQL
+/// writes `bigint`/`int8`, MySQL `bigint`, and SQLite calls its one
+/// 64-bit integer `INTEGER`, which each backend resolves for itself.
+#[must_use]
+pub fn declares_sixty_four_bit_int(declared_type: &str) -> IntWidth {
+    let declared = declared_type.trim();
+    if ["bigint", "int8", "bigserial", "serial8"]
+        .iter()
+        .any(|name| declared.eq_ignore_ascii_case(name))
+    {
+        IntWidth::SixtyFour
+    } else {
+        IntWidth::UpToThirtyTwo
     }
 }
 
@@ -132,12 +178,13 @@ impl BuiltinType {
 #[must_use]
 pub const fn refined_builtin(
     family: BuiltinKind,
+    int: IntWidth,
     float: FloatWidth,
     text: TextWidth,
 ) -> BuiltinType {
     match family {
         BuiltinKind::Bool => BuiltinType::Bool,
-        BuiltinKind::Int => BuiltinType::Int,
+        BuiltinKind::Int => BuiltinType::Int(int),
         BuiltinKind::Float => BuiltinType::Float(float),
         BuiltinKind::Decimal => BuiltinType::Decimal,
         BuiltinKind::String => BuiltinType::Text(text),
@@ -219,7 +266,7 @@ pub type ScalarKindOf<B> = ScalarKind<<<B as Backend>::Custom as CustomScalars>:
 pub type ValueKindOf<B> = ValueKind<<<B as Backend>::Custom as CustomScalars>::Kind>;
 
 mod builtin_type_serde {
-    use super::{BuiltinType, FloatWidth, TextWidth};
+    use super::{BuiltinType, FloatWidth, IntWidth, TextWidth};
 
     /// One byte per type, refinements included.
     ///
@@ -231,7 +278,7 @@ mod builtin_type_serde {
     const fn tag(kind: BuiltinType) -> u8 {
         match kind {
             BuiltinType::Bool => 0,
-            BuiltinType::Int => 1,
+            BuiltinType::Int(IntWidth::SixtyFour) => 1,
             BuiltinType::Float(FloatWidth::Double) => 2,
             BuiltinType::Decimal => 3,
             BuiltinType::Text(TextWidth::Varying) => 4,
@@ -245,13 +292,14 @@ mod builtin_type_serde {
             BuiltinType::Jsonb => 12,
             BuiltinType::Float(FloatWidth::Single) => 13,
             BuiltinType::Text(TextWidth::Fixed) => 14,
+            BuiltinType::Int(IntWidth::UpToThirtyTwo) => 15,
         }
     }
 
     const fn untag(tag: u8) -> Option<BuiltinType> {
         Some(match tag {
             0 => BuiltinType::Bool,
-            1 => BuiltinType::Int,
+            1 => BuiltinType::Int(IntWidth::SixtyFour),
             2 => BuiltinType::Float(FloatWidth::Double),
             3 => BuiltinType::Decimal,
             4 => BuiltinType::Text(TextWidth::Varying),
@@ -265,6 +313,7 @@ mod builtin_type_serde {
             12 => BuiltinType::Jsonb,
             13 => BuiltinType::Float(FloatWidth::Single),
             14 => BuiltinType::Text(TextWidth::Fixed),
+            15 => BuiltinType::Int(IntWidth::UpToThirtyTwo),
             _ => return None,
         })
     }
@@ -287,7 +336,7 @@ mod builtin_type_serde {
         untag(tag).ok_or_else(|| {
             serde::de::Error::invalid_value(
                 serde::de::Unexpected::Unsigned(u64::from(tag)),
-                &"a builtin type tag from 0 through 14",
+                &"a builtin type tag from 0 through 15",
             )
         })
     }
@@ -364,7 +413,7 @@ mod scalar_kind_serde_tests {
 
     #[test]
     fn scalar_kind_rejects_an_unknown_builtin_tag() {
-        assert!(postcard::from_bytes::<ScalarKind<TestCustom>>(&[0, 15]).is_err());
+        assert!(postcard::from_bytes::<ScalarKind<TestCustom>>(&[0, 16]).is_err());
     }
 }
 /// Owned SQL name for a column's declared collation.
@@ -669,6 +718,55 @@ pub enum DivisionRule {
     /// [`DivisionPrecisionIncrement`] before it can answer at all.
     /// Byte-identical in MySQL 5.7 through 9.0 and in MariaDB 11.4.
     QuotientsAreDecimalInWords,
+}
+
+/// What a `SUM` accumulates in, and therefore what it answers.
+///
+/// Measured 2026-09-05 on PostgreSQL 16.15, MySQL 8.4.11 and SQLite
+/// 3.51.1. No engine sums in `f64`, and no two agree:
+///
+/// ```text
+/// column           pg                    mysql           sqlite
+/// smallint, int    bigint                decimal(32,0)   integer
+/// bigint           numeric               decimal(41,0)   integer
+/// numeric          numeric, scale kept   decimal, kept   no decimal type
+/// real, double     double precision      double          real
+/// ```
+///
+/// None of them is unbounded either, and they run out differently, which
+/// is why the boundary rides on the variant rather than being checked once
+/// somewhere central.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SumRule {
+    /// Exact in 64 bits, and the engine raises when a total does not fit.
+    ///
+    /// PostgreSQL's `sum(smallint)` and `sum(int)`, whose result is
+    /// `bigint`.
+    Integer,
+    /// Exact in 64 bits until a non-integer value joins, at which point
+    /// the total becomes a double, and the engine raises on a 64-bit
+    /// overflow before that.
+    ///
+    /// SQLite, measured: two rows of `i64::MAX` answer `integer
+    /// overflow`, while `1 + 2 + 0.5` answers `3.5` typed `real`.
+    IntegerPromotingToDouble,
+    /// Exact decimal, bounded by `integer_digits` digits ahead of the
+    /// decimal point when the engine has such a bound.
+    ///
+    /// PostgreSQL's `numeric` stops at 131072 integer digits and answers
+    /// `value overflows numeric format`, which two rows can reach. MySQL
+    /// states no bound here because none is reachable: its `SELECT`
+    /// widens past `DECIMAL(65)`, answering 68 digits over 200 rows and 70
+    /// over 51200, and its internal ceiling needs about 10^16 rows of the
+    /// widest column it permits. The out-of-range error MySQL documents
+    /// belongs to storing such a total in a column, not to computing it.
+    Decimal {
+        /// Digits permitted ahead of the decimal point, or `None` when the
+        /// engine has no reachable bound.
+        integer_digits: Option<u32>,
+    },
+    /// A double, which is what every engine sums a floating column into.
+    Double,
 }
 
 /// MySQL's `div_precision_increment`, as the deployment declares it.
@@ -1216,8 +1314,8 @@ impl<C> From<BuiltinType> for ScalarKind<C> {
     }
 }
 
-/// A family widened to a type by taking each refinement's common case,
-/// float8 and varying text.
+/// A family widened to a type by taking each refinement's common case: a
+/// 64-bit integer, float8, and varying text.
 ///
 /// For fixtures only. Production code classifies through
 /// [`Backend::refine_builtin`], because choosing a refinement without
@@ -1227,6 +1325,7 @@ impl<C> From<BuiltinKind> for ScalarKind<C> {
     fn from(family: BuiltinKind) -> Self {
         Self::Builtin(refined_builtin(
             family,
+            IntWidth::SixtyFour,
             FloatWidth::Double,
             TextWidth::Varying,
         ))

@@ -1138,6 +1138,14 @@ pub enum InstallError {
 /// database read.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum AggregateInstallError {
+    /// A change held through the read window put the total outside what
+    /// the engine can represent, so there is no seeded value to install.
+    ///
+    /// Measured: SQLite answers `integer overflow` past 64 bits and
+    /// PostgreSQL answers `value overflows numeric format` past 131072
+    /// integer digits.
+    #[error("subscription {0}: the total leaves what this engine can represent")]
+    SumOutOfRange(crate::SubscriptionId),
     /// No aggregate subscription with this id, or it was unregistered.
     #[error("subscription {0} is not a live aggregate subscription")]
     UnknownAggregate(SubscriptionId),

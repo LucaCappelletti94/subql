@@ -14,7 +14,9 @@ use sql_traits::structs::ParserDB;
 use sqlparser::dialect::{MySqlDialect, PostgreSqlDialect};
 use subql::backend::{BuiltinKind, MySql, Postgres, Value};
 use subql::testing::TestEvent;
-use subql::{AggValue, AggregateBootstrap, DefaultIds, SubscriptionEngine, SubscriptionRequest};
+use subql::{
+    AggValue, AggregateBootstrap, DefaultIds, SubscriptionEngine, SubscriptionRequest, SumValue,
+};
 
 const DDL: &str = "CREATE TABLE t (id INT PRIMARY KEY, amount INT, status TEXT);";
 
@@ -150,7 +152,9 @@ fn bootstrap_kinds_per_aggspec() {
     let cases: [(&str, Vec<BuiltinKind>); 8] = [
         ("SELECT COUNT(*) FROM t", vec![int]),
         ("SELECT COUNT(amount) FROM t", vec![int]),
-        ("SELECT SUM(amount) FROM t", vec![float, int]),
+        // `amount` is an `INT`, whose sum is a `bigint` on Postgres, so the
+        // total component decodes exactly rather than as a double.
+        ("SELECT SUM(amount) FROM t", vec![int, int]),
         ("SELECT AVG(amount) FROM t", vec![float, int]),
         ("SELECT VAR_POP(amount) FROM t", vec![float, float, int]),
         ("SELECT VAR_SAMP(amount) FROM t", vec![float, float, int]),
@@ -186,20 +190,21 @@ fn a_seed_row_decodes_into_the_value_it_describes() {
         seeded_value("SELECT COUNT(amount) FROM t", &[Value::Int(3)]),
         AggValue::Count(3),
     );
-    // SUM: `(s, c)` components, from an integer or float column.
+    // SUM: `(s, c)` components. The total decodes in the type the engine
+    // sums into, which for this `INT` column is a `bigint`.
     assert_eq!(
         seeded_value(
             "SELECT SUM(amount) FROM t",
             &[Value::Int(10), Value::Int(1)]
         ),
-        AggValue::Sum(Some(10.0)),
+        AggValue::Sum(Some(SumValue::Integer(10))),
     );
     assert_eq!(
         seeded_value(
             "SELECT SUM(amount) FROM t",
-            &[Value::Float(2.5), Value::Int(2)]
+            &[Value::Int(-4), Value::Int(2)]
         ),
-        AggValue::Sum(Some(2.5)),
+        AggValue::Sum(Some(SumValue::Integer(-4))),
     );
     // AVG: `(s, c)` components.
     assert_eq!(

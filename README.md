@@ -127,7 +127,8 @@ assert_eq!(
 assert_eq!(
     updates[1].change,
     subql::AggregateValueChange::Set(subql::AggregateResultValue::Folded(
-        AggValue::Sum(Some(250.0)),
+        // `amount` is an `INT`, whose sum is a `bigint` on PostgreSQL.
+        AggValue::Sum(Some(subql::SumValue::Integer(250))),
     )),
 );
 ```
@@ -138,7 +139,7 @@ assert_eq!(
 |-----|--------------------|-------|
 | `SELECT COUNT(*) FROM t WHERE ...` | `Count(i64)` | +/-1 per matching row |
 | `SELECT COUNT(col) FROM t WHERE ...` | `Count(i64)` | skips `NULL` cells |
-| `SELECT SUM(col) FROM t WHERE ...` | `Sum(Option<f64>)` | skips `NULL`/`NaN`/`Inf`; `None` when no row contributes, which is what every engine answers |
+| `SELECT SUM(col) FROM t WHERE ...` | `Sum(Option<SumValue>)` | exact, in the type the engine sums into: `bigint`, `numeric`/`DECIMAL`, `integer` or double. `None` when no row contributes, which is what every engine answers |
 | `SELECT AVG(col) FROM t WHERE ...` | `Real(Option<f64>)` | `None` when no row contributes |
 
 ### Type validation

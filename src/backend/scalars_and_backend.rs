@@ -403,6 +403,17 @@ pub trait Backend: 'static {
     /// [`DivisionRule`](super::scalar_value::DivisionRule).
     const DIVISION: super::scalar_value::DivisionRule;
 
+    /// What `SUM` over a column of this type accumulates in, and answers.
+    ///
+    /// Required, and per backend, because the engines disagree at every
+    /// input: measured, `SUM` over an `int` column is a `bigint` on
+    /// PostgreSQL, a `decimal(32,0)` on MySQL and an `integer` on SQLite,
+    /// and over a `bigint` column PostgreSQL switches to `numeric` while
+    /// SQLite keeps a 64-bit integer that can overflow. See
+    /// [`SumRule`](super::scalar_value::SumRule).
+    #[must_use]
+    fn sum_rule(column: super::scalar_value::BuiltinType) -> super::scalar_value::SumRule;
+
     /// Two decimals divided at the scale this backend's
     /// [`Backend::DIVISION`] computes it to.
     ///

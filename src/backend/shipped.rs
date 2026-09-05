@@ -101,6 +101,7 @@ impl<V: postgres_jsonb_canonical::PgVersion + 'static> Backend for Postgres<V> {
         };
         super::scalar_value::refined_builtin(
             family,
+            super::scalar_value::declares_sixty_four_bit_int(declared),
             float,
             super::scalar_value::declares_fixed_width_text(declared),
         )
@@ -109,6 +110,21 @@ impl<V: postgres_jsonb_canonical::PgVersion + 'static> Backend for Postgres<V> {
     /// Measured: PostgreSQL raises `division by zero`.
     const DIVISION_BY_ZERO: crate::compiler::vm::refusal::DivisionByZero =
         crate::compiler::vm::refusal::DivisionByZero::Fails;
+
+    /// Measured: `sum(smallint)` and `sum(int)` are `bigint`, `sum(bigint)`
+    /// and `sum(numeric)` are `numeric`, and `sum(double precision)` is a
+    /// double. `numeric` stops at 131072 integer digits.
+    fn sum_rule(column: super::scalar_value::BuiltinType) -> super::scalar_value::SumRule {
+        use super::scalar_value::{BuiltinType, IntWidth, SumRule};
+
+        match column {
+            BuiltinType::Int(IntWidth::UpToThirtyTwo) => SumRule::Integer,
+            BuiltinType::Int(IntWidth::SixtyFour) | BuiltinType::Decimal => SumRule::Decimal {
+                integer_digits: Some(131_072),
+            },
+            _ => SumRule::Double,
+        }
+    }
 
     /// Measured: `7 / 2` is `3`, and `1::numeric / 3` is
     /// `0.33333333333333333333`, twenty digits and rounded up.
@@ -368,6 +384,7 @@ impl Backend for MySql {
         };
         super::scalar_value::refined_builtin(
             family,
+            super::scalar_value::declares_sixty_four_bit_int(declared),
             float,
             super::scalar_value::declares_fixed_width_text(declared),
         )
@@ -387,6 +404,21 @@ impl Backend for MySql {
     /// `ERROR_FOR_DIVISION_BY_ZERO` in `sql_mode`, which raises on writes.
     const DIVISION_BY_ZERO: crate::compiler::vm::refusal::DivisionByZero =
         crate::compiler::vm::refusal::DivisionByZero::IsNull;
+
+    /// Measured: every integer width and every decimal sums into a decimal,
+    /// `decimal(32,0)` for an `int` column and `decimal(41,0)` for a
+    /// `bigint` one, and a floating column sums into a double. No bound is
+    /// reachable in a `SELECT`.
+    fn sum_rule(column: super::scalar_value::BuiltinType) -> super::scalar_value::SumRule {
+        use super::scalar_value::{BuiltinType, SumRule};
+
+        match column {
+            BuiltinType::Int(_) | BuiltinType::Decimal => SumRule::Decimal {
+                integer_digits: None,
+            },
+            _ => SumRule::Double,
+        }
+    }
 
     /// Measured: `7 / 2` is `3.5000` and `2 / 3` compares as
     /// `0.666666666`, truncated at a nine-digit word. MySQL spells integer
@@ -585,8 +617,11 @@ impl Backend for SQLite {
         family: super::scalar_value::BuiltinKind,
         _declared_type: &str,
     ) -> super::scalar_value::BuiltinType {
+        // SQLite's one integer is 64 bits wide, whatever a column
+        // declares, so every integer column resolves the same way.
         super::scalar_value::refined_builtin(
             family,
+            super::scalar_value::IntWidth::SixtyFour,
             super::scalar_value::FloatWidth::Double,
             super::scalar_value::TextWidth::Varying,
         )
@@ -597,6 +632,19 @@ impl Backend for SQLite {
     /// Measured: SQLite answers `NULL`.
     const DIVISION_BY_ZERO: crate::compiler::vm::refusal::DivisionByZero =
         crate::compiler::vm::refusal::DivisionByZero::IsNull;
+
+    /// Measured: integers sum as one 64-bit integer, answering `integer
+    /// overflow` past it, and the total turns real as soon as a
+    /// non-integer joins. SQLite has no decimal type, so a column
+    /// declaring one carries integers or reals and follows the same rule.
+    fn sum_rule(column: super::scalar_value::BuiltinType) -> super::scalar_value::SumRule {
+        use super::scalar_value::{BuiltinType, SumRule};
+
+        match column {
+            BuiltinType::Int(_) => SumRule::IntegerPromotingToDouble,
+            _ => SumRule::Double,
+        }
+    }
 
     /// Measured: `7 / 2` is `3`. Only the integer half of this rule can
     /// run, since SQLite has no decimal type.

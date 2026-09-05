@@ -90,7 +90,11 @@ fn oracle(spec: &AggSpec, c: &Components) -> AggValue {
     match spec {
         AggSpec::CountStar => AggValue::Count(c.count_star),
         AggSpec::CountColumn { .. } => AggValue::Count(c.count_col),
-        AggSpec::Sum { .. } => AggValue::Sum((c.numeric > 0).then_some(sum)),
+        // The fixture sums an `INT` column under Postgres, whose sum is a
+        // `bigint`, so the oracle's total is an exact integer.
+        AggSpec::Sum { .. } => {
+            AggValue::Sum((c.numeric > 0).then_some(subql::SumValue::Integer(c.sum)))
+        }
         AggSpec::Avg { .. } => AggValue::Real((c.numeric > 0).then(|| sum / n)),
         AggSpec::VarPop { .. } => AggValue::Real(var_pop),
         AggSpec::VarSamp { .. } => AggValue::Real(var_samp),

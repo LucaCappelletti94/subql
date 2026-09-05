@@ -272,12 +272,6 @@ struct AggComponents {
 }
 
 impl AggComponents {
-    // Amounts originate from `i16`, so the running sums stay well inside
-    // f64's exact-integer range; the precision-loss lint is theoretical.
-    #[allow(clippy::cast_precision_loss)]
-    const fn sum_f64(&self) -> f64 {
-        self.sum as f64
-    }
     #[allow(clippy::cast_precision_loss)]
     const fn sum_sq_f64(&self) -> f64 {
         self.sum_sq as f64
@@ -316,6 +310,15 @@ fn agg_components(virt: &BTreeMap<i64, VirtRow>) -> AggComponents {
     c
 }
 
+/// The rule Postgres states for the fixtures' `i16` amount column: its
+/// sum is a `bigint`.
+const SUM_RULE: crate::backend::SumRule = crate::backend::SumRule::Integer;
+
+/// The oracle's exact total, in the type that rule answers.
+const fn exact_total(sum: i64) -> crate::SumValue {
+    crate::SumValue::Integer(sum)
+}
+
 /// Textbook aggregate value over the components, using the same formulas
 /// as [`AggAccumulator::value`], so seeding matches it exactly.
 #[allow(clippy::cast_precision_loss, clippy::suboptimal_flops)]
@@ -328,7 +331,9 @@ fn oracle_agg_value(spec: &AggSpec, c: &AggComponents) -> AggValue {
     match spec {
         AggSpec::CountStar => AggValue::Count(c.count_star),
         AggSpec::CountColumn { .. } => AggValue::Count(c.count_col),
-        AggSpec::Sum { .. } => AggValue::Sum((c.numeric > 0).then_some(sum)),
+        // The fixtures sum an `i16` column under Postgres, whose sum is a
+        // `bigint`, so the oracle's exact total is an integer.
+        AggSpec::Sum { .. } => AggValue::Sum((c.numeric > 0).then(|| exact_total(c.sum))),
         AggSpec::Avg { .. } => AggValue::Real((c.numeric > 0).then(|| sum / n)),
         AggSpec::VarPop { .. } => AggValue::Real(var_pop),
         AggSpec::VarSamp { .. } => AggValue::Real(var_samp),
@@ -347,13 +352,12 @@ fn oracle_agg_value(spec: &AggSpec, c: &AggComponents) -> AggValue {
 /// misrouted delta, which moves these values by whole units, because the
 /// amounts driving them are `i16`.
 #[allow(clippy::cast_precision_loss)]
-fn agg_values_agree(engine: AggValue, oracle: AggValue, c: &AggComponents) -> bool {
+fn agg_values_agree(engine: &AggValue, oracle: &AggValue, c: &AggComponents) -> bool {
     match (engine, oracle) {
         (AggValue::Count(a), AggValue::Count(b)) => a == b,
         (AggValue::Sum(None), AggValue::Sum(None)) => true,
-        (AggValue::Sum(Some(a)), AggValue::Sum(Some(b))) => {
-            (a - b).abs() <= 1e-9_f64.max(c.sum_f64().abs() * 1e-12)
-        }
+        // An exact total agrees exactly, which is the whole point of it.
+        (AggValue::Sum(Some(a)), AggValue::Sum(Some(b))) => a == b,
         (AggValue::Real(None), AggValue::Real(None)) => true,
         (AggValue::Real(Some(a)), AggValue::Real(Some(b))) => {
             (a - b).abs() <= 1e-3_f64.max(c.sum_sq_f64().abs().sqrt() * 1e-5)
@@ -396,7 +400,7 @@ fn assert_seed_matches_oracle(c: &AggComponents) {
     ];
     for spec in specs {
         assert_eq!(
-            AggAccumulator::seed_from_row(&spec, &seed_row(&spec, c)).value(),
+            AggAccumulator::seed_from_row(&spec, SUM_RULE, &seed_row(&spec, c)).value(),
             oracle_agg_value(&spec, c),
             "seed decode drift for {spec:?}",
         );
@@ -564,7 +568,7 @@ pub fn harness_aggregate_consistency(data: &[u8]) {
                     else {
                         panic!("ungrouped aggregate cannot remove a group")
                     };
-                    (u.subscription, *value)
+                    (u.subscription, value.clone())
                 })
                 .collect();
 
@@ -575,12 +579,12 @@ pub fn harness_aggregate_consistency(data: &[u8]) {
                     .current_aggregate_value(*subscription)
                     .expect("a seeded aggregate holds a value");
                 assert!(
-                    agg_values_agree(held, oracle, &now),
+                    agg_values_agree(&held, &oracle, &now),
                     "consumer {cid} value drift: engine={held:?} oracle={oracle:?}",
                 );
                 match reported.get(subscription) {
-                    Some(&value) => assert_eq!(
-                        value, held,
+                    Some(value) => assert_eq!(
+                        value, &held,
                         "consumer {cid} reported a value it does not hold",
                     ),
                     None => assert!(

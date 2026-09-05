@@ -108,7 +108,10 @@ fn oracle(spec: &AggSpec, amounts: &[Option<i64>]) -> AggValue {
     match spec {
         AggSpec::CountStar => AggValue::Count(count_star),
         AggSpec::CountColumn { .. } => AggValue::Count(numeric),
-        AggSpec::Sum { .. } => AggValue::Sum((numeric > 0).then_some(sum)),
+        // SQLite sums integers as one 64-bit integer, measured.
+        AggSpec::Sum { .. } => AggValue::Sum(
+            (numeric > 0).then(|| subql::SumValue::Integer(amounts.iter().flatten().sum())),
+        ),
         AggSpec::Avg { .. } => AggValue::Real((numeric > 0).then(|| sum / n)),
         AggSpec::VarPop { .. } => AggValue::Real(var_pop),
         AggSpec::VarSamp { .. } => AggValue::Real(var_samp),
@@ -155,13 +158,14 @@ fn execute_scalar_row_decodes_components() {
         .execute_scalar_row(&b.query.as_read_query(), &b.kinds, &())
         .unwrap();
     assert_eq!(row, vec![Value::Int(3)]);
-    // SUM: (sum cast to double, contributor count), since a sum over no
-    // contributing row is NULL rather than zero.
+    // SUM: (the exact total, contributor count). SQLite sums integers as
+    // one integer, measured, and a sum over no contributing row is NULL
+    // rather than zero.
     let b = bootstrap("SELECT SUM(amount) FROM t");
     let (row, _) = connector
         .execute_scalar_row(&b.query.as_read_query(), &b.kinds, &())
         .unwrap();
-    assert_eq!(row, vec![Value::Float(12.0), Value::Int(3)]);
+    assert_eq!(row, vec![Value::Int(12), Value::Int(3)]);
     // AVG: (sum, count).
     let b = bootstrap("SELECT AVG(amount) FROM t");
     let (row, _) = connector

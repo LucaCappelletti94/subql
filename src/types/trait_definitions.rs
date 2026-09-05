@@ -111,16 +111,48 @@ pub trait DurableShardStore: Send {
 
 /// Current value of an aggregate subscription, as the engine reports it on
 /// [`AggregateValueUpdate`].
-#[derive(Clone, Copy, Debug, PartialEq)]
+///
+/// Not `Copy`: an exact decimal total owns its digits.
+#[derive(Clone, Debug, PartialEq)]
 pub enum AggValue {
     /// `COUNT(*)` or `COUNT(col)`.
     Count(i64),
     /// `SUM(col)`. `None` when no row contributes a value, which every
     /// engine answers as NULL rather than as zero.
-    Sum(Option<f64>),
+    Sum(Option<SumValue>),
     /// A real-valued aggregate (AVG, variance, stddev). `None` when undefined
     /// for the current row count.
     Real(Option<f64>),
+}
+
+/// What a `SUM` answers, in the type its engine sums into.
+///
+/// Measured on PostgreSQL 16.15, MySQL 8.4.11 and SQLite 3.51.1: a sum
+/// over an `int` column is a `bigint` there, a `decimal(32,0)` there and
+/// an `integer` there, and none of the three sums in `f64`, so a single
+/// row of `9007199254740993` is itself rather than the nearest double.
+/// Which one a subscription answers is
+/// [`Backend::sum_rule`](crate::backend::Backend::sum_rule)'s to say.
+#[derive(Clone, Debug, PartialEq)]
+pub enum SumValue {
+    /// A 64-bit integer total: PostgreSQL's `sum(int)`, SQLite's integer
+    /// sum.
+    Integer(i64),
+    /// An exact decimal total, scale included: PostgreSQL's `numeric` and
+    /// every MySQL integer or decimal sum.
+    Decimal(bigdecimal::BigDecimal),
+    /// A double, which is what a floating column sums into everywhere.
+    Double(f64),
+}
+
+impl core::fmt::Display for SumValue {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Integer(value) => write!(f, "{value}"),
+            Self::Decimal(value) => write!(f, "{value}"),
+            Self::Double(value) => write!(f, "{value}"),
+        }
+    }
 }
 
 impl core::fmt::Display for AggValue {
@@ -516,9 +548,9 @@ impl<I: IdTypes, B: Backend> AggregateValueUpdate<I, B> {
 
     /// Additive value carried by `Set`, or `None` for another result kind.
     #[must_use]
-    pub const fn folded_value(&self) -> Option<AggValue> {
+    pub fn folded_value(&self) -> Option<AggValue> {
         match &self.change {
-            AggregateValueChange::Set(AggregateResultValue::Folded(value)) => Some(*value),
+            AggregateValueChange::Set(AggregateResultValue::Folded(value)) => Some(value.clone()),
             AggregateValueChange::Set(AggregateResultValue::Scalar(_))
             | AggregateValueChange::Remove => None,
         }
@@ -542,6 +574,17 @@ pub enum MaintenanceStopReason {
     /// A runtime value fell outside the selected canonical key domain.
     GroupKeyUnencodable {
         /// Source table carrying the value.
+        table_id: TableId,
+    },
+    /// A total left what its engine can represent, which is where the
+    /// engine itself raises.
+    ///
+    /// Measured: SQLite answers `integer overflow` past 64 bits and
+    /// PostgreSQL answers `value overflows numeric format` past 131072
+    /// integer digits, each reachable from two rows. A re-read cannot
+    /// answer either, so the tier changes and the caller learns why.
+    SumOutOfRange {
+        /// Source table whose column is summed.
         table_id: TableId,
     },
     /// A keyed row read received a CDC change with no readable primary key.
