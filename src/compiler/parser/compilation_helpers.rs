@@ -674,8 +674,21 @@ where
                 range_target,
             )?;
 
-            // Two ordered comparisons, so the same classification applies:
-            // the lower bound's pair carries it for both.
+            // Two ordered comparisons, and each resolves its own rule.
+            // The upper bound used to be built from the lower's left
+            // operand and the upper's own facts with no text rule at all,
+            // so it compared bytes while the lower bound compared as the
+            // engine does.
+            //
+            // Copying the lower's rule across is not the fix either, and
+            // the mutation battery is what established that. The two
+            // bounds can resolve differently: measured on PostgreSQL
+            // 16.15 with `free` a `text` holding `ab   `, `loose` a
+            // `varchar` holding the same, and `code` a `char(5)` holding
+            // `ab`, `free >= loose` is true and `free <= code` is false,
+            // because converting the `char` to `text` strips its padding.
+            // `free BETWEEN loose AND code` is therefore false, and only
+            // a rule resolved per bound answers that.
             let lower = out.comparison_for(
                 expr,
                 low,
@@ -683,11 +696,14 @@ where
                 database,
                 crate::backend::TextOperation::Ordering,
             )?;
-            let high_facts = out.intern_comparison(high, table_id, database);
-            out.push(Instruction::Between {
-                lower,
-                upper: ComparisonRef::new(lower.left, high_facts),
-            });
+            let upper = out.comparison_for(
+                expr,
+                high,
+                table_id,
+                database,
+                crate::backend::TextOperation::Ordering,
+            )?;
+            out.push(Instruction::Between { lower, upper });
 
             if *negated {
                 out.push(Instruction::Not);

@@ -377,3 +377,108 @@ fn a_pattern_keeps_trailing_spaces_whatever_the_collation_pads() {
         "and keeps them for a pattern, measured as `r LIKE 'ab'` = 0"
     );
 }
+
+/// `BETWEEN` applies the padding rule to both of its bounds.
+///
+/// Two ordered comparisons, so the classification the lower pair
+/// resolves is the upper pair's too. It was resolved once and attached
+/// once: the upper bound's `ComparisonRef` was built with the lower's
+/// left operand and the upper's own facts, and no text rule at all, so
+/// it compared the padded bytes while the lower bound compared as the
+/// engine does.
+///
+/// Measured on PostgreSQL 16.15 with a `char(5) COLLATE "C"` column
+/// holding `ab`:
+///
+/// ```text
+/// code BETWEEN 'aa' AND 'ab'   t
+/// code <= 'ab'                 t     the upper bound alone
+/// code >= 'aa'                 t     the lower bound alone
+/// code BETWEEN 'ab' AND 'ac'   t
+/// ```
+///
+/// The wire carries the padded `ab   `, so an upper bound comparing
+/// bytes answers false where the engine answers true, and the row is
+/// dropped.
+#[test]
+fn between_applies_the_padding_rule_to_both_bounds() {
+    let ddl = "CREATE TABLE codes (id INT PRIMARY KEY, code CHAR(5) COLLATE \"C\")";
+    let notifies = |predicate: &str, code: &str| {
+        let cells = vec![Value::<Postgres>::Int(1), Value::String(code.to_string())];
+        notifies!(Postgres, PostgreSqlDialect, ddl, predicate, cells)
+    };
+
+    assert!(
+        notifies(
+            "SELECT * FROM codes WHERE code BETWEEN 'aa' AND 'ab'",
+            "ab   "
+        ),
+        "the upper bound ignores the padding, so the row is in the answer"
+    );
+    assert!(
+        notifies(
+            "SELECT * FROM codes WHERE code BETWEEN 'ab' AND 'ac'",
+            "ab   "
+        ),
+        "and so does the lower bound, which already did"
+    );
+    assert!(
+        !notifies(
+            "SELECT * FROM codes WHERE code BETWEEN 'aa' AND 'aa'",
+            "ab   "
+        ),
+        "ignoring padding is still not ignoring content"
+    );
+}
+
+/// And each bound resolves its own rule, because the two can differ.
+///
+/// The mutation battery is why this test exists: with both bounds given
+/// the lower pair's rule, nothing changed, since the literals in the test
+/// above resolve alike. Two columns of different declared types do not.
+///
+/// Measured on PostgreSQL 16.15 with `free` a `text` holding `ab   `,
+/// `loose` a `varchar` holding the same, and `code` a `char(5)` holding
+/// `ab`:
+///
+/// ```text
+/// free >= loose                    t    text against varchar is exact
+/// free <= code                     f    the char converts to text and loses its padding
+/// free BETWEEN loose AND code      f
+/// ```
+///
+/// So the lower bound compares exactly and the upper strips the other
+/// side's padding, and a rule resolved once for both answers the wrong
+/// one of those.
+#[test]
+fn each_between_bound_resolves_its_own_rule() {
+    let ddl = "CREATE TABLE codes (id INT PRIMARY KEY, code CHAR(5) COLLATE \"C\", \
+               loose VARCHAR(9) COLLATE \"C\", free TEXT COLLATE \"C\")";
+    let cells = vec![
+        Value::<Postgres>::Int(1),
+        Value::String("ab   ".to_string()),
+        Value::String("ab   ".to_string()),
+        Value::String("ab   ".to_string()),
+    ];
+    assert!(
+        !notifies!(
+            Postgres,
+            PostgreSqlDialect,
+            ddl,
+            "SELECT * FROM codes WHERE free BETWEEN loose AND code",
+            cells.clone()
+        ),
+        "measured: PostgreSQL answers false, because the upper bound strips the \
+         char's padding while the lower bound compares exactly"
+    );
+    assert!(
+        notifies!(
+            Postgres,
+            PostgreSqlDialect,
+            ddl,
+            "SELECT * FROM codes WHERE free >= loose",
+            cells
+        ),
+        "and the lower bound on its own is true, which is the pair that differs"
+    );
+}
