@@ -777,7 +777,24 @@ pub enum SumRule {
         /// engine has no reachable bound.
         integer_digits: Option<u32>,
     },
-    /// A double, which is what every engine sums a floating column into.
+    /// Single precision, rounding at every addition, and the engine
+    /// raises when a finite pair leaves the range.
+    ///
+    /// PostgreSQL's `sum(real)` is itself `real`, measured:
+    /// `pg_typeof(SUM(v))` over a `real` column is `real`, three rows of
+    /// `0.1` answer `0.3` where a double accumulator answers
+    /// `0.30000000447034836`, and `16777216, 1, 1` answer
+    /// `1.6777216e+07` with both units lost where a double answers
+    /// `16777218`. Two rows of `3e38` answer `ERROR: value out of
+    /// range: overflow`.
+    Single,
+    /// A double, which is what the other engines sum a floating column
+    /// into whatever its declared width.
+    ///
+    /// Measured: MySQL's `SUM` over a `FLOAT` column holding three
+    /// `0.1`s answers `0.30000000447034836` and its `16777216, 1, 1`
+    /// answers `16777218`, so it widens each cell first. SQLite has no
+    /// single-precision storage to widen.
     Double,
 }
 

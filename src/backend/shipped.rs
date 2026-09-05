@@ -131,6 +131,10 @@ impl<V: postgres_jsonb_canonical::PgVersion + 'static> Backend for Postgres<V> {
             BuiltinType::Int(IntWidth::SixtyFour) | BuiltinType::Decimal => SumRule::Decimal {
                 integer_digits: Some(131_072),
             },
+            // `sum(real)` is a `real` aggregate here, unlike on the other
+            // two engines, so the width the column declares is the width
+            // the total accumulates in.
+            BuiltinType::Float(super::scalar_value::FloatWidth::Single) => SumRule::Single,
             _ => SumRule::Double,
         }
     }

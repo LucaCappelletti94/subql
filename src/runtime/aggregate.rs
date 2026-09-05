@@ -338,6 +338,10 @@ enum Total {
         value: bigdecimal::BigDecimal,
         integer_digits: Option<u32>,
     },
+    /// Single precision, which is what PostgreSQL's `sum(real)`
+    /// accumulates in. Every addition rounds, so the total is held as
+    /// `f32` rather than rounded once on the way out.
+    Single(f32),
     /// A double.
     Double(f64),
 }
@@ -367,6 +371,7 @@ impl Total {
                 value: bigdecimal::BigDecimal::from(0),
                 integer_digits,
             },
+            crate::backend::SumRule::Single => Self::Single(0.0),
             crate::backend::SumRule::Double => Self::Double(0.0),
         }
     }
@@ -415,6 +420,24 @@ impl Total {
                     _ => Ok(()),
                 }
             }
+            // Rounded per addition, because the engine's accumulator is
+            // this wide and a total rounded only once at the end is a
+            // different number: measured, `16777216 + 1 + 1` keeps both
+            // units in double and loses both in single.
+            Self::Single(value) => {
+                #[allow(clippy::cast_possible_truncation)]
+                let change = delta.as_f64() as f32;
+                let total = *value + change;
+                // Two finite operands whose total is not finite is where
+                // PostgreSQL answers `value out of range: overflow`. A
+                // non-finite operand is a different matter and folds
+                // through, which Phase c003686 measured.
+                if !total.is_finite() && value.is_finite() && change.is_finite() {
+                    return Err(SumOutOfRange);
+                }
+                *value = total;
+                Ok(())
+            }
             Self::Double(value) => {
                 *value += delta.as_f64();
                 Ok(())
@@ -448,6 +471,11 @@ impl Total {
                 }
                 _ => {}
             },
+            Self::Single(value) => {
+                #[allow(clippy::cast_possible_truncation)]
+                let seeded = AggAccumulator::seed_f64(cell).unwrap_or(0.0) as f32;
+                *value = seeded;
+            }
             Self::Double(value) => {
                 *value = AggAccumulator::seed_f64(cell).unwrap_or(0.0);
             }
@@ -464,6 +492,7 @@ impl Total {
             Self::Decimal { integer_digits, .. } => crate::backend::SumRule::Decimal {
                 integer_digits: *integer_digits,
             },
+            Self::Single(_) => crate::backend::SumRule::Single,
             Self::Double(_) => crate::backend::SumRule::Double,
         }
     }
@@ -473,6 +502,10 @@ impl Total {
         match self {
             Self::Integer { value, .. } => crate::NumericValue::Integer(*value),
             Self::Decimal { value, .. } => crate::NumericValue::Decimal(value.clone()),
+            // Reported as a double, because that is the carrier a caller
+            // reads a floating total through. The width belongs to the
+            // accumulation, and widening an `f32` is exact.
+            Self::Single(value) => crate::NumericValue::Double(f64::from(*value)),
             Self::Double(value) => crate::NumericValue::Double(*value),
         }
     }
@@ -749,6 +782,14 @@ impl AggAccumulator {
             (Total::Double(total), _) => {
                 Some(crate::NumericValue::Double(total / self.count as f64))
             }
+            // A mean never holds a single-precision total, because
+            // `catalog_helpers::total_rule` gives one only to a `SUM`:
+            // measured, PostgreSQL's `avg(real)` is `double precision`
+            // and answers the double quotient of the double sum. Read
+            // through the widened total, which is what that quotient is.
+            (Total::Single(total), _) => Some(crate::NumericValue::Double(
+                f64::from(*total) / self.count as f64,
+            )),
             (_, crate::backend::MeanRule::Double) => Some(double()),
             (Total::Integer { value, .. }, crate::backend::MeanRule::Exact) => Some(
                 crate::NumericValue::Decimal(self.quotient(&bigdecimal::BigDecimal::from(*value))),

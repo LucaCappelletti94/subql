@@ -452,13 +452,26 @@ pub fn total_rule<B: crate::backend::Backend, DB: DatabaseLike>(
     database: &DB,
     table_id: crate::TableId,
 ) -> crate::backend::SumRule {
-    spec.column()
+    let rule = spec
+        .column()
         .map_or(crate::backend::SumRule::Double, |column| {
             column_scalar_kind::<B, DB>(database, table_id, column)
                 .as_ref()
                 .and_then(crate::backend::ScalarKind::builtin)
                 .map_or(crate::backend::SumRule::Double, B::sum_rule)
-        })
+        });
+    // The accumulator's width belongs to the aggregate, not only to the
+    // column. Measured on PostgreSQL 16.15 over a `real` column:
+    // `pg_typeof(SUM(v))` is `real`, while `pg_typeof(AVG(v))` and
+    // `pg_typeof(VAR_POP(v))` are both `double precision`, and
+    // `AVG` over three `0.1`s answers `0.10000000149011612`, which is
+    // the double sum divided by three rather than the single one. So a
+    // narrower total is a `SUM`'s alone.
+    match (rule, spec) {
+        (crate::backend::SumRule::Single, crate::compiler::AggSpec::Sum { .. }) => rule,
+        (crate::backend::SumRule::Single, _) => crate::backend::SumRule::Double,
+        _ => rule,
+    }
 }
 
 #[must_use]

@@ -9,7 +9,8 @@
 //! smallint, int    bigint                 decimal(32,0)    integer
 //! bigint           numeric                decimal(41,0)    integer
 //! numeric/decimal  numeric, scale kept    decimal, scale kept   no decimal type
-//! real, double     double precision       double           real
+//! real             real                   double           real
+//! double           double precision       double           real
 //! ```
 //!
 //! And none of them is unbounded, but they run out in different places:
@@ -22,6 +23,7 @@
 //! mysql    that result stored into a DECIMAL column    ERROR 1264 out of range
 //! sqlite   integer sum past 64 bits                    ERROR integer overflow
 //! sqlite   a non-integer joins an integer sum           the sum becomes real
+//! pg       a real sum past single precision            ERROR value out of range: overflow
 //! ```
 //!
 //! subql accumulated everything in `f64`, so a single row of
@@ -43,15 +45,23 @@ use subql::{
 };
 
 const PG_DDL: &str = "CREATE TABLE t (id INT PRIMARY KEY, small INT, big BIGINT, \
-                      exact NUMERIC, approx DOUBLE PRECISION)";
+                      exact NUMERIC, approx DOUBLE PRECISION, single REAL)";
 const MYSQL_DDL: &str = "CREATE TABLE t (id INT PRIMARY KEY, small INT, big BIGINT, \
-                         exact DECIMAL(65,0), approx DOUBLE)";
-const SQLITE_DDL: &str =
-    "CREATE TABLE t (id INTEGER PRIMARY KEY, small INTEGER, big INTEGER, approx REAL)";
+                         exact DECIMAL(65,0), approx DOUBLE, single FLOAT)";
+const SQLITE_DDL: &str = "CREATE TABLE t (id INTEGER PRIMARY KEY, small INTEGER, \
+                          big INTEGER, approx REAL, single REAL)";
 
 /// Column ordinals shared by the three schemas above.
 const SMALL: usize = 1;
 const BIG: usize = 2;
+/// The single-precision column, last in each schema.
+const SINGLE: usize = 5;
+/// SQLite has no `NUMERIC`, so its schema is one column shorter.
+const SQLITE_SINGLE: usize = 4;
+
+/// `0.1` as a `real` cell arrives off the wire already rounded to
+/// single precision, which is what Phase 9a59536 made the decoder do.
+const TENTH: f64 = 0.100_000_001_490_116_12;
 
 /// A backend on the standard carriers, which is what an aggregate's
 /// running value is written in.
@@ -168,15 +178,21 @@ fn install<B: Summing>(
 }
 
 fn pg(column: &str) -> Folding<Postgres> {
-    folding(PG_DDL, PostgreSqlDialect {}, column, 5)
+    folding(PG_DDL, PostgreSqlDialect {}, column, 6)
 }
 
 fn mysql(column: &str) -> Folding<MySql> {
-    folding(MYSQL_DDL, MySqlDialect {}, column, 5)
+    folding(MYSQL_DDL, MySqlDialect {}, column, 6)
 }
 
 fn sqlite(column: &str) -> Folding<SQLite> {
-    folding(SQLITE_DDL, SQLiteDialect {}, column, 4)
+    folding(SQLITE_DDL, SQLiteDialect {}, column, 5)
+}
+
+/// A double-typed total, which is how a floating sum is reported on
+/// every engine: the width is the accumulator's, not the report's.
+const fn single(value: f64) -> AggValue {
+    AggValue::Sum(Some(NumericValue::Double(value)))
 }
 
 fn decimal(text: &str) -> NumericValue {
@@ -380,5 +396,118 @@ fn a_decimal_seed_decodes_exactly() {
         value,
         Some(AggValue::Sum(Some(decimal("9007199254740993.25")))),
         "every digit the read returned survives the seed"
+    );
+}
+
+/// PostgreSQL sums a `real` column in `real`, so each addition rounds
+/// to single precision.
+///
+/// Measured on PostgreSQL 16.15: `pg_typeof(SUM(v))` over a `real`
+/// column is `real`, and three rows of `0.1` answer `0.3`, the shortest
+/// text that round-trips to the single-precision total. Accumulating the
+/// same three cells in `f64` answers `0.30000000447034836` instead, and
+/// that is what MySQL and SQLite really answer, so there is no shared
+/// rule here either: the accumulator's width is the engine's.
+#[test]
+fn pg_sums_a_real_column_at_single_precision() {
+    let mut folding = pg("single");
+    assert_eq!(
+        folding.fold(SINGLE, Value::Float(TENTH)),
+        Some(single(TENTH))
+    );
+    assert_eq!(
+        folding.fold(SINGLE, Value::Float(TENTH)),
+        Some(single(0.200_000_002_980_232_24)),
+        "two tenths in single precision"
+    );
+    assert_eq!(
+        folding.fold(SINGLE, Value::Float(TENTH)),
+        Some(single(0.300_000_011_920_928_96)),
+        "and three, which is what PostgreSQL prints as 0.3"
+    );
+}
+
+/// The rounding is not cosmetic: single precision drops what it cannot
+/// hold.
+///
+/// Measured: `16777216, 1, 1` in a `real` column answers
+/// `1.6777216e+07`, both additions lost, where the same rows in
+/// `double precision` answer `16777218`. A double accumulator is
+/// therefore wrong by two whole units after two ordinary rows.
+#[test]
+fn a_real_total_drops_what_single_precision_cannot_hold() {
+    let mut folding = pg("single");
+    assert_eq!(
+        folding.fold(SINGLE, Value::Float(16_777_216.0)),
+        Some(single(16_777_216.0))
+    );
+    assert_eq!(
+        folding.fold(SINGLE, Value::Float(1.0)),
+        Some(single(16_777_216.0)),
+        "the unit does not fit beside 2^24 and is lost, as the engine loses it"
+    );
+    assert_eq!(
+        folding.fold(SINGLE, Value::Float(1.0)),
+        Some(single(16_777_216.0)),
+        "and the second is lost the same way"
+    );
+}
+
+/// A `real` total that leaves single precision is where PostgreSQL
+/// itself raises, so maintenance stops rather than reporting an infinity
+/// the engine would never return.
+///
+/// Measured: two rows of `3e38` in a `real` column answer
+/// `ERROR: value out of range: overflow`. A finite pair with a
+/// non-finite total is the same boundary the integer and decimal rules
+/// already report, and it is distinct from a non-finite *input*, which
+/// Phase c003686 measured folding through to a non-finite answer.
+#[test]
+fn a_real_total_past_single_precision_stops_maintenance() {
+    let mut folding = pg("single");
+    // `3e38` is not a single-precision number, and a `real` column
+    // carries the nearest one that is.
+    assert_eq!(
+        folding.fold(SINGLE, Value::Float(3e38)),
+        Some(single(3.000_000_005_497_755_8e38))
+    );
+    assert_eq!(
+        folding.stop(SINGLE, Value::Float(3e38)),
+        Some(MaintenanceStopReason::SumOutOfRange { table_id: 0 }),
+        "PostgreSQL answers `value out of range: overflow`, so there is no total to report"
+    );
+}
+
+/// MySQL and SQLite sum a single-precision column in double, so their
+/// rule does not change.
+///
+/// The guard on the fix above. Measured: MySQL's `SUM` over a `FLOAT`
+/// column holding three `0.1`s answers `0.30000000447034836`, the
+/// double-precision sum of three single-precision tenths, and its
+/// `16777216, 1, 1` answers `16777218`. SQLite has no
+/// single-precision storage at all.
+#[test]
+fn mysql_and_sqlite_sum_a_single_precision_column_in_double() {
+    let mut mysql = mysql("single");
+    assert_eq!(mysql.fold(SINGLE, Value::Float(TENTH)), Some(single(TENTH)));
+    assert_eq!(
+        mysql.fold(SINGLE, Value::Float(TENTH)),
+        Some(single(TENTH + TENTH))
+    );
+    assert_eq!(
+        mysql.fold(SINGLE, Value::Float(TENTH)),
+        Some(single(0.300_000_004_470_348_36)),
+        "MySQL widens each cell and sums in double"
+    );
+
+    let mut sqlite = sqlite("single");
+    assert_eq!(
+        sqlite.fold(SQLITE_SINGLE, Value::Float(16_777_216.0)),
+        Some(single(16_777_216.0))
+    );
+    assert_eq!(
+        sqlite.fold(SQLITE_SINGLE, Value::Float(1.0)),
+        Some(single(16_777_217.0)),
+        "SQLite keeps the unit, because its accumulator is a double"
     );
 }

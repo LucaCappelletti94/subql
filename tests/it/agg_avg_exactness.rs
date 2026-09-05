@@ -48,7 +48,7 @@ use subql::{
 };
 
 const PG_DDL: &str = "CREATE TABLE t (id INT PRIMARY KEY, small INT, big BIGINT, \
-                      exact NUMERIC, approx DOUBLE PRECISION)";
+                      exact NUMERIC, approx DOUBLE PRECISION, single REAL)";
 const MYSQL_DDL: &str = "CREATE TABLE t (id INT PRIMARY KEY, small INT, big BIGINT, \
                          exact DECIMAL(20,2), approx DOUBLE)";
 const SQLITE_DDL: &str =
@@ -57,6 +57,10 @@ const SQLITE_DDL: &str =
 const SMALL: usize = 1;
 const BIG: usize = 2;
 const EXACT: usize = 3;
+/// The single-precision column, last in the PostgreSQL schema.
+const SINGLE: usize = 5;
+/// `0.1` as a `real` cell arrives already rounded to single precision.
+const TENTH: f64 = 0.100_000_001_490_116_12;
 
 /// A backend on the standard carriers, which is what a running value is
 /// written in.
@@ -150,7 +154,7 @@ const fn four() -> DivisionPrecisionIncrement {
 }
 
 fn pg(column: &str) -> Folding<Postgres> {
-    folding(PG_DDL, PostgreSqlDialect {}, column, 5, None)
+    folding(PG_DDL, PostgreSqlDialect {}, column, 6, None)
 }
 
 fn mysql(column: &str) -> Folding<MySql> {
@@ -285,5 +289,29 @@ fn sqlite_avg_is_a_double() {
         folding.fold(SMALL, Value::Int(2)),
         Some(AggValue::Avg(Some(NumericValue::Double(1.5)))),
         "measured: typeof(avg(x)) is real"
+    );
+}
+
+/// A mean over a `real` column is the double quotient of a double sum,
+/// even though the sum of the same column is single precision.
+///
+/// Measured on PostgreSQL 16.15: `pg_typeof(AVG(v))` over a `real`
+/// column is `double precision`, and three rows of `0.1` answer
+/// `0.10000000149011612`. That is the double sum,
+/// `0.30000000447034836`, divided by three. Rounding the total at single
+/// precision first would give `0.30000001192092896 / 3`, a different
+/// number, so the accumulator's width is the aggregate's and not the
+/// column's: `SUM(real)` narrows and `AVG(real)` does not.
+#[test]
+fn pg_avg_of_a_real_column_is_the_double_quotient() {
+    let mut folding = pg("single");
+    folding.fold(SINGLE, Value::Float(TENTH));
+    folding.fold(SINGLE, Value::Float(TENTH));
+    assert_eq!(
+        folding.fold(SINGLE, Value::Float(TENTH)),
+        Some(AggValue::Avg(Some(NumericValue::Double(
+            0.100_000_001_490_116_12
+        )))),
+        "the mean PostgreSQL itself answers"
     );
 }

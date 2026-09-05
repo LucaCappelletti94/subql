@@ -1352,7 +1352,12 @@ pub(crate) fn aggregate_bootstrap_kinds(
             crate::backend::SumRule::Integer
             | crate::backend::SumRule::IntegerPromotingToDouble => crate::backend::BuiltinKind::Int,
             crate::backend::SumRule::Decimal { .. } => crate::backend::BuiltinKind::Decimal,
-            crate::backend::SumRule::Double => crate::backend::BuiltinKind::Float,
+            // A `real` total still decodes as a float cell: the width is
+            // the accumulator's, and `SUM(real)` comes back as a
+            // floating value either way.
+            crate::backend::SumRule::Single | crate::backend::SumRule::Double => {
+                crate::backend::BuiltinKind::Float
+            }
         },
         _ => crate::backend::BuiltinKind::Float,
     };
