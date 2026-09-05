@@ -1332,19 +1332,7 @@ where
                 subscription: subscription_id,
                 error,
             })?;
-        if snapshot.value.more || snapshot.value.rows.len() != 1 {
-            return Err(crate::AggregateInstallError::RowCount {
-                subscription: subscription_id,
-                rows: snapshot.value.rows.len(),
-            }
-            .into());
-        }
-        let row = snapshot
-            .value
-            .rows
-            .into_iter()
-            .next()
-            .expect("the row count was checked");
+        let row = one_grouped_row(subscription_id, snapshot.value)?;
         crate::Install::install(
             &mut self.inner,
             subscription_id,
@@ -1443,10 +1431,6 @@ where
         let Some(mut page_sql) = render(scoped, batch)? else {
             return Ok(());
         };
-        // Accumulated across pages, not per page. Resetting it would let a key
-        // answered on an earlier page back into the next statement, which
-        // delivers it twice and, with a stable row order, never terminates:
-        // the remaining sets oscillate between the halves of the batch.
         let mut seen: SeenKeys<E::Backend> = SeenKeys::new();
         loop {
             let page = self
@@ -1461,42 +1445,117 @@ where
                     subscription: subscription_id,
                     error,
                 })?;
-            if columns.is_empty() {
-                columns.clone_from(&page.value.columns);
-            }
-            let before = seen.recorded();
-            for row in page.value.rows {
-                let key: Vec<Value<E::Backend>> = key_positions
-                    .iter()
-                    .filter_map(|i| row.get(*i).cloned())
-                    .collect();
-                seen.record(&key);
-                present.push((key, row));
-            }
-            // A page with no rows ends the read whatever it claims about there
-            // being more. Our own reader cannot report that combination, but
-            // this trait has outside implementors, and without this a connector
-            // that did would loop here forever.
-            if !page.value.more || seen.recorded() == before {
-                return Ok(());
-            }
-            // Resume within the batch, excluding the keys already returned, so
-            // the statement stays bounded by the batch. `seen` accumulates
-            // across pages, so `remaining` strictly shrinks and the loop ends.
-            let remaining: Vec<Vec<Value<E::Backend>>> = batch
-                .iter()
-                .filter(|k| !seen.contains(k))
-                .cloned()
-                .collect();
-            if remaining.is_empty() {
-                return Ok(());
-            }
+            let remaining = match absorb_keyed_page(
+                page.value,
+                batch,
+                key_positions,
+                columns,
+                &mut seen,
+                present,
+            ) {
+                KeyedPage::Answered => return Ok(()),
+                KeyedPage::Resume(remaining) => remaining,
+            };
             match render(scoped, &remaining)? {
                 Some(next) => page_sql = next,
                 None => return Ok(()),
             }
         }
     }
+}
+
+/// What a keyed batch read does after one page.
+///
+/// Named rather than returned as a bare `Option`, because both outcomes
+/// are ordinary and the empty one is not a failure: a batch whose keys
+/// all came back is answered.
+pub(super) enum KeyedPage<B: Backend> {
+    /// This batch is answered. Stop reading it.
+    Answered,
+    /// Read this batch again for the keys that have not come back.
+    Resume(Vec<Vec<Value<B>>>),
+}
+
+/// Absorb one page of a keyed batch read, and say whether to read again.
+///
+/// Shared by both engines, which differ only in how they obtain the page:
+/// the synchronous one calls `read_page`, the asynchronous one awaits it.
+/// Everything after that is this function, and it holds no borrow of
+/// either engine, so neither has to change shape to use it.
+///
+/// Three rules live here, and each was written twice before:
+///
+/// - `seen` accumulates across pages, never per page. Resetting it would
+///   let a key answered on an earlier page back into the next statement,
+///   which delivers it twice and, with a stable row order, never
+///   terminates: the remaining sets oscillate between the halves of the
+///   batch.
+/// - A page with no new keys ends the read whatever it claims about
+///   there being more. This crate's own readers cannot report that
+///   combination, but the connector trait has outside implementors, and
+///   without this a connector that did would loop forever.
+/// - Resumption is inside the batch, so the statement stays bounded by
+///   it. Because `seen` accumulates, the remaining set strictly shrinks
+///   and the loop ends.
+pub(super) fn absorb_keyed_page<B: Backend>(
+    page: super::RowPage<B>,
+    batch: &[Vec<Value<B>>],
+    key_positions: &[usize],
+    columns: &mut Vec<String>,
+    seen: &mut SeenKeys<B>,
+    present: &mut Vec<(Vec<Value<B>>, Vec<Value<B>>)>,
+) -> KeyedPage<B> {
+    if columns.is_empty() {
+        columns.clone_from(&page.columns);
+    }
+    let before = seen.recorded();
+    for row in page.rows {
+        let key: Vec<Value<B>> = key_positions
+            .iter()
+            .filter_map(|position| row.get(*position).cloned())
+            .collect();
+        seen.record(&key);
+        present.push((key, row));
+    }
+    if !page.more || seen.recorded() == before {
+        return KeyedPage::Answered;
+    }
+    let remaining: Vec<Vec<Value<B>>> = batch
+        .iter()
+        .filter(|key| !seen.contains(key))
+        .cloned()
+        .collect();
+    if remaining.is_empty() {
+        return KeyedPage::Answered;
+    }
+    KeyedPage::Resume(remaining)
+}
+
+/// The one row a grouped scalar read has to answer with.
+///
+/// # Errors
+///
+/// [`crate::AggregateInstallError::RowCount`] when the read answered
+/// anything else. A grouped scalar reads one group's aggregate, so more
+/// than one row, no row, or a first page that claims a second all mean
+/// the statement was not the one this tier thinks it sent, and guessing
+/// which row to install would install an aggregate for the wrong group.
+pub(super) fn one_grouped_row<B: Backend, Err>(
+    subscription: SubscriptionId,
+    page: super::RowPage<B>,
+) -> Result<Vec<Value<B>>, ReExecError<Err>> {
+    if page.more || page.rows.len() != 1 {
+        return Err(crate::AggregateInstallError::RowCount {
+            subscription,
+            rows: page.rows.len(),
+        }
+        .into());
+    }
+    Ok(page
+        .rows
+        .into_iter()
+        .next()
+        .expect("the row count was just checked"))
 }
 
 pub(super) fn decode_grouped_seed_rows<B: Backend>(
@@ -3865,6 +3924,174 @@ mod tests {
             e.connector().call_count(),
             0,
             "and no read is issued for it"
+        );
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod shared_read_tests {
+    use super::{absorb_keyed_page, one_grouped_row, KeyedPage, SeenKeys};
+    use crate::backend::Postgres;
+    use crate::backend::Value;
+    use crate::reexec::RowPage;
+    use alloc::string::String;
+    use alloc::vec::Vec;
+
+    /// The subscription these reads belong to. Which one it is does not
+    /// matter here; it only travels into the refusal.
+    const SUBSCRIPTION: crate::SubscriptionId = 1;
+
+    /// One page holding `rows`, each row being one key column and one payload.
+    fn page(rows: &[i64], more: bool) -> RowPage<Postgres> {
+        RowPage {
+            columns: alloc::vec![String::from("id"), String::from("status")],
+            rows: rows
+                .iter()
+                .map(|id| alloc::vec![Value::Int(*id), Value::String("paid".into())])
+                .collect(),
+            more,
+        }
+    }
+
+    /// The keys `ids` name, as a batch.
+    fn batch(ids: &[i64]) -> Vec<Vec<Value<Postgres>>> {
+        ids.iter().map(|id| alloc::vec![Value::Int(*id)]).collect()
+    }
+
+    /// A page that answers every key in the batch ends the read.
+    #[test]
+    fn a_complete_page_answers_the_batch() {
+        let keys = batch(&[1, 2]);
+        let mut columns = Vec::new();
+        let mut seen = SeenKeys::new();
+        let mut present = Vec::new();
+        let outcome = absorb_keyed_page(
+            page(&[1, 2], false),
+            &keys,
+            &[0],
+            &mut columns,
+            &mut seen,
+            &mut present,
+        );
+        assert!(matches!(outcome, KeyedPage::Answered));
+        assert_eq!(present.len(), 2, "both rows were kept");
+        assert_eq!(columns, ["id", "status"], "the column names were adopted");
+    }
+
+    /// A page that claims more and answers some keys resumes on the rest.
+    #[test]
+    fn a_partial_page_resumes_on_the_keys_left() {
+        let keys = batch(&[1, 2, 3]);
+        let mut columns = Vec::new();
+        let mut seen = SeenKeys::new();
+        let mut present = Vec::new();
+        let outcome = absorb_keyed_page(
+            page(&[1], true),
+            &keys,
+            &[0],
+            &mut columns,
+            &mut seen,
+            &mut present,
+        );
+        let KeyedPage::Resume(remaining) = outcome else {
+            panic!("a page claiming more with keys left resumes");
+        };
+        assert_eq!(
+            remaining,
+            batch(&[2, 3]),
+            "only the unanswered keys go back"
+        );
+    }
+
+    /// The remaining set strictly shrinks across pages, which is what ends
+    /// the loop.
+    ///
+    /// `seen` accumulates rather than resetting per page. Resetting it
+    /// would let a key answered on an earlier page back into the next
+    /// statement, which delivers it twice and, with a stable row order,
+    /// never terminates: the remaining sets oscillate between the halves
+    /// of the batch.
+    #[test]
+    fn seen_keys_accumulate_across_pages() {
+        let keys = batch(&[1, 2, 3]);
+        let mut columns = Vec::new();
+        let mut seen = SeenKeys::new();
+        let mut present = Vec::new();
+        let first = absorb_keyed_page(
+            page(&[1], true),
+            &keys,
+            &[0],
+            &mut columns,
+            &mut seen,
+            &mut present,
+        );
+        assert!(matches!(first, KeyedPage::Resume(_)));
+        let second = absorb_keyed_page(
+            page(&[2], true),
+            &keys,
+            &[0],
+            &mut columns,
+            &mut seen,
+            &mut present,
+        );
+        let KeyedPage::Resume(remaining) = second else {
+            panic!("one key is still unanswered");
+        };
+        assert_eq!(
+            remaining,
+            batch(&[3]),
+            "the key answered on the first page does not come back"
+        );
+    }
+
+    /// A page with no new keys ends the read whatever it claims about
+    /// there being more.
+    ///
+    /// This crate's own readers cannot report that combination, but the
+    /// connector trait has outside implementors, and without this rule a
+    /// connector that did would loop forever.
+    #[test]
+    fn a_page_with_no_new_keys_ends_the_read() {
+        let keys = batch(&[1, 2]);
+        let mut columns = Vec::new();
+        let mut seen = SeenKeys::new();
+        let mut present = Vec::new();
+        let outcome = absorb_keyed_page(
+            page(&[], true),
+            &keys,
+            &[0],
+            &mut columns,
+            &mut seen,
+            &mut present,
+        );
+        assert!(
+            matches!(outcome, KeyedPage::Answered),
+            "an empty page that claims more still ends the read"
+        );
+    }
+
+    /// A grouped scalar read answers exactly one row, and anything else is
+    /// refused rather than guessed at.
+    #[test]
+    fn a_grouped_read_takes_exactly_one_row() {
+        let one = one_grouped_row::<Postgres, ()>(SUBSCRIPTION, page(&[7], false));
+        assert_eq!(
+            one.unwrap(),
+            alloc::vec![Value::Int(7), Value::String("paid".into())],
+            "one row is the answer"
+        );
+        assert!(
+            one_grouped_row::<Postgres, ()>(SUBSCRIPTION, page(&[7, 8], false)).is_err(),
+            "two rows are not one group's aggregate"
+        );
+        assert!(
+            one_grouped_row::<Postgres, ()>(SUBSCRIPTION, page(&[], false)).is_err(),
+            "no row is not one group's aggregate either"
+        );
+        assert!(
+            one_grouped_row::<Postgres, ()>(SUBSCRIPTION, page(&[7], true)).is_err(),
+            "a first page claiming a second was not the statement this tier sent"
         );
     }
 }

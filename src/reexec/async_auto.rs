@@ -302,24 +302,13 @@ where
                                 subscription: subscription_id,
                                 error,
                             })?;
-                        if page.value.more || page.value.rows.len() != 1 {
-                            return Err(crate::AggregateInstallError::RowCount {
-                                subscription: subscription_id,
-                                rows: page.value.rows.len(),
-                            }
-                            .into());
-                        }
+                        let row = super::auto::one_grouped_row(subscription_id, page.value)?;
                         let resolved = crate::Install::install(
                             &mut self.inner,
                             subscription_id,
                             crate::GroupedScalarInstall {
                                 group: group.clone(),
-                                row: page
-                                    .value
-                                    .rows
-                                    .into_iter()
-                                    .next()
-                                    .expect("the row count was checked"),
+                                row,
                                 checkpoint: trigger.checkpoint.clone(),
                             },
                         )?;
@@ -780,22 +769,8 @@ where
                         subscription,
                         error,
                     })?;
-                if page.value.more || page.value.rows.len() != 1 {
-                    return Err(crate::AggregateInstallError::RowCount {
-                        subscription,
-                        rows: page.value.rows.len(),
-                    }
-                    .into());
-                }
-                Ok(Resolved::GroupedScalar {
-                    group,
-                    row: page
-                        .value
-                        .rows
-                        .into_iter()
-                        .next()
-                        .expect("the row count was checked"),
-                })
+                let row = super::auto::one_grouped_row(subscription, page.value)?;
+                Ok(Resolved::GroupedScalar { group, row })
             }
             ResolveJob::Keyed(job) => {
                 let KeyedJob {
@@ -821,10 +796,6 @@ where
                         continue;
                     };
                     let mut page_sql = sql;
-                    // Accumulated across pages, not per page. Resetting it
-                    // would let a key answered on an earlier page back into the
-                    // next statement, which delivers it twice and, with a
-                    // stable row order, never terminates.
                     let mut seen_in_batch: super::auto::SeenKeys<E::Backend> =
                         super::auto::SeenKeys::new();
                     loop {
@@ -839,39 +810,20 @@ where
                                 subscription,
                                 error,
                             })?;
-                        if columns.is_empty() {
-                            columns.clone_from(&page.value.columns);
-                        }
-                        let before = seen_in_batch.recorded();
-                        for row in page.value.rows {
-                            let key: Vec<Value<E::Backend>> = plan
-                                .key_positions
-                                .iter()
-                                .filter_map(|i| row.get(*i).cloned())
-                                .collect();
-                            seen_in_batch.record(&key);
-                            present.push((key, row));
-                        }
-                        // A page with no rows ends the read whatever it claims
-                        // about there being more. Our own reader cannot report
-                        // that combination, but this trait has outside
-                        // implementors, and without this a connector that did
-                        // would loop here forever.
-                        if !page.value.more || seen_in_batch.recorded() == before {
-                            break;
-                        }
-                        // A batch whose rows do not fit one page resumes inside
-                        // the batch, so the statement stays bounded. No cursor
-                        // is needed, which is what keeps this tier
-                        // cancellation-safe with no server-side state to strand.
-                        let remaining: Vec<Vec<Value<E::Backend>>> = batch
-                            .iter()
-                            .filter(|k| !seen_in_batch.contains(k))
-                            .cloned()
-                            .collect();
-                        if remaining.is_empty() {
-                            break;
-                        }
+                        // Resuming inside the batch needs no cursor, which is
+                        // what keeps this tier cancellation-safe with no
+                        // server-side state to strand.
+                        let remaining = match super::auto::absorb_keyed_page(
+                            page.value,
+                            batch,
+                            &plan.key_positions,
+                            &mut columns,
+                            &mut seen_in_batch,
+                            &mut present,
+                        ) {
+                            super::auto::KeyedPage::Answered => break,
+                            super::auto::KeyedPage::Resume(remaining) => remaining,
+                        };
                         let Some(next) = scoped.render::<E::Backend>(&remaining).map_err(|e| {
                             ReExecError::Dispatch(crate::DispatchError::VmError(alloc::format!(
                                 "{e}"
