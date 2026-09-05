@@ -181,6 +181,22 @@ where
         NumericWidening::AtFloatWidth => {
             B::FLOAT_ORDER.compare(at_float_width(left)?, at_float_width(right)?)
         }
+        // An exact comparison still has to order an infinity, which has
+        // no decimal to be exact about: `BigDecimal::from_f64` answers
+        // `None` for one, the `?` propagated it, and the row was dropped
+        // as unknown. Measured on SQLite 3.51.1, which is the engine
+        // this arm serves: a `REAL` column holding `9e307 * 10` stores
+        // `inf`, and `r > i` is 1 while `i > r` is 0.
+        //
+        // Widening loses nothing in that case. An infinity outranks
+        // every finite number whatever the other side's precision, which
+        // is the only reason this arm exists.
+        NumericWidening::Exact
+            if matches!(left, Value::Float(value) if !value.is_finite())
+                || matches!(right, Value::Float(value) if !value.is_finite()) =>
+        {
+            B::FLOAT_ORDER.compare(at_float_width(left)?, at_float_width(right)?)
+        }
         NumericWidening::Exact => exactly(left)?.partial_cmp(&exactly(right)?),
     }
 }

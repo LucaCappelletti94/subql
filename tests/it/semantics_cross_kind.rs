@@ -276,3 +276,65 @@ fn same_kind_comparison_still_folds_in_process() {
         row(5, 0.0, "0", "")
     ));
 }
+
+/// An exact cross-kind comparison still orders an infinity, which has no
+/// decimal to be exact about.
+///
+/// Found by a maintainer review of the series, not by the differential
+/// sweep, and the two are complementary: the sweep writes its rows as
+/// SQL literals, and `'Infinity'` is not a numeric literal in SQLite, so
+/// the generator cannot put one in a `REAL` column at all. Arithmetic
+/// can: measured on SQLite 3.51.1,
+///
+/// ```text
+/// INSERT INTO t VALUES (9e307 * 10, 1)
+/// SELECT r, typeof(r)   inf, real
+/// SELECT r > i          1
+/// SELECT i > r          0
+/// ```
+///
+/// `NumericWidening::Exact` compared through `BigDecimal`, which has no
+/// representation for an infinity, so `from_f64` answered `None`, the
+/// `?` propagated it and the row was dropped as unknown. Widening loses
+/// nothing here: an infinity outranks every finite number whatever the
+/// other side's precision.
+#[test]
+fn sqlite_orders_an_infinity_against_an_integer() {
+    let cells = |qty: i64, price: f64| {
+        vec![
+            Value::<SQLite>::Int(1),
+            Value::Int(qty),
+            Value::Float(price),
+        ]
+    };
+    assert!(
+        notifies!(
+            SQLite,
+            SQLiteDialect,
+            SQLITE_DDL,
+            "SELECT * FROM t WHERE price > qty",
+            cells(1, f64::INFINITY)
+        ),
+        "measured as 1: an infinity is above every integer"
+    );
+    assert!(
+        !notifies!(
+            SQLite,
+            SQLiteDialect,
+            SQLITE_DDL,
+            "SELECT * FROM t WHERE qty > price",
+            cells(1, f64::INFINITY)
+        ),
+        "measured as 0, which is the same fact from the other side"
+    );
+    assert!(
+        notifies!(
+            SQLite,
+            SQLiteDialect,
+            SQLITE_DDL,
+            "SELECT * FROM t WHERE qty > price",
+            cells(1, f64::NEG_INFINITY)
+        ),
+        "and a negative infinity is below every integer"
+    );
+}
