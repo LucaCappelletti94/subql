@@ -798,6 +798,51 @@ pub enum SumRule {
     Double,
 }
 
+/// How an engine orders a float against another number.
+///
+/// IEEE leaves every pair involving `NaN` unordered, and PostgreSQL does
+/// not: measured on 16.15, `'NaN'::float8 = 'NaN'::float8` is true and
+/// `'NaN'::float8 > 1` is true, and so is the same pair widened from an
+/// `int` or a `numeric`, since the engine widens the other operand and
+/// then applies its own float order.
+///
+/// A rule rather than an arm inside one comparison, because it has to be
+/// read from two places that would otherwise disagree: the same-scalar
+/// float comparison, and the cross-kind pair that widens both sides to a
+/// double first. Spelling it twice is how `537ea04`'s correction came to
+/// reach only one of them.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum FloatOrder {
+    /// IEEE: a pair involving `NaN` has no order at all.
+    ///
+    /// MySQL and SQLite, truthfully rather than by default: measured,
+    /// MySQL refuses a non-finite double on the way into a column with
+    /// `ERROR 1367 Illegal double '1e400' value found during parsing`, so
+    /// no `NaN` cell reaches a comparison, and SQLite binds one as
+    /// `NULL`.
+    Ieee,
+    /// `NaN` equals itself and outranks every other number, PostgreSQL's
+    /// own total order.
+    NanIsGreatest,
+}
+
+impl FloatOrder {
+    /// How `left` and `right` order under this rule, or `None` when the
+    /// rule leaves them unordered.
+    #[must_use]
+    pub fn compare(self, left: f64, right: f64) -> Option<core::cmp::Ordering> {
+        match self {
+            Self::Ieee => left.partial_cmp(&right),
+            Self::NanIsGreatest => match (left.is_nan(), right.is_nan()) {
+                (true, true) => Some(core::cmp::Ordering::Equal),
+                (true, false) => Some(core::cmp::Ordering::Greater),
+                (false, true) => Some(core::cmp::Ordering::Less),
+                (false, false) => left.partial_cmp(&right),
+            },
+        }
+    }
+}
+
 /// Which shape a variance seed can read the spread back in.
 ///
 /// A stable fold keeps the sum of squared deviations, and the cheapest

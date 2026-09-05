@@ -7,3 +7,4 @@
 cc 68dacce97ed3b8cb7030d83d3cd65cf87d6a3807bff3e7d1f6589150c71b00aa # shrinks to v = Float(NaN)
 cc 0e9c8878bc1d102e0484c8a7d4a0b389882b76813ed16923ac0cf31d1ff98cc6 # shrinks to a = Float(NaN), b = Float(NaN)
 cc 02f9c2cda50aeb72ea875175b4bd15b2fc1a94e42a6a92412dd76872468dbfa8 # shrinks to a = Int(0), b = Float(inf)
+cc 21d06a36338bcacdfb8e439df31cff5579a13741f4936860ac3767409160ca82 # shrinks to a = Int(0), b = Float(NaN)

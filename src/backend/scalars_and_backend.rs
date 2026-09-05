@@ -403,6 +403,15 @@ pub trait Backend: 'static {
     /// [`DivisionRule`](super::scalar_value::DivisionRule).
     const DIVISION: super::scalar_value::DivisionRule;
 
+    /// How this engine orders a float against another number.
+    ///
+    /// Required, and per backend, because PostgreSQL defines its own
+    /// total order where IEEE defines none: measured,
+    /// `'NaN'::float8 > 1` is true, and stays true when the other
+    /// operand is an `int` or a `numeric` the engine widens. See
+    /// [`FloatOrder`](super::scalar_value::FloatOrder).
+    const FLOAT_ORDER: super::scalar_value::FloatOrder;
+
     /// Which shape this engine can hand a variance seed back in.
     ///
     /// Required, and per backend, because it is a question of what the

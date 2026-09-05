@@ -137,6 +137,10 @@ impl Backend for Custom {
         None
     }
 
+    /// This fixture stands in for PostgreSQL, so it orders floats the way
+    /// PostgreSQL does.
+    const FLOAT_ORDER: subql::backend::FloatOrder = subql::backend::FloatOrder::NanIsGreatest;
+
     /// And read a variance back the way it does, from its own answer.
     const VARIANCE_SEED: subql::backend::VarianceSeed = subql::backend::VarianceSeed::EnginesOwn;
 

@@ -175,7 +175,12 @@ where
         return None;
     }
     match B::numeric_widening(left_kind, right_kind)? {
-        NumericWidening::AtFloatWidth => at_float_width(left)?.partial_cmp(&at_float_width(right)?),
+        // Widened to a double on both sides, so this is a float pair and
+        // the engine's float order governs it. Asking IEEE here is what
+        // dropped a NaN row whose other operand was an `int`.
+        NumericWidening::AtFloatWidth => {
+            B::FLOAT_ORDER.compare(at_float_width(left)?, at_float_width(right)?)
+        }
         NumericWidening::Exact => exactly(left)?.partial_cmp(&exactly(right)?),
     }
 }
@@ -765,18 +770,27 @@ mod tests {
         }
 
         /// A NaN is ordered under this backend, not unknown: PostgreSQL puts
-        /// it above every non-NaN float and equal to another NaN, so `a < b`
-        /// holds exactly when `a` is the non-NaN side. Paired with a
-        /// non-`Float` operand it is still a cross-scalar pair, which stays
+        /// it above every non-NaN number and equal to another NaN, so
+        /// `a < b` holds exactly when `a` is the non-NaN side.
+        ///
+        /// That holds across kinds too, and this model used to say
+        /// otherwise. Measured on 16.15, `'NaN'::float8 > 1::int` and
+        /// `'NaN'::float8 > 1::numeric` are both true, because the engine
+        /// widens the other operand to a double and then applies this
+        /// order. A pair the backend does not widen at all, a float
+        /// against a string say, is still a cross-scalar pair and stays
         /// `Unknown`.
         #[test]
         fn ordered_cmp_follows_postgres_nan_order(a in arb_value(), b in arb_value()) {
             if (is_nan(&a) || is_nan(&b)) && is_present(&a) && is_present(&b) {
                 let got = compare_ordered_values(ComparisonContext::none(), &a, &b, Ordering::is_lt);
-                let expected = match (&a, &b) {
-                    (Value::Float(_), Value::Float(_)) if is_nan(&a) => Tri::False,
-                    (Value::Float(_), Value::Float(_)) => Tri::True,
-                    _ => Tri::Unknown,
+                let widened = |value: &Value<Postgres>| {
+                    matches!(value, Value::Float(_) | Value::Int(_) | Value::Decimal(_))
+                };
+                let expected = if widened(&a) && widened(&b) {
+                    if is_nan(&a) { Tri::False } else { Tri::True }
+                } else {
+                    Tri::Unknown
                 };
                 prop_assert_eq!(
                     got,

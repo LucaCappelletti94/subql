@@ -22,7 +22,8 @@ type PgEngine = SubscriptionEngine<TestEvent<Postgres>, DefaultIds, ParserDB>;
 type MySqlEngine = SubscriptionEngine<TestEvent<MySql>, DefaultIds, ParserDB>;
 type SqliteEngine = SubscriptionEngine<TestEvent<SQLite>, DefaultIds, ParserDB>;
 
-const PG_DDL: &str = "CREATE TABLE readings (id INT PRIMARY KEY, value DOUBLE PRECISION)";
+const PG_DDL: &str = "CREATE TABLE readings (id INT PRIMARY KEY, value DOUBLE PRECISION, \
+                      whole INT, exact NUMERIC)";
 const MYSQL_DDL: &str = "CREATE TABLE readings (id INT PRIMARY KEY, value DOUBLE)";
 const SQLITE_DDL: &str = "CREATE TABLE readings (id INTEGER PRIMARY KEY, value REAL)";
 
@@ -33,18 +34,37 @@ fn pg_engine() -> (PgEngine, TableId) {
 }
 
 /// One NaN row: the cell PostgreSQL orders above every number.
+///
+/// The PostgreSQL schema carries an `int` and a `numeric` beside the
+/// float so a comparison can cross kinds; the other two engines cannot
+/// hold a NaN at all, so their rows stay two columns wide.
 fn nan_row<B: subql::backend::Backend<Int = i64, Float = f64>>() -> Vec<Value<B>> {
     vec![Value::Int(1), Value::Float(f64::NAN)]
+}
+
+/// The same row over the wider PostgreSQL schema.
+fn pg_nan_row() -> Vec<Value<Postgres>> {
+    vec![
+        Value::Int(1),
+        Value::Float(f64::NAN),
+        Value::Int(1),
+        Value::Decimal(bigdecimal::BigDecimal::from(1)),
+    ]
 }
 
 /// Whether the one subscription registered for `predicate` sees the NaN row.
 fn pg_notifies(predicate: &str) -> bool {
     let (mut engine, table) = pg_engine();
-    engine
+    let registered = engine
         .register(SubscriptionRequest::new(1u64, predicate))
         .expect("the predicate registers");
+    assert!(
+        registered.not_served_because.is_none(),
+        "`{predicate}` is served in process, and this one was refused: {:?}",
+        registered.not_served_because
+    );
     let notifications = engine
-        .consumers(&TestEvent::insert(table, nan_row()))
+        .consumers(&TestEvent::insert(table, pg_nan_row()))
         .expect("dispatch succeeds");
     !notifications.inserted().is_empty()
 }
@@ -161,4 +181,62 @@ fn sqlite_keeps_the_ieee_rule() {
         notifications.inserted().is_empty(),
         "SQLite has no NaN of its own, so the IEEE rule stands"
     );
+}
+
+/// PostgreSQL's NaN order survives a widened comparison, which is where
+/// the rule stopped short.
+///
+/// Measured on PostgreSQL 16.15 with `f = 'NaN'::float8`, `i = 1::int`
+/// and `x = 1::numeric`:
+///
+/// ```text
+/// f > i    t        f > x    t        i < f    t
+/// ```
+///
+/// The engine widens the other operand and then applies its own float
+/// order, so every one of those is true. `537ea04` wrote that order into
+/// `Postgres::compare_scalars`, whose float arm only matches when both
+/// operands are already floats: a float against an `int` or a `numeric`
+/// fell through to the cross-kind path, which widened both sides and then
+/// asked IEEE `partial_cmp`, getting `None` and dropping the row.
+#[test]
+fn pg_nan_outranks_a_widened_operand() {
+    for predicate in [
+        "value > whole",
+        "value >= whole",
+        "value > exact",
+        "value >= exact",
+    ] {
+        assert!(
+            pg_notifies(&format!("SELECT * FROM readings WHERE {predicate}")),
+            "`{predicate}` is true for a NaN row, because NaN outranks every number \
+             the engine widens to a double"
+        );
+    }
+    for predicate in ["value < whole", "value <= whole", "value < exact"] {
+        assert!(
+            !pg_notifies(&format!("SELECT * FROM readings WHERE {predicate}")),
+            "`{predicate}` is false for a NaN row: nothing is above NaN"
+        );
+    }
+}
+
+/// The same comparison with the operands the other way round, because an
+/// order is only reproduced when it is antisymmetric.
+///
+/// Measured: `1::int < 'NaN'::float8` is true.
+#[test]
+fn a_widened_operand_ranks_below_pg_nan() {
+    for predicate in ["whole < value", "whole <= value", "exact < value"] {
+        assert!(
+            pg_notifies(&format!("SELECT * FROM readings WHERE {predicate}")),
+            "`{predicate}` is true: every number is below NaN"
+        );
+    }
+    for predicate in ["whole > value", "whole >= value", "exact > value"] {
+        assert!(
+            !pg_notifies(&format!("SELECT * FROM readings WHERE {predicate}")),
+            "`{predicate}` is false, which is the same fact read from the other side"
+        );
+    }
 }

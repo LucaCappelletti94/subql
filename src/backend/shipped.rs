@@ -113,6 +113,14 @@ impl<V: postgres_jsonb_canonical::PgVersion + 'static> Backend for Postgres<V> {
 
     /// Measured: `var_pop(x) * count(x)` is `2` exactly over the three
     /// rows whose sum of squares loses the answer.
+    /// Measured on 16.15: `'NaN'::float8 = 'NaN'::float8` is true,
+    /// `'NaN'::float8 > 1` is true, and so are `f > i`, `f > x` and
+    /// `i < f` for `f = 'NaN'::float8`, `i = 1::int` and `x = 1::numeric`,
+    /// since the engine widens the other operand and then applies this
+    /// order.
+    const FLOAT_ORDER: super::scalar_value::FloatOrder =
+        super::scalar_value::FloatOrder::NanIsGreatest;
+
     const VARIANCE_SEED: super::scalar_value::VarianceSeed =
         super::scalar_value::VarianceSeed::EnginesOwn;
 
@@ -304,15 +312,7 @@ impl<V: postgres_jsonb_canonical::PgVersion + 'static> Backend for Postgres<V> {
         right: &Value<Self>,
     ) -> Option<core::cmp::Ordering> {
         match (left, right) {
-            (Value::Float(x), Value::Float(y)) if x.is_nan() || y.is_nan() => {
-                Some(if x.is_nan() && y.is_nan() {
-                    core::cmp::Ordering::Equal
-                } else if x.is_nan() {
-                    core::cmp::Ordering::Greater
-                } else {
-                    core::cmp::Ordering::Less
-                })
-            }
+            (Value::Float(x), Value::Float(y)) => Self::FLOAT_ORDER.compare(*x, *y),
             _ => crate::compiler::value_cmp::structural_ordering(comparison, left, right),
         }
     }
@@ -426,6 +426,12 @@ impl Backend for MySql {
 
     /// Measured: it answers `var_pop` and `stddev_pop` digit for digit
     /// with PostgreSQL, so it can hand back its own spread too.
+    /// IEEE, and reachable only in principle: measured, MySQL refuses a
+    /// non-finite double on the way into a column with
+    /// `ERROR 1367 Illegal double '1e400' value found during parsing`, so
+    /// no `NaN` cell reaches a comparison.
+    const FLOAT_ORDER: super::scalar_value::FloatOrder = super::scalar_value::FloatOrder::Ieee;
+
     const VARIANCE_SEED: super::scalar_value::VarianceSeed =
         super::scalar_value::VarianceSeed::EnginesOwn;
 
@@ -672,6 +678,10 @@ impl Backend for SQLite {
 
     /// Measured: `no such function: VAR_POP`. SQLite has no variance
     /// function, so a seed there can only ask for a sum of squares.
+    /// IEEE, and likewise unreachable in practice: SQLite binds a
+    /// non-finite double as `NULL`, so a comparison never sees one.
+    const FLOAT_ORDER: super::scalar_value::FloatOrder = super::scalar_value::FloatOrder::Ieee;
+
     const VARIANCE_SEED: super::scalar_value::VarianceSeed =
         super::scalar_value::VarianceSeed::SumOfSquares;
 
