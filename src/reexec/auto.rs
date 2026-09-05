@@ -1856,6 +1856,9 @@ where
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
+    use super::super::test_fixtures::{
+        catalog, delete_event, insert_event, row, update_status_only,
+    };
     use super::*;
     use crate::backend::Postgres;
     use crate::testing::TestEvent;
@@ -1864,13 +1867,6 @@ mod tests {
     use core::cell::RefCell;
     use sql_traits::structs::ParserDB;
     use sqlparser::dialect::PostgreSqlDialect;
-
-    fn catalog() -> ParserDB {
-        ParserDB::parse::<PostgreSqlDialect>(
-            "CREATE TABLE orders (id INT PRIMARY KEY, price FLOAT, quantity INT, status TEXT);",
-        )
-        .unwrap()
-    }
 
     /// Records every call and serves a programmed value queue. Errors are
     /// modeled by leaving the queue empty when `panic_on_empty` is false.
@@ -2036,30 +2032,6 @@ mod tests {
         fn into_request(self) -> SubscriptionRequest<DefaultIds, Postgres> {
             self.0
         }
-    }
-
-    /// orders columns: id=0, price=1, quantity=2, status=3.
-    fn row(id: i64, price: f64) -> Vec<Value<Postgres>> {
-        alloc::vec![
-            Value::Int(id),
-            Value::Float(price),
-            Value::Int(1),
-            Value::String("paid".into()),
-        ]
-    }
-
-    fn insert_event(table_id: TableId, id: i64, price: f64) -> TestEvent<Postgres> {
-        TestEvent::<Postgres>::insert(table_id, row(id, price)).with_pk_columns([0u16])
-    }
-
-    fn delete_event(table_id: TableId, id: i64, price: f64) -> TestEvent<Postgres> {
-        TestEvent::<Postgres>::delete(table_id, row(id, price)).with_pk_columns([0u16])
-    }
-
-    fn update_status_only(table_id: TableId, id: i64, price: f64) -> TestEvent<Postgres> {
-        TestEvent::<Postgres>::update(table_id, row(id, price), row(id, price))
-            .with_pk_columns([0u16])
-            .with_changed_columns([3u16])
     }
 
     fn engine_with_values(

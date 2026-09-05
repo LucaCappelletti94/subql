@@ -1016,6 +1016,9 @@ where
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::super::connector::Snapshot;
+    use super::super::test_fixtures::{
+        catalog, delete_event, insert_event, row, update_status_only,
+    };
     use super::*;
     use crate::backend::{BuiltinKind, Postgres};
     use crate::testing::TestEvent;
@@ -1055,13 +1058,6 @@ mod tests {
                 return v;
             }
         }
-    }
-
-    fn catalog() -> ParserDB {
-        ParserDB::parse::<PostgreSqlDialect>(
-            "CREATE TABLE orders (id INT PRIMARY KEY, price FLOAT, quantity INT, status TEXT);",
-        )
-        .unwrap()
     }
 
     /// `parking_lot::Mutex`-backed mock so the futures are `Send`.
@@ -1242,29 +1238,6 @@ mod tests {
             self.log.lock().push("close");
             core::future::ready(Ok(()))
         }
-    }
-
-    fn row(id: i64, price: f64) -> Vec<Value<Postgres>> {
-        alloc::vec![
-            Value::Int(id),
-            Value::Float(price),
-            Value::Int(1),
-            Value::String("paid".into()),
-        ]
-    }
-
-    fn insert_event(table_id: TableId, id: i64, price: f64) -> TestEvent<Postgres> {
-        TestEvent::<Postgres>::insert(table_id, row(id, price)).with_pk_columns([0u16])
-    }
-
-    fn delete_event(table_id: TableId, id: i64, price: f64) -> TestEvent<Postgres> {
-        TestEvent::<Postgres>::delete(table_id, row(id, price)).with_pk_columns([0u16])
-    }
-
-    fn update_status_only(table_id: TableId, id: i64, price: f64) -> TestEvent<Postgres> {
-        TestEvent::<Postgres>::update(table_id, row(id, price), row(id, price))
-            .with_pk_columns([0u16])
-            .with_changed_columns([3u16])
     }
 
     fn engine_with_values(
