@@ -45,6 +45,7 @@
 #![allow(clippy::unwrap_used)]
 
 use bigdecimal::BigDecimal;
+#[cfg(feature = "pg-streaming")]
 use diesel::{sql_query, RunQueryDsl};
 use sql_traits::structs::ParserDB;
 use subql::backend::{Backend, CdcEvent, CellPresence, RowKind, Value};
@@ -191,6 +192,7 @@ where
     }
 }
 
+#[cfg(feature = "pg-streaming")]
 /// A nullable `bigint` read back from the server.
 #[derive(diesel::QueryableByName)]
 struct NullableInt {
@@ -198,6 +200,7 @@ struct NullableInt {
     value: Option<i64>,
 }
 
+#[cfg(feature = "pg-streaming")]
 /// A nullable boolean read back from the server.
 #[derive(diesel::QueryableByName)]
 struct NullableFlag {
@@ -205,6 +208,7 @@ struct NullableFlag {
     value: Option<bool>,
 }
 
+#[cfg(feature = "pg-streaming")]
 /// A nullable `numeric`, which is what PostgreSQL answers for a sum over
 /// a `bigint` column: measured, `pg_typeof(SUM(wide))` is `numeric`, and
 /// that is the type Phase D1b had to make subql sum into.
@@ -229,6 +233,10 @@ pub struct ServerRow {
     pub sum_wide: Option<BigDecimal>,
 }
 
+// Reading a row back needs a live connection, which only the streaming
+// feature brings in. The struct itself stays: `assert_agrees` compares
+// against one however it was built.
+#[cfg(feature = "pg-streaming")]
 impl ServerRow {
     /// Read it off a live PostgreSQL connection.
     ///
@@ -360,326 +368,21 @@ pub fn assert_agrees<B: Backend>(
 
 #[cfg(test)]
 mod tests {
+    use super::super::oracle::OracleCase;
     use super::{answers_for, assert_agrees, Answers, Folded, ServerRow};
-    use crate::common;
-    use crate::differential::oracle::{Oracle as _, OracleCase, PgOracle};
-    use diesel::{sql_query, RunQueryDsl};
     use sql_traits::structs::ParserDB;
     use sqlparser::dialect::PostgreSqlDialect;
-    use subql::backend::{CdcEvent as _, CellPresence, Postgres, RowKind, Value};
+    use subql::backend::{CellPresence, Postgres, Value};
     use subql::testing::TestEvent;
-    use subql::{
-        catalog_helpers, CdcSource as _, EventKind, PgLsn, PgStreamingCdcSource, PgStreamingConfig,
-    };
+    use subql::{catalog_helpers, PgLsn};
 
     /// The columns this phase's cases read. `wide` is the integer the
     /// comparison holds exactly, `padded` is a `char(n)`, and `bulky` is
     /// large enough to be TOASTed, which is what makes the `Missing`
     /// path reachable at all.
-    const DDL: &str = "CREATE TABLE t (id INT PRIMARY KEY, wide BIGINT, \
+    pub(super) const DDL: &str = "CREATE TABLE t (id INT PRIMARY KEY, wide BIGINT, \
                        padded CHAR(5), bulky TEXT)";
-    const COLUMNS: &[&str] = &["id", "wide", "padded", "bulky"];
-
-    fn current_thread_rt() -> tokio::runtime::Runtime {
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("a current-thread runtime builds")
-    }
-
-    /// Stand up PostgreSQL, create the table with a full replica
-    /// identity and a slot, run `dml`, and return the change event the
-    /// server streamed for it.
-    ///
-    /// Everything about this is the outer layer: the event is decoded
-    /// from the wire by the same code a deployment runs, not built in
-    /// the test.
-    fn streamed(slot: &str, dml: &str) -> (Container, diesel::PgConnection, subql::ChangeEvent) {
-        common::assert_docker_available();
-        let container = common::pg_with_wal2json();
-        let port = common::pg_port(&container);
-        let mut setup = common::pg_connect(port);
-        let mut writer = common::pg_connect(port);
-
-        sql_query(DDL)
-            .execute(&mut setup)
-            .expect("create the table");
-        sql_query("ALTER TABLE t REPLICA IDENTITY FULL")
-            .execute(&mut setup)
-            .expect("a full replica identity");
-        let publication = format!("{slot}_pub");
-        common::create_publication(&mut setup, &publication, "t");
-        common::create_pgoutput_slot(&mut setup, slot);
-
-        let catalog = ParserDB::parse::<PostgreSqlDialect>(DDL).expect("the DDL parses");
-        let config = PgStreamingConfig::new(common::pg_replication_url(port), slot, &publication);
-
-        let event = current_thread_rt().block_on(async move {
-            let mut source = PgStreamingCdcSource::connect(config, catalog)
-                .await
-                .expect("the replication connection opens");
-            sql_query(dml).execute(&mut writer).expect("the DML lands");
-            tokio::time::timeout(core::time::Duration::from_secs(10), source.next_event())
-                .await
-                .expect("the server streams the event")
-                .expect("the stream does not error")
-                .expect("the source is still open")
-        });
-        (container, setup, event)
-    }
-
-    type Container = testcontainers::Container<testcontainers::GenericImage>;
-
-    /// The outer layer reads a real event off the replication slot, and
-    /// what arrives is the INSERT that was issued.
-    ///
-    /// The weakest of the four and still worth its place: if this fails,
-    /// every assertion below is comparing against nothing.
-    #[test]
-    #[ignore = "requires Docker; run with --ignored"]
-    fn outer_layer_reads_the_event_off_the_stream() {
-        let (_container, mut setup, event) = streamed(
-            "sdr_outer_reads",
-            "INSERT INTO t (id, wide, padded, bulky) VALUES (1, 42, 'ab', 'x')",
-        );
-        assert_eq!(
-            event.kind(),
-            EventKind::Insert,
-            "the event off the slot is the INSERT that was issued"
-        );
-        assert!(
-            event.checkpoint().is_some(),
-            "a streamed event carries the LSN it was read at, which is what an ack advances"
-        );
-        common::drop_slot(&mut setup, "sdr_outer_reads");
-    }
-
-    /// Every cell the event carries says about the row what the server
-    /// says about it.
-    ///
-    /// This is the assertion no constructed event can make, because a
-    /// constructed event is built from the values the test already knows.
-    #[test]
-    #[ignore = "requires Docker; run with --ignored"]
-    fn decoded_cell_matches_the_engine_value() {
-        let (_container, mut setup, event) = streamed(
-            "sdr_decoded_cell",
-            "INSERT INTO t (id, wide, padded, bulky) VALUES (1, 9007199254740993, 'ab', NULL)",
-        );
-        let answers = answers_for(
-            DDL,
-            PostgreSqlDialect {},
-            "wide = 9007199254740993",
-            "SELECT SUM(wide) FROM t",
-            &event,
-        );
-        let server = ServerRow::read_pg(&mut setup, COLUMNS);
-        assert_agrees(
-            &answers,
-            &server,
-            &crate::differential::oracle::OracleVerdict::Answered(subql::compiler::Tri::True),
-            &OracleCase {
-                ddl: &[DDL],
-                insert: "",
-                predicate: "wide = 9007199254740993",
-            },
-        );
-        assert_eq!(
-            answers.wide,
-            Some(Value::Int(9_007_199_254_740_993)),
-            "a value one past 2^53 survives the wire, which is the boundary D1b had to correct"
-        );
-        common::drop_slot(&mut setup, "sdr_decoded_cell");
-    }
-
-    /// Whether subql selects the row is what the engine answers for the
-    /// same predicate over the same row.
-    #[test]
-    #[ignore = "requires Docker; run with --ignored"]
-    fn dispatch_verdict_matches_the_oracle() {
-        let (container, mut setup, event) = streamed(
-            "sdr_dispatch",
-            "INSERT INTO t (id, wide, padded, bulky) VALUES (1, 7, 'ab   ', 'x')",
-        );
-        // A `char(5)` holding 'ab' padded to width: measured in Phase
-        // C5, PostgreSQL compares it equal to 'ab' because the
-        // comparison ignores the padding, and comparing the decoded
-        // text byte for byte does not.
-        let predicate = "padded = 'ab'";
-        let port = common::pg_port(&container);
-        let mut oracle = PgOracle {
-            connection: common::pg_connect(port),
-        };
-        let verdict = oracle.answer(&OracleCase {
-            ddl: &[DDL],
-            insert: "INSERT INTO t (id, wide, padded, bulky) VALUES (1, 7, 'ab   ', 'x')",
-            predicate,
-        });
-        let answers = answers_for(
-            DDL,
-            PostgreSqlDialect {},
-            predicate,
-            "SELECT SUM(wide) FROM t",
-            &event,
-        );
-        assert!(
-            answers.dispatch.is_some(),
-            "a `char(n)` comparison is served in process, so there is a verdict to compare"
-        );
-        let server = ServerRow::read_pg(&mut setup, COLUMNS);
-        assert_agrees(
-            &answers,
-            &server,
-            &verdict,
-            &OracleCase {
-                ddl: &[DDL],
-                insert: "",
-                predicate,
-            },
-        );
-        common::drop_slot(&mut setup, "sdr_dispatch");
-    }
-
-    /// The folded aggregate is what the engine's own `SUM` answers over
-    /// the same row.
-    #[test]
-    #[ignore = "requires Docker; run with --ignored"]
-    fn folded_aggregate_matches_the_engine() {
-        let (_container, mut setup, event) = streamed(
-            "sdr_folded",
-            "INSERT INTO t (id, wide, padded, bulky) VALUES (1, 9007199254740993, 'ab', 'x')",
-        );
-        let answers = answers_for(
-            DDL,
-            PostgreSqlDialect {},
-            "wide > 0",
-            "SELECT SUM(wide) FROM t",
-            &event,
-        );
-        assert!(
-            matches!(&answers.folded, Folded::Value(_)),
-            "`SUM(wide)` over a BIGINT column is served and folded in process, got {:?}",
-            answers.folded
-        );
-        let server = ServerRow::read_pg(&mut setup, COLUMNS);
-        assert_agrees(
-            &answers,
-            &server,
-            &crate::differential::oracle::OracleVerdict::Answered(subql::compiler::Tri::True),
-            &OracleCase {
-                ddl: &[DDL],
-                insert: "",
-                predicate: "wide > 0",
-            },
-        );
-        common::drop_slot(&mut setup, "sdr_folded");
-    }
-
-    /// The inner layer cannot answer for a cell the stream did not
-    /// carry, so it cannot be the only layer.
-    ///
-    /// An `UPDATE` that leaves a TOASTed column alone is streamed without
-    /// that column's value: the server sends what changed, and a
-    /// megabyte of unchanged text is not resent. The outer layer sees
-    /// [`CellPresence::Missing`] and subql re-executes. A constructed
-    /// event built from the same table sees a value, because a
-    /// constructed row is written from what the test already read. That
-    /// gap is the defect `d4e07bc` corrected, and this test is the
-    /// standing proof that deleting the outer layer would hide it again.
-    #[test]
-    #[ignore = "requires Docker; run with --ignored"]
-    fn inner_layer_cannot_stand_alone() {
-        let bulky = "z".repeat(64 * 1024);
-        let slot = "sdr_toast";
-        common::assert_docker_available();
-        let container = common::pg_with_wal2json();
-        let port = common::pg_port(&container);
-        let mut setup = common::pg_connect(port);
-        let mut writer = common::pg_connect(port);
-
-        sql_query(DDL)
-            .execute(&mut setup)
-            .expect("create the table");
-        // Size alone does not make a column TOASTed, which is what the
-        // first attempt at this test got wrong. Measured on PostgreSQL
-        // 16: 64 KiB of one repeated character compresses to 762 bytes
-        // and stays inline, so the server resends it on every UPDATE and
-        // the Missing path is never reached. `SET STORAGE EXTERNAL` turns
-        // compression off, the same 64 KiB then occupies 65536 bytes out
-        // of line, and an UPDATE that leaves it alone omits it.
-        sql_query("ALTER TABLE t ALTER COLUMN bulky SET STORAGE EXTERNAL")
-            .execute(&mut setup)
-            .expect("the column stores out of line, uncompressed");
-        // DEFAULT, not FULL: a full identity resends the old row, and the
-        // point here is the column the server declines to resend.
-        sql_query("ALTER TABLE t REPLICA IDENTITY DEFAULT")
-            .execute(&mut setup)
-            .expect("the default replica identity");
-        sql_query(format!(
-            "INSERT INTO t (id, wide, padded, bulky) VALUES (1, 1, 'ab', '{bulky}')"
-        ))
-        .execute(&mut setup)
-        .expect("the wide row lands");
-        let publication = format!("{slot}_pub");
-        common::create_publication(&mut setup, &publication, "t");
-        common::create_pgoutput_slot(&mut setup, slot);
-
-        let catalog = ParserDB::parse::<PostgreSqlDialect>(DDL).expect("the DDL parses");
-        let config = PgStreamingConfig::new(common::pg_replication_url(port), slot, &publication);
-        let event = current_thread_rt().block_on(async move {
-            let mut source = PgStreamingCdcSource::connect(config, catalog)
-                .await
-                .expect("the replication connection opens");
-            sql_query("UPDATE t SET wide = 2 WHERE id = 1")
-                .execute(&mut writer)
-                .expect("the update lands");
-            tokio::time::timeout(core::time::Duration::from_secs(10), source.next_event())
-                .await
-                .expect("the server streams the event")
-                .expect("the stream does not error")
-                .expect("the source is still open")
-        });
-
-        let database = ParserDB::parse::<PostgreSqlDialect>(DDL).expect("the DDL parses");
-        let table = catalog_helpers::table_id(&database, "t").expect("the table is in the catalog");
-        let bulky_column =
-            catalog_helpers::column_id(&database, table, "bulky").expect("`bulky` is a column");
-
-        assert_eq!(
-            event.presence_at(&database, RowKind::New, bulky_column),
-            CellPresence::Missing,
-            "an UPDATE that leaves a TOASTed column alone streams without it, which is the \
-             only reason the Missing path exists"
-        );
-
-        // The same row, as the inner layer would build it: every cell
-        // written from what the test knows, so nothing is missing and the
-        // Missing path is unreachable from here.
-        let constructed: TestEvent<Postgres, PgLsn> = TestEvent::update(
-            table,
-            vec![
-                Value::Int(1),
-                Value::Int(1),
-                Value::String("ab   ".to_string()),
-                Value::String(bulky.clone()),
-            ],
-            vec![
-                Value::Int(1),
-                Value::Int(2),
-                Value::String("ab   ".to_string()),
-                Value::String(bulky),
-            ],
-        )
-        .with_pk_columns([0u16]);
-        assert_eq!(
-            constructed.presence_at(&database, RowKind::New, bulky_column),
-            CellPresence::Present,
-            "a constructed event carries every cell, so the inner layer can never produce \
-             the case the outer layer just produced: it cannot stand alone"
-        );
-
-        common::drop_slot(&mut setup, slot);
-    }
+    pub(super) const COLUMNS: &[&str] = &["id", "wide", "padded", "bulky"];
 
     /// The three answers are read from the same event, so a divergence
     /// names one layer rather than the pair.
@@ -842,5 +545,322 @@ mod tests {
         let (mut answers, server) = agreeing_pair();
         answers.folded = Folded::NoUpdate;
         assert_agrees(&answers, &server, &verdict(true), &case());
+    }
+}
+
+/// The outer layer, which only exists when the streaming source is
+/// compiled in.
+///
+/// `pg-streaming` is what brings [`PgStreamingCdcSource`] into the build,
+/// and without it there is no replication slot to read: the inner-layer
+/// tests above still run, which is exactly the asymmetry
+/// [`inner_layer_cannot_stand_alone`] is about.
+#[cfg(all(test, feature = "pg-streaming"))]
+mod streamed_tests {
+    use super::tests::{COLUMNS, DDL};
+    use super::{answers_for, assert_agrees, Folded, ServerRow};
+    use crate::common;
+    use crate::differential::oracle::{Oracle as _, OracleCase, PgOracle};
+    use diesel::{sql_query, RunQueryDsl};
+    use sql_traits::structs::ParserDB;
+    use sqlparser::dialect::PostgreSqlDialect;
+    use subql::backend::{CdcEvent as _, CellPresence, Postgres, RowKind, Value};
+    use subql::testing::TestEvent;
+    use subql::{
+        catalog_helpers, CdcSource as _, EventKind, PgLsn, PgStreamingCdcSource, PgStreamingConfig,
+    };
+
+    type Container = testcontainers::Container<testcontainers::GenericImage>;
+    fn current_thread_rt() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a current-thread runtime builds")
+    }
+    /// Stand up PostgreSQL, create the table with a full replica
+    /// identity and a slot, run `dml`, and return the change event the
+    /// server streamed for it.
+    ///
+    /// Everything about this is the outer layer: the event is decoded
+    /// from the wire by the same code a deployment runs, not built in
+    /// the test.
+    fn streamed(slot: &str, dml: &str) -> (Container, diesel::PgConnection, subql::ChangeEvent) {
+        common::assert_docker_available();
+        let container = common::pg_with_wal2json();
+        let port = common::pg_port(&container);
+        let mut setup = common::pg_connect(port);
+        let mut writer = common::pg_connect(port);
+
+        sql_query(DDL)
+            .execute(&mut setup)
+            .expect("create the table");
+        sql_query("ALTER TABLE t REPLICA IDENTITY FULL")
+            .execute(&mut setup)
+            .expect("a full replica identity");
+        let publication = format!("{slot}_pub");
+        common::create_publication(&mut setup, &publication, "t");
+        common::create_pgoutput_slot(&mut setup, slot);
+
+        let catalog = ParserDB::parse::<PostgreSqlDialect>(DDL).expect("the DDL parses");
+        let config = PgStreamingConfig::new(common::pg_replication_url(port), slot, &publication);
+
+        let event = current_thread_rt().block_on(async move {
+            let mut source = PgStreamingCdcSource::connect(config, catalog)
+                .await
+                .expect("the replication connection opens");
+            sql_query(dml).execute(&mut writer).expect("the DML lands");
+            tokio::time::timeout(core::time::Duration::from_secs(10), source.next_event())
+                .await
+                .expect("the server streams the event")
+                .expect("the stream does not error")
+                .expect("the source is still open")
+        });
+        (container, setup, event)
+    }
+    /// The outer layer reads a real event off the replication slot, and
+    /// what arrives is the INSERT that was issued.
+    ///
+    /// The weakest of the four and still worth its place: if this fails,
+    /// every assertion below is comparing against nothing.
+    #[test]
+    #[ignore = "requires Docker; run with --ignored"]
+    fn outer_layer_reads_the_event_off_the_stream() {
+        let (_container, mut setup, event) = streamed(
+            "sdr_outer_reads",
+            "INSERT INTO t (id, wide, padded, bulky) VALUES (1, 42, 'ab', 'x')",
+        );
+        assert_eq!(
+            event.kind(),
+            EventKind::Insert,
+            "the event off the slot is the INSERT that was issued"
+        );
+        assert!(
+            event.checkpoint().is_some(),
+            "a streamed event carries the LSN it was read at, which is what an ack advances"
+        );
+        common::drop_slot(&mut setup, "sdr_outer_reads");
+    }
+    /// Every cell the event carries says about the row what the server
+    /// says about it.
+    ///
+    /// This is the assertion no constructed event can make, because a
+    /// constructed event is built from the values the test already knows.
+    #[test]
+    #[ignore = "requires Docker; run with --ignored"]
+    fn decoded_cell_matches_the_engine_value() {
+        let (_container, mut setup, event) = streamed(
+            "sdr_decoded_cell",
+            "INSERT INTO t (id, wide, padded, bulky) VALUES (1, 9007199254740993, 'ab', NULL)",
+        );
+        let answers = answers_for(
+            DDL,
+            PostgreSqlDialect {},
+            "wide = 9007199254740993",
+            "SELECT SUM(wide) FROM t",
+            &event,
+        );
+        let server = ServerRow::read_pg(&mut setup, COLUMNS);
+        assert_agrees(
+            &answers,
+            &server,
+            &crate::differential::oracle::OracleVerdict::Answered(subql::compiler::Tri::True),
+            &OracleCase {
+                ddl: &[DDL],
+                insert: "",
+                predicate: "wide = 9007199254740993",
+            },
+        );
+        assert_eq!(
+            answers.wide,
+            Some(Value::Int(9_007_199_254_740_993)),
+            "a value one past 2^53 survives the wire, which is the boundary D1b had to correct"
+        );
+        common::drop_slot(&mut setup, "sdr_decoded_cell");
+    }
+    /// Whether subql selects the row is what the engine answers for the
+    /// same predicate over the same row.
+    #[test]
+    #[ignore = "requires Docker; run with --ignored"]
+    fn dispatch_verdict_matches_the_oracle() {
+        let (container, mut setup, event) = streamed(
+            "sdr_dispatch",
+            "INSERT INTO t (id, wide, padded, bulky) VALUES (1, 7, 'ab   ', 'x')",
+        );
+        // A `char(5)` holding 'ab' padded to width: measured in Phase
+        // C5, PostgreSQL compares it equal to 'ab' because the
+        // comparison ignores the padding, and comparing the decoded
+        // text byte for byte does not.
+        let predicate = "padded = 'ab'";
+        let port = common::pg_port(&container);
+        let mut oracle = PgOracle {
+            connection: common::pg_connect(port),
+        };
+        let verdict = oracle.answer(&OracleCase {
+            ddl: &[DDL],
+            insert: "INSERT INTO t (id, wide, padded, bulky) VALUES (1, 7, 'ab   ', 'x')",
+            predicate,
+        });
+        let answers = answers_for(
+            DDL,
+            PostgreSqlDialect {},
+            predicate,
+            "SELECT SUM(wide) FROM t",
+            &event,
+        );
+        assert!(
+            answers.dispatch.is_some(),
+            "a `char(n)` comparison is served in process, so there is a verdict to compare"
+        );
+        let server = ServerRow::read_pg(&mut setup, COLUMNS);
+        assert_agrees(
+            &answers,
+            &server,
+            &verdict,
+            &OracleCase {
+                ddl: &[DDL],
+                insert: "",
+                predicate,
+            },
+        );
+        common::drop_slot(&mut setup, "sdr_dispatch");
+    }
+    /// The folded aggregate is what the engine's own `SUM` answers over
+    /// the same row.
+    #[test]
+    #[ignore = "requires Docker; run with --ignored"]
+    fn folded_aggregate_matches_the_engine() {
+        let (_container, mut setup, event) = streamed(
+            "sdr_folded",
+            "INSERT INTO t (id, wide, padded, bulky) VALUES (1, 9007199254740993, 'ab', 'x')",
+        );
+        let answers = answers_for(
+            DDL,
+            PostgreSqlDialect {},
+            "wide > 0",
+            "SELECT SUM(wide) FROM t",
+            &event,
+        );
+        assert!(
+            matches!(&answers.folded, Folded::Value(_)),
+            "`SUM(wide)` over a BIGINT column is served and folded in process, got {:?}",
+            answers.folded
+        );
+        let server = ServerRow::read_pg(&mut setup, COLUMNS);
+        assert_agrees(
+            &answers,
+            &server,
+            &crate::differential::oracle::OracleVerdict::Answered(subql::compiler::Tri::True),
+            &OracleCase {
+                ddl: &[DDL],
+                insert: "",
+                predicate: "wide > 0",
+            },
+        );
+        common::drop_slot(&mut setup, "sdr_folded");
+    }
+    /// The inner layer cannot answer for a cell the stream did not
+    /// carry, so it cannot be the only layer.
+    ///
+    /// An `UPDATE` that leaves a TOASTed column alone is streamed without
+    /// that column's value: the server sends what changed, and a
+    /// megabyte of unchanged text is not resent. The outer layer sees
+    /// [`CellPresence::Missing`] and subql re-executes. A constructed
+    /// event built from the same table sees a value, because a
+    /// constructed row is written from what the test already read. That
+    /// gap is the defect `d4e07bc` corrected, and this test is the
+    /// standing proof that deleting the outer layer would hide it again.
+    #[test]
+    #[ignore = "requires Docker; run with --ignored"]
+    fn inner_layer_cannot_stand_alone() {
+        let bulky = "z".repeat(64 * 1024);
+        let slot = "sdr_toast";
+        common::assert_docker_available();
+        let container = common::pg_with_wal2json();
+        let port = common::pg_port(&container);
+        let mut setup = common::pg_connect(port);
+        let mut writer = common::pg_connect(port);
+
+        sql_query(DDL)
+            .execute(&mut setup)
+            .expect("create the table");
+        // Size alone does not make a column TOASTed, which is what the
+        // first attempt at this test got wrong. Measured on PostgreSQL
+        // 16: 64 KiB of one repeated character compresses to 762 bytes
+        // and stays inline, so the server resends it on every UPDATE and
+        // the Missing path is never reached. `SET STORAGE EXTERNAL` turns
+        // compression off, the same 64 KiB then occupies 65536 bytes out
+        // of line, and an UPDATE that leaves it alone omits it.
+        sql_query("ALTER TABLE t ALTER COLUMN bulky SET STORAGE EXTERNAL")
+            .execute(&mut setup)
+            .expect("the column stores out of line, uncompressed");
+        // DEFAULT, not FULL: a full identity resends the old row, and the
+        // point here is the column the server declines to resend.
+        sql_query("ALTER TABLE t REPLICA IDENTITY DEFAULT")
+            .execute(&mut setup)
+            .expect("the default replica identity");
+        sql_query(format!(
+            "INSERT INTO t (id, wide, padded, bulky) VALUES (1, 1, 'ab', '{bulky}')"
+        ))
+        .execute(&mut setup)
+        .expect("the wide row lands");
+        let publication = format!("{slot}_pub");
+        common::create_publication(&mut setup, &publication, "t");
+        common::create_pgoutput_slot(&mut setup, slot);
+
+        let catalog = ParserDB::parse::<PostgreSqlDialect>(DDL).expect("the DDL parses");
+        let config = PgStreamingConfig::new(common::pg_replication_url(port), slot, &publication);
+        let event = current_thread_rt().block_on(async move {
+            let mut source = PgStreamingCdcSource::connect(config, catalog)
+                .await
+                .expect("the replication connection opens");
+            sql_query("UPDATE t SET wide = 2 WHERE id = 1")
+                .execute(&mut writer)
+                .expect("the update lands");
+            tokio::time::timeout(core::time::Duration::from_secs(10), source.next_event())
+                .await
+                .expect("the server streams the event")
+                .expect("the stream does not error")
+                .expect("the source is still open")
+        });
+
+        let database = ParserDB::parse::<PostgreSqlDialect>(DDL).expect("the DDL parses");
+        let table = catalog_helpers::table_id(&database, "t").expect("the table is in the catalog");
+        let bulky_column =
+            catalog_helpers::column_id(&database, table, "bulky").expect("`bulky` is a column");
+
+        assert_eq!(
+            event.presence_at(&database, RowKind::New, bulky_column),
+            CellPresence::Missing,
+            "an UPDATE that leaves a TOASTed column alone streams without it, which is the \
+             only reason the Missing path exists"
+        );
+
+        // The same row, as the inner layer would build it: every cell
+        // written from what the test knows, so nothing is missing and the
+        // Missing path is unreachable from here.
+        let constructed: TestEvent<Postgres, PgLsn> = TestEvent::update(
+            table,
+            vec![
+                Value::Int(1),
+                Value::Int(1),
+                Value::String("ab   ".to_string()),
+                Value::String(bulky.clone()),
+            ],
+            vec![
+                Value::Int(1),
+                Value::Int(2),
+                Value::String("ab   ".to_string()),
+                Value::String(bulky),
+            ],
+        )
+        .with_pk_columns([0u16]);
+        assert_eq!(
+            constructed.presence_at(&database, RowKind::New, bulky_column),
+            CellPresence::Present,
+            "a constructed event carries every cell, so the inner layer can never produce \
+             the case the outer layer just produced: it cannot stand alone"
+        );
+
+        common::drop_slot(&mut setup, slot);
     }
 }

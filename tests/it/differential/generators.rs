@@ -843,6 +843,16 @@ mod tests {
         assert_schema_creates(&mut oracle, Engine::Postgres);
     }
 
+    #[cfg(any(
+        feature = "executor-diesel-postgres",
+        feature = "executor-diesel-async-postgres",
+        feature = "executor-diesel-postgres-r2d2",
+        feature = "executor-diesel-mysql",
+        feature = "executor-diesel-async-mysql",
+        feature = "diesel-typed-mysql",
+        feature = "apply-patchset-mysql",
+        feature = "apply-patchset-mysql-async",
+    ))]
     #[test]
     #[ignore = "requires Docker; run with --ignored"]
     fn the_generated_schema_creates_on_mysql() {
@@ -910,6 +920,16 @@ mod tests {
         assert_rows_are_readable(&mut oracle, Engine::Postgres);
     }
 
+    #[cfg(any(
+        feature = "executor-diesel-postgres",
+        feature = "executor-diesel-async-postgres",
+        feature = "executor-diesel-postgres-r2d2",
+        feature = "executor-diesel-mysql",
+        feature = "executor-diesel-async-mysql",
+        feature = "diesel-typed-mysql",
+        feature = "apply-patchset-mysql",
+        feature = "apply-patchset-mysql-async",
+    ))]
     #[test]
     #[ignore = "requires Docker; run with --ignored"]
     fn generated_rows_are_readable_by_mysql() {

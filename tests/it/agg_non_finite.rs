@@ -216,6 +216,16 @@ fn sqlite_folds_infinity() {
 /// MySQL never delivers a non-finite double, because it refuses the value
 /// while parsing the statement. Asserted against a real server, since
 /// that is the only place the refusal exists.
+#[cfg(any(
+    feature = "executor-diesel-postgres",
+    feature = "executor-diesel-async-postgres",
+    feature = "executor-diesel-postgres-r2d2",
+    feature = "executor-diesel-mysql",
+    feature = "executor-diesel-async-mysql",
+    feature = "diesel-typed-mysql",
+    feature = "apply-patchset-mysql",
+    feature = "apply-patchset-mysql-async",
+))]
 #[test]
 #[ignore = "requires Docker; run with --ignored"]
 fn mysql_refuses_a_non_finite_double() {

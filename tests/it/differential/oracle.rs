@@ -303,6 +303,17 @@ mod tests {
     use subql::compiler::Tri;
 
     const PG_DDL: &str = "CREATE TABLE t (id INT PRIMARY KEY, amount INT, label TEXT)";
+    // Only the MySQL case reads it, and that case needs a MySQL client.
+    #[cfg(any(
+        feature = "executor-diesel-postgres",
+        feature = "executor-diesel-async-postgres",
+        feature = "executor-diesel-postgres-r2d2",
+        feature = "executor-diesel-mysql",
+        feature = "executor-diesel-async-mysql",
+        feature = "diesel-typed-mysql",
+        feature = "apply-patchset-mysql",
+        feature = "apply-patchset-mysql-async",
+    ))]
     const MYSQL_DDL: &str = "CREATE TABLE t (id INT PRIMARY KEY, amount INT, \
                              label VARCHAR(64) COLLATE utf8mb4_bin)";
     const SQLITE_DDL: &str = "CREATE TABLE t (id INTEGER PRIMARY KEY, amount INTEGER, label TEXT)";
@@ -347,6 +358,16 @@ mod tests {
         assert_tri_state(&mut oracle, PG_DDL);
     }
 
+    #[cfg(any(
+        feature = "executor-diesel-postgres",
+        feature = "executor-diesel-async-postgres",
+        feature = "executor-diesel-postgres-r2d2",
+        feature = "executor-diesel-mysql",
+        feature = "executor-diesel-async-mysql",
+        feature = "diesel-typed-mysql",
+        feature = "apply-patchset-mysql",
+        feature = "apply-patchset-mysql-async",
+    ))]
     #[test]
     #[ignore = "requires Docker; run with --ignored"]
     fn mysql_oracle_answers_the_tri_state() {

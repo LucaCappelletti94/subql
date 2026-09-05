@@ -22,10 +22,15 @@
 //! the auto wrapper's job, which is where the connector lives.
 #![allow(clippy::unwrap_used)]
 
+// Only the streaming test reads a live slot, so only it needs the
+// container helpers and the event trait in scope.
+#[cfg(feature = "pg-streaming")]
 use crate::common;
 use sql_traits::structs::ParserDB;
 use sqlparser::dialect::PostgreSqlDialect;
-use subql::backend::{CdcEvent, Postgres, Value};
+#[cfg(feature = "pg-streaming")]
+use subql::backend::CdcEvent;
+use subql::backend::{Postgres, Value};
 use subql::testing::TestEvent;
 use subql::{catalog_helpers, DefaultIds, SubscriptionEngine, SubscriptionRequest};
 
@@ -334,6 +339,9 @@ fn an_update_whose_image_omits_the_cell_is_reported() {
 /// `REPLICA IDENTITY FULL` is set deliberately. It is the strongest
 /// identity available and still does not restore the column, which is why
 /// the replica-identity audit cannot cover this case.
+// The only test here that reads off a replication slot, so it is the only
+// one that needs the streaming source compiled in.
+#[cfg(feature = "pg-streaming")]
 #[test]
 #[ignore = "requires Docker; run with --ignored"]
 fn unchanged_toast_does_not_drop_a_subscription() {
