@@ -64,6 +64,26 @@ fn postgres_trailing_spaces<V: postgres_jsonb_canonical::PgVersion + 'static>(
 pub struct Postgres<V = postgres_jsonb_canonical::Pg18>(core::marker::PhantomData<V>);
 
 impl<V: postgres_jsonb_canonical::PgVersion + 'static> Backend for Postgres<V> {
+    fn hold_float_at_single(value: f64) -> f64 {
+        super::scalar_value::at_float4(value)
+    }
+
+    /// Measured on 16.11: two float4 operands keep a float4 result, while
+    /// any other pair promotes. `real * 3` has no operator, so an integer
+    /// operand lands in the promoting arm.
+    fn float_arithmetic_width(
+        left: Option<super::scalar_value::FloatWidth>,
+        right: Option<super::scalar_value::FloatWidth>,
+    ) -> Option<super::scalar_value::FloatWidth> {
+        use super::scalar_value::FloatWidth;
+
+        match (left, right) {
+            (Some(FloatWidth::Single), Some(FloatWidth::Single)) => Some(FloatWidth::Single),
+            (Some(_), _) | (_, Some(_)) => Some(FloatWidth::Double),
+            (None, None) => None,
+        }
+    }
+
     /// Measured: `real` and `float4` are float4, `double precision` and
     /// `float8` are float8.
     fn refine_builtin(
@@ -285,6 +305,20 @@ impl<V: postgres_jsonb_canonical::PgVersion + 'static> Backend for Postgres<V> {
 pub struct MySql;
 
 impl Backend for MySql {
+    fn hold_float_at_single(value: f64) -> f64 {
+        super::scalar_value::at_float4(value)
+    }
+
+    /// Measured on 8.4.11: `FLOAT + FLOAT + FLOAT` answers the double sum,
+    /// so a float4 operand promotes and nothing is held at float4.
+    fn float_arithmetic_width(
+        left: Option<super::scalar_value::FloatWidth>,
+        right: Option<super::scalar_value::FloatWidth>,
+    ) -> Option<super::scalar_value::FloatWidth> {
+        left.or(right)
+            .map(|_| super::scalar_value::FloatWidth::Double)
+    }
+
     /// Measured: MySQL's `FLOAT` is float4 and its `DOUBLE` is float8.
     fn refine_builtin(
         family: super::scalar_value::BuiltinKind,
@@ -458,6 +492,20 @@ impl Backend for MySql {
 pub struct SQLite;
 
 impl Backend for SQLite {
+    fn hold_float_at_single(value: f64) -> f64 {
+        super::scalar_value::at_float4(value)
+    }
+
+    /// SQLite has one floating type and it is float8, so no result is held
+    /// at float4.
+    fn float_arithmetic_width(
+        left: Option<super::scalar_value::FloatWidth>,
+        right: Option<super::scalar_value::FloatWidth>,
+    ) -> Option<super::scalar_value::FloatWidth> {
+        left.or(right)
+            .map(|_| super::scalar_value::FloatWidth::Double)
+    }
+
     /// SQLite has one floating type, `REAL`, and it is float8. Its
     /// `CHAR(n)` is advisory, stored as given, so no text type is fixed
     /// width here.

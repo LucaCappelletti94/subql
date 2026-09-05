@@ -21,6 +21,16 @@ use crate::types::ColumnId;
 use alloc::vec::Vec;
 use serde::{Deserialize, Serialize};
 
+/// The width an arithmetic instruction's float result is held at, or
+/// `None` when the operation is not on floats.
+///
+/// Resolved at compile time from the operands' declared widths, because it
+/// is a property of the expression rather than of the values that reach it:
+/// PostgreSQL computes `real + real` in float4 and promotes `real * 3` to
+/// double precision, so two programs over the same cells hold their results
+/// differently.
+pub type FloatResult = Option<crate::backend::FloatWidth>;
+
 /// Which column's comparison facts an instruction's operands carry, as
 /// indices into [`BytecodeProgram::column_comparisons`].
 ///
@@ -176,17 +186,17 @@ pub enum Instruction<B: Backend> {
     /// cross-scalar and `Missing` / `Null` operands) yields `Value::Null`.
     ///
     /// Stack: `[..., a, b] -> [..., Value]`.
-    Add,
+    Add(FloatResult),
 
     /// Subtract: `a - b`. Same-scalar rules as [`Add`](Self::Add).
     ///
     /// Stack: `[..., a, b] -> [..., Value]`.
-    Subtract,
+    Subtract(FloatResult),
 
     /// Multiply: `a * b`. Same-scalar rules as [`Add`](Self::Add).
     ///
     /// Stack: `[..., a, b] -> [..., Value]`.
-    Multiply,
+    Multiply(FloatResult),
 
     /// Divide: `a / b`. Same-scalar rules as [`Add`](Self::Add). Division by
     /// zero yields `Value::Null`. Integer division is truncated (result is
@@ -194,13 +204,13 @@ pub enum Instruction<B: Backend> {
     /// cast to `Float` upstream when the query wants float division.
     ///
     /// Stack: `[..., a, b] -> [..., Value]`.
-    Divide,
+    Divide(FloatResult),
 
     /// Modulo: `a % b`. `Int % Int -> Int` only (SQL modulo is undefined on
     /// floats). Any other pair, or a zero divisor, yields `Value::Null`.
     ///
     /// Stack: `[..., a, b] -> [..., Value]`.
-    Modulo,
+    Modulo(FloatResult),
 
     /// Negate: `-a` (unary minus).
     ///
@@ -209,7 +219,7 @@ pub enum Instruction<B: Backend> {
     /// `Value::Null`.
     ///
     /// Stack: `[..., a] -> [..., Value]`.
-    Negate,
+    Negate(FloatResult),
 
     // Special Operations
     /// `IN (...)`: membership test against a literal set.
@@ -443,12 +453,12 @@ impl<B: Backend> Clone for Instruction<B> {
             Self::And => Self::And,
             Self::Or => Self::Or,
             Self::Not => Self::Not,
-            Self::Add => Self::Add,
-            Self::Subtract => Self::Subtract,
-            Self::Multiply => Self::Multiply,
-            Self::Divide => Self::Divide,
-            Self::Modulo => Self::Modulo,
-            Self::Negate => Self::Negate,
+            Self::Add(width) => Self::Add(*width),
+            Self::Subtract(width) => Self::Subtract(*width),
+            Self::Multiply(width) => Self::Multiply(*width),
+            Self::Divide(width) => Self::Divide(*width),
+            Self::Modulo(width) => Self::Modulo(*width),
+            Self::Negate(width) => Self::Negate(*width),
             Self::In {
                 literals,
                 comparison,
@@ -490,12 +500,12 @@ impl<B: Backend> core::fmt::Debug for Instruction<B> {
             Self::And => f.write_str("And"),
             Self::Or => f.write_str("Or"),
             Self::Not => f.write_str("Not"),
-            Self::Add => f.write_str("Add"),
-            Self::Subtract => f.write_str("Subtract"),
-            Self::Multiply => f.write_str("Multiply"),
-            Self::Divide => f.write_str("Divide"),
-            Self::Modulo => f.write_str("Modulo"),
-            Self::Negate => f.write_str("Negate"),
+            Self::Add(width) => f.debug_tuple("Add").field(width).finish(),
+            Self::Subtract(width) => f.debug_tuple("Subtract").field(width).finish(),
+            Self::Multiply(width) => f.debug_tuple("Multiply").field(width).finish(),
+            Self::Divide(width) => f.debug_tuple("Divide").field(width).finish(),
+            Self::Modulo(width) => f.debug_tuple("Modulo").field(width).finish(),
+            Self::Negate(width) => f.debug_tuple("Negate").field(width).finish(),
             Self::In {
                 literals,
                 comparison,
@@ -539,13 +549,13 @@ impl<B: Backend> PartialEq for Instruction<B> {
             | (Self::IsNotNull, Self::IsNotNull)
             | (Self::And, Self::And)
             | (Self::Or, Self::Or)
-            | (Self::Not, Self::Not)
-            | (Self::Add, Self::Add)
-            | (Self::Subtract, Self::Subtract)
-            | (Self::Multiply, Self::Multiply)
-            | (Self::Divide, Self::Divide)
-            | (Self::Modulo, Self::Modulo)
-            | (Self::Negate, Self::Negate) => true,
+            | (Self::Not, Self::Not) => true,
+            (Self::Add(a), Self::Add(b))
+            | (Self::Subtract(a), Self::Subtract(b))
+            | (Self::Multiply(a), Self::Multiply(b))
+            | (Self::Divide(a), Self::Divide(b))
+            | (Self::Modulo(a), Self::Modulo(b))
+            | (Self::Negate(a), Self::Negate(b)) => a == b,
             (
                 Self::Between {
                     lower: al,

@@ -30,13 +30,15 @@ use sql_traits::{
     structs::{AlgorithmId, SchemaFingerprint},
 };
 
-/// Shard format version. v10: a stored column kind carries the refinements
+/// Shard format version. v11: a stored arithmetic instruction carries the
+/// width its float result is held at. v10: a stored column kind carries the
+/// refinements
 /// its declaration fixes, so a `real` column reloads as float4 rather than
 /// as float8. v9: a stored comparison carries the text rule resolved for its
 /// operation, so no evaluation consults a collation. v8: a stored bytecode
 /// program carries the comparison facts of every column it loads. v7: full
 /// fingerprint envelope replaced the legacy `u64` field.
-const SHARD_VERSION: u16 = 10;
+const SHARD_VERSION: u16 = 11;
 
 /// Hard cap for decompressed shard payload size (defense in depth).
 ///
@@ -635,7 +637,7 @@ mod tests {
 
     /// Every envelope field roundtrips through the on-wire header.
     #[test]
-    fn test_v10_envelope_roundtrip() {
+    fn test_v11_envelope_roundtrip() {
         let catalog = make_catalog();
         let tid = fixture_table_id(&catalog);
         let payload = shard_payload_with_consumers(vec![1, 2, 3], 42);
@@ -643,7 +645,7 @@ mod tests {
         let bytes = serialize_shard(tid, &payload, &catalog).unwrap();
         let (header, _) = deserialize_shard::<DefaultIds, _>(&bytes, &catalog).unwrap();
 
-        assert_eq!(header.version, 10);
+        assert_eq!(header.version, 11);
         assert_eq!(header.fingerprint.algorithm_id, ALGORITHM_ID_SHA2_256);
         assert_eq!(header.fingerprint.canonicalization_version, 1);
         assert_eq!(header.fingerprint.profile_id, 1);
@@ -655,9 +657,9 @@ mod tests {
     }
 
     /// Loading a shard whose header carries an older version must fail with
-    /// `VersionMismatch`: no legacy decode path is supported. v9 is the
-    /// version whose stored column kinds carry no refinement, so decoding it
-    /// under v10's shape would read a `real` column as float8.
+    /// `VersionMismatch`: no legacy decode path is supported. v10 is the
+    /// version whose stored arithmetic carries no result width, so decoding
+    /// it under v11's shape would compute a float4 sum in double.
     #[test]
     fn test_older_versions_rejected() {
         let catalog = make_catalog();
@@ -665,7 +667,7 @@ mod tests {
         let payload = empty_shard_payload(1);
         let bytes = serialize_shard(tid, &payload, &catalog).unwrap();
 
-        for stored in [6_u16, 7, 8, 9] {
+        for stored in [6_u16, 7, 8, 9, 10] {
             let tampered = tamper_shard_header(&bytes, |hdr| {
                 hdr.version = stored;
             });
@@ -674,10 +676,10 @@ mod tests {
             assert!(
                 matches!(
                     &result,
-                    Err(StorageError::VersionMismatch { expected: 10, got })
+                    Err(StorageError::VersionMismatch { expected: 11, got })
                         if *got == stored
                 ),
-                "expected VersionMismatch{{expected: 10, got: {stored}}}, got {result:?}"
+                "expected VersionMismatch{{expected: 11, got: {stored}}}, got {result:?}"
             );
         }
     }

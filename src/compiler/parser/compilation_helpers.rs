@@ -2,7 +2,7 @@
 
 use super::{Compiling, MAX_TERMS_PER_FILTER};
 use crate::backend::{Backend, BuiltinKind, Value, ValueKindOf};
-use crate::compiler::bytecode::ComparisonRef;
+use crate::compiler::bytecode::{ComparisonRef, FloatResult};
 use crate::compiler::literals::{resolve_column_ref, SqlLiteralParse};
 use crate::compiler::{canonicalize, sql_shape, BytecodeProgram, Instruction};
 use crate::term::{term_columns, CompiledTerm};
@@ -203,6 +203,52 @@ fn canonicalize_term_slots<B: Backend>(
     }
 
     Ok(sorted)
+}
+
+/// The width an expression's float result is held at, or `None` when it is
+/// not float arithmetic.
+///
+/// Resolved bottom-up from the columns the expression names, because the
+/// engines decide it per operation rather than per operand: measured,
+/// PostgreSQL computes `real + real` in float4 and promotes `real * 3` to
+/// double precision. A literal carries no declared width and so lands in
+/// the promoting arm, which is what the server does with `3`.
+///
+/// Stops at [`sql_shape::MAX_EXPR_DEPTH`], the ceiling compilation itself
+/// refuses past.
+fn float_result_width<B: Backend, DB: DatabaseLike>(
+    expr: &Expr,
+    table_id: TableId,
+    database: &DB,
+    depth: usize,
+) -> FloatResult {
+    if let Some(column) = resolve_column_ref(expr, table_id, database) {
+        return crate::catalog_helpers::column_comparison::<B, DB>(database, table_id, column)
+            .and_then(|facts| facts.kind.builtin())
+            .and_then(crate::backend::BuiltinType::float_width);
+    }
+    if depth >= sql_shape::MAX_EXPR_DEPTH {
+        return None;
+    }
+    match expr {
+        Expr::Nested(inner) | Expr::UnaryOp { expr: inner, .. } => {
+            float_result_width::<B, DB>(inner, table_id, database, depth + 1)
+        }
+        Expr::BinaryOp {
+            left,
+            op:
+                BinaryOperator::Plus
+                | BinaryOperator::Minus
+                | BinaryOperator::Multiply
+                | BinaryOperator::Divide
+                | BinaryOperator::Modulo,
+            right,
+        } => B::float_arithmetic_width(
+            float_result_width::<B, DB>(left, table_id, database, depth + 1),
+            float_result_width::<B, DB>(right, table_id, database, depth + 1),
+        ),
+        _ => None,
+    }
 }
 
 /// Recursive helper for expression compilation.
@@ -406,11 +452,23 @@ where
                             out.push(Instruction::GreaterThanOrEqual(cmp));
                         }
 
-                        BinaryOperator::Plus => out.push(Instruction::Add),
-                        BinaryOperator::Minus => out.push(Instruction::Subtract),
-                        BinaryOperator::Multiply => out.push(Instruction::Multiply),
-                        BinaryOperator::Divide => out.push(Instruction::Divide),
-                        BinaryOperator::Modulo => out.push(Instruction::Modulo),
+                        BinaryOperator::Plus
+                        | BinaryOperator::Minus
+                        | BinaryOperator::Multiply
+                        | BinaryOperator::Divide
+                        | BinaryOperator::Modulo => {
+                            let width = B::float_arithmetic_width(
+                                float_result_width::<B, DB>(left, table_id, database, depth),
+                                float_result_width::<B, DB>(right, table_id, database, depth),
+                            );
+                            out.push(match op {
+                                BinaryOperator::Plus => Instruction::Add(width),
+                                BinaryOperator::Minus => Instruction::Subtract(width),
+                                BinaryOperator::Multiply => Instruction::Multiply(width),
+                                BinaryOperator::Divide => Instruction::Divide(width),
+                                _ => Instruction::Modulo(width),
+                            });
+                        }
 
                         _ => {
                             return Err(RegisterError::UnsupportedSql(format!(
@@ -662,7 +720,9 @@ where
                     // Unary + is no-op.
                 }
                 UnaryOperator::Minus => {
-                    out.push(Instruction::Negate);
+                    out.push(Instruction::Negate(float_result_width::<B, DB>(
+                        expr, table_id, database, depth,
+                    )));
                 }
                 _ => {
                     return Err(RegisterError::UnsupportedSql(format!(

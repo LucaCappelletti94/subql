@@ -11,8 +11,8 @@ use arbitrary::{Arbitrary, Unstructured};
 use sql_traits::structs::ParserDB;
 use sqlparser::dialect::PostgreSqlDialect;
 
-use crate::backend::{Postgres, RowKind, Value};
-use crate::compiler::bytecode::{BytecodeProgram, ComparisonRef, Instruction};
+use crate::backend::{FloatWidth, Postgres, RowKind, Value};
+use crate::compiler::bytecode::{BytecodeProgram, ComparisonRef, FloatResult, Instruction};
 use crate::compiler::canonicalize::{hash_sql, normalize_sql};
 use crate::compiler::parser::parse_and_compile;
 use crate::compiler::vm::Vm;
@@ -79,6 +79,17 @@ fn arb_comparison_ref(u: &mut Unstructured<'_>) -> arbitrary::Result<ComparisonR
     Ok(ComparisonRef::new(left, right))
 }
 
+/// Generate a float result width from fuzzer-controlled bytes, so a
+/// generated program exercises both the narrowed and the plain arithmetic
+/// paths.
+fn arb_float_result(u: &mut Unstructured<'_>) -> arbitrary::Result<FloatResult> {
+    Ok(match u.int_in_range(0u8..=2)? {
+        0 => None,
+        1 => Some(FloatWidth::Single),
+        _ => Some(FloatWidth::Double),
+    })
+}
+
 /// Generate an [`Instruction<Postgres>`] from fuzzer-controlled bytes.
 pub fn arb_instruction(u: &mut Unstructured<'_>) -> arbitrary::Result<Instruction<Postgres>> {
     match u.int_in_range(0u8..=23)? {
@@ -95,12 +106,12 @@ pub fn arb_instruction(u: &mut Unstructured<'_>) -> arbitrary::Result<Instructio
         10 => Ok(Instruction::And),
         11 => Ok(Instruction::Or),
         12 => Ok(Instruction::Not),
-        13 => Ok(Instruction::Add),
-        14 => Ok(Instruction::Subtract),
-        15 => Ok(Instruction::Multiply),
-        16 => Ok(Instruction::Divide),
-        17 => Ok(Instruction::Modulo),
-        18 => Ok(Instruction::Negate),
+        13 => Ok(Instruction::Add(arb_float_result(u)?)),
+        14 => Ok(Instruction::Subtract(arb_float_result(u)?)),
+        15 => Ok(Instruction::Multiply(arb_float_result(u)?)),
+        16 => Ok(Instruction::Divide(arb_float_result(u)?)),
+        17 => Ok(Instruction::Modulo(arb_float_result(u)?)),
+        18 => Ok(Instruction::Negate(arb_float_result(u)?)),
         19 => {
             let len = u.int_in_range(0usize..=8)?;
             let list: Vec<Value<Postgres>> = (0..len)

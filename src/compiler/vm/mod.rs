@@ -31,7 +31,7 @@ pub mod arithmetic;
 pub mod refusal;
 
 use super::{
-    bytecode::ComparisonRef,
+    bytecode::{ComparisonRef, FloatResult},
     value_cmp::{compare_ordered_values, values_equal},
     BytecodeProgram, Instruction, Tri,
 };
@@ -524,13 +524,25 @@ impl<B: Backend> Vm<B> {
                 }));
             }
 
-            Instruction::Add => self.execute_binary_value_op(arithmetic_add::<B>)?,
-            Instruction::Subtract => self.execute_binary_value_op(arithmetic_subtract::<B>)?,
-            Instruction::Multiply => self.execute_binary_value_op(arithmetic_multiply::<B>)?,
-            Instruction::Divide => self.execute_binary_value_op(arithmetic_divide::<B>)?,
-            Instruction::Modulo => self.execute_binary_value_op(arithmetic_modulo::<B>)?,
+            Instruction::Add(width) => {
+                self.execute_binary_value_op(arithmetic_add::<B>, *width)?;
+            }
+            Instruction::Subtract(width) => {
+                self.execute_binary_value_op(arithmetic_subtract::<B>, *width)?;
+            }
+            Instruction::Multiply(width) => {
+                self.execute_binary_value_op(arithmetic_multiply::<B>, *width)?;
+            }
+            Instruction::Divide(width) => {
+                self.execute_binary_value_op(arithmetic_divide::<B>, *width)?;
+            }
+            Instruction::Modulo(width) => {
+                self.execute_binary_value_op(arithmetic_modulo::<B>, *width)?;
+            }
 
-            Instruction::Negate => self.execute_unary_value_op(arithmetic_negate::<B>)?,
+            Instruction::Negate(width) => {
+                self.execute_unary_value_op(arithmetic_negate::<B>, *width)?;
+            }
 
             // Jumps are handled in eval() before execute() is called.
             Instruction::JumpIfFalse(_) | Instruction::JumpIfTrue(_) => {}
@@ -547,19 +559,29 @@ impl<B: Backend> Vm<B> {
         Ok(())
     }
 
-    fn execute_binary_value_op(&mut self, op: FallibleBinaryOp<B>) -> Result<(), VmError> {
+    fn execute_binary_value_op(
+        &mut self,
+        op: FallibleBinaryOp<B>,
+        width: FloatResult,
+    ) -> Result<(), VmError> {
         let b = self.pop_value()?;
         let a = self.pop_value()?;
+        let value = op(a, b).map_err(VmError::Refused)?;
         self.stack
-            .push(StackValue::Value(op(a, b).map_err(VmError::Refused)?));
+            .push(StackValue::Value(hold_float_at::<B>(value, width)));
         Ok(())
     }
 
     /// The same for a fallible unary operation.
-    fn execute_unary_value_op(&mut self, op: FallibleUnaryOp<B>) -> Result<(), VmError> {
+    fn execute_unary_value_op(
+        &mut self,
+        op: FallibleUnaryOp<B>,
+        width: FloatResult,
+    ) -> Result<(), VmError> {
         let a = self.pop_value()?;
+        let value = op(a).map_err(VmError::Refused)?;
         self.stack
-            .push(StackValue::Value(op(a).map_err(VmError::Refused)?));
+            .push(StackValue::Value(hold_float_at::<B>(value, width)));
         Ok(())
     }
 
@@ -643,6 +665,19 @@ impl<B: Backend> Vm<B> {
             &b,
             f,
         ))
+    }
+}
+
+/// One arithmetic result, held at the width the compiler resolved for it.
+///
+/// The narrowing itself is the backend's, because only it knows whether its
+/// float carrier can be put on the float4 grid.
+fn hold_float_at<B: Backend>(value: Value<B>, width: FloatResult) -> Value<B> {
+    match (value, width) {
+        (Value::Float(float), Some(crate::backend::FloatWidth::Single)) => {
+            Value::Float(B::hold_float_at_single(float))
+        }
+        (value, _) => value,
     }
 }
 
@@ -967,7 +1002,7 @@ mod tests {
         let program: BytecodeProgram<Postgres> = BytecodeProgram::new(vec![
             Instruction::LoadColumn(0),
             Instruction::PushLiteral(Value::Int(3)),
-            Instruction::Add,
+            Instruction::Add(None),
             Instruction::PushLiteral(Value::Int(10)),
             Instruction::GreaterThan(ComparisonRef::NONE),
         ]);
@@ -996,7 +1031,7 @@ mod tests {
         let program: BytecodeProgram<Postgres> = BytecodeProgram::new(vec![
             Instruction::LoadColumn(0),
             Instruction::PushLiteral(Value::Int(0)),
-            Instruction::Divide,
+            Instruction::Divide(None),
             Instruction::PushLiteral(Value::Int(1)),
             Instruction::GreaterThan(ComparisonRef::NONE),
         ]);

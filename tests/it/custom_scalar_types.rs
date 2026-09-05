@@ -137,6 +137,21 @@ impl Backend for Custom {
         None
     }
 
+    /// On the standard carrier, so the shared narrowing serves even though
+    /// this backend never resolves a single-width result.
+    fn hold_float_at_single(value: f64) -> f64 {
+        subql::backend::at_float4(value)
+    }
+
+    /// The fixtures declare no single-width column, so no result is held at
+    /// float4 and this backend narrows nothing.
+    fn float_arithmetic_width(
+        left: Option<subql::backend::FloatWidth>,
+        right: Option<subql::backend::FloatWidth>,
+    ) -> Option<subql::backend::FloatWidth> {
+        left.or(right).map(|_| subql::backend::FloatWidth::Double)
+    }
+
     /// The fixtures declare no fixed-width or single-width column, so the
     /// common refinements serve.
     fn refine_builtin(

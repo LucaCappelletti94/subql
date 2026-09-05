@@ -30,7 +30,7 @@ pub type BuiltinKind = sql_traits::utils::scalar_family::ScalarFamily;
 /// which is float8. The width decides what the wire text means, what an
 /// expression computes in, and what an aggregate accumulates in, so it
 /// belongs to the type rather than to each of those layers.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum FloatWidth {
     /// `real`, `float4`, MySQL `FLOAT`.
     Single,
@@ -150,6 +150,18 @@ pub const fn refined_builtin(
         BuiltinKind::Json => BuiltinType::Json,
         BuiltinKind::Jsonb => BuiltinType::Jsonb,
     }
+}
+
+/// One float4 value, as an `f64`.
+///
+/// The narrowing is the point rather than a hazard: a float4 result is held
+/// on the float4 grid, and a value computed or parsed in `f64` has to be put
+/// back on it to be the number the engine holds. Every float4 is exactly
+/// representable as an `f64`, so widening back is lossless.
+#[must_use]
+#[allow(clippy::cast_possible_truncation)]
+pub fn at_float4(double: f64) -> f64 {
+    f64::from(double as f32)
 }
 
 /// Whether a declared type names a fixed-width character type.

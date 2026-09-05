@@ -12,22 +12,7 @@ use bigdecimal::BigDecimal;
 use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, Utc};
 use uuid::Uuid;
 
-use crate::backend::{BuiltinKind, BuiltinType, FloatWidth, MySql, Postgres, Value};
-
-/// Decode a pgoutput text-format value into a typed [`Value<Postgres>`],
-/// routed by the column's catalog [`BuiltinKind`] (the schema-driven path).
-///
-/// One float4 value, as an `f64`.
-///
-/// The narrowing is the point rather than a hazard: the server already
-/// rounded the source value to float4 before writing it, and a wire number
-/// parsed as `f64` has to be put back on that grid to be the number the
-/// server holds. Every float4 is exactly representable as an `f64`, so the
-/// widening back is lossless.
-#[allow(clippy::cast_possible_truncation)]
-fn at_float4(double: f64) -> f64 {
-    f64::from(double as f32)
-}
+use crate::backend::{at_float4, BuiltinKind, BuiltinType, FloatWidth, MySql, Postgres, Value};
 
 /// Parse float text at the width the column declares.
 ///

@@ -22,8 +22,9 @@
 #![allow(clippy::unwrap_used, clippy::float_cmp)]
 
 use sql_traits::structs::ParserDB;
-use sqlparser::dialect::PostgreSqlDialect;
-use subql::backend::{CdcEvent, RowKind, Value};
+use sqlparser::dialect::{MySqlDialect, PostgreSqlDialect, SQLiteDialect};
+use subql::backend::{CdcEvent, MySql, RowKind, SQLite, Value};
+use subql::testing::TestEvent;
 use subql::{catalog_helpers, DefaultIds, SubscriptionEngine, SubscriptionRequest};
 
 const DDL: &str =
@@ -110,5 +111,103 @@ fn pg_double_column_is_unaffected() {
     assert!(
         notifies("SELECT * FROM readings WHERE double = double", "0.1"),
         "an f64 column compares as it always did"
+    );
+}
+
+/// Measured on 16.11: `real + real + real` is computed in float4 and its
+/// result is `0.3`, which as an `f64` is `0.30000001192092896`. Computing
+/// the same sum in `f64` gives `0.30000000447034836`, a smaller number, so
+/// this predicate holds under the server's arithmetic and fails under
+/// double arithmetic.
+#[test]
+fn pg_real_arithmetic_keeps_float4_width() {
+    assert!(
+        notifies(
+            "SELECT * FROM readings WHERE single + single + single > 0.30000000447034836",
+            "0.1"
+        ),
+        "a float4 sum is above the double sum of the same cells"
+    );
+}
+
+/// And measured: `real * 3` is *not* float4. PostgreSQL has no
+/// `real * integer` operator, so the pair promotes and the result is
+/// `double precision` `0.30000000447034836`, which a float4 result would
+/// not equal.
+#[test]
+fn pg_real_times_an_integer_promotes_to_double() {
+    assert!(
+        notifies(
+            "SELECT * FROM readings WHERE single * 3 = 0.30000000447034836",
+            "0.1"
+        ),
+        "an integer operand promotes the result to double precision"
+    );
+    assert!(
+        !notifies(
+            "SELECT * FROM readings WHERE single * 3 > 0.30000000447034836",
+            "0.1"
+        ),
+        "so the product is exactly the double product, not above it"
+    );
+}
+
+/// The control, measured on MySQL 8.4.11: `FLOAT + FLOAT + FLOAT` is
+/// computed in double and answers `0.30000000447034836`, so MySQL narrows
+/// nothing and the rule is PostgreSQL's alone.
+#[test]
+fn mysql_float_arithmetic_stays_double() {
+    let db = ParserDB::parse::<MySqlDialect>(
+        "CREATE TABLE readings (id INT PRIMARY KEY, single FLOAT, double DOUBLE)",
+    )
+    .expect("DDL parses");
+    let table = catalog_helpers::table_id(&db, "readings").expect("readings is cataloged");
+    let mut engine: SubscriptionEngine<TestEvent<MySql>, DefaultIds, ParserDB> =
+        SubscriptionEngine::new(db, MySqlDialect {});
+    engine
+        .register(SubscriptionRequest::new(
+            1u64,
+            "SELECT * FROM readings WHERE single + single + single = 0.30000000447034836",
+        ))
+        .expect("the predicate registers");
+    let cell = f64::from(0.1_f32);
+    let row = vec![Value::Int(1), Value::Float(cell), Value::Float(cell)];
+    assert!(
+        !engine
+            .consumers(&TestEvent::insert(table, row))
+            .expect("dispatch succeeds")
+            .inserted()
+            .is_empty(),
+        "MySQL computes the sum in double, measured as 0.30000000447034836"
+    );
+}
+
+/// SQLite has one floating type and it is float8, so nothing there is held
+/// at float4 however the column is spelled: `REAL`, and even `FLOAT`, is a
+/// double.
+#[test]
+fn sqlite_real_arithmetic_is_never_narrowed() {
+    let db = ParserDB::parse::<SQLiteDialect>(
+        "CREATE TABLE readings (id INTEGER PRIMARY KEY, single REAL, double REAL)",
+    )
+    .expect("DDL parses");
+    let table = catalog_helpers::table_id(&db, "readings").expect("readings is cataloged");
+    let mut engine: SubscriptionEngine<TestEvent<SQLite>, DefaultIds, ParserDB> =
+        SubscriptionEngine::new(db, SQLiteDialect {});
+    engine
+        .register(SubscriptionRequest::new(
+            1u64,
+            "SELECT * FROM readings WHERE single + single + single = 0.30000000447034836",
+        ))
+        .expect("the predicate registers");
+    let cell = f64::from(0.1_f32);
+    let row = vec![Value::Int(1), Value::Float(cell), Value::Float(cell)];
+    assert!(
+        !engine
+            .consumers(&TestEvent::insert(table, row))
+            .expect("dispatch succeeds")
+            .inserted()
+            .is_empty(),
+        "SQLite computes the sum in double, so it is the double sum"
     );
 }

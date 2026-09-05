@@ -278,6 +278,39 @@ pub trait Backend: 'static {
     /// escape cannot have a dangling one, so the two facts belong together.
     const LIKE_ESCAPE: Option<crate::compiler::vm::refusal::LikeEscape>;
 
+    /// The width an arithmetic result is held at, given each operand's
+    /// width, or `None` when the operation is not on floats.
+    ///
+    /// Required rather than defaulted, because the engines disagree.
+    /// Measured on PostgreSQL 16.11: `real + real + real` is computed in
+    /// float4 and answers `0.3`, while `real * 3` has no operator and
+    /// promotes, answering the double product. Measured on MySQL 8.4.11:
+    /// `FLOAT + FLOAT + FLOAT` answers the double sum, so MySQL narrows
+    /// nothing, and SQLite has no float4 column to narrow.
+    #[must_use]
+    fn float_arithmetic_width(
+        left: Option<super::scalar_value::FloatWidth>,
+        right: Option<super::scalar_value::FloatWidth>,
+    ) -> Option<super::scalar_value::FloatWidth>
+    where
+        Self: Sized;
+
+    /// One float value put on the float4 grid, for a result this backend
+    /// holds at single width.
+    ///
+    /// Required rather than defaulted, and deliberately so: a default of
+    /// "unchanged" lets this and
+    /// [`Backend::float_arithmetic_width`](Backend::float_arithmetic_width)
+    /// disagree in silence, so a backend could resolve a float4 result and
+    /// then not hold it at float4. A backend on the standard carrier
+    /// delegates to [`crate::backend::at_float4`]; one whose float is not
+    /// `f64` has no float4 grid this crate can compute and says so by
+    /// returning the value.
+    #[must_use]
+    fn hold_float_at_single(value: Self::Float) -> Self::Float
+    where
+        Self: Sized;
+
     /// The exact type a declaration of `family` names on this engine.
     ///
     /// Required rather than defaulted, because the spellings differ: `real`
