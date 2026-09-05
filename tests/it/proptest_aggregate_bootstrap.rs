@@ -62,8 +62,10 @@ fn seed_row(spec: &AggSpec, c: &Components) -> Vec<Value<Postgres>> {
     match spec {
         AggSpec::CountStar => vec![Value::Int(c.count_star)],
         AggSpec::CountColumn { .. } => vec![Value::Int(c.count_col)],
-        AggSpec::Sum { .. } => vec![sum_cell(c.sum, c.numeric)],
-        AggSpec::Avg { .. } => vec![sum_cell(c.sum, c.numeric), Value::Int(c.numeric)],
+        // SUM and AVG read the same pair: the total and its contributors.
+        AggSpec::Sum { .. } | AggSpec::Avg { .. } => {
+            vec![sum_cell(c.sum, c.numeric), Value::Int(c.numeric)]
+        }
         AggSpec::VarPop { .. }
         | AggSpec::VarSamp { .. }
         | AggSpec::StddevPop { .. }
@@ -88,7 +90,7 @@ fn oracle(spec: &AggSpec, c: &Components) -> AggValue {
     match spec {
         AggSpec::CountStar => AggValue::Count(c.count_star),
         AggSpec::CountColumn { .. } => AggValue::Count(c.count_col),
-        AggSpec::Sum { .. } => AggValue::Sum(sum),
+        AggSpec::Sum { .. } => AggValue::Sum((c.numeric > 0).then_some(sum)),
         AggSpec::Avg { .. } => AggValue::Real((c.numeric > 0).then(|| sum / n)),
         AggSpec::VarPop { .. } => AggValue::Real(var_pop),
         AggSpec::VarSamp { .. } => AggValue::Real(var_samp),

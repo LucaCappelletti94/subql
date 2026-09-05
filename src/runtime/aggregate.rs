@@ -24,10 +24,16 @@ use hashbrown::HashMap;
 pub enum AggDelta {
     /// COUNT(*) / COUNT(column) delta: always +/-1 per matching (non-NULL) row.
     Count(i64),
-    /// SUM(column) delta: signed change in the column sum.
-    Sum(f64),
-    /// AVG(column) delta: the two components of a running average.
-    Avg { sum_delta: f64, count_delta: i64 },
+    /// SUM(column) or AVG(column) delta: the signed change in the column
+    /// total, and the signed change in how many rows contribute one.
+    ///
+    /// One variant for both, because both read the same pair. `AVG`
+    /// divides the total by the count; `SUM` reports NULL when the count
+    /// is zero, since measured, every engine answers NULL for a sum over
+    /// no contributing rows and `0` for a sum over one row worth zero, so
+    /// a total alone cannot tell those apart. Which function reads the
+    /// pair is [`AggAccumulator`]'s to know.
+    Totalled { sum_delta: f64, count_delta: i64 },
     /// VAR_POP / VAR_SAMP / STDDEV_POP / STDDEV_SAMP delta, carrying the three
     /// components all four derive their value from. See [`AggAccumulator`].
     Stats {
@@ -43,13 +49,12 @@ impl AggDelta {
     pub fn merge(&mut self, other: &Self) {
         match (self, other) {
             (Self::Count(a), Self::Count(b)) => *a += b,
-            (Self::Sum(a), Self::Sum(b)) => *a += b,
             (
-                Self::Avg {
+                Self::Totalled {
                     sum_delta,
                     count_delta,
                 },
-                Self::Avg {
+                Self::Totalled {
                     sum_delta: s,
                     count_delta: c,
                 },
@@ -85,8 +90,7 @@ impl AggDelta {
     pub fn is_zero(&self) -> bool {
         match self {
             Self::Count(n) => *n == 0,
-            Self::Sum(v) => *v == 0.0,
-            Self::Avg {
+            Self::Totalled {
                 sum_delta,
                 count_delta,
             } => *sum_delta == 0.0 && *count_delta == 0,
@@ -148,7 +152,7 @@ impl AggAccumulator {
     /// [`AggregateBootstrap`](crate::AggregateBootstrap).
     ///
     /// Consumes the components in the documented column order: `[c]` for
-    /// COUNT, `[s]` for SUM, `[s, c]` for AVG, and `[s, sq, c]` for the
+    /// COUNT, `[s, c]` for SUM, `[s, c]` for AVG, and `[s, sq, c]` for the
     /// variance and stddev family. A zero-row result (COUNT `0`, NULL
     /// sum components) seeds the empty-aggregate state, matching the
     /// "set went empty" semantics of the re-execution family.
@@ -161,6 +165,7 @@ impl AggAccumulator {
             }
             S::Sum { .. } => {
                 acc.sum = row.first().and_then(|v| Self::seed_f64(v)).unwrap_or(0.0);
+                acc.count = row.get(1).and_then(|v| Self::seed_i64(v)).unwrap_or(0);
             }
             S::Avg { .. } => {
                 acc.sum = row.first().and_then(|v| Self::seed_f64(v)).unwrap_or(0.0);
@@ -187,8 +192,13 @@ impl AggAccumulator {
     }
 
     /// Decode a numeric component cell to `f64`. NULL/Missing/non-numeric
-    /// cells return `None` (the caller defaults them to `0.0`, safe because
-    /// a zero-count accumulator reports the empty state regardless of sum).
+    /// cells return `None`, and the caller defaults them to `0.0`.
+    ///
+    /// That default is safe because every function here reports through its
+    /// count, so a zero-count accumulator reports the empty state whatever
+    /// its sum holds. `SUM` was the exception until it maintained a count
+    /// of its own: a NULL seed became `0.0` and was reported as a total of
+    /// zero, where all three engines answer NULL.
     #[allow(clippy::cast_precision_loss)]
     fn seed_f64<B: Backend>(v: &Value<B>) -> Option<f64> {
         use core::any::Any;
@@ -225,8 +235,7 @@ impl AggAccumulator {
     pub fn apply(&mut self, delta: &AggDelta) {
         match delta {
             AggDelta::Count(d) => self.count += d,
-            AggDelta::Sum(d) => self.sum += d,
-            AggDelta::Avg {
+            AggDelta::Totalled {
                 sum_delta,
                 count_delta,
             } => {
@@ -257,12 +266,26 @@ impl AggAccumulator {
     pub fn value(&self) -> AggValue {
         match self.kind {
             AggKind::Count => AggValue::Count(self.count),
-            AggKind::Sum => AggValue::Sum(self.sum),
+            AggKind::Sum => AggValue::Sum(self.total()),
             AggKind::Avg => AggValue::Real(self.mean()),
             AggKind::VarPop => AggValue::Real(self.var_pop()),
             AggKind::VarSamp => AggValue::Real(self.var_samp()),
             AggKind::StddevPop => AggValue::Real(self.var_pop().map(f64::sqrt)),
             AggKind::StddevSamp => AggValue::Real(self.var_samp().map(f64::sqrt)),
+        }
+    }
+
+    /// The sum, or `None` when no row contributes one.
+    ///
+    /// Measured on all three engines: `SUM` over no rows, and over rows
+    /// whose value is NULL, answers NULL, while one row worth zero answers
+    /// `0`. The count is what separates them, so the total is read through
+    /// it rather than reported raw.
+    const fn total(&self) -> Option<f64> {
+        if self.count > 0 {
+            Some(self.sum)
+        } else {
+            None
         }
     }
 
@@ -277,7 +300,7 @@ impl AggAccumulator {
     pub fn value_as(&self, function: crate::HavingFunction) -> AggValue {
         match function {
             crate::HavingFunction::CountColumn => AggValue::Count(self.count),
-            crate::HavingFunction::Sum => AggValue::Sum(self.sum),
+            crate::HavingFunction::Sum => AggValue::Sum(self.total()),
             crate::HavingFunction::Avg => AggValue::Real(self.mean()),
             crate::HavingFunction::VarPop => AggValue::Real(self.var_pop()),
             crate::HavingFunction::VarSamp => AggValue::Real(self.var_samp()),
@@ -516,16 +539,13 @@ impl GroupHaving {
     fn passes<B: Backend>(&self, group: &GroupValue<B>) -> bool {
         let value = match self.subject {
             crate::HavingSubject::RowCount => Some(group.rows as f64),
-            // SQL's `SUM` over zero contributions is NULL, and a comparison
-            // over NULL is UNKNOWN. The subject widens at registration, so
-            // the contribution count here is real.
-            crate::HavingSubject::Aggregate(crate::HavingFunction::Sum) => {
-                (group.accumulator.count > 0).then_some(group.accumulator.sum)
-            }
+            // A `SUM` over zero contributions is NULL and a comparison
+            // over NULL is UNKNOWN, which the value itself now says: this
+            // used to re-derive it here from the contribution count.
             crate::HavingSubject::Aggregate(function) => {
                 match group.accumulator.value_as(function) {
                     AggValue::Count(count) => Some(count as f64),
-                    AggValue::Sum(sum) => Some(sum),
+                    AggValue::Sum(sum) => sum,
                     AggValue::Real(real) => real,
                 }
             }

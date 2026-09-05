@@ -319,7 +319,8 @@ fn a_grouped_aggregate_seeds_one_row_per_group() {
         .expect("a grouped aggregate seeds");
     assert_eq!(
         bootstrap.query.sql(),
-        "SELECT \"status\" AS c0, \"id\" AS c1, SUM(amount) AS c2, COUNT(*) AS c3 FROM g GROUP BY status, id"
+        "SELECT \"status\" AS c0, \"id\" AS c1, SUM(amount) AS c2, COUNT(amount) AS c3, \
+         COUNT(*) AS c4 FROM g GROUP BY status, id"
     );
     assert_eq!(bootstrap.group_columns, 2);
 }

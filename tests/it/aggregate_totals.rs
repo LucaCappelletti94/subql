@@ -424,11 +424,12 @@ fn a_seeded_sum_follows_inserts_updates_and_deletes() {
         ))
         .unwrap()
         .subscription_id;
-    install_seed(&mut engine, sub, vec![Value::Int(0)], None).unwrap();
+    // An empty table: a NULL sum over no contributing rows.
+    install_seed(&mut engine, sub, vec![Value::Null, Value::Int(0)], None).unwrap();
 
     assert_eq!(
         reported(&engine.aggregate_updates(&paid(orders, 1, 100, 10)).unwrap()),
-        vec![(sub, 7, AggValue::Sum(100.0))],
+        vec![(sub, 7, AggValue::Sum(Some(100.0)))],
     );
 
     let raise = TestEvent::update(
@@ -441,7 +442,7 @@ fn a_seeded_sum_follows_inserts_updates_and_deletes() {
     .with_checkpoint(PgLsn(20));
     assert_eq!(
         reported(&engine.aggregate_updates(&raise).unwrap()),
-        vec![(sub, 7, AggValue::Sum(250.0))],
+        vec![(sub, 7, AggValue::Sum(Some(250.0)))],
     );
 
     assert_eq!(
@@ -450,6 +451,7 @@ fn a_seeded_sum_follows_inserts_updates_and_deletes() {
                 .aggregate_updates(&unpaid_delete(orders, 1, 250, 30))
                 .unwrap()
         ),
-        vec![(sub, 7, AggValue::Sum(0.0))],
+        vec![(sub, 7, AggValue::Sum(None))],
+        "the only contributing row left, so the sum is NULL again rather than zero",
     );
 }

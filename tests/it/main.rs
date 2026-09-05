@@ -9,6 +9,8 @@
 
 mod common;
 
+mod agg_sum_nullability;
+
 mod aggregate_bootstrap;
 
 mod aggregate_totals;

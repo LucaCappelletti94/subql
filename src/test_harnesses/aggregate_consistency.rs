@@ -328,7 +328,7 @@ fn oracle_agg_value(spec: &AggSpec, c: &AggComponents) -> AggValue {
     match spec {
         AggSpec::CountStar => AggValue::Count(c.count_star),
         AggSpec::CountColumn { .. } => AggValue::Count(c.count_col),
-        AggSpec::Sum { .. } => AggValue::Sum(sum),
+        AggSpec::Sum { .. } => AggValue::Sum((c.numeric > 0).then_some(sum)),
         AggSpec::Avg { .. } => AggValue::Real((c.numeric > 0).then(|| sum / n)),
         AggSpec::VarPop { .. } => AggValue::Real(var_pop),
         AggSpec::VarSamp { .. } => AggValue::Real(var_samp),
@@ -350,7 +350,8 @@ fn oracle_agg_value(spec: &AggSpec, c: &AggComponents) -> AggValue {
 fn agg_values_agree(engine: AggValue, oracle: AggValue, c: &AggComponents) -> bool {
     match (engine, oracle) {
         (AggValue::Count(a), AggValue::Count(b)) => a == b,
-        (AggValue::Sum(a), AggValue::Sum(b)) => {
+        (AggValue::Sum(None), AggValue::Sum(None)) => true,
+        (AggValue::Sum(Some(a)), AggValue::Sum(Some(b))) => {
             (a - b).abs() <= 1e-9_f64.max(c.sum_f64().abs() * 1e-12)
         }
         (AggValue::Real(None), AggValue::Real(None)) => true,
@@ -367,8 +368,10 @@ fn seed_row(spec: &AggSpec, c: &AggComponents) -> Vec<Value<Postgres>> {
     match spec {
         AggSpec::CountStar => alloc::vec![Value::Int(c.count_star)],
         AggSpec::CountColumn { .. } => alloc::vec![Value::Int(c.count_col)],
-        AggSpec::Sum { .. } => alloc::vec![c.sum_cell()],
-        AggSpec::Avg { .. } => alloc::vec![c.sum_cell(), Value::Int(c.numeric)],
+        // SUM and AVG read the same pair: the total and its contributors.
+        AggSpec::Sum { .. } | AggSpec::Avg { .. } => {
+            alloc::vec![c.sum_cell(), Value::Int(c.numeric)]
+        }
         AggSpec::VarPop { .. }
         | AggSpec::VarSamp { .. }
         | AggSpec::StddevPop { .. }

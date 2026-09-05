@@ -1271,8 +1271,10 @@ pub(crate) fn render_aggregate_bootstrap<B: crate::backend::Backend, DB: Databas
         _ if widened => alloc::vec![sum(), sum_of_squares(&arg)?, count()],
         AggSpec::CountStar => alloc::vec![agg_call("COUNT", FunctionArgExpr::Wildcard)],
         AggSpec::CountColumn { .. } => alloc::vec![count()],
-        AggSpec::Sum { .. } => alloc::vec![sum()],
-        AggSpec::Avg { .. } => alloc::vec![sum(), count()],
+        // `SUM` and `AVG` read the same pair: the total and how many rows
+        // contributed to it. `AVG` divides by that count and `SUM` reports
+        // NULL when it is zero.
+        AggSpec::Sum { .. } | AggSpec::Avg { .. } => alloc::vec![sum(), count()],
         AggSpec::VarPop { .. }
         | AggSpec::VarSamp { .. }
         | AggSpec::StddevPop { .. }
@@ -1325,8 +1327,7 @@ pub(crate) fn aggregate_bootstrap_kinds(spec: &AggSpec) -> Vec<crate::backend::B
         AggSpec::CountStar | AggSpec::CountColumn { .. } => {
             alloc::vec![crate::backend::BuiltinKind::Int]
         }
-        AggSpec::Sum { .. } => alloc::vec![crate::backend::BuiltinKind::Float],
-        AggSpec::Avg { .. } => alloc::vec![
+        AggSpec::Sum { .. } | AggSpec::Avg { .. } => alloc::vec![
             crate::backend::BuiltinKind::Float,
             crate::backend::BuiltinKind::Int,
         ],

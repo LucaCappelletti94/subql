@@ -85,17 +85,17 @@ where
             }
         }
         AggSpec::Sum { column } => {
+            // No early-out on a zero delta: a row worth zero moves the
+            // answer from NULL to 0, or back, without moving the total.
             let value = read(*column).numeric()?;
-            let delta = value * weight as f64;
-            if delta == 0.0 {
-                None
-            } else {
-                Some(AggDelta::Sum(delta))
-            }
+            Some(AggDelta::Totalled {
+                sum_delta: value * weight as f64,
+                count_delta: weight,
+            })
         }
         AggSpec::Avg { column } => {
             let value = read(*column).numeric()?;
-            Some(AggDelta::Avg {
+            Some(AggDelta::Totalled {
                 sum_delta: value * weight as f64,
                 count_delta: weight,
             })

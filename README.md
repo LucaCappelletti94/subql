@@ -89,7 +89,9 @@ subql::Install::install(
     &mut engine,
     counted.subscription_id,
     subql::AggregateSeedInstall {
-        rows: vec![vec![Value::Int(0)]],
+        // An empty table: a NULL total over no contributing rows, and a
+        // contributor count of zero.
+        rows: vec![vec![Value::Null, Value::Int(0)]],
         read_at: None,
     },
 )
@@ -125,7 +127,7 @@ assert_eq!(
 assert_eq!(
     updates[1].change,
     subql::AggregateValueChange::Set(subql::AggregateResultValue::Folded(
-        AggValue::Sum(250.0),
+        AggValue::Sum(Some(250.0)),
     )),
 );
 ```
@@ -136,9 +138,8 @@ assert_eq!(
 |-----|--------------------|-------|
 | `SELECT COUNT(*) FROM t WHERE ...` | `Count(i64)` | +/-1 per matching row |
 | `SELECT COUNT(col) FROM t WHERE ...` | `Count(i64)` | skips `NULL` cells |
-| `SELECT SUM(col) FROM t WHERE ...` | `Sum(f64)` | skips `NULL`/`NaN`/`Inf` |
+| `SELECT SUM(col) FROM t WHERE ...` | `Sum(Option<f64>)` | skips `NULL`/`NaN`/`Inf`; `None` when no row contributes, which is what every engine answers |
 | `SELECT AVG(col) FROM t WHERE ...` | `Real(Option<f64>)` | `None` when no row contributes |
-| `SELECT VAR_POP(col) FROM t WHERE ...` (also `VAR_SAMP`/`STDDEV_POP`/`STDDEV_SAMP`) | `Real(Option<f64>)` | `None` until the row count makes the statistic defined |
 
 ### Type validation
 

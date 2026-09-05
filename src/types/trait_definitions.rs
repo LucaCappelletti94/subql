@@ -115,8 +115,9 @@ pub trait DurableShardStore: Send {
 pub enum AggValue {
     /// `COUNT(*)` or `COUNT(col)`.
     Count(i64),
-    /// `SUM(col)`.
-    Sum(f64),
+    /// `SUM(col)`. `None` when no row contributes a value, which every
+    /// engine answers as NULL rather than as zero.
+    Sum(Option<f64>),
     /// A real-valued aggregate (AVG, variance, stddev). `None` when undefined
     /// for the current row count.
     Real(Option<f64>),
@@ -126,9 +127,9 @@ impl core::fmt::Display for AggValue {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::Count(c) => write!(f, "{c}"),
-            Self::Sum(s) => write!(f, "{s}"),
+            Self::Sum(Some(s)) => write!(f, "{s}"),
             Self::Real(Some(v)) => write!(f, "{v}"),
-            Self::Real(None) => f.write_str("-"),
+            Self::Sum(None) | Self::Real(None) => f.write_str("-"),
         }
     }
 }

@@ -69,7 +69,9 @@ fn bootstrap_sql_per_aggspec() {
         ),
         (
             "SELECT SUM(amount) FROM t",
-            "SELECT SUM(amount) AS c0 FROM t",
+            // `SUM` reads its contribution count too, since a sum over no
+            // contributing row is NULL on every engine rather than zero.
+            "SELECT SUM(amount) AS c0, COUNT(amount) AS c1 FROM t",
         ),
         (
             "SELECT AVG(amount) FROM t",
@@ -109,7 +111,7 @@ fn bootstrap_sql_preserves_where() {
         bootstrap_of("SELECT SUM(amount) FROM t WHERE amount > 10")
             .map(|b| b.query.sql().to_string())
             .as_deref(),
-        Some("SELECT SUM(amount) AS c0 FROM t WHERE amount > 10"),
+        Some("SELECT SUM(amount) AS c0, COUNT(amount) AS c1 FROM t WHERE amount > 10"),
     );
     assert_eq!(
         bootstrap_of("SELECT COUNT(*) FROM t WHERE status = 'open'")
@@ -134,7 +136,7 @@ fn aggregate_bootstrap_carries_registration_binds() {
         .expect("aggregate has a bootstrap");
     assert_eq!(
         bootstrap.query.sql(),
-        "SELECT SUM(amount) AS c0 FROM t WHERE amount > $1"
+        "SELECT SUM(amount) AS c0, COUNT(amount) AS c1 FROM t WHERE amount > $1"
     );
     assert_eq!(bootstrap.query.binds(), &[Value::Int(10)]);
 }
@@ -148,7 +150,7 @@ fn bootstrap_kinds_per_aggspec() {
     let cases: [(&str, Vec<BuiltinKind>); 8] = [
         ("SELECT COUNT(*) FROM t", vec![int]),
         ("SELECT COUNT(amount) FROM t", vec![int]),
-        ("SELECT SUM(amount) FROM t", vec![float]),
+        ("SELECT SUM(amount) FROM t", vec![float, int]),
         ("SELECT AVG(amount) FROM t", vec![float, int]),
         ("SELECT VAR_POP(amount) FROM t", vec![float, float, int]),
         ("SELECT VAR_SAMP(amount) FROM t", vec![float, float, int]),
@@ -184,14 +186,20 @@ fn a_seed_row_decodes_into_the_value_it_describes() {
         seeded_value("SELECT COUNT(amount) FROM t", &[Value::Int(3)]),
         AggValue::Count(3),
     );
-    // SUM: single `s` component, from an integer or float column.
+    // SUM: `(s, c)` components, from an integer or float column.
     assert_eq!(
-        seeded_value("SELECT SUM(amount) FROM t", &[Value::Int(10)]),
-        AggValue::Sum(10.0),
+        seeded_value(
+            "SELECT SUM(amount) FROM t",
+            &[Value::Int(10), Value::Int(1)]
+        ),
+        AggValue::Sum(Some(10.0)),
     );
     assert_eq!(
-        seeded_value("SELECT SUM(amount) FROM t", &[Value::Float(2.5)]),
-        AggValue::Sum(2.5),
+        seeded_value(
+            "SELECT SUM(amount) FROM t",
+            &[Value::Float(2.5), Value::Int(2)]
+        ),
+        AggValue::Sum(Some(2.5)),
     );
     // AVG: `(s, c)` components.
     assert_eq!(
@@ -228,8 +236,8 @@ fn a_seed_over_an_empty_table_is_the_empty_value() {
         AggValue::Count(0),
     );
     assert_eq!(
-        seeded_value("SELECT SUM(amount) FROM t", &[Value::Null]),
-        AggValue::Sum(0.0),
+        seeded_value("SELECT SUM(amount) FROM t", &[Value::Null, Value::Int(0)]),
+        AggValue::Sum(None),
     );
     assert_eq!(
         seeded_value("SELECT AVG(amount) FROM t", &[Value::Null, Value::Int(0)],),
