@@ -16,4 +16,5 @@
 //! a refusal as unknown.
 
 pub mod generators;
+pub mod layers;
 pub mod oracle;
