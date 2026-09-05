@@ -75,12 +75,12 @@ pub enum AggSpec {
     /// resolved at registration.
     Avg { column: crate::ColumnId },
     /// `SELECT VAR_POP(column_name)`. Population variance. Emits `Stats`
-    /// deltas (`sum`, `sum_sq`, `count`). Consumer computes
-    /// `sum_sq / N - (sum / N).powi(2)`.
+    /// deltas (`sum`, `squared_deviations`, `count`). The value is
+    /// `squared_deviations / N`.
     VarPop { column: crate::ColumnId },
     /// `SELECT VAR_SAMP(column_name)` (alias `VARIANCE`). Sample variance.
-    /// Emits `Stats` deltas. Consumer computes
-    /// `(sum_sq - sum.powi(2) / N) / (N - 1)`, requires `N >= 2`.
+    /// Emits `Stats` deltas. The value is
+    /// `squared_deviations / (N - 1)`, and requires `N >= 2`.
     VarSamp { column: crate::ColumnId },
     /// `SELECT STDDEV_POP(column_name)`. Population standard deviation.
     /// Same `Stats` deltas as `VarPop`. Consumer takes `sqrt(var_pop)`.
@@ -1268,7 +1268,7 @@ pub(crate) fn render_aggregate_bootstrap<B: crate::backend::Backend, DB: Databas
         )?);
     }
     let components: Vec<Expr> = match spec {
-        _ if widened => alloc::vec![sum(), sum_of_squares(&arg)?, count()],
+        _ if widened => alloc::vec![sum(), sum_of_squared_deviations::<B>(&arg)?, count()],
         AggSpec::CountStar => alloc::vec![agg_call("COUNT", FunctionArgExpr::Wildcard)],
         AggSpec::CountColumn { .. } => alloc::vec![count()],
         // `SUM` and `AVG` read the same pair: the total and how many rows
@@ -1278,7 +1278,9 @@ pub(crate) fn render_aggregate_bootstrap<B: crate::backend::Backend, DB: Databas
         AggSpec::VarPop { .. }
         | AggSpec::VarSamp { .. }
         | AggSpec::StddevPop { .. }
-        | AggSpec::StddevSamp { .. } => alloc::vec![sum(), sum_of_squares(&arg)?, count()],
+        | AggSpec::StddevSamp { .. } => {
+            alloc::vec![sum(), sum_of_squared_deviations::<B>(&arg)?, count()]
+        }
     };
     let component_count = components.len();
     items.extend(
@@ -1442,34 +1444,53 @@ fn component(expr: Expr, slot: usize) -> SelectItem {
     }
 }
 
-/// `SUM(arg * 1.0 * arg)`, the squared term a variance or standard deviation
-/// seed carries.
+/// The seed component for the variance family's spread: the engine's own
+/// sum of squared deviations, spelled `VAR_POP(x) * COUNT(x)`.
 ///
-/// The `* 1.0 *` forces the product into floating or decimal arithmetic on
-/// every backend, so `col * col` cannot overflow the source integer type before
-/// it is summed. Portable across PostgreSQL (numeric), MySQL (decimal) and
-/// SQLite (real), and it needs no dialect-specific cast keyword.
-fn sum_of_squares(arg: &FunctionArgExpr) -> Option<Expr> {
+/// Read back from the server rather than derived from a sum of squares,
+/// because `sum_sq - sum^2/n` is the cancellation this fold exists to
+/// avoid, and a seed carrying it would reintroduce the wrong answer the
+/// moment a subscription starts from a database read. Measured over
+/// `100000000.0`, `100000001.0` and `100000002.0`, PostgreSQL answers `2`
+/// for `var_pop(x) * count(x)` exactly, while `sum(x*x)` is
+/// `3.0000000600000004e+16` and loses the answer.
+///
+/// `VAR_POP` is NULL over no rows, so the product is NULL there, which
+/// seeds the empty state exactly as the other components do.
+fn sum_of_squared_deviations<B: crate::backend::Backend>(arg: &FunctionArgExpr) -> Option<Expr> {
     let FunctionArgExpr::Expr(col) = arg else {
-        // `COUNT(*)` has no column to square, and no spec that needs this term
-        // accepts a wildcard argument.
+        // `COUNT(*)` has no column to spread, and no spec that needs this
+        // term accepts a wildcard argument.
         return None;
     };
-    let one =
-        Expr::Value(sqlparser::ast::Value::Number("1.0".to_string(), false).with_empty_span());
-    let scaled = Expr::BinaryOp {
-        left: alloc::boxed::Box::new(col.clone()),
-        op: BinaryOperator::Multiply,
-        right: alloc::boxed::Box::new(one),
-    };
-    Some(agg_call(
-        "SUM",
-        FunctionArgExpr::Expr(Expr::BinaryOp {
-            left: alloc::boxed::Box::new(scaled),
+    match B::VARIANCE_SEED {
+        crate::backend::VarianceSeed::EnginesOwn => Some(Expr::BinaryOp {
+            left: alloc::boxed::Box::new(agg_call("VAR_POP", arg.clone())),
             op: BinaryOperator::Multiply,
-            right: alloc::boxed::Box::new(col.clone()),
+            right: alloc::boxed::Box::new(agg_call("COUNT", arg.clone())),
         }),
-    ))
+        // No variance function to ask, so the seed asks for a sum of
+        // squares and the deviations are derived from it. The `* 1.0 *`
+        // keeps the product out of the source integer type.
+        crate::backend::VarianceSeed::SumOfSquares => {
+            let one = Expr::Value(
+                sqlparser::ast::Value::Number("1.0".to_string(), false).with_empty_span(),
+            );
+            let scaled = Expr::BinaryOp {
+                left: alloc::boxed::Box::new(col.clone()),
+                op: BinaryOperator::Multiply,
+                right: alloc::boxed::Box::new(one),
+            };
+            Some(agg_call(
+                "SUM",
+                FunctionArgExpr::Expr(Expr::BinaryOp {
+                    left: alloc::boxed::Box::new(scaled),
+                    op: BinaryOperator::Multiply,
+                    right: alloc::boxed::Box::new(col.clone()),
+                }),
+            ))
+        }
+    }
 }
 
 fn select_projection(stmt: &Statement) -> Option<&[SelectItem]> {

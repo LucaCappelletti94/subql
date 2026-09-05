@@ -111,6 +111,11 @@ impl<V: postgres_jsonb_canonical::PgVersion + 'static> Backend for Postgres<V> {
     const DIVISION_BY_ZERO: crate::compiler::vm::refusal::DivisionByZero =
         crate::compiler::vm::refusal::DivisionByZero::Fails;
 
+    /// Measured: `var_pop(x) * count(x)` is `2` exactly over the three
+    /// rows whose sum of squares loses the answer.
+    const VARIANCE_SEED: super::scalar_value::VarianceSeed =
+        super::scalar_value::VarianceSeed::EnginesOwn;
+
     /// Measured: `avg(int)` of 1 and 2 is `1.5000000000000000`, which is
     /// this engine's own `numeric` division of the total by the count.
     const MEAN: super::scalar_value::MeanRule = super::scalar_value::MeanRule::Exact;
@@ -409,6 +414,11 @@ impl Backend for MySql {
     const DIVISION_BY_ZERO: crate::compiler::vm::refusal::DivisionByZero =
         crate::compiler::vm::refusal::DivisionByZero::IsNull;
 
+    /// Measured: it answers `var_pop` and `stddev_pop` digit for digit
+    /// with PostgreSQL, so it can hand back its own spread too.
+    const VARIANCE_SEED: super::scalar_value::VarianceSeed =
+        super::scalar_value::VarianceSeed::EnginesOwn;
+
     /// Measured: `avg` over 1, 2 and 2 compares as `1.666666666`, which is
     /// this engine's own `/` applied to the total and the count, and it
     /// follows the declared increment exactly as `/` does.
@@ -641,6 +651,11 @@ impl Backend for SQLite {
     /// Measured: SQLite answers `NULL`.
     const DIVISION_BY_ZERO: crate::compiler::vm::refusal::DivisionByZero =
         crate::compiler::vm::refusal::DivisionByZero::IsNull;
+
+    /// Measured: `no such function: VAR_POP`. SQLite has no variance
+    /// function, so a seed there can only ask for a sum of squares.
+    const VARIANCE_SEED: super::scalar_value::VarianceSeed =
+        super::scalar_value::VarianceSeed::SumOfSquares;
 
     /// Measured: `typeof(avg(x))` is `real` for every column, and
     /// `avg` of one row of `9007199254740993` is `9.00719925474099e+15`,

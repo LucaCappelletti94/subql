@@ -83,19 +83,23 @@ fn bootstrap_sql_per_aggspec() {
         ),
         (
             "SELECT VAR_POP(amount) FROM t",
-            "SELECT SUM(amount) AS c0, SUM(amount * 1.0 * amount) AS c1, COUNT(amount) AS c2 FROM t",
+            "SELECT SUM(amount) AS c0, VAR_POP(amount) * COUNT(amount) AS c1, \
+             COUNT(amount) AS c2 FROM t",
         ),
         (
             "SELECT VAR_SAMP(amount) FROM t",
-            "SELECT SUM(amount) AS c0, SUM(amount * 1.0 * amount) AS c1, COUNT(amount) AS c2 FROM t",
+            "SELECT SUM(amount) AS c0, VAR_POP(amount) * COUNT(amount) AS c1, \
+             COUNT(amount) AS c2 FROM t",
         ),
         (
             "SELECT STDDEV_POP(amount) FROM t",
-            "SELECT SUM(amount) AS c0, SUM(amount * 1.0 * amount) AS c1, COUNT(amount) AS c2 FROM t",
+            "SELECT SUM(amount) AS c0, VAR_POP(amount) * COUNT(amount) AS c1, \
+             COUNT(amount) AS c2 FROM t",
         ),
         (
             "SELECT STDDEV_SAMP(amount) FROM t",
-            "SELECT SUM(amount) AS c0, SUM(amount * 1.0 * amount) AS c1, COUNT(amount) AS c2 FROM t",
+            "SELECT SUM(amount) AS c0, VAR_POP(amount) * COUNT(amount) AS c1, \
+             COUNT(amount) AS c2 FROM t",
         ),
     ];
     for (sql, expected) in cases {
@@ -222,22 +226,23 @@ fn a_seed_row_decodes_into_the_value_it_describes() {
             BigDecimal::from_str("2.5000000000000000").unwrap()
         ))),
     );
-    // VAR_POP: `(s, sq, c)`. amounts [2, 4, 6] -> sum=12, sum_sq=56, n=3.
-    // var_pop = 56/3 - (12/3)^2 = 2.6666666666666665.
+    // VAR_POP: `(sum, squared_deviations, count)`. Amounts [2, 4, 6] give
+    // sum 12, deviations 8 (4 + 0 + 4) and n 3, which is what the server
+    // hands back as `var_pop(x) * count(x)`.
     assert_eq!(
         seeded_value(
             "SELECT VAR_POP(amount) FROM t",
-            &[Value::Float(12.0), Value::Float(56.0), Value::Int(3)],
+            &[Value::Float(12.0), Value::Float(8.0), Value::Int(3)],
         ),
-        AggValue::Real(Some(56.0 / 3.0 - 16.0)),
+        AggValue::Real(Some(8.0 / 3.0)),
     );
-    // STDDEV_POP over the same components is sqrt(var_pop).
+    // STDDEV_POP over the same components is its square root.
     assert_eq!(
         seeded_value(
             "SELECT STDDEV_POP(amount) FROM t",
-            &[Value::Float(12.0), Value::Float(56.0), Value::Int(3)],
+            &[Value::Float(12.0), Value::Float(8.0), Value::Int(3)],
         ),
-        AggValue::Real(Some((56.0f64 / 3.0 - 16.0).sqrt())),
+        AggValue::Real(Some((8.0f64 / 3.0).sqrt())),
     );
 }
 

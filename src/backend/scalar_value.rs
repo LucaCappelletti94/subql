@@ -769,6 +769,28 @@ pub enum SumRule {
     Double,
 }
 
+/// Which shape a variance seed can read the spread back in.
+///
+/// A stable fold keeps the sum of squared deviations, and the cheapest
+/// way to seed it is to ask the engine for its own: `VAR_POP(x) *
+/// COUNT(x)`, which PostgreSQL and MySQL compute stably and which
+/// measured exactly `2` over `100000000.0`, `100000001.0` and
+/// `100000002.0`.
+///
+/// SQLite has no variance function at all, so it cannot express that
+/// product: the seed query answers `no such function: VAR_POP`. There the
+/// only shape a single projection can ask for is a sum of squares, and
+/// the deviations are derived from it, which is the cancellation this fold
+/// exists to avoid and is therefore as good as that engine gets.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum VarianceSeed {
+    /// `VAR_POP(x) * COUNT(x)`, the engine's own stable answer.
+    EnginesOwn,
+    /// `SUM(x * 1.0 * x)`, from which the deviations are derived, for an
+    /// engine with no variance function to ask.
+    SumOfSquares,
+}
+
 /// What `AVG` answers over a column whose total is exact.
 ///
 /// Measured 2026-09-05. PostgreSQL and MySQL both answer an exact

@@ -37,12 +37,14 @@ pub enum AggDelta {
     /// VAR_POP / VAR_SAMP / STDDEV_POP / STDDEV_SAMP delta, carrying the three
     /// components all four derive their value from. See [`AggAccumulator`].
     Stats {
-        /// The exact contribution, because a widened seed still projects
-        /// the function's own total and a `SUM` beside a sibling `HAVING`
-        /// answers it exactly.
+        /// The exact contribution to the total, because a widened seed
+        /// still projects the function's own total and a `SUM` beside a
+        /// sibling `HAVING` answers it exactly.
         value: TotalDelta,
-        sum_sq_delta: f64,
-        count_delta: i64,
+        /// The rows joining, summarised.
+        added: Spread,
+        /// The rows leaving, summarised.
+        removed: Spread,
     },
 }
 
@@ -104,6 +106,137 @@ impl TotalDelta {
     }
 }
 
+/// A set of rows summarised as its count, its sum, and its sum of
+/// squared deviations from its own mean.
+///
+/// The last one is what makes a variance stable. `sum_sq / n - (sum / n)^2`
+/// subtracts two large numbers, so at a large mean it keeps almost no
+/// significant digits: measured over `100000000.0`, `100000001.0` and
+/// `100000002.0`, `sum(x*x)` is `3.0000000600000004e+16` and that identity
+/// answers `2.0` where PostgreSQL and MySQL both answer
+/// `0.6666666666666666`. Accumulating the deviations instead reproduces
+/// them digit for digit.
+///
+/// Summarised rather than kept row by row so that several rows at one
+/// stream position merge into one delta without allocating, which is what
+/// [`Spread::combine`] is for.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Spread {
+    /// Rows in this set.
+    pub rows: i64,
+    /// Their sum.
+    pub sum: f64,
+    /// Their sum of squared deviations from their own mean.
+    pub squared_deviations: f64,
+}
+
+impl Spread {
+    /// The empty set.
+    pub const EMPTY: Self = Self {
+        rows: 0,
+        sum: 0.0,
+        squared_deviations: 0.0,
+    };
+
+    /// One row on its own, which deviates from its own mean by nothing.
+    pub const fn of_one(value: f64) -> Self {
+        Self {
+            rows: 1,
+            sum: value,
+            squared_deviations: 0.0,
+        }
+    }
+
+    /// Two sets read as one.
+    ///
+    /// One row joining takes the engines' own per-row step, which
+    /// subtracts before it divides. That is not a rearrangement for
+    /// taste: with an infinity in play, `value * rows - sum` is
+    /// `inf - inf` and the spread becomes `NaN`, which is what PostgreSQL
+    /// answers, while dividing first would answer `Infinity`. A genuine
+    /// batch, two sets each of several rows, takes the engines' combine
+    /// step instead, whose term is the spread between the two means
+    /// weighted by their sizes.
+    ///
+    /// The subtraction is deliberately unfused. A fused multiply-add is
+    /// more accurate, and that is the problem: the engines compute
+    /// `value * rows - sum` as two operations, and reproducing their
+    /// answer means reproducing their rounding rather than improving on
+    /// it.
+    #[must_use]
+    #[allow(clippy::cast_precision_loss, clippy::suboptimal_flops)]
+    pub fn combine(self, other: Self) -> Self {
+        if self.rows == 0 {
+            return other;
+        }
+        if other.rows == 0 {
+            return self;
+        }
+        let rows = self.rows + other.rows;
+        let sum = self.sum + other.sum;
+        if other.rows == 1 {
+            let deviation = other.sum * rows as f64 - sum;
+            return Self {
+                rows,
+                sum,
+                squared_deviations: self.squared_deviations
+                    + deviation * deviation / (rows as f64 * self.rows as f64),
+            };
+        }
+        let between = self.sum / self.rows as f64 - other.sum / other.rows as f64;
+        Self {
+            rows,
+            sum,
+            squared_deviations: self.squared_deviations
+                + other.squared_deviations
+                + between * between * (self.rows as f64) * (other.rows as f64) / rows as f64,
+        }
+    }
+
+    /// `other` taken back out of this set, which is [`Spread::combine`]
+    /// read backwards.
+    ///
+    /// One row leaving inverts the per-row step exactly, so adding a row
+    /// and taking it back out returns the spread it started from.
+    /// Emptying the set answers the empty one rather than a residue of
+    /// rounding, which is what the engines answer for no rows.
+    ///
+    /// The subtraction is deliberately unfused. A fused multiply-add is
+    /// more accurate, and that is the problem: the engines compute
+    /// `value * rows - sum` as two operations, and reproducing their
+    /// answer means reproducing their rounding rather than improving on
+    /// it.
+    #[must_use]
+    #[allow(clippy::cast_precision_loss, clippy::suboptimal_flops)]
+    pub fn without(self, other: Self) -> Self {
+        if other.rows == 0 {
+            return self;
+        }
+        let rows = self.rows - other.rows;
+        if rows <= 0 {
+            return Self::EMPTY;
+        }
+        let sum = self.sum - other.sum;
+        if other.rows == 1 {
+            let deviation = other.sum * self.rows as f64 - self.sum;
+            return Self {
+                rows,
+                sum,
+                squared_deviations: self.squared_deviations
+                    - deviation * deviation / (self.rows as f64 * rows as f64),
+            };
+        }
+        let between = sum / rows as f64 - other.sum / other.rows as f64;
+        Self {
+            rows,
+            sum,
+            squared_deviations: self.squared_deviations
+                - other.squared_deviations
+                - between * between * (rows as f64) * (other.rows as f64) / self.rows as f64,
+        }
+    }
+}
+
 impl AggDelta {
     /// Add `other` into `self`. Both come from one subscription, so both are
     /// the same variant and a mismatch cannot happen.
@@ -123,18 +256,18 @@ impl AggDelta {
             (
                 Self::Stats {
                     value,
-                    sum_sq_delta,
-                    count_delta,
+                    added,
+                    removed,
                 },
                 Self::Stats {
                     value: v,
-                    sum_sq_delta: sq,
-                    count_delta: c,
+                    added: a,
+                    removed: r,
                 },
             ) => {
                 value.merge(v);
-                *sum_sq_delta += sq;
-                *count_delta += c;
+                *added = added.combine(*a);
+                *removed = removed.combine(*r);
             }
             // One subscription folds one delta shape, kept by dispatch
             // handing every event the same spec. A mismatch reaching here
@@ -151,9 +284,9 @@ impl AggDelta {
             Self::Totalled { value, count_delta } => value.is_zero() && *count_delta == 0,
             Self::Stats {
                 value,
-                sum_sq_delta,
-                count_delta,
-            } => value.is_zero() && *sum_sq_delta == 0.0 && *count_delta == 0,
+                added,
+                removed,
+            } => value.is_zero() && added.rows == 0 && removed.rows == 0,
         }
     }
 }
@@ -185,6 +318,8 @@ pub struct FoldRule {
     /// fold that computes no mean, and registration refuses a mean whose
     /// engine needs a setting it was not given.
     pub quotient: crate::compiler::bytecode::Quotient,
+    /// Which shape this engine's variance seed arrives in.
+    pub variance_seed: crate::backend::VarianceSeed,
 }
 
 /// A running total, in the type its engine sums into.
@@ -376,7 +511,10 @@ pub struct AggAccumulator {
     kind: AggKind,
     count: i64,
     sum: f64,
-    sum_sq: f64,
+    /// The variance family's own state: the rows so far, their sum, and
+    /// their sum of squared deviations. Held beside `count` and `sum`
+    /// because a `COUNT` or a `SUM` maintains no spread at all.
+    spread: Spread,
     /// `SUM`'s own running total, exact in the type its engine sums into.
     /// `sum` above stays beside it because the variance family and a
     /// widened `HAVING` still read squares from it, which Phase D4 takes
@@ -384,6 +522,8 @@ pub struct AggAccumulator {
     total: Total,
     /// What a mean answers on this engine.
     mean_rule: crate::backend::MeanRule,
+    /// Which shape a variance seed arrives in on this engine.
+    variance_seed: crate::backend::VarianceSeed,
     /// How this engine divides, for the mean.
     quotient_rule: crate::compiler::bytecode::Quotient,
 }
@@ -406,9 +546,10 @@ impl AggAccumulator {
             kind,
             count: 0,
             sum: 0.0,
-            sum_sq: 0.0,
+            spread: Spread::EMPTY,
             total: Total::empty(rule.total),
             mean_rule: rule.mean,
+            variance_seed: rule.variance_seed,
             quotient_rule: rule.quotient,
         }
     }
@@ -443,9 +584,7 @@ impl AggAccumulator {
                 acc.count = row.get(1).and_then(|v| Self::seed_i64(v)).unwrap_or(0);
             }
             S::VarPop { .. } | S::VarSamp { .. } | S::StddevPop { .. } | S::StddevSamp { .. } => {
-                acc.sum = row.first().and_then(|v| Self::seed_f64(v)).unwrap_or(0.0);
-                acc.sum_sq = row.get(1).and_then(|v| Self::seed_f64(v)).unwrap_or(0.0);
-                acc.count = row.get(2).and_then(|v| Self::seed_i64(v)).unwrap_or(0);
+                acc.seed_spread(row);
             }
         }
         acc
@@ -459,10 +598,37 @@ impl AggAccumulator {
         if let Some(cell) = row.first() {
             acc.total.seed(cell);
         }
-        acc.sum = row.first().and_then(|v| Self::seed_f64(v)).unwrap_or(0.0);
-        acc.sum_sq = row.get(1).and_then(|v| Self::seed_f64(v)).unwrap_or(0.0);
-        acc.count = row.get(2).and_then(|v| Self::seed_i64(v)).unwrap_or(0);
+        acc.seed_spread(row);
         acc
+    }
+
+    /// Seed the variance family's state from `[sum, squared_deviations,
+    /// count]`.
+    ///
+    /// The middle component is the engine's own sum of squared
+    /// deviations, which it computes stably, rather than a sum of
+    /// squares: re-deriving the deviations from squares would put the
+    /// cancellation this phase removed back at seed time.
+    #[allow(clippy::cast_precision_loss)]
+    fn seed_spread<B: Backend>(&mut self, row: &[Value<B>]) {
+        self.sum = row.first().and_then(|v| Self::seed_f64(v)).unwrap_or(0.0);
+        self.count = row.get(2).and_then(|v| Self::seed_i64(v)).unwrap_or(0);
+        let component = row.get(1).and_then(|v| Self::seed_f64(v)).unwrap_or(0.0);
+        let squared_deviations = match self.variance_seed {
+            crate::backend::VarianceSeed::EnginesOwn => component,
+            // Derived, because this engine has no variance function to
+            // ask: the one place the cancellation survives, and only for
+            // an engine that cannot express the stable answer at all.
+            crate::backend::VarianceSeed::SumOfSquares if self.count > 0 => {
+                component - self.sum * self.sum / self.count as f64
+            }
+            crate::backend::VarianceSeed::SumOfSquares => 0.0,
+        };
+        self.spread = Spread {
+            rows: self.count,
+            sum: self.sum,
+            squared_deviations,
+        };
     }
 
     /// Decode a numeric component cell to `f64`. NULL/Missing/non-numeric
@@ -521,13 +687,13 @@ impl AggAccumulator {
             }
             AggDelta::Stats {
                 value,
-                sum_sq_delta,
-                count_delta,
+                added,
+                removed,
             } => {
                 self.total.add(value)?;
                 self.sum += value.as_f64();
-                self.sum_sq += sum_sq_delta;
-                self.count += count_delta;
+                self.count += added.rows - removed.rows;
+                self.spread = self.spread.combine(*added).without(*removed);
             }
         }
         Ok(())
@@ -538,7 +704,7 @@ impl AggAccumulator {
     pub fn clear(&mut self) {
         self.count = 0;
         self.sum = 0.0;
-        self.sum_sq = 0.0;
+        self.spread = Spread::EMPTY;
         self.total = Total::empty(self.total.rule());
     }
 
@@ -628,20 +794,39 @@ impl AggAccumulator {
         }
     }
 
-    #[allow(clippy::cast_precision_loss, clippy::suboptimal_flops)]
+    /// The population variance, which is the spread divided by the rows.
+    #[allow(clippy::cast_precision_loss)]
     fn var_pop(&self) -> Option<f64> {
-        (self.count > 0).then(|| {
-            let n = self.count as f64;
-            self.sum_sq / n - (self.sum / n).powi(2)
-        })
+        (self.spread.rows > 0).then(|| self.deviations() / self.spread.rows as f64)
     }
 
-    #[allow(clippy::cast_precision_loss, clippy::suboptimal_flops)]
+    /// The sample variance, undefined below two rows, which is the NULL
+    /// every engine answers there.
+    #[allow(clippy::cast_precision_loss)]
     fn var_samp(&self) -> Option<f64> {
-        (self.count >= 2).then(|| {
-            let n = self.count as f64;
-            (self.sum_sq - self.sum.powi(2) / n) / (n - 1.0)
-        })
+        (self.spread.rows >= 2).then(|| self.deviations() / (self.spread.rows - 1) as f64)
+    }
+
+    /// The accumulated deviations, with rounding's negatives read as
+    /// zero.
+    ///
+    /// The sum of squared deviations of a real set cannot be negative, so
+    /// a negative here is rounding left over from taking rows back out,
+    /// and a standard deviation must not answer `NaN` for a set whose
+    /// spread has merely gone.
+    ///
+    /// Written as a comparison rather than `f64::max`, which answers the
+    /// other operand for a `NaN` and would swallow the one case where
+    /// `NaN` is the engine's own answer: measured, PostgreSQL's `var_pop`
+    /// over `1.0` and `Infinity` is `NaN`. `NaN < 0.0` is false, so it
+    /// travels through.
+    fn deviations(&self) -> f64 {
+        let deviations = self.spread.squared_deviations;
+        if deviations < 0.0 {
+            0.0
+        } else {
+            deviations
+        }
     }
 }
 

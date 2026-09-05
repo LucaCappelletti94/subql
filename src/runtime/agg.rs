@@ -86,6 +86,33 @@ pub enum DeltaSpec<'a> {
     FullStats(ColumnId),
 }
 
+/// This row read as a pair of one-row sets: the one joining and the one
+/// leaving.
+///
+/// A variance is not a sum, so a row cannot be folded as a signed
+/// contribution: taking a row back out has to know the set it is leaving.
+/// A row is therefore summarised on the side it belongs to and the
+/// accumulator combines or uncombines it.
+fn spread_of(
+    cell: &AggCellRead,
+    weight: i64,
+) -> Option<(
+    crate::runtime::aggregate::Spread,
+    crate::runtime::aggregate::Spread,
+)> {
+    use crate::runtime::aggregate::Spread;
+
+    let one = Spread::of_one(cell.numeric()?);
+    Some(match weight.signum() {
+        1 => (one, Spread::EMPTY),
+        -1 => (Spread::EMPTY, one),
+        // A row that neither joins nor leaves moves no spread. Dispatch
+        // weighs every matched row `+1` or `-1`, so this is the arm that
+        // cannot happen rather than a case with an answer of its own.
+        _ => (Spread::EMPTY, Spread::EMPTY),
+    })
+}
+
 /// Compute the per-row aggregate delta for a matched row image.
 ///
 /// Returns `None` when the row contributes no delta under SQL semantics
@@ -99,12 +126,11 @@ where
         DeltaSpec::Projected(spec) => spec,
         DeltaSpec::FullStats(column) => {
             let cell = read(column);
-            let squared = cell.numeric()?;
-            let w = weight as f64;
+            let (added, removed) = spread_of(&cell, weight)?;
             return Some(AggDelta::Stats {
                 value: cell.contribution(weight)?,
-                sum_sq_delta: squared * squared * w,
-                count_delta: weight,
+                added,
+                removed,
             });
         }
     };
@@ -134,12 +160,11 @@ where
         | AggSpec::StddevPop { column }
         | AggSpec::StddevSamp { column } => {
             let cell = read(*column);
-            let squared = cell.numeric()?;
-            let w = weight as f64;
+            let (added, removed) = spread_of(&cell, weight)?;
             Some(AggDelta::Stats {
                 value: cell.contribution(weight)?,
-                sum_sq_delta: squared * squared * w,
-                count_delta: weight,
+                added,
+                removed,
             })
         }
     }

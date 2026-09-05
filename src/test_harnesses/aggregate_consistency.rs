@@ -276,7 +276,8 @@ impl AggComponents {
     const fn sum_sq_f64(&self) -> f64 {
         self.sum_sq as f64
     }
-    /// SUM / SUM(sq) components read back as NULL when no non-NULL row matched.
+    /// SUM and the spread's component read back as NULL when no non-NULL
+    /// row matched.
     const fn sum_cell(&self) -> Value<Postgres> {
         if self.numeric == 0 {
             Value::Null
@@ -284,11 +285,24 @@ impl AggComponents {
             Value::Int(self.sum)
         }
     }
-    const fn sum_sq_cell(&self) -> Value<Postgres> {
+    /// The sum of squared deviations, which is what a Postgres seed
+    /// carries: the server hands back `var_pop(x) * count(x)` rather than
+    /// a sum of squares.
+    #[allow(clippy::cast_precision_loss)]
+    fn deviations(&self) -> f64 {
+        if self.numeric == 0 {
+            return 0.0;
+        }
+        let n = self.numeric as f64;
+        let sum = self.sum as f64;
+        self.sum_sq as f64 - sum * sum / n
+    }
+
+    fn deviations_cell(&self) -> Value<Postgres> {
         if self.numeric == 0 {
             Value::Null
         } else {
-            Value::Int(self.sum_sq)
+            Value::Float(self.deviations())
         }
     }
 }
@@ -317,6 +331,7 @@ const FOLD_RULE: crate::runtime::aggregate::FoldRule = crate::runtime::aggregate
     total: crate::backend::SumRule::Integer,
     mean: crate::backend::MeanRule::Exact,
     quotient: crate::compiler::bytecode::Quotient::FromTheOperands,
+    variance_seed: crate::backend::VarianceSeed::EnginesOwn,
 };
 
 /// The oracle's exact total, in the type that rule answers.
@@ -329,10 +344,9 @@ const fn exact_total(sum: i64) -> crate::NumericValue {
 #[allow(clippy::cast_precision_loss, clippy::suboptimal_flops)]
 fn oracle_agg_value(spec: &AggSpec, c: &AggComponents) -> AggValue {
     let n = c.numeric as f64;
-    let sum = c.sum as f64;
-    let sum_sq = c.sum_sq as f64;
-    let var_pop = (c.numeric > 0).then(|| sum_sq / n - (sum / n).powi(2));
-    let var_samp = (c.numeric >= 2).then(|| (sum_sq - sum.powi(2) / n) / (n - 1.0));
+    let deviations = c.deviations();
+    let var_pop = (c.numeric > 0).then(|| deviations / n);
+    let var_samp = (c.numeric >= 2).then(|| deviations / (n - 1.0));
     match spec {
         AggSpec::CountStar => AggValue::Count(c.count_star),
         AggSpec::CountColumn { .. } => AggValue::Count(c.count_col),
@@ -397,7 +411,7 @@ fn seed_row(spec: &AggSpec, c: &AggComponents) -> Vec<Value<Postgres>> {
         | AggSpec::VarSamp { .. }
         | AggSpec::StddevPop { .. }
         | AggSpec::StddevSamp { .. } => {
-            alloc::vec![c.sum_cell(), c.sum_sq_cell(), Value::Int(c.numeric)]
+            alloc::vec![c.sum_cell(), c.deviations_cell(), Value::Int(c.numeric)]
         }
     }
 }

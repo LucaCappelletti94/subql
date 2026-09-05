@@ -62,7 +62,7 @@ pub use scalar_value::{
     ColumnComparisonOf, ComparisonContext, CustomScalars, DivisionPrecisionIncrement, DivisionRule,
     FloatWidth, GroupKeyEncoder, IntWidth, MeanRule, NoCustom, NoCustomScalars, NumericWidening,
     ScalarKind, ScalarKindOf, SumRule, TextCase, TextOperation, TextRule, TextWidth,
-    TrailingSpacePadding, TrailingSpaces, Value, ValueKind, ValueKindOf,
+    TrailingSpacePadding, TrailingSpaces, Value, ValueKind, ValueKindOf, VarianceSeed,
 };
 pub use scalars_and_backend::{
     Backend, JsonDocument, ScalarCore, ScalarKey, ScalarText, ScalarTruth, SqliteJson,

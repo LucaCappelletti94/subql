@@ -403,6 +403,15 @@ pub trait Backend: 'static {
     /// [`DivisionRule`](super::scalar_value::DivisionRule).
     const DIVISION: super::scalar_value::DivisionRule;
 
+    /// Which shape this engine can hand a variance seed back in.
+    ///
+    /// Required, and per backend, because it is a question of what the
+    /// engine can be asked: PostgreSQL and MySQL answer
+    /// `VAR_POP(x) * COUNT(x)`, while SQLite has no variance function and
+    /// its seed query fails with `no such function: VAR_POP`. See
+    /// [`VarianceSeed`](super::scalar_value::VarianceSeed).
+    const VARIANCE_SEED: super::scalar_value::VarianceSeed;
+
     /// What `AVG` answers when the total it divides is exact.
     ///
     /// Required, and per backend, because a mean is a quotient and the

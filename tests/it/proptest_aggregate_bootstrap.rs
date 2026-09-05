@@ -71,7 +71,7 @@ fn seed_row(spec: &AggSpec, c: &Components) -> Vec<Value<Postgres>> {
         | AggSpec::StddevPop { .. }
         | AggSpec::StddevSamp { .. } => vec![
             sum_cell(c.sum, c.numeric),
-            sum_cell(c.sum_sq, c.numeric),
+            deviations_cell(c),
             Value::Int(c.numeric),
         ],
         _ => unreachable!("all_specs enumerates every AggSpec variant"),
@@ -80,13 +80,34 @@ fn seed_row(spec: &AggSpec, c: &Components) -> Vec<Value<Postgres>> {
 
 /// Textbook aggregate value over the components, independent of the
 /// accumulator's own arithmetic path where possible.
+/// The sum of squared deviations, which is what a Postgres seed carries:
+/// the server hands back `var_pop(x) * count(x)` rather than a sum of
+/// squares.
 #[allow(clippy::cast_precision_loss, clippy::suboptimal_flops)]
-fn oracle(spec: &AggSpec, c: &Components) -> AggValue {
+fn deviations_of(c: &Components) -> f64 {
+    if c.numeric == 0 {
+        return 0.0;
+    }
     let n = c.numeric as f64;
     let sum = c.sum as f64;
-    let sum_sq = c.sum_sq as f64;
-    let var_pop = (c.numeric > 0).then(|| sum_sq / n - (sum / n).powi(2));
-    let var_samp = (c.numeric >= 2).then(|| (sum_sq - sum.powi(2) / n) / (n - 1.0));
+    c.sum_sq as f64 - sum * sum / n
+}
+
+/// That value as a seed cell, NULL when no row contributed one.
+fn deviations_cell(c: &Components) -> Value<Postgres> {
+    if c.numeric == 0 {
+        Value::Null
+    } else {
+        Value::Float(deviations_of(c))
+    }
+}
+
+#[allow(clippy::cast_precision_loss)]
+fn oracle(spec: &AggSpec, c: &Components) -> AggValue {
+    let n = c.numeric as f64;
+    let deviations = deviations_of(c);
+    let var_pop = (c.numeric > 0).then(|| deviations / n);
+    let var_samp = (c.numeric >= 2).then(|| deviations / (n - 1.0));
     match spec {
         AggSpec::CountStar => AggValue::Count(c.count_star),
         AggSpec::CountColumn { .. } => AggValue::Count(c.count_col),

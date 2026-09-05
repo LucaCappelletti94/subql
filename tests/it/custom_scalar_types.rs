@@ -137,6 +137,9 @@ impl Backend for Custom {
         None
     }
 
+    /// And read a variance back the way it does, from its own answer.
+    const VARIANCE_SEED: subql::backend::VarianceSeed = subql::backend::VarianceSeed::EnginesOwn;
+
     /// And average like it: an exact total's mean is an exact decimal.
     const MEAN: subql::backend::MeanRule = subql::backend::MeanRule::Exact;
 

@@ -434,6 +434,7 @@ pub fn fold_rule<B: crate::backend::Backend, DB: DatabaseLike>(
     crate::runtime::aggregate::FoldRule {
         total,
         mean: B::MEAN,
+        variance_seed: B::VARIANCE_SEED,
         // A fold that computes no mean never reads this, and one that
         // does is refused at registration when the setting is missing,
         // which `mysql_avg_without_the_declared_increment_is_refused`

@@ -13,6 +13,8 @@ mod agg_avg_exactness;
 
 mod agg_non_finite;
 
+mod agg_variance;
+
 mod agg_sum_decimal;
 
 mod agg_sum_exactness;
