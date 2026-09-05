@@ -398,11 +398,11 @@ mod comparison_descriptor_tests {
             text: None,
         };
         assert_eq!(
-            <Postgres as Backend>::text_rule(&context, TextOperation::Equality),
+            <Postgres as Backend>::text_rule(&context, TextOperation::Equality).rule(),
             Some(TextRule::EXACT)
         );
         assert_eq!(
-            <Postgres as Backend>::text_rule(&context, TextOperation::Ordering),
+            <Postgres as Backend>::text_rule(&context, TextOperation::Ordering).rule(),
             None,
             "the server answers 'a' < 'B' true, which byte order does not"
         );
@@ -414,7 +414,7 @@ mod comparison_descriptor_tests {
             text: None,
         };
         assert_eq!(
-            <Postgres as Backend>::text_rule(&context, TextOperation::Ordering),
+            <Postgres as Backend>::text_rule(&context, TextOperation::Ordering).rule(),
             Some(TextRule::EXACT),
             "C orders by byte, measured"
         );

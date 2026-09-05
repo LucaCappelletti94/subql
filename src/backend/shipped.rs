@@ -208,17 +208,28 @@ impl<V: postgres_jsonb_canonical::PgVersion + 'static> Backend for Postgres<V> {
     fn text_rule(
         comparison: &super::scalar_value::ComparisonContext<'_, Self>,
         operation: crate::backend::TextOperation,
-    ) -> Option<crate::backend::TextRule> {
-        use crate::backend::{TextOperation, TextRule};
+    ) -> crate::backend::TextResolution {
+        use crate::backend::{TextOperation, TextResolution, TextRule};
 
+        // Two columns naming different collations is a statement the
+        // server will not run: measured, `c ("C") = p ("POSIX")` answers
+        // `ERROR: could not determine which collation to use for string
+        // comparison`, while `c = d` against the database default and
+        // `c = 'ab'` both answer normally, because those sides yield.
+        if super::scalar_value::named_collations_conflict(comparison) {
+            return TextResolution::Refused {
+                reason: "the operands name different collations, and PostgreSQL answers \
+                         `could not determine which collation to use for string comparison`",
+            };
+        }
         for side in [comparison.left, comparison.right] {
             let Some(facts) = side else { continue };
             if !postgres_reproduces(facts, operation) {
-                return None;
+                return TextResolution::NeedsRead;
             }
         }
         let rule = TextRule::EXACT;
-        Some(match operation {
+        TextResolution::Rule(match operation {
             // `LIKE` reads the stored value, padding included: measured,
             // a `char(5)` holding `ab` does not match the pattern `ab`.
             TextOperation::Pattern => rule,
@@ -563,8 +574,8 @@ impl Backend for MySql {
     fn text_rule(
         comparison: &super::scalar_value::ComparisonContext<'_, Self>,
         operation: crate::backend::TextOperation,
-    ) -> Option<crate::backend::TextRule> {
-        use crate::backend::TextRule;
+    ) -> crate::backend::TextResolution {
+        use crate::backend::{TextResolution, TextRule};
 
         // Measured: `a ILIKE 'x'` is a syntax error on 8.4.11, so there is
         // no answer to reproduce and none is offered.
@@ -572,14 +583,27 @@ impl Backend for MySql {
             operation,
             crate::backend::TextOperation::CaseInsensitivePattern
         ) {
-            return None;
+            return TextResolution::NeedsRead;
+        }
+        // Two columns naming different collations: measured,
+        // `b (utf8mb4_bin) = n (utf8mb4_0900_bin)` answers `ERROR 1267
+        // Illegal mix of collations`, and so does any other differing
+        // pair of the same charset. A column against the database default
+        // resolves instead, in favour of the binary side.
+        if super::scalar_value::named_collations_conflict(comparison) {
+            return TextResolution::Refused {
+                reason: "the operands name different collations, and MySQL answers \
+                         `ERROR 1267 Illegal mix of collations`",
+            };
         }
         for side in [comparison.left, comparison.right] {
             let Some(facts) = side else { continue };
-            mysql_binary_text_rule(facts)?;
+            if mysql_binary_text_rule(facts).is_none() {
+                return TextResolution::NeedsRead;
+            }
         }
-        // Both sides agree, so either resolves the pair; a literal side
-        // takes the column's collation.
+        // Both sides name the same collation or one side is a literal, so
+        // either resolves the pair.
         let rule = comparison
             .left
             .or(comparison.right)
@@ -590,7 +614,7 @@ impl Backend for MySql {
         // `ab   ` under `utf8mb4_bin`, which is `PAD SPACE`: `b = 'ab'`
         // is 1 and `b LIKE 'ab'` is 0, so the pattern reads the stored
         // value with its spaces where equality does not.
-        Some(match operation {
+        TextResolution::Rule(match operation {
             crate::backend::TextOperation::Pattern => {
                 rule.with_spaces(crate::backend::TrailingSpaces::BothSignificant)
             }
@@ -827,18 +851,34 @@ impl Backend for SQLite {
     fn text_rule(
         comparison: &super::scalar_value::ComparisonContext<'_, Self>,
         operation: crate::backend::TextOperation,
-    ) -> Option<crate::backend::TextRule> {
+    ) -> crate::backend::TextResolution {
+        use crate::backend::TextResolution;
+
         if matches!(
             operation,
             crate::backend::TextOperation::CaseInsensitivePattern
         ) {
-            return None;
+            return TextResolution::NeedsRead;
         }
-        let mut rule = crate::backend::TextRule::EXACT;
+        // The leftmost operand carrying a collation decides, which is
+        // SQLite's own rule and not an arbitrary choice: measured on
+        // 3.51.1, `nocase_col = binary_col` is 1 and `binary_col =
+        // nocase_col` is 0, and a literal carries no collation, so a
+        // column against one answers under the column's either way.
+        //
+        // The loop used to overwrite the rule per side, so the *last*
+        // operand decided and the two directions answered alike.
+        let mut rule = None;
         for side in [comparison.left, comparison.right] {
             let Some(facts) = side else { continue };
-            rule = sqlite_text_rule(facts)?;
+            let Some(resolved) = sqlite_text_rule(facts) else {
+                return TextResolution::NeedsRead;
+            };
+            if rule.is_none() {
+                rule = Some(resolved);
+            }
         }
+        let mut rule = rule.unwrap_or(crate::backend::TextRule::EXACT);
         if matches!(operation, crate::backend::TextOperation::Pattern) {
             rule.case = crate::backend::TextCase::AsciiNoCase;
             // `LIKE` is a function here and consults no collation at all.
@@ -846,7 +886,7 @@ impl Backend for SQLite {
             // holding `ab   `: `r = 'ab'` is 1 and `r LIKE 'ab'` is 0.
             rule.spaces = crate::backend::TrailingSpaces::BothSignificant;
         }
-        Some(rule)
+        TextResolution::Rule(rule)
     }
 
     fn group_key_encoder(

@@ -204,22 +204,38 @@ impl<B: Backend> Compiling<B> {
             // The rule is what this call resolves; it is not an input.
             text: None,
         };
-        let Some(rule) = B::text_rule(&context, operation) else {
-            let collation = match &self.comparisons[usize::from(
-                reference
+        let rule = match B::text_rule(&context, operation) {
+            crate::backend::TextResolution::Rule(rule) => rule,
+            // The engine will not run the statement, so neither an
+            // in-process answer nor a read produces one. Reporting this
+            // as not-served would promise a read that raises.
+            crate::backend::TextResolution::Refused { reason } => {
+                return Err(RegisterError::RefusedByEngine {
+                    engine: core::any::type_name::<B>(),
+                    reason: reason.to_string(),
+                });
+            }
+            crate::backend::TextResolution::NeedsRead => {
+                // The named collation, when a side has one to name. No
+                // `expect` here: a text column whose facts were never
+                // interned is a refusal like any other, and panicking in
+                // `register` would be worse than the refusal it sits
+                // beside.
+                let collation = reference
                     .left
                     .or(reference.right)
-                    .expect("a text column interned its facts"),
-            )]
-            .collation
-            {
-                crate::backend::CollationFacts::Named { name, .. } => Some(name.name.clone()),
-                crate::backend::CollationFacts::DatabaseDefault
-                | crate::backend::CollationFacts::Unknown => None,
-            };
-            return Err(RegisterError::NotServedInProcess(
-                crate::errors::Refusal::CollationNotReproducible { column, collation },
-            ));
+                    .and_then(|slot| self.comparisons.get(usize::from(slot)))
+                    .and_then(|facts| match &facts.collation {
+                        crate::backend::CollationFacts::Named { name, .. } => {
+                            Some(name.name.clone())
+                        }
+                        crate::backend::CollationFacts::DatabaseDefault
+                        | crate::backend::CollationFacts::Unknown => None,
+                    });
+                return Err(RegisterError::NotServedInProcess(
+                    crate::errors::Refusal::CollationNotReproducible { column, collation },
+                ));
+            }
         };
         Ok(reference.with_text(Some(rule)))
     }

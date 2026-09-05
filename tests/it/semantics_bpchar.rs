@@ -220,7 +220,7 @@ fn mysql_binary_collation_padding_is_per_collation() {
             right: None,
             text: None,
         };
-        context.text = MySql::text_rule(&context, TextOperation::Equality);
+        context.text = MySql::text_rule(&context, TextOperation::Equality).rule();
         assert!(
             context.text.is_some(),
             "a binary collation is reproducible: {collation}"
@@ -329,7 +329,9 @@ fn a_pattern_keeps_trailing_spaces_whatever_the_collation_pads() {
             right: None,
             text: None,
         };
-        MySql::text_rule(&context, operation).expect("a binary collation is reproducible")
+        MySql::text_rule(&context, operation)
+            .rule()
+            .expect("a binary collation is reproducible")
     };
 
     assert_eq!(
@@ -363,7 +365,9 @@ fn a_pattern_keeps_trailing_spaces_whatever_the_collation_pads() {
             right: None,
             text: None,
         };
-        SQLite::text_rule(&context, operation).expect("RTRIM is reproducible")
+        SQLite::text_rule(&context, operation)
+            .rule()
+            .expect("RTRIM is reproducible")
     };
 
     assert_eq!(

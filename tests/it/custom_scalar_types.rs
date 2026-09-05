@@ -224,8 +224,8 @@ impl Backend for Custom {
     fn text_rule(
         _comparison: &subql::backend::ComparisonContext<'_, Self>,
         _operation: TextOperation,
-    ) -> Option<TextRule> {
-        Some(TextRule::EXACT)
+    ) -> subql::backend::TextResolution {
+        subql::backend::TextResolution::Rule(TextRule::EXACT)
     }
 
     type Dialect = PostgreSqlDialect;

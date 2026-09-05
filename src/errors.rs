@@ -159,6 +159,28 @@ pub enum RegisterError {
     #[error("{0}")]
     NotServedInProcess(Refusal),
 
+    /// The engine itself will not execute this statement, so neither an
+    /// in-process answer nor a database read can produce one.
+    ///
+    /// Distinct from [`Self::NotServedInProcess`], which promises that a
+    /// read answers. Measured on PostgreSQL 16.15, a comparison between
+    /// two columns whose collations differ answers
+    /// `ERROR: could not determine which collation to use for string
+    /// comparison`, and `EXPLAIN` of the same statement plans without
+    /// complaint, so registration cannot discover it by asking the
+    /// planner and a re-read raises the identical error. Reporting it as
+    /// not-served-in-process would tell a caller to do the one thing
+    /// that cannot work.
+    #[error("{engine} will not execute this statement: {reason}")]
+    RefusedByEngine {
+        /// Which engine refuses it, since the three disagree about
+        /// which statements they will run.
+        engine: &'static str,
+        /// The engine's own account of why, in its words where it gives
+        /// one.
+        reason: String,
+    },
+
     /// Table name not found in catalog
     #[error("Unknown table: {0}")]
     UnknownTable(String),

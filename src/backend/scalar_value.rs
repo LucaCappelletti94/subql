@@ -798,6 +798,73 @@ pub enum SumRule {
     Double,
 }
 
+/// What a backend can do with one text comparison.
+///
+/// Three answers, not two, because the engines have three. A rule is
+/// reproducible in process; a read is needed when the engine answers
+/// something this comparator cannot compute; and some statements the
+/// engine will not execute at all, which is neither.
+///
+/// The third arrived with mixed collations. Measured on PostgreSQL
+/// 16.15, comparing two columns whose named collations differ answers
+/// `ERROR: could not determine which collation to use for string
+/// comparison`, and `EXPLAIN` of the same statement plans without
+/// complaint. Reporting that as a read would send the caller to a
+/// statement that raises the identical error.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TextResolution {
+    /// Reproducible in process under this rule.
+    Rule(TextRule),
+    /// The engine answers, in a way this comparator does not reproduce,
+    /// so a database read answers it instead.
+    NeedsRead,
+    /// The engine will not execute the statement, so nothing answers it.
+    Refused {
+        /// The engine's own account of why, for the caller's error.
+        reason: &'static str,
+    },
+}
+
+impl TextResolution {
+    /// The rule, or `None` for either outcome that has none.
+    ///
+    /// For a caller that only needs to know whether it can compare in
+    /// process, which is every caller that is not registration.
+    #[must_use]
+    pub const fn rule(self) -> Option<TextRule> {
+        match self {
+            Self::Rule(rule) => Some(rule),
+            Self::NeedsRead | Self::Refused { .. } => None,
+        }
+    }
+}
+
+/// Whether two operands' collations can resolve together, and under
+/// which one, for an engine that refuses a mismatch.
+///
+/// Measured, the shape is the same on PostgreSQL and MySQL: two columns
+/// naming different collations is an error, while a column against the
+/// database default or against a literal resolves to the named one.
+///
+/// ```text
+/// pg      c ("C")   = p ("POSIX")     ERROR could not determine which collation
+/// pg      c ("C")   = d (default)     t
+/// pg      c ("C")   = 'ab'            t
+/// mysql   b (_bin)  = n (_0900_bin)   ERROR 1267 illegal mix of collations
+/// mysql   b (_bin)  = d (default)     1, the binary collation wins
+/// mysql   b (_bin)  = 'ab'            1
+/// ```
+pub(super) fn named_collations_conflict<B: Backend>(comparison: &ComparisonContext<'_, B>) -> bool {
+    let named = |side: Option<&ColumnComparisonOf<B>>| match side.map(|facts| &facts.collation) {
+        Some(CollationFacts::Named { name, .. }) => Some(name.name.to_ascii_lowercase()),
+        _ => None,
+    };
+    match (named(comparison.left), named(comparison.right)) {
+        (Some(left), Some(right)) => left != right,
+        _ => false,
+    }
+}
+
 /// What an engine answers when a floating total leaves its range.
 ///
 /// Measured 2026-09-05, and no two engines agree:
@@ -1268,6 +1335,7 @@ pub fn single_column_rule<B: Backend>(column: &ColumnComparisonOf<B>) -> Option<
         },
         TextOperation::Equality,
     )
+    .rule()
 }
 
 /// Whether any in-process comparison reproduces this PostgreSQL column for

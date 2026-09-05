@@ -325,9 +325,9 @@ pub trait Backend: 'static {
     where
         Self: Sized;
 
-    /// How this backend answers one text comparison in process, or `None`
-    /// when no in-process comparison reproduces it and the statement must
-    /// take a database read.
+    /// How this backend answers one text comparison: in process, by a
+    /// database read, or not at all, per
+    /// [`TextResolution`](super::scalar_value::TextResolution).
     ///
     /// Asked per operation because reproducibility does not factor per
     /// column: PostgreSQL's default collation has byte equality and locale
@@ -341,7 +341,7 @@ pub trait Backend: 'static {
     fn text_rule(
         comparison: &super::scalar_value::ComparisonContext<'_, Self>,
         operation: crate::backend::TextOperation,
-    ) -> Option<crate::backend::TextRule>
+    ) -> crate::backend::TextResolution
     where
         Self: Sized;
 

@@ -345,6 +345,8 @@ mod semantics_bpchar;
 
 mod semantics_collation;
 
+mod semantics_collation_pairs;
+
 mod semantics_cross_kind;
 
 mod semantics_arith_overflow;
