@@ -335,6 +335,8 @@ mod semantics_arith_overflow;
 
 mod semantics_div_zero;
 
+mod semantics_division;
+
 mod semantics_missing_cell;
 
 mod semantics_float_width;

@@ -287,6 +287,10 @@ where
     /// deployment-specific, and defaulting it fails silently when wrong.
     #[cfg(feature = "membership-term")]
     translator: Option<rls2fga::translator::Translator>,
+    /// MySQL's `div_precision_increment` as this deployment declared it.
+    /// Only an engine whose `/` answers a decimal needs it, and that
+    /// engine refuses the operator until it is given.
+    division_increment: Option<crate::backend::DivisionPrecisionIncrement>,
     /// Which term slots a change to each table moves, keyed by the table whose
     /// rows carry the membership.
     ///
@@ -471,6 +475,7 @@ where
             &self.dialect,
             &self.database,
             binds,
+            self.division_increment,
         )?;
 
         // Registration policy: under RLS, viewers observe different rows,
@@ -1138,6 +1143,7 @@ where
             aggregate_registrations: HashMap::new(),
             #[cfg(feature = "membership-term")]
             translator: None,
+            division_increment: None,
             term_watch: HashMap::new(),
             aggregates: HashMap::new(),
             grouped_aggregates: HashMap::new(),
@@ -1190,6 +1196,27 @@ where
     #[must_use]
     pub fn with_translator(mut self, translator: rls2fga::translator::Translator) -> Self {
         self.translator = Some(translator);
+        self
+    }
+
+    /// Supply MySQL's `div_precision_increment`, which its `/` needs.
+    ///
+    /// Without this, a MySQL predicate using `/` is refused with
+    /// [`crate::errors::Refusal::DivisionPrecisionNotDeclared`]
+    /// and answered by re-executing the query, because the setting decides
+    /// the answer and no default may be assumed: measured on MySQL 8.4.11,
+    /// `1 / 3` compares equal to `0` at increment 0 and to
+    /// `0.333333333333333333` at increment 10. Read the deployment's own
+    /// with `SELECT @@div_precision_increment`.
+    ///
+    /// PostgreSQL and SQLite need nothing here: their `/` truncates two
+    /// integers and their decimal scale follows no session setting.
+    #[must_use]
+    pub const fn with_division_precision_increment(
+        mut self,
+        increment: crate::backend::DivisionPrecisionIncrement,
+    ) -> Self {
+        self.division_increment = Some(increment);
         self
     }
 
@@ -1564,6 +1591,7 @@ where
             source_query,
             self.dialect(),
             &self.database,
+            self.division_increment,
         );
         let registration = RereadRegistration {
             consumer: consumer_id,
@@ -1629,6 +1657,7 @@ where
             Refusal::CollationNotReproducible { column, collation } => {
                 crate::NotServed::CollationNotReproducible { column, collation }
             }
+            Refusal::DivisionPrecisionNotDeclared => crate::NotServed::DivisionPrecisionNotDeclared,
             Refusal::CrossKindComparison {
                 left,
                 left_kind,
@@ -2488,6 +2517,7 @@ where
             &entry.source_query,
             &self.dialect,
             &self.database,
+            self.division_increment,
         )
         .map_err(|e| DropReason::Unplannable {
             message: format!("{e:?}"),

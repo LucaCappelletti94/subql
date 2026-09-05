@@ -704,6 +704,10 @@ pub enum NotServed<B: Backend> {
         /// reports the rules changed without naming them.
         collation: Option<String>,
     },
+    /// `/` on this engine answers a decimal whose scale depends on a
+    /// session setting the engine was not told, so only the database can
+    /// answer the quotient.
+    DivisionPrecisionNotDeclared,
     /// The comparison mixes two column types the in-process comparator does
     /// not reconcile, so the database's own coercion decides it.
     CrossKindComparison {
@@ -755,6 +759,12 @@ impl<B: Backend> core::fmt::Display for NotServed<B> {
                 "column {column} has type {kind}, whose ordered comparison \
                  subql cannot reproduce in process",
                 kind = ScalarKindName::<B>(kind)
+            ),
+            Self::DivisionPrecisionNotDeclared => write!(
+                f,
+                "division on this engine answers a decimal whose scale follows its \
+                 div_precision_increment, which this engine was not given: supply it with \
+                 with_division_precision_increment"
             ),
             Self::CollationNotReproducible { column, collation } => match collation {
                 Some(name) => write!(

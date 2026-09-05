@@ -393,6 +393,52 @@ pub trait Backend: 'static {
     /// every numeric type, while MySQL and SQLite answer `NULL`.
     const DIVISION_BY_ZERO: crate::compiler::vm::refusal::DivisionByZero;
 
+    /// What `/` answers on this backend: whether two integers divide to an
+    /// integer, and what scale a decimal quotient carries.
+    ///
+    /// Required, and per backend, because the engines disagree at every
+    /// input rather than at a boundary: measured, `7 / 2 > 3` is false on
+    /// PostgreSQL and SQLite and true on MySQL, whose `/` is decimal
+    /// division whatever its operands are. See
+    /// [`DivisionRule`](super::scalar_value::DivisionRule).
+    const DIVISION: super::scalar_value::DivisionRule;
+
+    /// Two decimals divided at the scale this backend's
+    /// [`Backend::DIVISION`] computes it to.
+    ///
+    /// Required rather than defaulted, for the reason
+    /// [`Backend::hold_float_at_single`] is: a default would let the rule
+    /// and the arithmetic disagree in silence. A backend on the standard
+    /// `bigdecimal` carrier delegates to
+    /// [`crate::compiler::vm::arithmetic::quotient_in_words`] or
+    /// [`crate::compiler::vm::arithmetic::quotient_at_significant_digits`]
+    /// according to the rule it states.
+    #[must_use]
+    fn decimal_quotient(
+        dividend: Self::Decimal,
+        divisor: Self::Decimal,
+        quotient: crate::compiler::bytecode::Quotient,
+    ) -> Self::Decimal
+    where
+        Self: Sized;
+
+    /// Two integers divided to a decimal, for a backend whose `/` answers
+    /// one.
+    ///
+    /// Called only under
+    /// [`DivisionRule::QuotientsAreDecimalInWords`](super::scalar_value::DivisionRule::QuotientsAreDecimalInWords),
+    /// where `7 / 2` is `3.5000` rather than `3`. A backend on the
+    /// standard carriers widens both sides and delegates to
+    /// [`crate::compiler::vm::arithmetic::quotient_in_words`].
+    #[must_use]
+    fn integer_quotient(
+        dividend: Self::Int,
+        divisor: Self::Int,
+        increment: super::scalar_value::DivisionPrecisionIncrement,
+    ) -> Self::Decimal
+    where
+        Self: Sized;
+
     /// Integer `+`, `-` or `*` as this backend answers it, including what
     /// it answers when the result does not fit.
     ///

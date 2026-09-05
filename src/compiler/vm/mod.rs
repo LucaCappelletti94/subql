@@ -44,10 +44,7 @@ use arithmetic::{
 use refusal::{DanglingEscape, EvaluationRefusal, LikeEscape};
 use sql_traits::prelude::DatabaseLike;
 
-/// A binary arithmetic operation the target engine may refuse.
-type FallibleBinaryOp<B> = fn(Value<B>, Value<B>) -> Result<Value<B>, EvaluationRefusal>;
-
-/// The unary form of [`FallibleBinaryOp`].
+/// One fallible unary arithmetic operation, as the VM dispatches it.
 type FallibleUnaryOp<B> = fn(Value<B>) -> Result<Value<B>, EvaluationRefusal>;
 
 /// VM evaluation error.
@@ -533,8 +530,12 @@ impl<B: Backend> Vm<B> {
             Instruction::Multiply(width) => {
                 self.execute_binary_value_op(arithmetic_multiply::<B>, *width)?;
             }
-            Instruction::Divide(width) => {
-                self.execute_binary_value_op(arithmetic_divide::<B>, *width)?;
+            Instruction::Divide(width, quotient) => {
+                let quotient = *quotient;
+                self.execute_binary_value_op(
+                    |a, b| arithmetic_divide::<B>(a, b, quotient),
+                    *width,
+                )?;
             }
             Instruction::Modulo(width) => {
                 self.execute_binary_value_op(arithmetic_modulo::<B>, *width)?;
@@ -561,7 +562,7 @@ impl<B: Backend> Vm<B> {
 
     fn execute_binary_value_op(
         &mut self,
-        op: FallibleBinaryOp<B>,
+        op: impl FnOnce(Value<B>, Value<B>) -> Result<Value<B>, EvaluationRefusal>,
         width: FloatResult,
     ) -> Result<(), VmError> {
         let b = self.pop_value()?;
@@ -1031,7 +1032,7 @@ mod tests {
         let program: BytecodeProgram<Postgres> = BytecodeProgram::new(vec![
             Instruction::LoadColumn(0),
             Instruction::PushLiteral(Value::Int(0)),
-            Instruction::Divide(None),
+            Instruction::Divide(None, crate::compiler::bytecode::Quotient::FromTheOperands),
             Instruction::PushLiteral(Value::Int(1)),
             Instruction::GreaterThan(ComparisonRef::NONE),
         ]);

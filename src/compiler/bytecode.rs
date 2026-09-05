@@ -31,6 +31,25 @@ use serde::{Deserialize, Serialize};
 /// differently.
 pub type FloatResult = Option<crate::backend::FloatWidth>;
 
+/// What one `/` needs to answer, resolved once at registration.
+///
+/// The engine's [`DivisionRule`](crate::backend::DivisionRule) says how a
+/// quotient is computed, and one of those ways needs a session setting the
+/// deployment declares. Resolving both into a single value here is what
+/// keeps the VM from holding a rule and a setting that could disagree: a
+/// program either carries an increment because its engine's rule wants
+/// one, or carries no place to put it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
+pub enum Quotient {
+    /// The operands decide it: two integers truncate toward zero, and a
+    /// decimal quotient takes the scale that gives sixteen significant
+    /// digits, rounded half away from zero.
+    FromTheOperands,
+    /// Every quotient is a decimal whose digits are quantised to
+    /// nine-digit words and truncated, at this declared increment.
+    InWordsAt(crate::backend::DivisionPrecisionIncrement),
+}
+
 /// Which column's comparison facts an instruction's operands carry, as
 /// indices into [`BytecodeProgram::column_comparisons`].
 ///
@@ -198,13 +217,17 @@ pub enum Instruction<B: Backend> {
     /// Stack: `[..., a, b] -> [..., Value]`.
     Multiply(FloatResult),
 
-    /// Divide: `a / b`. Same-scalar rules as [`Add`](Self::Add). Division by
-    /// zero yields `Value::Null`. Integer division is truncated (result is
-    /// `Int` when both operands are `Int`); the compiler emits an explicit
-    /// cast to `Float` upstream when the query wants float division.
+    /// Divide: `a / b`, answered by the engine's own rule, which
+    /// registration resolved into the [`Quotient`] this carries.
+    ///
+    /// Where two integers divide to an integer the quotient is truncated
+    /// toward zero; where they divide to a decimal it carries the declared
+    /// increment. A zero divisor is [`Backend::DIVISION_BY_ZERO`]'s
+    /// answer. Cross-scalar pairs and `Missing` / `Null` operands yield
+    /// `Value::Null`.
     ///
     /// Stack: `[..., a, b] -> [..., Value]`.
-    Divide(FloatResult),
+    Divide(FloatResult, Quotient),
 
     /// Modulo: `a % b`. `Int % Int -> Int` only (SQL modulo is undefined on
     /// floats). Any other pair, or a zero divisor, yields `Value::Null`.
@@ -456,7 +479,7 @@ impl<B: Backend> Clone for Instruction<B> {
             Self::Add(width) => Self::Add(*width),
             Self::Subtract(width) => Self::Subtract(*width),
             Self::Multiply(width) => Self::Multiply(*width),
-            Self::Divide(width) => Self::Divide(*width),
+            Self::Divide(width, quotient) => Self::Divide(*width, *quotient),
             Self::Modulo(width) => Self::Modulo(*width),
             Self::Negate(width) => Self::Negate(*width),
             Self::In {
@@ -503,7 +526,11 @@ impl<B: Backend> core::fmt::Debug for Instruction<B> {
             Self::Add(width) => f.debug_tuple("Add").field(width).finish(),
             Self::Subtract(width) => f.debug_tuple("Subtract").field(width).finish(),
             Self::Multiply(width) => f.debug_tuple("Multiply").field(width).finish(),
-            Self::Divide(width) => f.debug_tuple("Divide").field(width).finish(),
+            Self::Divide(width, quotient) => f
+                .debug_tuple("Divide")
+                .field(width)
+                .field(quotient)
+                .finish(),
             Self::Modulo(width) => f.debug_tuple("Modulo").field(width).finish(),
             Self::Negate(width) => f.debug_tuple("Negate").field(width).finish(),
             Self::In {
@@ -553,9 +580,11 @@ impl<B: Backend> PartialEq for Instruction<B> {
             (Self::Add(a), Self::Add(b))
             | (Self::Subtract(a), Self::Subtract(b))
             | (Self::Multiply(a), Self::Multiply(b))
-            | (Self::Divide(a), Self::Divide(b))
             | (Self::Modulo(a), Self::Modulo(b))
             | (Self::Negate(a), Self::Negate(b)) => a == b,
+            (Self::Divide(width_a, quotient_a), Self::Divide(width_b, quotient_b)) => {
+                width_a == width_b && quotient_a == quotient_b
+            }
             (
                 Self::Between {
                     lower: al,

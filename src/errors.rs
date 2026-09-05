@@ -109,6 +109,13 @@ pub enum Refusal {
         /// database default and for rules the catalog cannot name.
         collation: Option<String>,
     },
+    /// `/` on this engine answers a decimal whose scale depends on a
+    /// session setting the engine was not told.
+    #[error(
+        "division on this engine needs its declared div_precision_increment, which this engine \
+         was not given: pass it through with_division_precision_increment"
+    )]
+    DivisionPrecisionNotDeclared,
     /// The comparison names two columns of different kinds and this
     /// backend has no widening for the pair.
     #[error("columns {left} and {right} have kinds {left_kind:?} and {right_kind:?}, which are not compared in process")]

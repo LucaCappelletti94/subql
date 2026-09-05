@@ -31,15 +31,26 @@ use subql::{catalog_helpers, DefaultIds, SubscriptionEngine, SubscriptionRequest
 const DDL: &str = "CREATE TABLE t (id INT PRIMARY KEY, qty BIGINT, rate DOUBLE PRECISION)";
 const SQLITE_DDL: &str = "CREATE TABLE t (id INTEGER PRIMARY KEY, qty INTEGER, rate REAL)";
 
+/// Every engine here declares MySQL's `div_precision_increment`, because
+/// MySQL's `/` answers a decimal whose scale follows it and a subscription
+/// that did not declare it is refused rather than evaluated. Without this,
+/// the MySQL cases below would pass by never running.
 macro_rules! dispatch {
     ($backend:ty, $dialect:ty, $ddl:expr, $predicate:expr, $cells:expr) => {{
         let db = ParserDB::parse::<$dialect>($ddl).expect("DDL parses");
         let table = catalog_helpers::table_id(&db, "t").expect("t is in the catalog");
         let mut engine: SubscriptionEngine<TestEvent<$backend>, DefaultIds, ParserDB> =
-            SubscriptionEngine::new(db, <$dialect>::default());
-        engine
+            SubscriptionEngine::new(db, <$dialect>::default()).with_division_precision_increment(
+                subql::backend::DivisionPrecisionIncrement::new(4).expect("4 is in range"),
+            );
+        let registered = engine
             .register(SubscriptionRequest::new(1u64, $predicate))
             .expect("the predicate registers");
+        assert!(
+            registered.not_served_because.is_none(),
+            "this case is about in-process evaluation, but the predicate was refused: {:?}",
+            registered.not_served_because
+        );
         engine
             .consumers(&TestEvent::insert(table, $cells))
             .expect("dispatch succeeds")

@@ -618,6 +618,99 @@ pub enum NumericWidening {
     Exact,
 }
 
+/// What `/` answers, which is an engine's choice and not one rule.
+///
+/// Measured 2026-09-05 on PostgreSQL 16.15, MySQL 8.4.11 and SQLite
+/// 3.51.1, and read back to both servers' sources:
+///
+/// ```text
+/// expression           pg                      mysql        sqlite
+/// 7 / 2                3                       3.5000       3
+/// 1 / 3                0                       0.333333333  0
+/// 1::numeric / 3       0.33333333333333333333  -            no decimal type
+/// ```
+///
+/// Two independent choices hide in that table. Whether an integer
+/// quotient stays an integer: PostgreSQL and SQLite truncate toward zero,
+/// MySQL answers a decimal instead, so `7 / 2 > 3` is false on two
+/// engines and true on the third. And what scale a decimal quotient
+/// carries, since neither engine computes one exactly.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum DivisionRule {
+    /// Two integers divide to an integer, truncated toward zero, and a
+    /// decimal quotient carries the scale that gives sixteen significant
+    /// digits, rounded half away from zero.
+    ///
+    /// PostgreSQL's rule, from `select_div_scale`
+    /// (`src/backend/utils/adt/numeric.c`), whose scale is
+    /// `max(16 - quotient_weight * 4, dividend_scale, divisor_scale, 0)`
+    /// where the weight counts four-digit words. Byte-identical in
+    /// PostgreSQL 12 through 17 and driven by no session variable.
+    ///
+    /// SQLite states this too, and only its integer half ever runs: its
+    /// numeric tower is `INTEGER` and `REAL`, so no decimal value reaches
+    /// arithmetic.
+    IntegersTruncate,
+    /// Every quotient is a decimal, even for two integers, and its
+    /// fractional digits are quantised to whole nine-digit words and
+    /// truncated toward zero.
+    ///
+    /// MySQL's rule, from `do_div_mod` (`mysys/decimal.cc`):
+    ///
+    /// ```text
+    /// frame1 = ceil(dividend_scale / 9) * 9
+    /// frame2 = ceil(divisor_scale  / 9) * 9
+    /// adj    = max(0, increment - ((frame1 - dividend_scale) + (frame2 - divisor_scale)))
+    /// digits = ceil((frame1 + frame2 + adj) / 9) * 9
+    /// ```
+    ///
+    /// Nine is `DIG_PER_DEC1`, the digits one stored word holds. The
+    /// `increment` is a session setting, so this rule needs
+    /// [`DivisionPrecisionIncrement`] before it can answer at all.
+    /// Byte-identical in MySQL 5.7 through 9.0 and in MariaDB 11.4.
+    QuotientsAreDecimalInWords,
+}
+
+/// MySQL's `div_precision_increment`, as the deployment declares it.
+///
+/// A session setting, default 4, valid from 0 through 30
+/// (`Sys_var_ulong Sys_div_precincrement`, `sql/sys_vars.cc`), and it is
+/// answer-visible rather than cosmetic. Measured on MySQL 8.4.11, `1 / 3`
+/// compares as `0` at increment 0, as `0.333333333` at 4 and 9, and as
+/// `0.333333333333333333` at 10, because
+/// [`DivisionRule::QuotientsAreDecimalInWords`] spends it a whole word at
+/// a time.
+///
+/// Nothing in a change stream carries it, so an engine that must answer
+/// division is told through
+/// [`SubscriptionEngine::with_division_precision_increment`](crate::SubscriptionEngine::with_division_precision_increment)
+/// and refuses the operator until it is.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
+pub struct DivisionPrecisionIncrement(u8);
+
+impl DivisionPrecisionIncrement {
+    /// The largest increment MySQL accepts, `DECIMAL_MAX_SCALE`.
+    const MAX: u8 = 30;
+
+    /// The declared increment, or `None` when the server would reject it.
+    ///
+    /// Read one from a deployment with
+    /// `SELECT @@div_precision_increment`.
+    #[must_use]
+    pub const fn new(increment: u8) -> Option<Self> {
+        if increment > Self::MAX {
+            return None;
+        }
+        Some(Self(increment))
+    }
+
+    /// The declared digits, as the quotient formula spends them.
+    #[must_use]
+    pub const fn digits(self) -> u8 {
+        self.0
+    }
+}
+
 /// The catalog facts of both operands of one comparison.
 ///
 /// Two-sided because a comparison's answer can depend on both columns, not

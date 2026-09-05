@@ -79,7 +79,7 @@ mod tests {
             Instruction::Add(_) => 13,
             Instruction::Subtract(_) => 14,
             Instruction::Multiply(_) => 15,
-            Instruction::Divide(_) => 16,
+            Instruction::Divide(..) => 16,
             Instruction::Modulo(_) => 17,
             Instruction::Negate(_) => 18,
             Instruction::In { .. } => 19,

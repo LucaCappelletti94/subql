@@ -1,7 +1,12 @@
 //! Arithmetic instructions split out of `vm`.
 
 use super::refusal::{ArithmeticOp, DivisionByZero, EvaluationRefusal, IntegerOverflow};
-use crate::backend::{Backend, Value};
+use crate::backend::{Backend, DivisionPrecisionIncrement, Value};
+use alloc::string::ToString as _;
+use bigdecimal::{
+    num_bigint::{BigInt, Sign},
+    BigDecimal,
+};
 
 /// `Value::Missing` / `Value::Null` on either side propagates to
 /// `Value::Null` (SQL NULL propagation).
@@ -143,6 +148,7 @@ pub(crate) fn arithmetic_multiply<B: Backend>(
 pub(crate) fn arithmetic_divide<B: Backend>(
     a: Value<B>,
     b: Value<B>,
+    quotient: crate::compiler::bytecode::Quotient,
 ) -> Result<Value<B>, EvaluationRefusal> {
     if let Some(null) = null_propagate_binary(&a, &b) {
         return Ok(null);
@@ -152,7 +158,14 @@ pub(crate) fn arithmetic_divide<B: Backend>(
             if let Some(null) = zero_divisor::<B, _>(&y, ArithmeticOp::Divide)? {
                 return Ok(null);
             }
-            return B::integer_binary(ArithmeticOp::Divide, x, y);
+            match quotient {
+                crate::compiler::bytecode::Quotient::FromTheOperands => {
+                    return B::integer_binary(ArithmeticOp::Divide, x, y)
+                }
+                crate::compiler::bytecode::Quotient::InWordsAt(increment) => {
+                    Value::Decimal(B::integer_quotient(x, y, increment))
+                }
+            }
         }
         (Value::Float(x), Value::Float(y)) => {
             if let Some(null) = zero_divisor::<B, _>(&y, ArithmeticOp::Divide)? {
@@ -164,7 +177,7 @@ pub(crate) fn arithmetic_divide<B: Backend>(
             if let Some(null) = zero_divisor::<B, _>(&y, ArithmeticOp::Divide)? {
                 return Ok(null);
             }
-            Value::Decimal(x / y)
+            Value::Decimal(B::decimal_quotient(x, y, quotient))
         }
         _ => Value::Null,
     })
@@ -241,4 +254,171 @@ where
 {
     let cleared = x.clone() - x.clone();
     &cleared == x
+}
+
+/// One decimal quotient's fractional digits, and how the digit after them
+/// is spent.
+///
+/// Both engines compute a quotient to a scale they pick and neither keeps
+/// more, so a quotient is a scale plus a rule for the first digit dropped.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct Quantisation {
+    /// Fractional digits kept.
+    scale: i64,
+    /// Whether a dropped half rounds the last kept digit away from zero.
+    rounds: bool,
+}
+
+/// MySQL's quotient of two decimals, at the increment the deployment
+/// declared.
+///
+/// The scale is quantised to whole nine-digit words and the quotient is
+/// truncated, per
+/// [`DivisionRule::QuotientsAreDecimalInWords`](crate::backend::DivisionRule::QuotientsAreDecimalInWords).
+/// A backend
+/// on the standard `bigdecimal` carrier delegates here.
+#[must_use]
+pub fn quotient_in_words(
+    dividend: &BigDecimal,
+    divisor: &BigDecimal,
+    increment: DivisionPrecisionIncrement,
+) -> BigDecimal {
+    let dividend_scale = fractional_digits(dividend);
+    let divisor_scale = fractional_digits(divisor);
+    let framed_dividend = whole_words(dividend_scale);
+    let framed_divisor = whole_words(divisor_scale);
+    let padding = (framed_dividend - dividend_scale) + (framed_divisor - divisor_scale);
+    let adjusted = i64::from(increment.digits()).saturating_sub(padding);
+    quotient(
+        dividend,
+        divisor,
+        Quantisation {
+            scale: whole_words(framed_dividend + framed_divisor + adjusted),
+            rounds: false,
+        },
+    )
+}
+
+/// PostgreSQL's quotient of two `numeric` values.
+///
+/// The scale is whatever gives sixteen significant digits, floored by
+/// either operand's own scale, and the quotient is rounded half away from
+/// zero, per
+/// [`DivisionRule::IntegersTruncate`](crate::backend::DivisionRule::IntegersTruncate).
+/// A backend on the standard
+/// `bigdecimal` carrier delegates here.
+#[must_use]
+pub fn quotient_at_significant_digits(dividend: &BigDecimal, divisor: &BigDecimal) -> BigDecimal {
+    /// `NUMERIC_MIN_SIG_DIGITS`, the significant digits a quotient gets.
+    const SIGNIFICANT: i64 = 16;
+    /// `DEC_DIGITS`, the decimal digits one stored word holds.
+    const PER_WORD: i64 = 4;
+    /// `NUMERIC_MAX_DISPLAY_SCALE`.
+    const MAX_SCALE: i64 = 1000;
+
+    let (dividend_weight, dividend_lead) = leading_word(dividend);
+    let (divisor_weight, divisor_lead) = leading_word(divisor);
+    // The server's own conservative estimate: equal leading words leave the
+    // ordering undecided, so it assumes the quotient is the smaller one and
+    // buys another word of scale.
+    let quotient_weight =
+        dividend_weight - divisor_weight - i64::from(dividend_lead <= divisor_lead);
+    let scale = (SIGNIFICANT - quotient_weight * PER_WORD)
+        .max(fractional_digits(dividend))
+        .max(fractional_digits(divisor))
+        .clamp(0, MAX_SCALE);
+    quotient(
+        dividend,
+        divisor,
+        Quantisation {
+            scale,
+            rounds: true,
+        },
+    )
+}
+
+/// `dividend / divisor` at exactly `quantisation`.
+///
+/// Computed as one integer division rather than by dividing and then
+/// re-scaling: `bigdecimal` divides to a fixed number of significant
+/// digits, and a quotient here can want eighty fractional digits on top of
+/// an integer part, which would put the digit being kept past that
+/// horizon.
+fn quotient(dividend: &BigDecimal, divisor: &BigDecimal, quantisation: Quantisation) -> BigDecimal {
+    let (dividend_digits, dividend_scale) = dividend.as_bigint_and_exponent();
+    let (divisor_digits, divisor_scale) = divisor.as_bigint_and_exponent();
+    // dividend / divisor * 10^scale, as a ratio of integers.
+    let shift = quantisation.scale + divisor_scale - dividend_scale;
+    let (numerator, denominator) = if shift >= 0 {
+        (dividend_digits * power_of_ten(shift), divisor_digits)
+    } else {
+        (dividend_digits, divisor_digits * power_of_ten(-shift))
+    };
+    let negative = (numerator.sign() == Sign::Minus) != (denominator.sign() == Sign::Minus);
+    let numerator = numerator.magnitude().clone();
+    let denominator = denominator.magnitude().clone();
+    let mut digits = &numerator / &denominator;
+    if quantisation.rounds {
+        let remainder = numerator % &denominator;
+        if remainder * 2u8 >= denominator {
+            digits += 1u8;
+        }
+    }
+    let signed = BigInt::from_biguint(if negative { Sign::Minus } else { Sign::Plus }, digits);
+    BigDecimal::new(signed, quantisation.scale)
+}
+
+/// `10^exponent`, for a non-negative exponent.
+fn power_of_ten(exponent: i64) -> BigInt {
+    let exponent = u32::try_from(exponent).unwrap_or(u32::MAX);
+    BigInt::from(10u8).pow(exponent)
+}
+
+/// The value's own fractional digits, never negative.
+///
+/// `1E+2` carries a negative scale, which is no engine's fractional digit
+/// count: both floor theirs at zero.
+fn fractional_digits(value: &BigDecimal) -> i64 {
+    value.as_bigint_and_exponent().1.max(0)
+}
+
+/// `digits` rounded up to a whole nine-digit MySQL word.
+///
+/// `ROUND_UP(X) * DIG_PER_DEC1` in `mysys/decimal.cc`.
+const fn whole_words(digits: i64) -> i64 {
+    /// `DIG_PER_DEC1`, the decimal digits one stored word holds.
+    const PER_WORD: i64 = 9;
+
+    (digits + PER_WORD - 1) / PER_WORD * PER_WORD
+}
+
+/// The value's leading four-digit word: which word it is, and what it
+/// holds.
+///
+/// PostgreSQL stores a `numeric` in base 10000 aligned on the decimal
+/// point, and its division scale reads both the leading word's position
+/// and its value. Word 0 covers the digits `10^0` through `10^3`, so `7`
+/// is word 0 holding 7, `12345` is word 1 holding 1, and `0.5` is word -1
+/// holding 5000.
+fn leading_word(value: &BigDecimal) -> (i64, i64) {
+    /// `DEC_DIGITS`.
+    const PER_WORD: i64 = 4;
+
+    let (digits, scale) = value.as_bigint_and_exponent();
+    if digits.sign() == Sign::NoSign {
+        return (0, 0);
+    }
+    let spelled = digits.magnitude().to_string();
+    // Position of the most significant digit, as a power of ten.
+    let most_significant = i64::try_from(spelled.len()).unwrap_or(i64::MAX) - 1 - scale;
+    let weight = most_significant.div_euclid(PER_WORD);
+    // The leading word holds every digit from the word's top down to the
+    // most significant one, zero-padded when the value has no more.
+    let width = usize::try_from(most_significant - weight * PER_WORD + 1).unwrap_or(1);
+    let mut lead = spelled;
+    lead.truncate(width);
+    while lead.len() < width {
+        lead.push('0');
+    }
+    (weight, lead.parse::<i64>().unwrap_or(0))
 }

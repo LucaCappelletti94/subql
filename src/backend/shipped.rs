@@ -110,6 +110,42 @@ impl<V: postgres_jsonb_canonical::PgVersion + 'static> Backend for Postgres<V> {
     const DIVISION_BY_ZERO: crate::compiler::vm::refusal::DivisionByZero =
         crate::compiler::vm::refusal::DivisionByZero::Fails;
 
+    /// Measured: `7 / 2` is `3`, and `1::numeric / 3` is
+    /// `0.33333333333333333333`, twenty digits and rounded up.
+    const DIVISION: super::scalar_value::DivisionRule =
+        super::scalar_value::DivisionRule::IntegersTruncate;
+
+    /// The quotient's scale is the engine's, resolved at registration.
+    fn decimal_quotient(
+        dividend: bigdecimal::BigDecimal,
+        divisor: bigdecimal::BigDecimal,
+        quotient: crate::compiler::bytecode::Quotient,
+    ) -> bigdecimal::BigDecimal {
+        match quotient {
+            crate::compiler::bytecode::Quotient::FromTheOperands => {
+                crate::compiler::vm::arithmetic::quotient_at_significant_digits(&dividend, &divisor)
+            }
+            crate::compiler::bytecode::Quotient::InWordsAt(increment) => {
+                crate::compiler::vm::arithmetic::quotient_in_words(&dividend, &divisor, increment)
+            }
+        }
+    }
+
+    /// Never called: this engine's `/` truncates two integers rather than
+    /// answering a decimal, so the integer arm stays on
+    /// [`Backend::integer_binary`].
+    fn integer_quotient(
+        dividend: i64,
+        divisor: i64,
+        increment: super::scalar_value::DivisionPrecisionIncrement,
+    ) -> bigdecimal::BigDecimal {
+        crate::compiler::vm::arithmetic::quotient_in_words(
+            &bigdecimal::BigDecimal::from(dividend),
+            &bigdecimal::BigDecimal::from(divisor),
+            increment,
+        )
+    }
+
     type Custom = NoCustomScalars<Self>;
 
     /// Measured: a backslash escapes, and a pattern ending with one is
@@ -352,6 +388,42 @@ impl Backend for MySql {
     const DIVISION_BY_ZERO: crate::compiler::vm::refusal::DivisionByZero =
         crate::compiler::vm::refusal::DivisionByZero::IsNull;
 
+    /// Measured: `7 / 2` is `3.5000` and `2 / 3` compares as
+    /// `0.666666666`, truncated at a nine-digit word. MySQL spells integer
+    /// division `DIV`, which is a different operator.
+    const DIVISION: super::scalar_value::DivisionRule =
+        super::scalar_value::DivisionRule::QuotientsAreDecimalInWords;
+
+    /// The quotient's scale is the engine's, resolved at registration.
+    fn decimal_quotient(
+        dividend: bigdecimal::BigDecimal,
+        divisor: bigdecimal::BigDecimal,
+        quotient: crate::compiler::bytecode::Quotient,
+    ) -> bigdecimal::BigDecimal {
+        match quotient {
+            crate::compiler::bytecode::Quotient::FromTheOperands => {
+                crate::compiler::vm::arithmetic::quotient_at_significant_digits(&dividend, &divisor)
+            }
+            crate::compiler::bytecode::Quotient::InWordsAt(increment) => {
+                crate::compiler::vm::arithmetic::quotient_in_words(&dividend, &divisor, increment)
+            }
+        }
+    }
+
+    /// Two integers divide to a decimal here, so both widen and take the
+    /// same word quantisation any other pair takes.
+    fn integer_quotient(
+        dividend: i64,
+        divisor: i64,
+        increment: super::scalar_value::DivisionPrecisionIncrement,
+    ) -> bigdecimal::BigDecimal {
+        crate::compiler::vm::arithmetic::quotient_in_words(
+            &bigdecimal::BigDecimal::from(dividend),
+            &bigdecimal::BigDecimal::from(divisor),
+            increment,
+        )
+    }
+
     /// Measured: MySQL raises `BIGINT value is out of range`. Its unary
     /// minus on the smallest integer promotes past `i64` instead, which is
     /// reported as a failure here rather than answered from a number this
@@ -525,6 +597,40 @@ impl Backend for SQLite {
     /// Measured: SQLite answers `NULL`.
     const DIVISION_BY_ZERO: crate::compiler::vm::refusal::DivisionByZero =
         crate::compiler::vm::refusal::DivisionByZero::IsNull;
+
+    /// Measured: `7 / 2` is `3`. Only the integer half of this rule can
+    /// run, since SQLite has no decimal type.
+    const DIVISION: super::scalar_value::DivisionRule =
+        super::scalar_value::DivisionRule::IntegersTruncate;
+
+    /// SQLite decodes no decimal cell, so this states the rule it declares rather than a second one.
+    fn decimal_quotient(
+        dividend: bigdecimal::BigDecimal,
+        divisor: bigdecimal::BigDecimal,
+        quotient: crate::compiler::bytecode::Quotient,
+    ) -> bigdecimal::BigDecimal {
+        match quotient {
+            crate::compiler::bytecode::Quotient::FromTheOperands => {
+                crate::compiler::vm::arithmetic::quotient_at_significant_digits(&dividend, &divisor)
+            }
+            crate::compiler::bytecode::Quotient::InWordsAt(increment) => {
+                crate::compiler::vm::arithmetic::quotient_in_words(&dividend, &divisor, increment)
+            }
+        }
+    }
+
+    /// Never called: this engine's `/` truncates two integers.
+    fn integer_quotient(
+        dividend: i64,
+        divisor: i64,
+        increment: super::scalar_value::DivisionPrecisionIncrement,
+    ) -> bigdecimal::BigDecimal {
+        crate::compiler::vm::arithmetic::quotient_in_words(
+            &bigdecimal::BigDecimal::from(dividend),
+            &bigdecimal::BigDecimal::from(divisor),
+            increment,
+        )
+    }
 
     /// Measured: SQLite carries an overflowed integer result as a real.
     fn integer_binary(

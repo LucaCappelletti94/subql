@@ -44,14 +44,36 @@ struct Compiling<B: Backend> {
     /// Comparison facts interned as they are needed, addressed by
     /// [`crate::compiler::bytecode::ComparisonRef`] index.
     comparisons: Vec<crate::backend::ColumnComparisonOf<B>>,
+    /// MySQL's `div_precision_increment` as the deployment declared it, or
+    /// `None` when it did not. Only an engine whose `/` answers a decimal
+    /// reads it, and that engine refuses the operator without it.
+    increment: Option<crate::backend::DivisionPrecisionIncrement>,
 }
 
 impl<B: Backend> Compiling<B> {
-    const fn new() -> Self {
+    const fn new(increment: Option<crate::backend::DivisionPrecisionIncrement>) -> Self {
         Self {
             out: Vec::new(),
             terms: Vec::new(),
             comparisons: Vec::new(),
+            increment,
+        }
+    }
+
+    /// The [`Quotient`](crate::compiler::bytecode::Quotient) a `/` compiles
+    /// to under this backend, or the refusal when its rule needs a setting
+    /// this engine was not given.
+    fn quotient(&self) -> Result<crate::compiler::bytecode::Quotient, RegisterError> {
+        match B::DIVISION {
+            crate::backend::DivisionRule::IntegersTruncate => {
+                Ok(crate::compiler::bytecode::Quotient::FromTheOperands)
+            }
+            crate::backend::DivisionRule::QuotientsAreDecimalInWords => self
+                .increment
+                .map(crate::compiler::bytecode::Quotient::InWordsAt)
+                .ok_or(RegisterError::NotServedInProcess(
+                    crate::errors::Refusal::DivisionPrecisionNotDeclared,
+                )),
         }
     }
 
@@ -367,7 +389,7 @@ where
     B: Backend + SqlLiteralParse,
     DB: DatabaseLike,
 {
-    parse_compile_normalize_and_prefilter_with_binds(sql, dialect, database, &[])
+    parse_compile_normalize_and_prefilter_with_binds(sql, dialect, database, &[], None)
 }
 
 /// Like [`parse_compile_normalize_and_prefilter`], but first resolves `$N`/`?`
@@ -381,6 +403,7 @@ pub fn parse_compile_normalize_and_prefilter_with_binds<B, DB>(
     dialect: &B::Dialect,
     database: &DB,
     binds: &[Value<B>],
+    increment: Option<crate::backend::DivisionPrecisionIncrement>,
 ) -> Result<CompiledQuery<B>, RegisterError>
 where
     B: Backend + SqlLiteralParse,
@@ -396,6 +419,7 @@ where
                 pq.table_id,
                 database,
                 &Canonicalizer::new(dialect as &dyn Dialect),
+                increment,
             )?
         } else {
             // No WHERE clause matches every row. Feed the bare `true` literal
@@ -452,6 +476,7 @@ pub(crate) fn parse_table_and_where_deps<B, DB>(
     dialect: &B::Dialect,
     database: &DB,
     binds: &[Value<B>],
+    increment: Option<crate::backend::DivisionPrecisionIncrement>,
 ) -> Result<TableAndWhereDeps<B>, RegisterError>
 where
     B: Backend + SqlLiteralParse,
@@ -467,6 +492,7 @@ where
             table_id,
             database,
             &Canonicalizer::new(dialect as &dyn Dialect),
+            increment,
         )?;
         // This path serves the queries the engine itself rejects, which are the
         // scalar aggregates. One in-process accumulator is shared by every

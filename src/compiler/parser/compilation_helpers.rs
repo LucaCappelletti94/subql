@@ -53,15 +53,41 @@ fn nested_column_scalar_of<B: Backend, DB: DatabaseLike>(
         return None;
     }
     match expr {
-        Expr::BinaryOp { left, right, .. } => {
-            nested_column_scalar_of::<B, DB>(left, table_id, database, depth + 1)
-                .or_else(|| nested_column_scalar_of::<B, DB>(right, table_id, database, depth + 1))
+        Expr::BinaryOp { left, op, right } => {
+            let operand = nested_column_scalar_of::<B, DB>(left, table_id, database, depth + 1)
+                .or_else(|| nested_column_scalar_of::<B, DB>(right, table_id, database, depth + 1));
+            quotient_kind::<B>(op, operand)
         }
         Expr::UnaryOp { expr, .. } | Expr::Nested(expr) => {
             nested_column_scalar_of::<B, DB>(expr, table_id, database, depth + 1)
         }
         _ => None,
     }
+}
+
+/// The kind a binary operation answers, given the kind its operands carry.
+///
+/// Only `/` moves it, and only where the engine's `/` answers a decimal:
+/// MySQL's `qty / 3` is a decimal even though `qty` is an integer, so a
+/// literal compared against it has to be read as a decimal too. A float
+/// operand keeps its own kind, since a float divided there stays a double
+/// rather than becoming a decimal.
+fn quotient_kind<B: Backend>(
+    op: &BinaryOperator,
+    operand: Option<ValueKindOf<B>>,
+) -> Option<ValueKindOf<B>> {
+    if !matches!(op, BinaryOperator::Divide)
+        || !matches!(
+            B::DIVISION,
+            crate::backend::DivisionRule::QuotientsAreDecimalInWords
+        )
+    {
+        return operand;
+    }
+    if operand == Some(BuiltinKind::Float.into()) {
+        return operand;
+    }
+    Some(BuiltinKind::Decimal.into())
 }
 
 /// Return `true` if `instr` produces a [`crate::compiler::Tri`] on the
@@ -133,12 +159,13 @@ pub(super) fn compile_expression<B, DB>(
     table_id: TableId,
     database: &DB,
     canonicalizer: &Canonicalizer<'_>,
+    increment: Option<crate::backend::DivisionPrecisionIncrement>,
 ) -> Result<(BytecodeProgram<B>, Vec<CompiledTerm>), RegisterError>
 where
     B: Backend + SqlLiteralParse,
     DB: DatabaseLike,
 {
-    let mut compiling: Compiling<B> = Compiling::new();
+    let mut compiling: Compiling<B> = Compiling::new(increment);
     compile_expr_recursive::<B, DB>(
         expr,
         table_id,
@@ -461,13 +488,16 @@ where
                                 float_result_width::<B, DB>(left, table_id, database, depth),
                                 float_result_width::<B, DB>(right, table_id, database, depth),
                             );
-                            out.push(match op {
+                            let instruction = match op {
                                 BinaryOperator::Plus => Instruction::Add(width),
                                 BinaryOperator::Minus => Instruction::Subtract(width),
                                 BinaryOperator::Multiply => Instruction::Multiply(width),
-                                BinaryOperator::Divide => Instruction::Divide(width),
+                                BinaryOperator::Divide => {
+                                    Instruction::Divide(width, out.quotient()?)
+                                }
                                 _ => Instruction::Modulo(width),
-                            });
+                            };
+                            out.push(instruction);
                         }
 
                         _ => {

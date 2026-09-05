@@ -137,6 +137,31 @@ impl Backend for Custom {
         None
     }
 
+    /// The fixtures divide like PostgreSQL: two integers truncate, and a
+    /// decimal quotient takes the significant-digit scale.
+    const DIVISION: subql::backend::DivisionRule = subql::backend::DivisionRule::IntegersTruncate;
+
+    fn decimal_quotient(
+        dividend: bigdecimal::BigDecimal,
+        divisor: bigdecimal::BigDecimal,
+        _quotient: subql::compiler::bytecode::Quotient,
+    ) -> bigdecimal::BigDecimal {
+        subql::compiler::vm::arithmetic::quotient_at_significant_digits(&dividend, &divisor)
+    }
+
+    /// Never called: this backend's `/` truncates two integers.
+    fn integer_quotient(
+        dividend: i64,
+        divisor: i64,
+        increment: subql::backend::DivisionPrecisionIncrement,
+    ) -> bigdecimal::BigDecimal {
+        subql::compiler::vm::arithmetic::quotient_in_words(
+            &bigdecimal::BigDecimal::from(dividend),
+            &bigdecimal::BigDecimal::from(divisor),
+            increment,
+        )
+    }
+
     /// On the standard carrier, so the shared narrowing serves even though
     /// this backend never resolves a single-width result.
     fn hold_float_at_single(value: f64) -> f64 {

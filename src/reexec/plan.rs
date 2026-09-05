@@ -126,6 +126,7 @@ pub fn build_plan<B, DB>(
     query: &crate::reexec::BoundQuery<B>,
     dialect: &B::Dialect,
     database: &DB,
+    increment: Option<crate::backend::DivisionPrecisionIncrement>,
 ) -> Result<QueryPlan<B>, RegisterError>
 where
     B: Backend + SqlLiteralParse,
@@ -136,11 +137,11 @@ where
     // re-read for everything else. An intermediate tier's error only means the
     // query belongs to the next tier, so it surfaces only when every tier
     // refused, where each tier's own reason is the whole diagnosis.
-    let grouped = match grouped_scalar_plan::<B, DB>(query, dialect, database) {
+    let grouped = match grouped_scalar_plan::<B, DB>(query, dialect, database, increment) {
         Ok(plan) => return Ok(plan),
         Err(error) => error,
     };
-    let scalar = match scalar_plan::<B, DB>(query, dialect, database) {
+    let scalar = match scalar_plan::<B, DB>(query, dialect, database, increment) {
         Ok(plan) => return Ok(plan),
         Err(error) => error,
     };
@@ -258,13 +259,19 @@ fn grouped_scalar_plan<B, DB>(
     query: &crate::reexec::BoundQuery<B>,
     dialect: &B::Dialect,
     database: &DB,
+    increment: Option<crate::backend::DivisionPrecisionIncrement>,
 ) -> Result<QueryPlan<B>, RegisterError>
 where
     B: Backend + SqlLiteralParse,
     DB: DatabaseLike,
 {
-    let parsed =
-        parser::parse_table_and_where_deps::<B, DB>(query.sql(), dialect, database, query.binds())?;
+    let parsed = parser::parse_table_and_where_deps::<B, DB>(
+        query.sql(),
+        dialect,
+        database,
+        query.binds(),
+        increment,
+    )?;
     let projection =
         extract_grouped_extreme::<B, DB>(&parsed.statement, parsed.table_id, database)?
             .ok_or_else(|| {
@@ -581,13 +588,19 @@ fn scalar_plan<B, DB>(
     query: &crate::reexec::BoundQuery<B>,
     dialect: &B::Dialect,
     database: &DB,
+    increment: Option<crate::backend::DivisionPrecisionIncrement>,
 ) -> Result<QueryPlan<B>, RegisterError>
 where
     B: Backend + SqlLiteralParse,
     DB: DatabaseLike,
 {
-    let parsed =
-        parser::parse_table_and_where_deps::<B, DB>(query.sql(), dialect, database, query.binds())?;
+    let parsed = parser::parse_table_and_where_deps::<B, DB>(
+        query.sql(),
+        dialect,
+        database,
+        query.binds(),
+        increment,
+    )?;
     // The shared parse admits `HAVING` because the grouped plan serves it.
     // A scalar read takes one value and cannot honour the clause, so a
     // statement carrying one falls through to the whole re-read, which
