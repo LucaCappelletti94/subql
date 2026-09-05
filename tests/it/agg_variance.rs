@@ -110,8 +110,14 @@ impl<B: Folding> Folding2<B> {
         } else {
             self.delete(x)
         };
-        let Some(AggValue::Real(Some(value))) = value else {
-            panic!("the variance family reports a real, got {value:?}")
+        let value = match value {
+            Some(
+                AggValue::VarPop(Some(value))
+                | AggValue::VarSamp(Some(value))
+                | AggValue::StddevPop(Some(value))
+                | AggValue::StddevSamp(Some(value)),
+            ) => value,
+            other => panic!("the variance family reports a real, got {other:?}"),
         };
         value
     }
@@ -251,7 +257,7 @@ fn one_row_has_no_sample_variance() {
     let mut folding = pg("SELECT VAR_SAMP(x) FROM t");
     assert_eq!(
         folding.insert(ROWS[0]),
-        Some(AggValue::Real(None)),
+        Some(AggValue::VarSamp(None)),
         "measured: var_samp over one row is NULL"
     );
 }

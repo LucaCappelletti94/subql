@@ -202,11 +202,11 @@ fn a_seed_row_decodes_into_the_value_it_describes() {
     // COUNT family: single `c` component.
     assert_eq!(
         seeded_value("SELECT COUNT(*) FROM t", &[Value::Int(5)]),
-        AggValue::Count(5),
+        AggValue::CountStar(5),
     );
     assert_eq!(
         seeded_value("SELECT COUNT(amount) FROM t", &[Value::Int(3)]),
-        AggValue::Count(3),
+        AggValue::CountColumn(3),
     );
     // SUM: `(s, c)` components. The total decodes in the type the engine
     // sums into, which for this `INT` column is a `bigint`.
@@ -244,7 +244,7 @@ fn a_seed_row_decodes_into_the_value_it_describes() {
             "SELECT VAR_POP(amount) FROM t",
             &[Value::Float(12.0), Value::Float(8.0), Value::Int(3)],
         ),
-        AggValue::Real(Some(8.0 / 3.0)),
+        AggValue::VarPop(Some(8.0 / 3.0)),
     );
     // STDDEV_POP over the same components is its square root.
     assert_eq!(
@@ -252,7 +252,7 @@ fn a_seed_row_decodes_into_the_value_it_describes() {
             "SELECT STDDEV_POP(amount) FROM t",
             &[Value::Float(12.0), Value::Float(8.0), Value::Int(3)],
         ),
-        AggValue::Real(Some((8.0f64 / 3.0).sqrt())),
+        AggValue::StddevPop(Some((8.0f64 / 3.0).sqrt())),
     );
 }
 
@@ -261,7 +261,7 @@ fn a_seed_over_an_empty_table_is_the_empty_value() {
     // Zero matching rows: COUNT returns 0, SUM/variance components are NULL.
     assert_eq!(
         seeded_value("SELECT COUNT(*) FROM t", &[Value::Int(0)]),
-        AggValue::Count(0),
+        AggValue::CountStar(0),
     );
     assert_eq!(
         seeded_value("SELECT SUM(amount) FROM t", &[Value::Null, Value::Int(0)]),
@@ -276,7 +276,7 @@ fn a_seed_over_an_empty_table_is_the_empty_value() {
             "SELECT VAR_POP(amount) FROM t",
             &[Value::Null, Value::Null, Value::Int(0)],
         ),
-        AggValue::Real(None),
+        AggValue::VarPop(None),
     );
 }
 

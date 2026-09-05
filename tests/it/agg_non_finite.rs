@@ -178,7 +178,7 @@ fn pg_avg_of_infinity_is_infinity() {
 fn pg_count_includes_a_non_finite_value() {
     assert_eq!(
         pg("SELECT COUNT(approx) FROM t", &[1.0, f64::INFINITY], 1),
-        Some(AggValue::Count(2)),
+        Some(AggValue::CountColumn(2)),
         "measured: count(f) is 2"
     );
 }
@@ -188,7 +188,7 @@ fn pg_count_includes_a_non_finite_value() {
 #[test]
 fn pg_variance_with_an_infinity_is_nan() {
     let value = pg("SELECT VAR_POP(approx) FROM t", &[1.0, f64::INFINITY], 3);
-    let Some(AggValue::Real(Some(value))) = value else {
+    let Some(AggValue::VarPop(Some(value))) = value else {
         panic!("expected a real, got {value:?}")
     };
     assert!(
@@ -466,7 +466,7 @@ fn pg_variance_recovers_when_an_infinity_leaves() {
     );
     assert_eq!(
         after,
-        Some(AggValue::Real(Some(0.25))),
+        Some(AggValue::VarPop(Some(0.25))),
         "measured: PostgreSQL answers 0.25 over the two rows that remain"
     );
 }

@@ -263,7 +263,7 @@ where
     /// assert_eq!(
     ///     updates[0].change,
     ///     subql::AggregateValueChange::Set(subql::AggregateResultValue::Folded(
-    ///         AggValue::Count(5),
+    ///         AggValue::CountStar(5),
     ///     ))
     /// );
     ///

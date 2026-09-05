@@ -112,20 +112,50 @@ pub trait DurableShardStore: Send {
 /// Current value of an aggregate subscription, as the engine reports it on
 /// [`AggregateValueUpdate`].
 ///
+/// One variant per aggregate, so a reported value says which aggregate
+/// produced it. `Real` used to carry all four of the variance family, and
+/// that lost the question: measured on PostgreSQL 16, MySQL 8.4 and
+/// SQLite 3.51.1, the two rows 5 and 7 give a population variance of 1
+/// and a population standard deviation of 1, so the two answers were
+/// byte-identical and no care at the call site could recover which had
+/// been asked for.
+///
+/// `None` means the engine answers NULL, and what makes it NULL differs
+/// by aggregate. Measured on all three engines over an `int` column:
+///
+/// ```text
+/// rows          count(*) count(v)  sum   avg  var_pop  var_samp
+/// none                 0        0  NULL  NULL  NULL     NULL
+/// one NULL             1        0  NULL  NULL  NULL     NULL
+/// one value            1        1     5     5  0        NULL
+/// two values           2        2    12     6  1        2
+/// ```
+///
+/// So a count is never NULL, a sum and a mean are NULL until one row
+/// contributes a value, the population pair is NULL until one does and
+/// answers zero at exactly one, and the sample pair is NULL until two do.
+/// No engine distinguishes no rows from rows that are all NULL: both
+/// answer NULL, so neither does this type.
+///
 /// Not `Copy`: an exact decimal total owns its digits.
 #[derive(Clone, Debug, PartialEq)]
 pub enum AggValue {
-    /// `COUNT(*)` or `COUNT(col)`.
-    Count(i64),
-    /// `SUM(col)`. `None` when no row contributes a value, which every
-    /// engine answers as NULL rather than as zero.
+    /// `COUNT(*)`: rows matched, NULL included. Never NULL itself.
+    CountStar(i64),
+    /// `COUNT(col)`: rows whose value is not NULL. Never NULL itself.
+    CountColumn(i64),
+    /// `SUM(col)`, in the type its engine sums into.
     Sum(Option<NumericValue>),
-    /// `AVG(col)`, in the type its engine answers. `None` when no row
-    /// contributes, which is what every engine answers for an empty set.
+    /// `AVG(col)`, in the type its engine answers.
     Avg(Option<NumericValue>),
-    /// A real-valued aggregate (variance and stddev). `None` when undefined
-    /// for the current row count.
-    Real(Option<f64>),
+    /// `VAR_POP(col)`.
+    VarPop(Option<f64>),
+    /// `VAR_SAMP(col)`.
+    VarSamp(Option<f64>),
+    /// `STDDEV_POP(col)`.
+    StddevPop(Option<f64>),
+    /// `STDDEV_SAMP(col)`.
+    StddevSamp(Option<f64>),
 }
 
 /// A number in the type its engine answers, for a total or a mean.
@@ -164,10 +194,18 @@ impl core::fmt::Display for NumericValue {
 impl core::fmt::Display for AggValue {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            Self::Count(c) => write!(f, "{c}"),
-            Self::Sum(Some(s)) | Self::Avg(Some(s)) => write!(f, "{s}"),
-            Self::Real(Some(v)) => write!(f, "{v}"),
-            Self::Sum(None) | Self::Avg(None) | Self::Real(None) => f.write_str("-"),
+            Self::CountStar(count) | Self::CountColumn(count) => write!(f, "{count}"),
+            Self::Sum(Some(number)) | Self::Avg(Some(number)) => write!(f, "{number}"),
+            Self::VarPop(Some(real))
+            | Self::VarSamp(Some(real))
+            | Self::StddevPop(Some(real))
+            | Self::StddevSamp(Some(real)) => write!(f, "{real}"),
+            Self::Sum(None)
+            | Self::Avg(None)
+            | Self::VarPop(None)
+            | Self::VarSamp(None)
+            | Self::StddevPop(None)
+            | Self::StddevSamp(None) => f.write_str("-"),
         }
     }
 }

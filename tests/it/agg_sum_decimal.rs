@@ -181,7 +181,7 @@ fn decimal_column_variance_folds() {
     );
     assert_eq!(
         inserted(&mut engine, table, decimal("10.25"), 10),
-        Some(AggValue::Real(Some(0.0))),
+        Some(AggValue::VarPop(Some(0.0))),
         "one row has no spread, which is 0 rather than nothing"
     );
 }

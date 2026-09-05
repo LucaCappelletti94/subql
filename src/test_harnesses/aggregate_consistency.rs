@@ -350,8 +350,8 @@ fn oracle_agg_value(spec: &AggSpec, c: &AggComponents) -> AggValue {
     let var_pop = (c.numeric > 0).then(|| deviations / n);
     let var_samp = (c.numeric >= 2).then(|| deviations / (n - 1.0));
     match spec {
-        AggSpec::CountStar => AggValue::Count(c.count_star),
-        AggSpec::CountColumn { .. } => AggValue::Count(c.count_col),
+        AggSpec::CountStar => AggValue::CountStar(c.count_star),
+        AggSpec::CountColumn { .. } => AggValue::CountColumn(c.count_col),
         // The fixtures sum an `i16` column under Postgres, whose sum is a
         // `bigint`, so the oracle's exact total is an integer.
         AggSpec::Sum { .. } => AggValue::Sum((c.numeric > 0).then(|| exact_total(c.sum))),
@@ -364,10 +364,10 @@ fn oracle_agg_value(spec: &AggSpec, c: &AggComponents) -> AggValue {
                 ),
             )
         })),
-        AggSpec::VarPop { .. } => AggValue::Real(var_pop),
-        AggSpec::VarSamp { .. } => AggValue::Real(var_samp),
-        AggSpec::StddevPop { .. } => AggValue::Real(var_pop.map(f64::sqrt)),
-        AggSpec::StddevSamp { .. } => AggValue::Real(var_samp.map(f64::sqrt)),
+        AggSpec::VarPop { .. } => AggValue::VarPop(var_pop),
+        AggSpec::VarSamp { .. } => AggValue::VarSamp(var_samp),
+        AggSpec::StddevPop { .. } => AggValue::StddevPop(var_pop.map(f64::sqrt)),
+        AggSpec::StddevSamp { .. } => AggValue::StddevSamp(var_samp.map(f64::sqrt)),
     }
 }
 
@@ -382,8 +382,14 @@ fn oracle_agg_value(spec: &AggSpec, c: &AggComponents) -> AggValue {
 /// amounts driving them are `i16`.
 #[allow(clippy::cast_precision_loss)]
 fn agg_values_agree(engine: &AggValue, oracle: &AggValue, c: &AggComponents) -> bool {
+    // Pairing per aggregate rather than per carrier is what makes the
+    // `_ => false` arm mean something: while all four of the variance
+    // family reported as one `Real`, a variance compared against a
+    // standard deviation matched the same arm and agreed whenever their
+    // values happened to coincide, which for a spread of 1 they do.
     match (engine, oracle) {
-        (AggValue::Count(a), AggValue::Count(b)) => a == b,
+        (AggValue::CountStar(a), AggValue::CountStar(b))
+        | (AggValue::CountColumn(a), AggValue::CountColumn(b)) => a == b,
         (AggValue::Sum(None), AggValue::Sum(None)) => true,
         // An exact total agrees exactly, which is the whole point of it.
         (AggValue::Sum(Some(a)), AggValue::Sum(Some(b))) => a == b,
@@ -391,8 +397,14 @@ fn agg_values_agree(engine: &AggValue, oracle: &AggValue, c: &AggComponents) -> 
         // A mean is exact here too, being the engine's own division of the
         // exact total by the count.
         (AggValue::Avg(Some(a)), AggValue::Avg(Some(b))) => a == b,
-        (AggValue::Real(None), AggValue::Real(None)) => true,
-        (AggValue::Real(Some(a)), AggValue::Real(Some(b))) => {
+        (AggValue::VarPop(None), AggValue::VarPop(None))
+        | (AggValue::VarSamp(None), AggValue::VarSamp(None))
+        | (AggValue::StddevPop(None), AggValue::StddevPop(None))
+        | (AggValue::StddevSamp(None), AggValue::StddevSamp(None)) => true,
+        (AggValue::VarPop(Some(a)), AggValue::VarPop(Some(b)))
+        | (AggValue::VarSamp(Some(a)), AggValue::VarSamp(Some(b)))
+        | (AggValue::StddevPop(Some(a)), AggValue::StddevPop(Some(b)))
+        | (AggValue::StddevSamp(Some(a)), AggValue::StddevSamp(Some(b))) => {
             (a - b).abs() <= 1e-3_f64.max(c.sum_sq_f64().abs().sqrt() * 1e-5)
         }
         _ => false,

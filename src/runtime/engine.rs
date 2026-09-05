@@ -4011,7 +4011,7 @@ where
     /// assert_eq!(
     ///     out.aggregate_updates()[0].change,
     ///     subql::AggregateValueChange::Set(subql::AggregateResultValue::Folded(
-    ///         AggValue::Count(1),
+    ///         AggValue::CountStar(1),
     ///     ))
     /// );
     /// assert_eq!(out.notified(), vec![7, 9]); // deduped union of both paths

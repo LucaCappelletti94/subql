@@ -454,37 +454,31 @@ impl AggDelta {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
-enum AggKind {
-    Count,
+/// Which aggregate a running value is read through.
+///
+/// Eight, not seven: `COUNT(*)` and `COUNT(col)` read different counters,
+/// rows matched against rows whose value is not NULL, so collapsing them
+/// would put the choice back into a field that means two things.
+/// [`crate::HavingFunction`] is the seven of these that aggregate a
+/// column, and maps into this by [`crate::HavingFunction::kind`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AggKind {
+    /// `COUNT(*)`, over rows matched.
+    CountStar,
+    /// `COUNT(col)`, over rows whose value is not NULL.
+    CountColumn,
+    /// `SUM(col)`.
     Sum,
+    /// `AVG(col)`.
     Avg,
+    /// `VAR_POP(col)`.
     VarPop,
+    /// `VAR_SAMP(col)`.
     VarSamp,
+    /// `STDDEV_POP(col)`.
     StddevPop,
+    /// `STDDEV_SAMP(col)`.
     StddevSamp,
-}
-
-impl AggKind {
-    /// The kind a `HAVING` family function reads through.
-    ///
-    /// The one place the pairing is spelled. `from_spec` derives the same
-    /// kind from the projected `AggSpec`, and the two must agree, because
-    /// a projected `SUM` and a `HAVING SUM(...)` over one subscription
-    /// read the same held components and have to report the same number.
-    /// `COUNT(*)` has no function here: it aggregates no column, so
-    /// `HavingFunction::of` answers `None` for it.
-    const fn of_having(function: crate::HavingFunction) -> Self {
-        match function {
-            crate::HavingFunction::CountColumn => Self::Count,
-            crate::HavingFunction::Sum => Self::Sum,
-            crate::HavingFunction::Avg => Self::Avg,
-            crate::HavingFunction::VarPop => Self::VarPop,
-            crate::HavingFunction::VarSamp => Self::VarSamp,
-            crate::HavingFunction::StddevPop => Self::StddevPop,
-            crate::HavingFunction::StddevSamp => Self::StddevSamp,
-        }
-    }
 }
 
 /// How one subscription's fold answers, resolved once at registration.
@@ -808,7 +802,23 @@ fn integer_digits_of(value: &bigdecimal::BigDecimal) -> u64 {
 #[derive(Clone, Debug)]
 pub struct AggAccumulator {
     kind: AggKind,
-    count: i64,
+    /// Rows matched, whatever their value, which is what `COUNT(*)`
+    /// counts.
+    ///
+    /// Maintained only for [`AggKind::CountStar`], which is the only
+    /// aggregate that reads it and the only one whose bootstrap row
+    /// carries it: a `SUM` subscription is seeded from `COUNT(col)`, so
+    /// this crate cannot know how many rows it matched without asking a
+    /// different question of the database. Zero for every other kind, and
+    /// no other kind reads it.
+    ///
+    /// Separate from `contributions` regardless, because one field served
+    /// both before, chosen by which spec was registered, so its meaning
+    /// depended on state elsewhere and no reader could tell which it held.
+    rows_matched: i64,
+    /// Rows whose value is not NULL, which is what every aggregate but
+    /// `COUNT(*)` counts, and what decides whether one answers NULL.
+    contributions: i64,
     sum: f64,
     /// The variance family's own state: the rows so far, their sum, and
     /// their sum of squared deviations. Held beside `count` and `sum`
@@ -833,7 +843,8 @@ impl AggAccumulator {
     pub fn from_spec(spec: &AggSpec, rule: FoldRule) -> Self {
         use AggSpec as S;
         let kind = match spec {
-            S::CountStar | S::CountColumn { .. } => AggKind::Count,
+            S::CountStar => AggKind::CountStar,
+            S::CountColumn { .. } => AggKind::CountColumn,
             S::Sum { .. } => AggKind::Sum,
             S::Avg { .. } => AggKind::Avg,
             S::VarPop { .. } => AggKind::VarPop,
@@ -843,7 +854,8 @@ impl AggAccumulator {
         };
         Self {
             kind,
-            count: 0,
+            rows_matched: 0,
+            contributions: 0,
             sum: 0.0,
             spread: Spread::EMPTY,
             total: Total::empty(rule.total, FloatBoundary(rule.float_overflow)),
@@ -865,22 +877,25 @@ impl AggAccumulator {
         use AggSpec as S;
         let mut acc = Self::from_spec(spec, rule);
         match spec {
-            S::CountStar | S::CountColumn { .. } => {
-                acc.count = row.first().and_then(|v| Self::seed_i64(v)).unwrap_or(0);
+            S::CountStar => {
+                acc.rows_matched = row.first().and_then(|v| Self::seed_i64(v)).unwrap_or(0);
+            }
+            S::CountColumn { .. } => {
+                acc.contributions = row.first().and_then(|v| Self::seed_i64(v)).unwrap_or(0);
             }
             S::Sum { .. } => {
                 if let Some(cell) = row.first() {
                     acc.total.seed(cell);
                 }
                 acc.sum = row.first().and_then(|v| Self::seed_f64(v)).unwrap_or(0.0);
-                acc.count = row.get(1).and_then(|v| Self::seed_i64(v)).unwrap_or(0);
+                acc.contributions = row.get(1).and_then(|v| Self::seed_i64(v)).unwrap_or(0);
             }
             S::Avg { .. } => {
                 if let Some(cell) = row.first() {
                     acc.total.seed(cell);
                 }
                 acc.sum = row.first().and_then(|v| Self::seed_f64(v)).unwrap_or(0.0);
-                acc.count = row.get(1).and_then(|v| Self::seed_i64(v)).unwrap_or(0);
+                acc.contributions = row.get(1).and_then(|v| Self::seed_i64(v)).unwrap_or(0);
             }
             S::VarPop { .. } | S::VarSamp { .. } | S::StddevPop { .. } | S::StddevSamp { .. } => {
                 acc.seed_spread(row);
@@ -911,20 +926,20 @@ impl AggAccumulator {
     #[allow(clippy::cast_precision_loss)]
     fn seed_spread<B: Backend>(&mut self, row: &[Value<B>]) {
         self.sum = row.first().and_then(|v| Self::seed_f64(v)).unwrap_or(0.0);
-        self.count = row.get(2).and_then(|v| Self::seed_i64(v)).unwrap_or(0);
+        self.contributions = row.get(2).and_then(|v| Self::seed_i64(v)).unwrap_or(0);
         let component = row.get(1).and_then(|v| Self::seed_f64(v)).unwrap_or(0.0);
         let squared_deviations = match self.variance_seed {
             crate::backend::VarianceSeed::EnginesOwn => component,
             // Derived, because this engine has no variance function to
             // ask: the one place the cancellation survives, and only for
             // an engine that cannot express the stable answer at all.
-            crate::backend::VarianceSeed::SumOfSquares if self.count > 0 => {
-                component - self.sum * self.sum / self.count as f64
+            crate::backend::VarianceSeed::SumOfSquares if self.contributions > 0 => {
+                component - self.sum * self.sum / self.contributions as f64
             }
             crate::backend::VarianceSeed::SumOfSquares => 0.0,
         };
         self.spread = Spread {
-            rows: self.count,
+            rows: self.contributions,
             sum: self.sum,
             squared_deviations,
             // A seed read from the engine reports over rows the engine
@@ -982,11 +997,18 @@ impl AggAccumulator {
     /// represent, which is the point the engine itself raises.
     pub fn apply(&mut self, delta: &AggDelta) -> Result<(), SumOutOfRange> {
         match delta {
-            AggDelta::Count(d) => self.count += d,
+            // `COUNT(*)` counts rows, every other count counts values.
+            // The producer already applied the NULL filter for the
+            // latter, emitting no delta at all for an absent cell, so the
+            // only thing left to decide here is which counter it lands in.
+            AggDelta::Count(delta) => match self.kind {
+                AggKind::CountStar => self.rows_matched += delta,
+                _ => self.contributions += delta,
+            },
             AggDelta::Totalled { value, count_delta } => {
                 self.total.add(value)?;
                 self.sum += value.as_f64();
-                self.count += count_delta;
+                self.contributions += count_delta;
             }
             AggDelta::Stats {
                 value,
@@ -995,7 +1017,7 @@ impl AggAccumulator {
             } => {
                 self.total.add(value)?;
                 self.sum += value.as_f64();
-                self.count += added.rows - removed.rows;
+                self.contributions += added.rows - removed.rows;
                 self.spread = self.spread.combine(*added).without(*removed);
             }
         }
@@ -1005,7 +1027,12 @@ impl AggAccumulator {
     /// Empty the running value, which is exactly the state a re-read of an
     /// emptied table would seed.
     pub fn clear(&mut self) {
-        self.count = 0;
+        // Both counters, because an emptied table matched no rows and
+        // received no values. Resetting only the contributions left a
+        // `COUNT(*)` reporting its old row count after a truncate, which
+        // `a_truncate_zeroes_a_held_total_and_reports_it` caught.
+        self.rows_matched = 0;
+        self.contributions = 0;
         self.sum = 0.0;
         self.spread = Spread::EMPTY;
         self.total.clear();
@@ -1024,13 +1051,14 @@ impl AggAccumulator {
     /// mistake would be silent: both answers are plausible.
     fn value_of(&self, kind: AggKind) -> AggValue {
         match kind {
-            AggKind::Count => AggValue::Count(self.count),
+            AggKind::CountStar => AggValue::CountStar(self.rows_matched),
+            AggKind::CountColumn => AggValue::CountColumn(self.contributions),
             AggKind::Sum => AggValue::Sum(self.reported_total()),
             AggKind::Avg => AggValue::Avg(self.mean()),
-            AggKind::VarPop => AggValue::Real(self.var_pop()),
-            AggKind::VarSamp => AggValue::Real(self.var_samp()),
-            AggKind::StddevPop => AggValue::Real(self.var_pop().map(f64::sqrt)),
-            AggKind::StddevSamp => AggValue::Real(self.var_samp().map(f64::sqrt)),
+            AggKind::VarPop => AggValue::VarPop(self.var_pop()),
+            AggKind::VarSamp => AggValue::VarSamp(self.var_samp()),
+            AggKind::StddevPop => AggValue::StddevPop(self.var_pop().map(f64::sqrt)),
+            AggKind::StddevSamp => AggValue::StddevSamp(self.var_samp().map(f64::sqrt)),
         }
     }
 
@@ -1041,7 +1069,7 @@ impl AggAccumulator {
     /// `0`. The count is what separates them, so the total is read through
     /// it rather than reported raw.
     fn reported_total(&self) -> Option<crate::NumericValue> {
-        (self.count > 0).then(|| self.total.value())
+        (self.contributions > 0).then(|| self.total.value())
     }
 
     /// The mean, or `None` when no row contributes one.
@@ -1054,10 +1082,10 @@ impl AggAccumulator {
     /// total is a double everywhere.
     #[allow(clippy::cast_precision_loss)]
     fn mean(&self) -> Option<crate::NumericValue> {
-        if self.count <= 0 {
+        if self.contributions <= 0 {
             return None;
         }
-        let double = || crate::NumericValue::Double(self.sum / self.count as f64);
+        let double = || crate::NumericValue::Double(self.sum / self.contributions as f64);
         match (&self.total, self.mean_rule) {
             // A mean never holds a single-precision total, because
             // `catalog_helpers::total_rule` gives one only to a `SUM`:
@@ -1066,7 +1094,7 @@ impl AggAccumulator {
             // through the widened total, which is what that quotient is,
             // so both widths answer alike here.
             (Total::Double(total, _) | Total::Single(total, _), _) => Some(
-                crate::NumericValue::Double(total.value() / self.count as f64),
+                crate::NumericValue::Double(total.value() / self.contributions as f64),
             ),
             (_, crate::backend::MeanRule::Double) => Some(double()),
             (Total::Integer { value, .. }, crate::backend::MeanRule::Exact) => Some(
@@ -1085,14 +1113,14 @@ impl AggAccumulator {
             crate::compiler::bytecode::Quotient::InWordsAt(increment) => {
                 crate::compiler::vm::arithmetic::quotient_in_words(
                     total,
-                    &bigdecimal::BigDecimal::from(self.count),
+                    &bigdecimal::BigDecimal::from(self.contributions),
                     increment,
                 )
             }
             crate::compiler::bytecode::Quotient::FromTheOperands => {
                 crate::compiler::vm::arithmetic::quotient_at_significant_digits(
                     total,
-                    &bigdecimal::BigDecimal::from(self.count),
+                    &bigdecimal::BigDecimal::from(self.contributions),
                 )
             }
         }
@@ -1102,7 +1130,7 @@ impl AggAccumulator {
     /// Meaningful only when the components are maintained in full, which the
     /// widened delta and seed paths guarantee.
     pub fn value_as(&self, function: crate::HavingFunction) -> AggValue {
-        self.value_of(AggKind::of_having(function))
+        self.value_of(function.kind())
     }
 
     /// The population variance, which is the spread divided by the rows.
@@ -1388,13 +1416,16 @@ impl GroupHaving {
             // used to re-derive it here from the contribution count.
             crate::HavingSubject::Aggregate(function) => {
                 match group.accumulator.value_as(function) {
-                    AggValue::Count(count) => Some(count as f64),
+                    AggValue::CountStar(count) | AggValue::CountColumn(count) => Some(count as f64),
                     // A `HAVING` compares in `f64`, which Phase D2 makes
                     // exact along with `AVG`.
                     AggValue::Sum(value) | AggValue::Avg(value) => {
                         value.as_ref().and_then(numeric_as_f64)
                     }
-                    AggValue::Real(real) => real,
+                    AggValue::VarPop(real)
+                    | AggValue::VarSamp(real)
+                    | AggValue::StddevPop(real)
+                    | AggValue::StddevSamp(real) => real,
                 }
             }
         };
@@ -1913,6 +1944,60 @@ mod tests {
             accumulator.value(),
             accumulator.value_as(HavingFunction::Avg),
             "a total of 9 and a mean of 3 are not the same value"
+        );
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod reported_kind_tests {
+    use super::{AggAccumulator, AggDelta, FoldRule, Spread};
+    use crate::compiler::sql_shape::AggSpec;
+
+    const RULE: FoldRule = FoldRule {
+        total: crate::backend::SumRule::Integer,
+        mean: crate::backend::MeanRule::Double,
+        quotient: crate::compiler::bytecode::Quotient::FromTheOperands,
+        variance_seed: crate::backend::VarianceSeed::EnginesOwn,
+        float_overflow: crate::backend::FloatSumOverflow::Raises,
+    };
+
+    /// An accumulator of `spec` holding the two rows 5 and 7.
+    ///
+    /// Chosen because it is the row set where the defect is visible:
+    /// measured on PostgreSQL 16, MySQL 8.4 and SQLite 3.51.1, its
+    /// population variance is 1 and its population standard deviation is
+    /// also 1, since the square root of one is one.
+    fn over_five_and_seven(spec: &AggSpec) -> AggAccumulator {
+        let mut accumulator = AggAccumulator::from_spec(spec, RULE);
+        for (exact, real) in [(5_i128, 5.0), (7, 7.0)] {
+            accumulator
+                .apply(&AggDelta::Stats {
+                    value: super::TotalDelta::Integer(exact),
+                    added: Spread::of_one(real),
+                    removed: Spread::EMPTY,
+                })
+                .unwrap();
+        }
+        accumulator
+    }
+
+    /// A reported value says which aggregate produced it.
+    ///
+    /// `AggValue::Real` lumps all four of `VAR_POP`, `VAR_SAMP`,
+    /// `STDDEV_POP` and `STDDEV_SAMP`, so a consumer holding one cannot
+    /// tell a variance from a standard deviation. That is not a matter of
+    /// taste: for these two rows both answer 1, so the reported values are
+    /// byte-identical and no amount of care at the call site recovers
+    /// which was asked for.
+    #[test]
+    fn a_reported_value_names_the_aggregate_that_produced_it() {
+        let variance = over_five_and_seven(&AggSpec::VarPop { column: 0 }).value();
+        let deviation = over_five_and_seven(&AggSpec::StddevPop { column: 0 }).value();
+        assert_ne!(
+            variance, deviation,
+            "a population variance and a population standard deviation are \
+             different aggregates and must not report as the same value"
         );
     }
 }

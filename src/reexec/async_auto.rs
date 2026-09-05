@@ -2398,7 +2398,7 @@ mod tests {
         );
         assert_eq!(
             n.aggregate_updates[0].folded_value(),
-            Some(crate::AggValue::Count(6)),
+            Some(crate::AggValue::CountStar(6)),
             "the incremented total"
         );
         assert_eq!(
@@ -2441,7 +2441,7 @@ mod tests {
         assert_eq!(aggregate_updates.len(), 2, "each insert folds");
         assert_eq!(
             aggregate_updates.last().unwrap().folded_value(),
-            Some(crate::AggValue::Count(7)),
+            Some(crate::AggValue::CountStar(7)),
             "the running total after both inserts"
         );
     }

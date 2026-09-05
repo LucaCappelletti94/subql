@@ -3356,7 +3356,7 @@ mod tests {
         );
         assert_eq!(
             n.aggregate_updates[0].folded_value(),
-            Some(crate::AggValue::Count(6)),
+            Some(crate::AggValue::CountStar(6)),
             "the incremented total"
         );
         assert_eq!(
@@ -3400,7 +3400,7 @@ mod tests {
         let last_fold = folds.last();
         assert_eq!(
             last_fold.unwrap().folded_value(),
-            Some(crate::AggValue::Count(7)),
+            Some(crate::AggValue::CountStar(7)),
             "the running total after both inserts"
         );
     }
@@ -3646,7 +3646,7 @@ mod tests {
         assert_eq!(applied.aggregate_updates.len(), 1);
         assert_eq!(
             applied.aggregate_updates[0].folded_value(),
-            Some(crate::AggValue::Count(4)),
+            Some(crate::AggValue::CountStar(4)),
             "the delete folds exactly once, at apply time"
         );
         assert_eq!(e.pending_read_count(), 1, "the displaced MIN queues a read");

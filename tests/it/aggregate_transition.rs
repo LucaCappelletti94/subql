@@ -63,9 +63,9 @@ fn seed_group(engine: &mut Engine, subscription: u64, region: &str) {
     assert_eq!(output.updates.len(), 1);
     assert_eq!(
         output.updates[0].change,
-        AggregateValueChange::Set(subql::AggregateResultValue::Folded(subql::AggValue::Count(
-            1
-        ),))
+        AggregateValueChange::Set(subql::AggregateResultValue::Folded(
+            subql::AggValue::CountStar(1),
+        ))
     );
 }
 

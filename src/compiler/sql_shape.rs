@@ -201,6 +201,27 @@ pub enum HavingFunction {
 }
 
 impl HavingFunction {
+    /// This function as the aggregate kind it reads through.
+    ///
+    /// A `HAVING` function is a view onto the seven of
+    /// [`AggKind`](crate::AggKind) that aggregate a
+    /// column. `COUNT(*)` is the eighth and is not one of these, because
+    /// it counts rows rather than a column's values, so the view is total
+    /// in this direction and partial in the other.
+    #[must_use]
+    pub const fn kind(self) -> crate::AggKind {
+        use crate::AggKind as K;
+        match self {
+            Self::CountColumn => K::CountColumn,
+            Self::Sum => K::Sum,
+            Self::Avg => K::Avg,
+            Self::VarPop => K::VarPop,
+            Self::VarSamp => K::VarSamp,
+            Self::StddevPop => K::StddevPop,
+            Self::StddevSamp => K::StddevSamp,
+        }
+    }
+
     /// The function a projected spec maintains, `None` for `COUNT(*)`,
     /// which aggregates no column.
     #[must_use]

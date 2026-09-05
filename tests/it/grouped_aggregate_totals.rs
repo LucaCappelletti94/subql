@@ -107,7 +107,7 @@ fn a_group_that_empties_is_removed_and_comes_back_under_the_same_key() {
     let north = north_group.key.clone();
     assert_eq!(
         one(&opening).change,
-        AggregateValueChange::Set(subql::AggregateResultValue::Folded(AggValue::Count(1)))
+        AggregateValueChange::Set(subql::AggregateResultValue::Folded(AggValue::CountStar(1)))
     );
 
     let removed = engine
@@ -142,7 +142,7 @@ fn a_group_that_empties_is_removed_and_comes_back_under_the_same_key() {
     );
     assert_eq!(
         one(&returned).change,
-        AggregateValueChange::Set(subql::AggregateResultValue::Folded(AggValue::Count(1)))
+        AggregateValueChange::Set(subql::AggregateResultValue::Folded(AggValue::CountStar(1)))
     );
 }
 
@@ -163,9 +163,9 @@ fn moving_a_row_between_groups_emits_remove_and_set() {
         .iter()
         .find(|update| {
             update.change
-                == AggregateValueChange::Set(subql::AggregateResultValue::Folded(AggValue::Count(
-                    1,
-                )))
+                == AggregateValueChange::Set(subql::AggregateResultValue::Folded(
+                    AggValue::CountStar(1),
+                ))
         })
         .and_then(|update| update.group.clone())
         .expect("north key");
@@ -173,9 +173,9 @@ fn moving_a_row_between_groups_emits_remove_and_set() {
         .iter()
         .find(|update| {
             update.change
-                == AggregateValueChange::Set(subql::AggregateResultValue::Folded(AggValue::Count(
-                    2,
-                )))
+                == AggregateValueChange::Set(subql::AggregateResultValue::Folded(
+                    AggValue::CountStar(2),
+                ))
         })
         .and_then(|update| update.group.clone())
         .expect("south key");
@@ -190,9 +190,9 @@ fn moving_a_row_between_groups_emits_remove_and_set() {
     assert!(moved.iter().any(|update| {
         update.group.as_ref() == Some(&south)
             && update.change
-                == AggregateValueChange::Set(subql::AggregateResultValue::Folded(AggValue::Count(
-                    3,
-                )))
+                == AggregateValueChange::Set(subql::AggregateResultValue::Folded(
+                    AggValue::CountStar(3),
+                ))
     }));
 }
 
@@ -232,9 +232,9 @@ fn empty_and_refill_during_the_seed_read_uses_position_and_row_count_together() 
     assert!(
         opening.iter().all(|update| {
             update.change
-                == AggregateValueChange::Set(subql::AggregateResultValue::Folded(AggValue::Count(
-                    1,
-                )))
+                == AggregateValueChange::Set(subql::AggregateResultValue::Folded(
+                    AggValue::CountStar(1),
+                ))
         }),
         "an already-read insert must not be counted twice: {opening:?}"
     );
@@ -267,7 +267,9 @@ fn an_all_null_group_uses_source_row_count_not_aggregate_value() {
     );
     assert_eq!(
         one(&opening).change,
-        AggregateValueChange::Set(subql::AggregateResultValue::Folded(AggValue::Count(0))),
+        AggregateValueChange::Set(subql::AggregateResultValue::Folded(AggValue::CountColumn(
+            0
+        ))),
         "the group exists even though no aggregate cell contributes"
     );
 
@@ -354,7 +356,7 @@ fn a_replayed_multi_column_group_keeps_its_identity() {
     assert_eq!(&identity.key[..5], b"SQGK\x01");
     assert_eq!(
         replayed.change,
-        AggregateValueChange::Set(subql::AggregateResultValue::Folded(AggValue::Count(1)))
+        AggregateValueChange::Set(subql::AggregateResultValue::Folded(AggValue::CountStar(1)))
     );
     assert!(opening.iter().any(|update| {
         update.group.as_ref().is_some_and(|group| {

@@ -109,8 +109,8 @@ fn oracle(spec: &AggSpec, c: &Components) -> AggValue {
     let var_pop = (c.numeric > 0).then(|| deviations / n);
     let var_samp = (c.numeric >= 2).then(|| deviations / (n - 1.0));
     match spec {
-        AggSpec::CountStar => AggValue::Count(c.count_star),
-        AggSpec::CountColumn { .. } => AggValue::Count(c.count_col),
+        AggSpec::CountStar => AggValue::CountStar(c.count_star),
+        AggSpec::CountColumn { .. } => AggValue::CountColumn(c.count_col),
         // The fixture sums an `INT` column under Postgres, whose sum is a
         // `bigint`, so the oracle's total is an exact integer.
         AggSpec::Sum { .. } => {
@@ -125,10 +125,10 @@ fn oracle(spec: &AggSpec, c: &Components) -> AggValue {
                 ),
             )
         })),
-        AggSpec::VarPop { .. } => AggValue::Real(var_pop),
-        AggSpec::VarSamp { .. } => AggValue::Real(var_samp),
-        AggSpec::StddevPop { .. } => AggValue::Real(var_pop.map(f64::sqrt)),
-        AggSpec::StddevSamp { .. } => AggValue::Real(var_samp.map(f64::sqrt)),
+        AggSpec::VarPop { .. } => AggValue::VarPop(var_pop),
+        AggSpec::VarSamp { .. } => AggValue::VarSamp(var_samp),
+        AggSpec::StddevPop { .. } => AggValue::StddevPop(var_pop.map(f64::sqrt)),
+        AggSpec::StddevSamp { .. } => AggValue::StddevSamp(var_samp.map(f64::sqrt)),
         _ => unreachable!("all_specs enumerates every AggSpec variant"),
     }
 }

@@ -118,8 +118,8 @@ fn oracle(spec: &AggSpec, amounts: &[Option<i64>]) -> AggValue {
     let var_pop = (numeric > 0).then(|| deviations / n);
     let var_samp = (numeric >= 2).then(|| deviations / (n - 1.0));
     match spec {
-        AggSpec::CountStar => AggValue::Count(count_star),
-        AggSpec::CountColumn { .. } => AggValue::Count(numeric),
+        AggSpec::CountStar => AggValue::CountStar(count_star),
+        AggSpec::CountColumn { .. } => AggValue::CountColumn(numeric),
         // SQLite sums integers as one 64-bit integer, measured.
         AggSpec::Sum { .. } => AggValue::Sum(
             (numeric > 0).then(|| subql::NumericValue::Integer(amounts.iter().flatten().sum())),
@@ -128,10 +128,10 @@ fn oracle(spec: &AggSpec, amounts: &[Option<i64>]) -> AggValue {
         AggSpec::Avg { .. } => {
             AggValue::Avg((numeric > 0).then(|| subql::NumericValue::Double(sum / n)))
         }
-        AggSpec::VarPop { .. } => AggValue::Real(var_pop),
-        AggSpec::VarSamp { .. } => AggValue::Real(var_samp),
-        AggSpec::StddevPop { .. } => AggValue::Real(var_pop.map(f64::sqrt)),
-        AggSpec::StddevSamp { .. } => AggValue::Real(var_samp.map(f64::sqrt)),
+        AggSpec::VarPop { .. } => AggValue::VarPop(var_pop),
+        AggSpec::VarSamp { .. } => AggValue::VarSamp(var_samp),
+        AggSpec::StddevPop { .. } => AggValue::StddevPop(var_pop.map(f64::sqrt)),
+        AggSpec::StddevSamp { .. } => AggValue::StddevSamp(var_samp.map(f64::sqrt)),
         _ => unreachable!("every AggSpec variant handled"),
     }
 }

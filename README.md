@@ -121,7 +121,7 @@ assert_eq!(updates[0].consumer, 42);
 assert_eq!(
     updates[0].change,
     subql::AggregateValueChange::Set(subql::AggregateResultValue::Folded(
-        AggValue::Count(1),
+        AggValue::CountStar(1),
     )),
 );
 assert_eq!(
@@ -137,10 +137,14 @@ assert_eq!(
 
 | SQL | `AggValue` variant | Notes |
 |-----|--------------------|-------|
-| `SELECT COUNT(*) FROM t WHERE ...` | `Count(i64)` | +/-1 per matching row |
-| `SELECT COUNT(col) FROM t WHERE ...` | `Count(i64)` | skips `NULL` cells |
+| `SELECT COUNT(*) FROM t WHERE ...` | `CountStar(i64)` | +/-1 per matching row |
+| `SELECT COUNT(col) FROM t WHERE ...` | `CountColumn(i64)` | skips `NULL` cells |
 | `SELECT SUM(col) FROM t WHERE ...` | `Sum(Option<NumericValue>)` | exact, in the type the engine sums into: `bigint`, `numeric`/`DECIMAL`, `integer` or double. `Infinity` and `NaN` fold as the engine folds them. `None` when no row contributes, which is what every engine answers |
 | `SELECT AVG(col) FROM t WHERE ...` | `Avg(Option<NumericValue>)` | the engine's own division of the exact total by the count: `numeric` on PostgreSQL, `DECIMAL` on MySQL, a real on SQLite. `None` when no row contributes |
+| `SELECT VAR_POP(col) FROM t WHERE ...` | `VarPop(Option<f64>)` | `None` until one row contributes, and zero at exactly one |
+| `SELECT VAR_SAMP(col) FROM t WHERE ...` | `VarSamp(Option<f64>)` | `None` until two rows contribute |
+| `SELECT STDDEV_POP(col) FROM t WHERE ...` | `StddevPop(Option<f64>)` | the square root of `VAR_POP` |
+| `SELECT STDDEV_SAMP(col) FROM t WHERE ...` | `StddevSamp(Option<f64>)` | the square root of `VAR_SAMP` |
 
 ### Type validation
 

@@ -15,7 +15,7 @@ pub use pg_sqlite_emu::{PgSqliteEmuError, PgSqliteEmuSource};
 #[cfg(feature = "pg-streaming")]
 pub use polling::{PollingPgCdcConfig, PollingPgCdcError, PollingPgCdcSource};
 pub use runtime::aggregate::{
-    DEFAULT_MAX_CHANGES_DURING_AGGREGATE_READ, DEFAULT_MAX_GROUPS_PER_AGGREGATE,
+    AggKind, DEFAULT_MAX_CHANGES_DURING_AGGREGATE_READ, DEFAULT_MAX_GROUPS_PER_AGGREGATE,
 };
 pub use runtime::SubscriptionEngine;
 #[cfg(feature = "sqlite-cdc")]
