@@ -152,6 +152,12 @@ jobs:
     name: tests (all-features)
     needs: test-build
     runs-on: ubuntu-latest
+    env:
+      # The differential sweeps read this: rows per predicate form. Shallow on
+      # every pull request so the wall clock stays honest, deep on the weekly
+      # schedule, which is where a rare collation or version divergence has the
+      # cases to show up in.
+      SUBQL_SWEEP_ROWS: ${{ github.event_name == 'schedule' && '600' || '48' }}
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v5
@@ -171,6 +177,12 @@ jobs:
     name: integration (${{ matrix.group.name }})
     needs: test-build
     runs-on: ubuntu-latest
+    env:
+      # The differential sweeps read this: rows per predicate form. Shallow on
+      # every pull request so the wall clock stays honest, deep on the weekly
+      # schedule, which is where a rare collation or version divergence has the
+      # cases to show up in.
+      SUBQL_SWEEP_ROWS: ${{ github.event_name == 'schedule' && '600' || '48' }}
     timeout-minutes: 20
     strategy:
       fail-fast: false

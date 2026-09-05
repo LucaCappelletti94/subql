@@ -47,6 +47,19 @@ pub enum OracleVerdict {
     /// read this as [`Tri::Unknown`] would have called every measured
     /// raise agreement.
     Refused(String),
+    /// It would not build the schema or accept the row, so the predicate
+    /// was never asked.
+    ///
+    /// Separate from [`Self::Refused`] because the two mean opposite
+    /// things about the harness. A refused predicate is a legitimate
+    /// measurement: the engine will not answer that question and subql
+    /// has to agree it cannot. A refused setup is a defect in the
+    /// generator, and it is silent, because a case that was never asked
+    /// cannot disagree. Dropping the `DROP COLLATION` from the
+    /// PostgreSQL preamble made every case after the first refuse its
+    /// DDL, and the sweep still passed on the strength of the one case
+    /// that ran.
+    SetupFailed(String),
 }
 
 impl OracleVerdict {
@@ -56,7 +69,7 @@ impl OracleVerdict {
     pub const fn answered(&self) -> Option<Tri> {
         match self {
             Self::Answered(tri) => Some(*tri),
-            Self::Refused(_) => None,
+            Self::Refused(_) | Self::SetupFailed(_) => None,
         }
     }
 }
@@ -222,7 +235,7 @@ impl Oracle for PgOracle {
     fn answer(&mut self, case: &OracleCase<'_>) -> OracleVerdict {
         for statement in case.setup() {
             if let Err(error) = sql_query(statement).execute(&mut self.connection) {
-                return OracleVerdict::Refused(error.to_string());
+                return OracleVerdict::SetupFailed(error.to_string());
             }
         }
         match sql_query(case.verdict_sql()).get_result::<BoolVerdict>(&mut self.connection) {
@@ -248,7 +261,7 @@ impl Oracle for MySqlOracle {
     fn answer(&mut self, case: &OracleCase<'_>) -> OracleVerdict {
         for statement in case.setup() {
             if let Err(error) = sql_query(statement).execute(&mut self.connection) {
-                return OracleVerdict::Refused(error.to_string());
+                return OracleVerdict::SetupFailed(error.to_string());
             }
         }
         match sql_query(case.verdict_sql()).get_result::<IntVerdict>(&mut self.connection) {
@@ -287,7 +300,7 @@ impl Oracle for SqliteOracle {
     fn answer(&mut self, case: &OracleCase<'_>) -> OracleVerdict {
         for statement in case.setup() {
             if let Err(error) = sql_query(statement).execute(&mut self.connection) {
-                return OracleVerdict::Refused(error.to_string());
+                return OracleVerdict::SetupFailed(error.to_string());
             }
         }
         match sql_query(case.verdict_sql()).get_result::<IntVerdict>(&mut self.connection) {

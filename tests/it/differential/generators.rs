@@ -262,13 +262,20 @@ impl CollationVariant {
 /// The statement that has to precede the schema for a nondeterministic
 /// collation to exist, on the one engine that can declare one.
 #[must_use]
-pub const fn collation_preamble(engine: Engine) -> &'static str {
+pub fn collation_preamble(engine: Engine) -> Vec<&'static str> {
     match engine {
-        Engine::Postgres => {
+        // Dropped first, because a sweep builds this schema once per
+        // generated case and PostgreSQL has no `CREATE COLLATION IF NOT
+        // EXISTS`. Found by the sweep: without the drop, every case after
+        // the first was refused with `collation "ci" already exists`, and
+        // the run compared nothing while reporting no divergence. The
+        // table is dropped ahead of this, so nothing depends on it.
+        Engine::Postgres => vec![
+            "DROP COLLATION IF EXISTS ci",
             "CREATE COLLATION ci (provider = icu, locale = 'und-u-ks-level2', \
-             deterministic = false)"
-        }
-        Engine::MySql | Engine::Sqlite => "",
+             deterministic = false)",
+        ],
+        Engine::MySql | Engine::Sqlite => Vec::new(),
     }
 }
 
@@ -282,11 +289,10 @@ pub const fn collation_preamble(engine: Engine) -> &'static str {
 /// carries every comparison the engine answers differently.
 #[must_use]
 pub fn schema_statements(engine: Engine) -> Vec<String> {
-    let preamble = collation_preamble(engine);
-    let mut statements = Vec::new();
-    if !preamble.is_empty() {
-        statements.push(preamble.to_string());
-    }
+    let mut statements: Vec<String> = collation_preamble(engine)
+        .into_iter()
+        .map(str::to_string)
+        .collect();
     statements.push(schema_ddl(engine));
     statements
 }
@@ -378,16 +384,77 @@ impl Cell {
         }
     }
 
+    /// This cell as the engine stores it, which is not always as it was
+    /// written.
+    ///
+    /// Found by the sweep: PostgreSQL pads a `char(n)` value out to `n`
+    /// on write, so a generated `ab` is stored as `ab   ` and the wire
+    /// carries the padded value. Handing subql the unpadded one asked
+    /// the two sides about different rows, and `padded_bytes LIKE 'ab'`
+    /// then answered `false` on the server, which sees the padding, and
+    /// `true` in process, which did not.
+    ///
+    /// Measured: PostgreSQL pads and reports `length` without the
+    /// padding, while MySQL strips trailing spaces from a `CHAR` on
+    /// retrieval, so `CHAR_LENGTH` is 2 for the same value and nothing
+    /// is added. SQLite has no `char(n)` semantics at all.
+    #[must_use]
+    pub fn as_stored(&self, engine: Engine, declared_type: &str) -> Self {
+        // A single-precision column stores the rounded value, and the
+        // wire carries that, which is what Phase 9a59536 made the
+        // decoder honour. Found by the sweep too: with the unrounded
+        // value in hand, `single = twice` answered true in process where
+        // PostgreSQL answers false, because widening the stored `real`
+        // 0.1 gives 0.10000000149011612 and that is not the double 0.1.
+        if let Self::Float(value) = self {
+            let single = matches!(declared_type, "REAL" | "FLOAT")
+                || declared_type.starts_with("REAL ")
+                || declared_type.starts_with("FLOAT ");
+            if single && engine != Engine::Sqlite {
+                #[allow(clippy::cast_possible_truncation)]
+                return Self::Float(f64::from(*value as f32));
+            }
+            return self.clone();
+        }
+        let Self::Text(text) = self else {
+            return self.clone();
+        };
+        let width = declared_type
+            .strip_prefix("CHAR(")
+            .and_then(|rest| rest.split(')').next())
+            .and_then(|digits| digits.parse::<usize>().ok());
+        match (engine, width) {
+            (Engine::Postgres, Some(width)) if text.chars().count() < width => {
+                let mut padded = text.clone();
+                while padded.chars().count() < width {
+                    padded.push(' ');
+                }
+                Self::Text(padded)
+            }
+            // The other direction, and measured: MySQL strips trailing
+            // spaces from a `CHAR` on retrieval, so `CHAR_LENGTH` is 2
+            // for a stored `ab` at width five and the wire carries `ab`.
+            // With the padded value in hand, `padded_bytes LIKE 'ab'`
+            // answered false in process where MySQL answers 1.
+            (Engine::MySql, Some(_)) => Self::Text(text.trim_end_matches(' ').to_string()),
+            _ => self.clone(),
+        }
+    }
+
     /// This cell as a subql value, for the inner layer's hand-built event.
     #[must_use]
     pub fn value<B>(&self) -> Value<B>
     where
-        B: Backend<Bool = bool, Int = i64, Float = f64, Decimal = BigDecimal, String = String>,
+        B: Backend<Int = i64, Float = f64, Decimal = BigDecimal, String = String>,
+        B::Bool: From<bool>,
         B::Bytes: From<Vec<u8>>,
     {
         match self {
             Self::Null => Value::Null,
-            Self::Bool(flag) => Value::Bool(*flag),
+            // Converted rather than placed: SQLite's boolean really is an
+            // integer, which is why `Backend::Bool` is a carrier and not
+            // `bool`.
+            Self::Bool(flag) => Value::Bool((*flag).into()),
             Self::Int(value) => Value::Int(*value),
             Self::Float(value) => Value::Float(*value),
             Self::Decimal(value) => Value::Decimal(value.clone()),
@@ -444,7 +511,10 @@ pub fn row_strategy(engine: Engine) -> impl Strategy<Value = Row> {
         if column.declared(engine).is_none() {
             continue;
         }
-        let Some(strategy) = cell_strategy(column.kind) else {
+        let declared = column
+            .declared(engine)
+            .expect("the column declares a type on this engine, checked just above");
+        let Some(strategy) = cell_strategy(column.kind, declared, engine) else {
             continue;
         };
         if column.kind == BuiltinKind::String {
@@ -454,7 +524,7 @@ pub fn row_strategy(engine: Engine) -> impl Strategy<Value = Row> {
                 }
                 let name: &'static str = collated_name(column.name, *variant);
                 cells.push(
-                    cell_strategy(column.kind)
+                    cell_strategy(column.kind, declared, engine)
                         .expect("text has a cell strategy")
                         .prop_map(move |cell| (name, cell))
                         .boxed(),
@@ -482,30 +552,88 @@ fn collated_name(column: &'static str, variant: CollationVariant) -> &'static st
 /// `2^53`, where `f64` stops being exact, and `i64::MAX`, where an
 /// addition overflows.
 pub fn integer_strategy() -> impl Strategy<Value = Cell> {
+    integer_strategy_within(i64::MIN, i64::MAX)
+}
+
+/// Integers a column of this declared type accepts.
+///
+/// Found by the sweep once a refused setup became its own outcome: the
+/// `narrow` column is `INT` on both PostgreSQL and MySQL, so the wide
+/// values here overflow it and the server rejects the row. Those cases
+/// were never compared, and before the outcome was separated they were
+/// counted as ordinary engine refusals and passed in silence.
+///
+/// SQLite is not consulted, because its `INTEGER` is 64-bit whatever the
+/// declaration says. Bounding by the narrowest engine that declares the
+/// column is what keeps one generated row valid on all three.
+pub fn integer_strategy_for(declared: &str) -> BoxedStrategy<Cell> {
+    if declared.eq_ignore_ascii_case("INT") || declared.eq_ignore_ascii_case("INTEGER") {
+        return integer_strategy_within(i64::from(i32::MIN), i64::from(i32::MAX)).boxed();
+    }
+    integer_strategy().boxed()
+}
+
+/// The integer edges, clamped into `[low, high]`.
+///
+/// The edges are the point of the strategy, so they are clamped rather
+/// than filtered out: a column that cannot hold `i64::MAX` should still
+/// be asked about the largest value it *can* hold.
+fn integer_strategy_within(low: i64, high: i64) -> impl Strategy<Value = Cell> {
     prop_oneof![
-        Just(Cell::Int(9_007_199_254_740_992)),
-        Just(Cell::Int(9_007_199_254_740_993)),
-        Just(Cell::Int(i64::MAX)),
-        Just(Cell::Int(i64::MIN)),
+        Just(Cell::Int(9_007_199_254_740_992.clamp(low, high))),
+        Just(Cell::Int(9_007_199_254_740_993.clamp(low, high))),
+        Just(Cell::Int(high)),
+        Just(Cell::Int(low)),
         Just(Cell::Int(0)),
         Just(Cell::Int(-1)),
         Just(Cell::Null),
-        any::<i64>().prop_map(Cell::Int),
+        (low..=high).prop_map(Cell::Int),
     ]
 }
 
-/// Floating values including the non-finite ones, which Phase D3 measured
-/// the engines folding and answering with.
-pub fn float_strategy() -> impl Strategy<Value = Cell> {
-    prop_oneof![
-        Just(Cell::Float(f64::NAN)),
-        Just(Cell::Float(f64::INFINITY)),
-        Just(Cell::Float(f64::NEG_INFINITY)),
+/// Floating values, with the non-finite ones only where the engine
+/// stores them.
+///
+/// Found by the sweep on its first run, which is what a sweep is for.
+/// `Cell::sql` renders a non-finite float as the literal `'NaN'`, and
+/// SQLite stores that as *text*, because its affinity leaves a
+/// non-numeric literal alone. The row in the database was then not the
+/// row subql was handed, and comparing the two answers compared nothing:
+/// SQLite answered `TRUE` for `twice > 1e308` on a text cell, since text
+/// sorts above every number there, while subql answered on a `NaN`.
+///
+/// Measured across the three: PostgreSQL stores `'Infinity'` and `'NaN'`
+/// in a float column, MySQL refuses them while parsing the statement
+/// (`ERROR 1367 Illegal double value`, Phase c003686), and SQLite keeps
+/// the text. So only PostgreSQL is asked about one, and the other two
+/// get `NULL`, which is what they can actually hold.
+pub fn float_strategy(engine: Engine) -> impl Strategy<Value = Cell> {
+    let finite = prop_oneof![
         Just(Cell::Float(0.1)),
         Just(Cell::Float(0.0)),
         Just(Cell::Null),
-        any::<f64>().prop_map(Cell::Float),
-    ]
+        // Generated through `f32`, because the widest column here is
+        // `single`, and a `f64` that is not a `f32` is rejected on write
+        // rather than rounded: measured, PostgreSQL answers "is out of
+        // range for type real" for a subnormal one. A case the server
+        // will not store is a case nothing is compared over.
+        any::<f32>().prop_map(|value| Cell::Float(f64::from(value))),
+    ];
+    match engine {
+        Engine::Postgres => prop_oneof![
+            Just(Cell::Float(f64::NAN)),
+            Just(Cell::Float(f64::INFINITY)),
+            Just(Cell::Float(f64::NEG_INFINITY)),
+            finite,
+        ]
+        .boxed(),
+        Engine::MySql | Engine::Sqlite => finite
+            .prop_filter(
+                "a non-finite float is not storable here",
+                |cell| !matches!(cell, Cell::Float(value) if !value.is_finite()),
+            )
+            .boxed(),
+    }
 }
 
 /// Exact decimals, including one past what `f64` can hold and one whose
@@ -520,6 +648,38 @@ pub fn decimal_strategy() -> impl Strategy<Value = Cell> {
         Just(Cell::Null),
         any::<i64>().prop_map(|value| Cell::Decimal(BigDecimal::from(value))),
     ]
+}
+
+/// Decimals a column of this declared type accepts.
+///
+/// MySQL declares `DECIMAL(20,4)`, which holds sixteen integral digits,
+/// and rejects a wider value rather than rounding it: "Out of range
+/// value for column 'exact'". PostgreSQL's unqualified `NUMERIC` has no
+/// such limit, so the bound is read off the declaration rather than
+/// assumed per engine.
+pub fn decimal_strategy_for(declared: &str) -> BoxedStrategy<Cell> {
+    let Some(integral_digits) = integral_digits(declared) else {
+        return decimal_strategy().boxed();
+    };
+    let limit = BigDecimal::from_str(&"9".repeat(integral_digits))
+        .expect("a run of nines parses as a decimal");
+    decimal_strategy()
+        .prop_map(move |cell| match cell {
+            Cell::Decimal(value) if value.abs() > limit => Cell::Decimal(limit.clone()),
+            cell => cell,
+        })
+        .boxed()
+}
+
+/// How many integral digits a declared `DECIMAL(p, s)` holds, or `None`
+/// when the declaration sets no limit.
+fn integral_digits(declared: &str) -> Option<usize> {
+    let open = declared.find('(')?;
+    let inside = declared[open + 1..].strip_suffix(')')?;
+    let (precision, scale) = inside.split_once(',')?;
+    let precision: usize = precision.trim().parse().ok()?;
+    let scale: usize = scale.trim().parse().ok()?;
+    precision.checked_sub(scale)
 }
 
 /// Text values including the ones a comparison reads differently: trailing
@@ -540,7 +700,11 @@ pub fn text_strategy() -> impl Strategy<Value = Cell> {
 
 /// A cell for a column of `kind`, or `None` for a kind whose carrier this
 /// generator does not build.
-pub fn cell_strategy(kind: BuiltinKind) -> Option<BoxedStrategy<Cell>> {
+pub fn cell_strategy(
+    kind: BuiltinKind,
+    declared: &str,
+    engine: Engine,
+) -> Option<BoxedStrategy<Cell>> {
     match kind {
         BuiltinKind::Bool => Some(
             prop_oneof![
@@ -550,9 +714,9 @@ pub fn cell_strategy(kind: BuiltinKind) -> Option<BoxedStrategy<Cell>> {
             ]
             .boxed(),
         ),
-        BuiltinKind::Int => Some(integer_strategy().boxed()),
-        BuiltinKind::Float => Some(float_strategy().boxed()),
-        BuiltinKind::Decimal => Some(decimal_strategy().boxed()),
+        BuiltinKind::Int => Some(integer_strategy_for(declared)),
+        BuiltinKind::Float => Some(float_strategy(engine).boxed()),
+        BuiltinKind::Decimal => Some(decimal_strategy_for(declared)),
         BuiltinKind::String => Some(text_strategy().boxed()),
         BuiltinKind::Bytes => Some(
             prop_oneof![
@@ -582,6 +746,18 @@ pub fn cell_strategy(kind: BuiltinKind) -> Option<BoxedStrategy<Cell>> {
 /// bug, which is the property `predicate_generator_only_emits_well_typed_sql`
 /// holds in place.
 pub fn predicate_strategy(engine: Engine) -> impl Strategy<Value = String> {
+    proptest::sample::select(predicate_forms(engine))
+}
+
+/// Every predicate form for `engine`, as a list.
+///
+/// Exposed because sampling them is not the same as covering them. The
+/// sweep runs each form in turn: found by the acceptance check, which
+/// reverted a fix the harness should catch and watched it pass, because
+/// hitting one form out of twenty-six and the one cell value that
+/// exercises it is a lottery a few dozen cases do not win.
+#[must_use]
+pub fn predicate_forms(engine: Engine) -> Vec<String> {
     let mut forms: Vec<String> = vec![
         // C7: two columns of different kinds.
         "narrow = wide".to_string(),
@@ -627,7 +803,7 @@ pub fn predicate_strategy(engine: Engine) -> impl Strategy<Value = String> {
     if engine == Engine::MySql {
         forms.push("exact / 3 > 0.333333333".to_string());
     }
-    proptest::sample::select(forms)
+    forms
 }
 
 #[cfg(test)]
@@ -981,7 +1157,7 @@ mod tests {
             BuiltinKind::Bytes,
         ] {
             assert!(
-                cell_strategy(kind).is_some(),
+                cell_strategy(kind, "INT", Engine::Postgres).is_some(),
                 "{kind:?} has a shared carrier, so a cell has to be generated for it"
             );
         }
@@ -992,7 +1168,7 @@ mod tests {
             BuiltinKind::Jsonb,
         ] {
             assert!(
-                cell_strategy(kind).is_none(),
+                cell_strategy(kind, "INT", Engine::Postgres).is_none(),
                 "{kind:?} is decoded off the wire by Phase E3, not built here"
             );
         }
