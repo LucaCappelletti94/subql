@@ -272,11 +272,41 @@ struct Quantisation {
 /// MySQL's quotient of two decimals, at the increment the deployment
 /// declared.
 ///
-/// The scale is quantised to whole nine-digit words and the quotient is
-/// truncated, per
+/// The quotient is truncated, and the scale it is truncated at is
+/// measured rather than derived, per
 /// [`DivisionRule::QuotientsAreDecimalInWords`](crate::backend::DivisionRule::QuotientsAreDecimalInWords).
-/// A backend
-/// on the standard `bigdecimal` carrier delegates here.
+/// A backend on the standard `bigdecimal` carrier delegates here.
+///
+/// # The scale
+///
+/// Measured on MySQL 8.0 over declared `DECIMAL(30,n)` columns, by
+/// searching for the smallest number of digits that compares equal to
+/// the quotient. One scaled operand quantises the way the name of the
+/// rule suggests, breaking at 6 and 15:
+///
+/// ```text
+/// one operand scaled  0 1 2 4 5  6 9 10 14  15
+/// compared at         9 9 9 9 9 18 18 18 18  27
+/// ```
+///
+/// Two scaled operands do not add that way, which is what the earlier
+/// formula here assumed. `(1, 1)` compares at 18 where adding the scales
+/// gives 9, and `(10, 10)` at 36 where it gives 27, so each operand is
+/// framed to whole words *before* the two contribute:
+///
+/// ```text
+/// digits = 9 * max(words(dividend_scale) + words(divisor_scale),
+///                  words(dividend_scale + divisor_scale + increment))
+/// ```
+///
+/// That fits every measured point: both axes to twenty digits, a joint
+/// grid, seventeen randomly chosen pairs, and increments 2, 4, 10 and
+/// 20. The two terms disagree on 72 of the 441 scale pairs up to twenty
+/// digits, and the earlier formula computed only the second.
+///
+/// The scale MySQL *prints* is a different number, `dividend_scale +
+/// increment`, which is why this hid: `7.00 / 3.00` displays as
+/// `2.333333` and compares equal to eighteen digits of `3`.
 #[must_use]
 pub fn quotient_in_words(
     dividend: &BigDecimal,
@@ -285,15 +315,13 @@ pub fn quotient_in_words(
 ) -> BigDecimal {
     let dividend_scale = fractional_digits(dividend);
     let divisor_scale = fractional_digits(divisor);
-    let framed_dividend = whole_words(dividend_scale);
-    let framed_divisor = whole_words(divisor_scale);
-    let padding = (framed_dividend - dividend_scale) + (framed_divisor - divisor_scale);
-    let adjusted = i64::from(increment.digits()).saturating_sub(padding);
+    let framed = whole_words(dividend_scale) + whole_words(divisor_scale);
+    let summed = whole_words(dividend_scale + divisor_scale + i64::from(increment.digits()));
     quotient(
         dividend,
         divisor,
         Quantisation {
-            scale: whole_words(framed_dividend + framed_divisor + adjusted),
+            scale: framed.max(summed),
             rounds: false,
         },
     )

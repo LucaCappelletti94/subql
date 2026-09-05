@@ -51,7 +51,8 @@ use subql::{catalog_helpers, DefaultIds, SubscriptionEngine, SubscriptionRequest
 /// `qty` is the integer side, `d2` and `d6` the two declared scales that
 /// separate MySQL's word quantisation.
 const MYSQL_DDL: &str = "CREATE TABLE t (id INT PRIMARY KEY, qty BIGINT, \
-                         d2 DECIMAL(20,2), d6 DECIMAL(20,6))";
+                         d2 DECIMAL(20,2), d6 DECIMAL(20,6), e2 DECIMAL(20,2), \
+                         d10 DECIMAL(30,10), e10 DECIMAL(30,10))";
 const PG_DDL: &str = "CREATE TABLE t (id INT PRIMARY KEY, qty BIGINT, \
                       d2 NUMERIC, d6 NUMERIC)";
 const SQLITE_DDL: &str = "CREATE TABLE t (id INTEGER PRIMARY KEY, qty INTEGER)";
@@ -91,7 +92,41 @@ fn mysql_row(qty: i64, d2: &str, d6: &str) -> Vec<Value<MySql>> {
         Value::Int(qty),
         Value::Decimal(BigDecimal::from_str(d2).unwrap()),
         Value::Decimal(BigDecimal::from_str(d6).unwrap()),
+        Value::Null,
+        Value::Null,
+        Value::Null,
     ]
+}
+
+/// `(id, qty, d2, d6, e2, d10, e10)` with one pair of equally scaled
+/// decimals filled, which is the shape the two candidate formulas
+/// disagree about.
+fn mysql_scaled_pair(dividend: &str, divisor: &str, wide: bool) -> Vec<Value<MySql>> {
+    let (left, right) = (
+        Value::Decimal(BigDecimal::from_str(dividend).unwrap()),
+        Value::Decimal(BigDecimal::from_str(divisor).unwrap()),
+    );
+    if wide {
+        vec![
+            Value::Int(1),
+            Value::Int(1),
+            Value::Null,
+            Value::Null,
+            Value::Null,
+            left,
+            right,
+        ]
+    } else {
+        vec![
+            Value::Int(1),
+            Value::Int(1),
+            left,
+            Value::Null,
+            right,
+            Value::Null,
+            Value::Null,
+        ]
+    }
 }
 
 /// As [`mysql_matches`], for PostgreSQL, which needs no declared setting.
@@ -394,5 +429,81 @@ fn sqlite_integer_division_still_truncates() {
             .inserted()
             .is_empty(),
         "SQLite answers 3 for 7 / 2"
+    );
+}
+
+/// Two scaled operands are compared at a wider scale than their sum
+/// implies, which is the case the word formula was missing.
+///
+/// Measured on MySQL 8.0 over declared `DECIMAL(30,n)` columns by
+/// searching for the smallest number of `3`s that compares equal to
+/// `7 / 3`. Each axis alone quantises at `ceil((f + increment) / 9) * 9`,
+/// breaking at 6 and 15:
+///
+/// ```text
+/// one operand scaled  0 1 2 4 5  6 9 10 14  15
+/// compared at         9 9 9 9 9 18 18 18 18  27
+/// ```
+///
+/// Two scaled operands do not add that way. `(1, 1)` compares at 18 where
+/// the sum rule gives 9, and `(10, 10)` at 36 where it gives 27. The
+/// function fitting every measured point, on both axes, across the joint
+/// grid and at increments 2, 4, 10 and 20, is
+///
+/// ```text
+/// digits = 9 * max(words(dividend_scale) + words(divisor_scale),
+///                  words(dividend_scale + divisor_scale + increment))
+/// ```
+///
+/// with `words(x) = ceil(x / 9)`. subql computed the second term alone,
+/// which disagrees on 72 of the 441 scale pairs up to twenty digits.
+#[test]
+fn mysql_two_scaled_operands_widen_past_the_sum() {
+    // `7.00 / 3.00` truncated at nine digits is 2.333333333 and at
+    // eighteen is 2.333333333333333333, and MySQL holds the wider one.
+    assert!(
+        mysql_matches(
+            "SELECT * FROM t WHERE d2 / e2 > 2.3333333333",
+            default_increment(),
+            mysql_scaled_pair("7.00", "3.00", false),
+        ),
+        "MySQL compares `7.00 / 3.00` at eighteen digits, so it exceeds a ten-digit \
+         bound that a nine-digit quotient does not reach"
+    );
+    assert!(
+        !mysql_matches(
+            "SELECT * FROM t WHERE d2 / e2 > 2.3333333333333333333",
+            default_increment(),
+            mysql_scaled_pair("7.00", "3.00", false),
+        ),
+        "and it stops at eighteen: a nineteen-digit bound is above it"
+    );
+}
+
+/// Each operand is framed to whole words before the scales add, which is
+/// what the `max` in that formula says and what separates it from the
+/// sum rule at wider scales too.
+///
+/// Measured: two `DECIMAL(30,10)` operands compare at 36, where
+/// `words(10 + 10 + 4)` gives 27. Only the per-operand word sum,
+/// `words(10) + words(10)` is `2 + 2`, reaches four words.
+#[test]
+fn mysql_each_operand_is_framed_before_the_scales_add() {
+    assert!(
+        mysql_matches(
+            "SELECT * FROM t WHERE d10 / e10 > 2.3333333333333333333333333333",
+            default_increment(),
+            mysql_scaled_pair("7.0000000000", "3.0000000000", true),
+        ),
+        "the quotient runs past twenty-seven digits, so it exceeds a \
+         twenty-eight-digit bound"
+    );
+    assert!(
+        !mysql_matches(
+            "SELECT * FROM t WHERE d10 / e10 > 2.333333333333333333333333333333333333",
+            default_increment(),
+            mysql_scaled_pair("7.0000000000", "3.0000000000", true),
+        ),
+        "and stops at thirty-six"
     );
 }
