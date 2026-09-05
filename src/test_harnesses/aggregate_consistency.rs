@@ -332,6 +332,8 @@ const FOLD_RULE: crate::runtime::aggregate::FoldRule = crate::runtime::aggregate
     mean: crate::backend::MeanRule::Exact,
     quotient: crate::compiler::bytecode::Quotient::FromTheOperands,
     variance_seed: crate::backend::VarianceSeed::EnginesOwn,
+    // The harness stands in for PostgreSQL, which raises.
+    float_overflow: crate::backend::FloatSumOverflow::Raises,
 };
 
 /// The oracle's exact total, in the type that rule answers.

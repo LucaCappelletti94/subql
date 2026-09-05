@@ -137,6 +137,10 @@ impl Backend for Custom {
         None
     }
 
+    /// And raises when a floating total leaves range, as PostgreSQL does.
+    const FLOAT_SUM_OVERFLOW: subql::backend::FloatSumOverflow =
+        subql::backend::FloatSumOverflow::Raises;
+
     /// This fixture stands in for PostgreSQL, so it orders floats the way
     /// PostgreSQL does.
     const FLOAT_ORDER: subql::backend::FloatOrder = subql::backend::FloatOrder::NanIsGreatest;

@@ -403,6 +403,14 @@ pub trait Backend: 'static {
     /// [`DivisionRule`](super::scalar_value::DivisionRule).
     const DIVISION: super::scalar_value::DivisionRule;
 
+    /// What this engine answers when a floating total leaves its range.
+    ///
+    /// Required, and per backend, because no two agree: measured,
+    /// PostgreSQL raises, MySQL answers `0` and stays there, and SQLite
+    /// saturates to an infinity. See
+    /// [`FloatSumOverflow`](super::scalar_value::FloatSumOverflow).
+    const FLOAT_SUM_OVERFLOW: super::scalar_value::FloatSumOverflow;
+
     /// How this engine orders a float against another number.
     ///
     /// Required, and per backend, because PostgreSQL defines its own

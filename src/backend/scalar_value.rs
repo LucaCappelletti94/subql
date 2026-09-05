@@ -798,6 +798,52 @@ pub enum SumRule {
     Double,
 }
 
+/// What an engine answers when a floating total leaves its range.
+///
+/// Measured 2026-09-05, and no two engines agree:
+///
+/// ```text
+/// pg      SUM over 1e308, 1e308 (float8)   ERROR value out of range: overflow
+/// mysql   SUM over 1e308, 1e308 (DOUBLE)   0, no error on the aggregate
+/// mysql   SUM over 1e308, 1e308, -1e308    0: once out of range it stays there
+/// mysql   SUM over 1e308, -1e308, 1e308    1e308: accumulated in scan order
+/// sqlite  SUM over 9e307, 9e307            inf
+/// sqlite  SUM over 9e307, 9e307, -9e307    inf, plain IEEE
+/// ```
+///
+/// MySQL's `0` is measured on 8.0.46 and 8.4.11 alike, and the
+/// interleaved case answering `1e308` shows the total really is
+/// accumulated in scan order rather than pre-checked. Its `+` operator
+/// raising `ERROR 1690 DOUBLE value is out of range` while its `SUM`
+/// answers `0` is MySQL disagreeing with itself, not with us.
+///
+/// A finite pair leaving range is a different question from a non-finite
+/// *input*, which folds through to a non-finite answer on every engine.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum FloatSumOverflow {
+    /// The engine raises, so there is no total to report and maintenance
+    /// stops. PostgreSQL.
+    Raises,
+    /// The engine answers a number that an incremental fold cannot
+    /// reproduce, so the total is not maintainable and a read answers
+    /// instead. MySQL.
+    ///
+    /// Measured, MySQL's `0` depends on the whole row set rather than on
+    /// a running value: `1e308, 1e308` answers `0`, adding `-1e308`
+    /// still answers `0`, and reordering to `1e308, -1e308, 1e308`
+    /// answers `1e308`. A fold that has already left range has
+    /// destroyed the information the answer needs, and it cannot know
+    /// whether a later row would have kept the recomputed total in
+    /// range. Reproducing `0` by resetting and continuing gets the
+    /// second of those measurements wrong; holding `0` for good gets a
+    /// row leaving wrong. So this stops maintenance, which is what
+    /// decision 1 of the plan chose for every contribution the fold
+    /// cannot reverse.
+    Unmaintainable,
+    /// The total saturates to an infinity, which is IEEE. SQLite.
+    Saturates,
+}
+
 /// How an engine orders a float against another number.
 ///
 /// IEEE leaves every pair involving `NaN` unordered, and PostgreSQL does

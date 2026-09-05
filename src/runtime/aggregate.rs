@@ -483,6 +483,8 @@ pub struct FoldRule {
     pub quotient: crate::compiler::bytecode::Quotient,
     /// Which shape this engine's variance seed arrives in.
     pub variance_seed: crate::backend::VarianceSeed,
+    /// What this engine answers when a floating total leaves its range.
+    pub float_overflow: crate::backend::FloatSumOverflow,
 }
 
 /// A running total, in the type its engine sums into.
@@ -520,9 +522,41 @@ enum Total {
     /// accumulates in. Every addition rounds the finite part, so the
     /// total is held at that width rather than rounded once on the way
     /// out.
-    Single(FloatParts),
+    Single(FloatParts, FloatBoundary),
     /// A double.
-    Double(FloatParts),
+    Double(FloatParts, FloatBoundary),
+}
+
+/// What a floating accumulator does when its finite part leaves range.
+///
+/// Carried beside the parts rather than checked centrally, so the
+/// boundary travels with the number exactly as the exact accumulators'
+/// boundaries do.
+#[derive(Clone, Copy, Debug)]
+struct FloatBoundary(crate::backend::FloatSumOverflow);
+
+impl FloatBoundary {
+    /// Apply this engine's rule to a finite part that has just left
+    /// range, or leave it alone when it has not.
+    ///
+    /// Only the finite part is passed, and only ever finite values are
+    /// added to it: a non-finite contribution is counted apart, so it
+    /// cannot reach here. The mutation battery is what established that,
+    /// by surviving a guard against non-finite operands, which was
+    /// unreachable and is gone.
+    const fn settle(self, total: f64) -> Result<f64, SumOutOfRange> {
+        if total.is_finite() {
+            return Ok(total);
+        }
+        match self.0 {
+            // Both stop, for different reasons that reach the caller
+            // the same way: PostgreSQL has no answer to give, and
+            // MySQL's answer is not one a running total can hold.
+            crate::backend::FloatSumOverflow::Raises
+            | crate::backend::FloatSumOverflow::Unmaintainable => Err(SumOutOfRange),
+            crate::backend::FloatSumOverflow::Saturates => Ok(total),
+        }
+    }
 }
 
 /// The total cannot be represented as this engine would represent it, so
@@ -536,7 +570,7 @@ pub struct SumOutOfRange;
 
 impl Total {
     /// An empty total under `rule`.
-    fn empty(rule: crate::backend::SumRule) -> Self {
+    fn empty(rule: crate::backend::SumRule, boundary: FloatBoundary) -> Self {
         match rule {
             crate::backend::SumRule::Integer => Self::Integer {
                 value: 0,
@@ -552,8 +586,8 @@ impl Total {
                 value: bigdecimal::BigDecimal::from(0),
                 integer_digits,
             },
-            crate::backend::SumRule::Single => Self::Single(FloatParts::EMPTY),
-            crate::backend::SumRule::Double => Self::Double(FloatParts::EMPTY),
+            crate::backend::SumRule::Single => Self::Single(FloatParts::EMPTY, boundary),
+            crate::backend::SumRule::Double => Self::Double(FloatParts::EMPTY, boundary),
         }
     }
 
@@ -617,25 +651,16 @@ impl Total {
             // this wide and a total rounded only once at the end is a
             // different number: measured, `16777216 + 1 + 1` keeps both
             // units in double and loses both in single.
-            Self::Single(parts) => {
-                let change = delta.float_parts();
-                let previous = parts.finite;
-                parts.add(change);
+            Self::Single(parts, boundary) => {
+                parts.add(delta.float_parts());
                 #[allow(clippy::cast_possible_truncation)]
-                let rounded = parts.finite as f32;
-                // Two finite operands whose total is not finite is where
-                // PostgreSQL answers `value out of range: overflow`. A
-                // non-finite *operand* is a different matter and folds
-                // through, which Phase c003686 measured, and which the
-                // parts now carry separately from the finite sum.
-                if !rounded.is_finite() && previous.is_finite() && change.finite.is_finite() {
-                    return Err(SumOutOfRange);
-                }
-                parts.finite = f64::from(rounded);
+                let rounded = f64::from(parts.finite as f32);
+                parts.finite = boundary.settle(rounded)?;
                 Ok(())
             }
-            Self::Double(parts) => {
+            Self::Double(parts, boundary) => {
                 parts.add(delta.float_parts());
+                parts.finite = boundary.settle(parts.finite)?;
                 Ok(())
             }
         }
@@ -679,33 +704,32 @@ impl Total {
                 }
                 _ => {}
             },
-            Self::Single(parts) => {
+            Self::Single(parts, _) => {
                 #[allow(clippy::cast_possible_truncation)]
                 let seeded = AggAccumulator::seed_f64(cell).unwrap_or(0.0) as f32;
                 *parts = FloatParts::finite(f64::from(seeded));
             }
-            Self::Double(parts) => {
+            Self::Double(parts, _) => {
                 *parts = FloatParts::finite(AggAccumulator::seed_f64(cell).unwrap_or(0.0));
             }
         }
     }
 
-    /// The rule this total was built from, for rebuilding an emptied one.
-    const fn rule(&self) -> crate::backend::SumRule {
+    /// Empty this total, keeping the rule it was built with.
+    ///
+    /// In place rather than rebuilt. Reconstructing it from a rule read
+    /// back off the current state is how a `TRUNCATE` used to cost
+    /// SQLite its integer boundary: the state after a promotion reported
+    /// the promoted rule, not the declared one. Nothing infers a rule
+    /// from a value any more.
+    fn clear(&mut self) {
         match self {
-            // Read from the flag rather than from the current state, so
-            // an emptied total is rebuilt with the rule it was built
-            // with. Inferring it from the state is how a promotion used
-            // to cost SQLite its integer boundary across a truncate.
-            Self::Integer { promotes: true, .. } => {
-                crate::backend::SumRule::IntegerPromotingToDouble
+            Self::Integer { value, reals, .. } => {
+                *value = 0;
+                *reals = FloatParts::EMPTY;
             }
-            Self::Integer { .. } => crate::backend::SumRule::Integer,
-            Self::Decimal { integer_digits, .. } => crate::backend::SumRule::Decimal {
-                integer_digits: *integer_digits,
-            },
-            Self::Single(_) => crate::backend::SumRule::Single,
-            Self::Double(_) => crate::backend::SumRule::Double,
+            Self::Decimal { value, .. } => *value = bigdecimal::BigDecimal::from(0),
+            Self::Single(parts, _) | Self::Double(parts, _) => *parts = FloatParts::EMPTY,
         }
     }
 
@@ -724,7 +748,9 @@ impl Total {
             // Reported as a double, because that is the carrier a caller
             // reads a floating total through. The width belongs to the
             // accumulation, and widening an `f32` is exact.
-            Self::Single(parts) | Self::Double(parts) => crate::NumericValue::Double(parts.value()),
+            Self::Single(parts, _) | Self::Double(parts, _) => {
+                crate::NumericValue::Double(parts.value())
+            }
         }
     }
 }
@@ -798,7 +824,7 @@ impl AggAccumulator {
             count: 0,
             sum: 0.0,
             spread: Spread::EMPTY,
-            total: Total::empty(rule.total),
+            total: Total::empty(rule.total, FloatBoundary(rule.float_overflow)),
             mean_rule: rule.mean,
             variance_seed: rule.variance_seed,
             quotient_rule: rule.quotient,
@@ -960,7 +986,7 @@ impl AggAccumulator {
         self.count = 0;
         self.sum = 0.0;
         self.spread = Spread::EMPTY;
-        self.total = Total::empty(self.total.rule());
+        self.total.clear();
     }
 
     /// Current aggregate value.
@@ -1007,9 +1033,9 @@ impl AggAccumulator {
             // and answers the double quotient of the double sum. Read
             // through the widened total, which is what that quotient is,
             // so both widths answer alike here.
-            (Total::Double(total) | Total::Single(total), _) => Some(crate::NumericValue::Double(
-                total.value() / self.count as f64,
-            )),
+            (Total::Double(total, _) | Total::Single(total, _), _) => Some(
+                crate::NumericValue::Double(total.value() / self.count as f64),
+            ),
             (_, crate::backend::MeanRule::Double) => Some(double()),
             (Total::Integer { value, .. }, crate::backend::MeanRule::Exact) => Some(
                 crate::NumericValue::Decimal(self.quotient(&bigdecimal::BigDecimal::from(*value))),

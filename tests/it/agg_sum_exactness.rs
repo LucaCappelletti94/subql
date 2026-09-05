@@ -56,6 +56,10 @@ const SMALL: usize = 1;
 const BIG: usize = 2;
 /// The single-precision column, last in each schema.
 const SINGLE: usize = 5;
+/// The double-precision column.
+const APPROX: usize = 4;
+/// Its SQLite counterpart, one column earlier.
+const SQLITE_APPROX: usize = 3;
 /// SQLite has no `NUMERIC`, so its schema is one column shorter.
 const SQLITE_SINGLE: usize = 4;
 
@@ -623,5 +627,84 @@ fn sqlite_keeps_its_rule_across_a_truncate_after_a_promotion() {
     assert!(
         matches!(stop, Some(MaintenanceStopReason::SumOutOfRange { .. })),
         "with the boundary intact, got {stop:?}"
+    );
+}
+
+/// A floating total that leaves its range answers what its engine
+/// answers, and the three engines answer three different things.
+///
+/// Measured 2026-09-05, and this one was found by the prerequisite
+/// measurement for the non-finite work rather than reported by a
+/// reviewer:
+///
+/// ```text
+/// pg      SUM over 1e308, 1e308 (float8)   ERROR value out of range: overflow
+/// mysql   SUM over 1e308, 1e308 (DOUBLE)   0, no error on the aggregate
+/// mysql   SUM over 1e308, 1e308, -1e308    0: once out of range it stays there
+/// mysql   SUM over 1e308, -1e308, 1e308    1e308: accumulated in scan order
+/// sqlite  SUM over 9e307, 9e307            inf
+/// sqlite  SUM over 9e307, 9e307, -9e307    inf: plain IEEE, and it stays
+/// ```
+///
+/// subql answered `inf` everywhere, which is SQLite's answer and nobody
+/// else's. MySQL's `0` is measured on 8.0.46 and 8.4.11 alike and is not
+/// an artefact: the interleaved case answers `1e308`, so the total really
+/// is accumulated in scan order, and an addition that leaves range yields
+/// `0` and stays there. Its `+` operator raising `ERROR 1690` while its
+/// `SUM` does not is MySQL disagreeing with itself.
+///
+/// This is a distinct axis from a non-finite *input*, which folds through
+/// to a non-finite answer on every engine.
+#[test]
+fn pg_double_total_past_its_range_stops_maintenance() {
+    let mut folding = pg("approx");
+    assert_eq!(
+        folding.fold(APPROX, Value::Float(1e308)),
+        Some(AggValue::Sum(Some(NumericValue::Double(1e308))))
+    );
+    let stop = folding.stop(APPROX, Value::Float(1e308));
+    assert!(
+        matches!(stop, Some(MaintenanceStopReason::SumOutOfRange { .. })),
+        "measured: PostgreSQL answers `value out of range: overflow`, got {stop:?}"
+    );
+}
+
+/// MySQL answers zero for the same total, and that zero is not
+/// something a running total can hold, so maintenance stops instead.
+///
+/// Measured: `1e308, 1e308` answers `0`; adding `-1e308` still answers
+/// `0`; and reordering to `1e308, -1e308, 1e308` answers `1e308`. So the
+/// zero is a property of the whole row set, not of a running value. A
+/// fold that has left range has already destroyed what the answer needs,
+/// and it cannot know whether a later row would have kept a recomputed
+/// total in range: resetting to zero and continuing gets the second
+/// measurement wrong, and holding zero for good gets a row leaving
+/// wrong. Neither is MySQL, so the subscription re-reads and MySQL
+/// answers for itself.
+#[test]
+fn mysql_double_total_past_its_range_stops_maintenance() {
+    let mut folding = mysql("approx");
+    folding.fold(APPROX, Value::Float(1e308));
+    let stop = folding.stop(APPROX, Value::Float(1e308));
+    assert!(
+        matches!(stop, Some(MaintenanceStopReason::SumOutOfRange { .. })),
+        "MySQL's answer is not maintainable in process, so the total is re-read, got {stop:?}"
+    );
+}
+
+/// SQLite saturates, which is plain IEEE and what subql always did.
+#[test]
+fn sqlite_double_total_past_its_range_saturates() {
+    let mut folding = sqlite("approx");
+    folding.fold(SQLITE_APPROX, Value::Float(9e307));
+    assert_eq!(
+        folding.fold(SQLITE_APPROX, Value::Float(9e307)),
+        Some(AggValue::Sum(Some(NumericValue::Double(f64::INFINITY)))),
+        "measured: SQLite answers inf"
+    );
+    assert_eq!(
+        folding.fold(SQLITE_APPROX, Value::Float(-9e307)),
+        Some(AggValue::Sum(Some(NumericValue::Double(f64::INFINITY)))),
+        "measured: and it stays inf, because inf minus a finite value is inf"
     );
 }
