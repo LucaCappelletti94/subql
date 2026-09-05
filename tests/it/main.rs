@@ -9,6 +9,8 @@
 
 mod common;
 
+mod differential;
+
 mod agg_avg_exactness;
 
 mod agg_non_finite;
