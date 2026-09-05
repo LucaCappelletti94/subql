@@ -36,20 +36,39 @@ struct NewReading {
 
 // IoT Catalog
 
-/// Schema catalog for the `readings` table across both PG and MySQL.
+/// The PostgreSQL catalog for the `readings` table.
 ///
-/// One bare `readings` declaration serves all three callers:
+/// Its default collation is deterministic, so text equality is byte
+/// equality and subql answers it in process. MySQL needs its own
+/// declaration, which is what [`iot_catalog_mysql`] is for.
+///
+/// One bare `readings` declaration serves both remaining callers:
 /// - subscription registration (`SELECT * FROM readings WHERE ...`),
 /// - wal2json (sends `schema="public"`, resolved as `public.readings`
-///   which Postgres aliases to bare `readings`),
-/// - Maxwell (sends `schema="testdb"`, no `testdb.readings` exists so
-///   `resolve_table_reference` falls back to the unqualified lookup
-///   that hits the bare table).
+///   which Postgres aliases to bare `readings`).
 fn iot_catalog() -> ParserDB {
     ParserDB::parse::<PostgreSqlDialect>(
-        "CREATE TABLE readings (sensor_id INT PRIMARY KEY, temperature DOUBLE PRECISION, humidity DOUBLE PRECISION, location TEXT);",
+        "CREATE TABLE readings (sensor_id INT PRIMARY KEY, temperature DOUBLE PRECISION, humidity DOUBLE PRECISION, location VARCHAR(100));",
     )
     .expect("iot fixture DDL parses")
+}
+
+/// The MySQL catalog, which has to name `location`'s collation.
+///
+/// MySQL 8's schema default is `utf8mb4_0900_ai_ci`, case- and
+/// accent-insensitive, and subql refuses to answer equality under it in
+/// process: measured here, registration returns
+/// `CollationNotReproducible { column: 3, collation: None }` and routes
+/// the subscription to a database read, which is the rule Phase C6
+/// introduced. Byte comparison would have answered a question MySQL was
+/// not asked. So the column declares `utf8mb4_bin`, under which equality
+/// really is byte equality, and the parity this test is about becomes
+/// meaningful rather than accidental.
+fn iot_catalog_mysql() -> ParserDB {
+    ParserDB::parse::<sqlparser::dialect::MySqlDialect>(
+        "CREATE TABLE readings (sensor_id INT PRIMARY KEY, temperature DOUBLE, humidity DOUBLE, location VARCHAR(100) COLLATE utf8mb4_bin);",
+    )
+    .expect("iot fixture MySQL DDL parses")
 }
 
 mod container_setup {
@@ -240,7 +259,7 @@ mod dml_setup {
             sensor_id INT PRIMARY KEY,
             temperature DOUBLE,
             humidity DOUBLE,
-            location VARCHAR(100)
+            location VARCHAR(100) COLLATE utf8mb4_bin
         )",
         )
         .execute(my)
@@ -516,7 +535,7 @@ mod engine_setup {
 
         // Set up engines, one per CDC source
         let mut pg_engine = setup_pg_engine(iot_catalog());
-        let mut mx_engine = setup_mysql_engine(iot_catalog());
+        let mut mx_engine = setup_mysql_engine(super::iot_catalog_mysql());
 
         // Dispatch and collect results
         let pg_results = dispatch_events(&mut pg_engine, parse_wal2json_v2, &pg_messages);

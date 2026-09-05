@@ -355,9 +355,12 @@ fn execute_scalar_row_decodes_integer_aggregate_seed_async() {
             .execute_scalar_row(&bundle.query.as_read_query(), &bundle.kinds, &())
             .await
             .expect("execute_scalar_row");
+        // (sum, squared deviations, count) = (12, 8, 3). Eight because
+        // the seed reads the engine's own `VAR_POP(amount) * COUNT(amount)`
+        // rather than a sum of squares, which would be 56.
         assert_eq!(
             row,
-            vec![Value::Float(12.0), Value::Float(56.0), Value::Int(3)]
+            vec![Value::Float(12.0), Value::Float(8.0), Value::Int(3)]
         );
         assert!(checkpoint.is_some());
     });
