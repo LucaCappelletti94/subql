@@ -135,6 +135,26 @@ pub(super) struct ResolveContext<I: IdTypes, B: Backend, A> {
     pub(super) auth: A,
 }
 
+impl<I: IdTypes, B: Backend, A> ResolveContext<I, B, A> {
+    /// Whether a snapshot has nothing to prime for this subscription.
+    ///
+    /// One predicate, read by both the sync and the async engine, rather
+    /// than a check spelled once in each. Spelled twice it was spelled
+    /// once: the async engine never had it, and because a
+    /// [`InProcessKind::StreamServedFilter`] context sets `whole_result`,
+    /// the async path reached its whole-result branch and issued a read
+    /// its twin never issues, answering
+    /// [`ReExecError::Cursor`](super::ReExecError::Cursor) where the sync
+    /// engine answers `Ok(None)`.
+    ///
+    /// The retained query answers a report, not a snapshot: it exists for
+    /// the one case the stream cannot answer, a cell the event did not
+    /// carry.
+    pub(super) fn stream_answers_the_filter(&self) -> bool {
+        self.in_process == Some(InProcessKind::StreamServedFilter)
+    }
+}
+
 /// Why an in-process subscription holds a resolve context at all, since
 /// neither kind is resolved by a read while it stays in process.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -981,9 +1001,8 @@ where
         let Some(context) = self.contexts.get(&subscription_id) else {
             return Ok(None);
         };
-        // A subscription the stream maintains has nothing to prime: its
-        // retained query answers a report, not a snapshot.
-        if context.in_process == Some(InProcessKind::StreamServedFilter) {
+        // A subscription the stream maintains has nothing to prime.
+        if context.stream_answers_the_filter() {
             return Ok(None);
         }
         let grouped_bootstrap = context.grouped_bootstrap.clone();

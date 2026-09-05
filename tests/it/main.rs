@@ -255,6 +255,8 @@ mod reexec_postgres_r2d2;
 
 mod reexec_proptest;
 
+mod reexec_snapshot_parity;
+
 mod reexec_rls_guard;
 
 mod reexec_throttle;

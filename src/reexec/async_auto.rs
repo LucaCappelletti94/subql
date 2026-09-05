@@ -258,6 +258,12 @@ where
         let Some(context) = self.contexts.get(&subscription_id) else {
             return Ok(None);
         };
+        // A subscription the stream maintains has nothing to prime. Ahead
+        // of every branch below, because such a context carries
+        // `whole_result` and would otherwise be read as one.
+        if context.stream_answers_the_filter() {
+            return Ok(None);
+        }
         let grouped_bootstrap = context.grouped_bootstrap.clone();
         if let Some(bootstrap) = grouped_bootstrap {
             let (pages, checkpoint) = Self::read_whole_with(
