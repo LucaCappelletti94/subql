@@ -2307,6 +2307,45 @@ mod tests {
         assert_eq!(queries[0].binds(), &[Value::String("paid".into())]);
     }
 
+    /// A keyed read asks about the row the event says is its own.
+    ///
+    /// The key is built from the columns the event declares as its
+    /// primary key, in `KeyedQuery::on_event`, so a declaration naming
+    /// the wrong column asks the database about the wrong row. Two
+    /// inserts are used rather than one, and their ids differ, because
+    /// one insert cannot tell a correct declaration from one naming a
+    /// column that happens to hold the same value in every fixture row:
+    /// `quantity` is always 1 here, so pointing the key at it collapses
+    /// both rows onto a single key and the read asks about half of what
+    /// changed.
+    ///
+    /// The delete path was already covered by
+    /// `sync_keyed_event_scopes_registration_binds`. This is the insert
+    /// path, which nothing depended on: pointing the shared fixture's
+    /// insert at another column reddened no test in the suite.
+    #[test]
+    fn sync_keyed_insert_asks_about_the_declared_key() {
+        let (mut engine, table) = engine_with_values(alloc::vec![]);
+        engine
+            .register(
+                SubscriptionRequest::new(1u64, "SELECT * FROM orders WHERE lower(status) = 'paid'"),
+                (),
+            )
+            .expect("keyed read registers");
+
+        engine.apply(&insert_event(table, 1, 5.0)).unwrap();
+        engine.apply(&insert_event(table, 2, 6.0)).unwrap();
+        let _ = engine.resolve_collect();
+
+        let queries = engine.connector().page_queries.borrow();
+        assert_eq!(queries.len(), 1, "both keys are asked in one read");
+        assert_eq!(
+            queries[0].sql(),
+            "SELECT * FROM orders WHERE (lower(status) = 'paid') AND \"id\" IN (1, 2)",
+            "the read names the id column and both ids"
+        );
+    }
+
     #[test]
     fn sync_grouped_bootstrap_forwards_registration_binds() {
         let (mut engine, _) = engine_with_values(alloc::vec![]);
