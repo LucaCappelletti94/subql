@@ -105,6 +105,34 @@ impl<B: Summing> Folding<B> {
             .and_then(subql::AggregateValueUpdate::folded_value)
     }
 
+    /// One row leaving, and the value the engine then reports.
+    fn remove(&mut self, at: usize, cell: Value<B>) -> Option<AggValue> {
+        self.lsn += 10;
+        let mut cells = empty_row(self.arity);
+        cells[0] = Value::Int(i64::try_from(self.lsn).unwrap());
+        cells[at] = cell;
+        let event = TestEvent::delete(self.table, cells)
+            .with_pk_columns([0u16])
+            .with_checkpoint(PgLsn(self.lsn));
+        let output = self.engine.aggregate_updates(&event).unwrap();
+        if !output.transitions.is_empty() {
+            return None;
+        }
+        output
+            .updates
+            .first()
+            .and_then(subql::AggregateValueUpdate::folded_value)
+    }
+
+    /// Every row leaving at once, which is what a `TRUNCATE` delivers.
+    fn truncate(&mut self) {
+        self.lsn += 10;
+        let event = TestEvent::truncate(self.table).with_checkpoint(PgLsn(self.lsn));
+        self.engine
+            .aggregate_updates(&event)
+            .expect("a truncate folds");
+    }
+
     /// Why the engine stopped maintaining the total, if it did. A stop
     /// leaves the subscription on a re-read tier, which the transition
     /// reports.
@@ -509,5 +537,91 @@ fn mysql_and_sqlite_sum_a_single_precision_column_in_double() {
         sqlite.fold(SQLITE_SINGLE, Value::Float(1.0)),
         Some(single(16_777_217.0)),
         "SQLite keeps the unit, because its accumulator is a double"
+    );
+}
+
+/// And the promotion is undone when the last real value leaves.
+///
+/// Measured on SQLite 3.51.1 over an `INTEGER` column holding
+/// `i64::MAX` and `0.5`:
+///
+/// ```text
+/// both rows                  SUM 9.223372036854776e+18, typeof real
+/// after the 0.5 is deleted   SUM 9223372036854775807,    typeof integer
+/// two rows of i64::MAX       ERROR integer overflow
+/// ```
+///
+/// So the type is a property of the rows present, not of the rows that
+/// have ever been present. Replacing the accumulator on promotion threw
+/// the integer away, so nothing could restore it.
+#[test]
+fn sqlite_integer_sum_demotes_when_the_last_real_leaves() {
+    let mut folding = sqlite("big");
+    assert_eq!(
+        folding.fold(BIG, Value::Int(2)),
+        Some(AggValue::Sum(Some(NumericValue::Integer(2))))
+    );
+    assert_eq!(
+        folding.fold(BIG, Value::Float(0.5)),
+        Some(AggValue::Sum(Some(NumericValue::Double(2.5)))),
+        "measured: the sum is real while a real participates"
+    );
+    assert_eq!(
+        folding.remove(BIG, Value::Float(0.5)),
+        Some(AggValue::Sum(Some(NumericValue::Integer(2)))),
+        "measured: it is an integer again once the real leaves"
+    );
+}
+
+/// The exact accumulator comes back with its boundary, so the overflow
+/// the engine raises is raised again.
+///
+/// This is what the silent rounding cost: with the integer thrown away,
+/// a later 64-bit overflow accumulated in `f64` and answered a rounded
+/// double where SQLite answers `integer overflow`.
+#[test]
+fn sqlite_regains_its_integer_boundary_after_a_real_leaves() {
+    let mut folding = sqlite("big");
+    folding.fold(BIG, Value::Int(i64::MAX));
+    assert!(
+        folding.fold(BIG, Value::Float(0.5)).is_some(),
+        "a real joining promotes rather than refusing"
+    );
+    assert_eq!(
+        folding.remove(BIG, Value::Float(0.5)),
+        Some(AggValue::Sum(Some(NumericValue::Integer(i64::MAX)))),
+        "the exact total is back, to the digit"
+    );
+    let stop = folding.stop(BIG, Value::Int(i64::MAX));
+    assert!(
+        matches!(stop, Some(MaintenanceStopReason::SumOutOfRange { .. })),
+        "and so is its boundary: measured, SQLite answers `integer overflow`, got {stop:?}"
+    );
+}
+
+/// A truncate does not cost the accumulator its rule either.
+///
+/// The guard on `clear`: it rebuilt the total from whatever the total
+/// currently was, so after a promotion it rebuilt a double and SQLite's
+/// integer boundary was gone for good. With the two halves kept apart
+/// there is no rule to lose, and this test is what says so.
+#[test]
+fn sqlite_keeps_its_rule_across_a_truncate_after_a_promotion() {
+    let mut folding = sqlite("big");
+    folding.fold(BIG, Value::Int(2));
+    assert!(
+        folding.fold(BIG, Value::Float(0.5)).is_some(),
+        "promoted while the real is live"
+    );
+    folding.truncate();
+    assert_eq!(
+        folding.fold(BIG, Value::Int(i64::MAX)),
+        Some(AggValue::Sum(Some(NumericValue::Integer(i64::MAX)))),
+        "an emptied total accumulates exactly again"
+    );
+    let stop = folding.stop(BIG, Value::Int(i64::MAX));
+    assert!(
+        matches!(stop, Some(MaintenanceStopReason::SumOutOfRange { .. })),
+        "with the boundary intact, got {stop:?}"
     );
 }

@@ -494,7 +494,22 @@ enum Total {
     /// Exact in 64 bits. `promotes` is SQLite's rule: a non-integer value
     /// joining turns the total into a double, where PostgreSQL's
     /// `sum(int)` can never see one.
-    Integer { value: i64, promotes: bool },
+    ///
+    /// `reals` holds what those non-integer values contribute, kept apart
+    /// from `value` rather than folded into it. The promotion is a
+    /// property of the rows present, not of the rows that have ever been
+    /// present: measured on SQLite 3.51.1, an `INTEGER` column holding
+    /// `i64::MAX` and `0.5` sums to `9.223372036854776e+18` typed real,
+    /// and once the `0.5` is deleted it sums to `9223372036854775807`
+    /// typed integer, and two rows of `i64::MAX` then answer `integer
+    /// overflow` again. Replacing the accumulator threw the integer away,
+    /// so nothing could restore it, and a later overflow rounded in
+    /// silence where the engine raises.
+    Integer {
+        value: i64,
+        promotes: bool,
+        reals: FloatParts,
+    },
     /// Exact decimal, bounded by the engine's integer-digit ceiling when
     /// it has a reachable one.
     Decimal {
@@ -526,10 +541,12 @@ impl Total {
             crate::backend::SumRule::Integer => Self::Integer {
                 value: 0,
                 promotes: false,
+                reals: FloatParts::EMPTY,
             },
             crate::backend::SumRule::IntegerPromotingToDouble => Self::Integer {
                 value: 0,
                 promotes: true,
+                reals: FloatParts::EMPTY,
             },
             crate::backend::SumRule::Decimal { integer_digits } => Self::Decimal {
                 value: bigdecimal::BigDecimal::from(0),
@@ -547,22 +564,26 @@ impl Total {
     /// [`SumOutOfRange`] where the engine itself would raise.
     fn add(&mut self, delta: &TotalDelta) -> Result<(), SumOutOfRange> {
         match self {
-            Self::Integer { value, promotes } => match delta {
+            Self::Integer {
+                value,
+                promotes,
+                reals,
+            } => match delta {
                 TotalDelta::Integer(change) => {
                     let total = i128::from(*value) + change;
+                    // The exact half keeps its own boundary even while a
+                    // real value is live, so the boundary is back the
+                    // moment the last one leaves rather than gone for
+                    // good.
                     *value = i64::try_from(total).map_err(|_| SumOutOfRange)?;
                     Ok(())
                 }
                 // A non-integer value joined. SQLite turns the total real
-                // here; an engine whose integer sum cannot see one has a
-                // catalog and a stream that disagree, and no answer to
-                // give.
+                // while one is live; an engine whose integer sum cannot
+                // see one has a catalog and a stream that disagree, and no
+                // answer to give.
                 _ if *promotes => {
-                    #[allow(clippy::cast_precision_loss)]
-                    let promoted = *value as f64;
-                    let mut parts = FloatParts::finite(promoted);
-                    parts.add(delta.float_parts());
-                    *self = Self::Double(parts);
+                    reals.add(delta.float_parts());
                     Ok(())
                 }
                 _ => Err(SumOutOfRange),
@@ -624,11 +645,23 @@ impl Total {
     fn seed<B: Backend>(&mut self, cell: &Value<B>) {
         use core::any::Any;
         match self {
-            Self::Integer { value, .. } => {
-                if let Value::Int(int) = cell {
-                    if let Some(int) = (int as &dyn Any).downcast_ref::<i64>() {
-                        *value = *int;
+            Self::Integer { value, reals, .. } => {
+                *reals = FloatParts::EMPTY;
+                match cell {
+                    Value::Int(int) => {
+                        if let Some(int) = (int as &dyn Any).downcast_ref::<i64>() {
+                            *value = *int;
+                        }
                     }
+                    // A seed read back as a real is an engine reporting a
+                    // sum that has already promoted, so it seeds the real
+                    // half. Measured, SQLite answers `typeof real` for
+                    // exactly that set.
+                    Value::Float(_) => {
+                        *value = 0;
+                        *reals = FloatParts::finite(AggAccumulator::seed_f64(cell).unwrap_or(0.0));
+                    }
+                    _ => {}
                 }
             }
             Self::Decimal { value, .. } => match cell {
@@ -660,6 +693,10 @@ impl Total {
     /// The rule this total was built from, for rebuilding an emptied one.
     const fn rule(&self) -> crate::backend::SumRule {
         match self {
+            // Read from the flag rather than from the current state, so
+            // an emptied total is rebuilt with the rule it was built
+            // with. Inferring it from the state is how a promotion used
+            // to cost SQLite its integer boundary across a truncate.
             Self::Integer { promotes: true, .. } => {
                 crate::backend::SumRule::IntegerPromotingToDouble
             }
@@ -675,6 +712,13 @@ impl Total {
     /// The total as a caller reads it.
     fn value(&self) -> crate::NumericValue {
         match self {
+            // Real while a non-integer contribution is live, exact
+            // again once none is, which is what SQLite answers for the
+            // rows present.
+            #[allow(clippy::cast_precision_loss)]
+            Self::Integer { value, reals, .. } if !reals.is_zero() => {
+                crate::NumericValue::Double(*value as f64 + reals.value())
+            }
             Self::Integer { value, .. } => crate::NumericValue::Integer(*value),
             Self::Decimal { value, .. } => crate::NumericValue::Decimal(value.clone()),
             // Reported as a double, because that is the carrier a caller
