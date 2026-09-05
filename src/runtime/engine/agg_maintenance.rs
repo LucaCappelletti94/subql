@@ -407,10 +407,11 @@ where
                     crate::runtime::aggregate::AggregateTotal::new(
                         consumer,
                         spec.clone(),
-                        crate::catalog_helpers::sum_rule::<E::Backend, _>(
+                        crate::catalog_helpers::fold_rule::<E::Backend, _>(
                             spec,
                             &self.database,
                             table_id,
+                            self.division_increment,
                         ),
                     ),
                 );
@@ -442,10 +443,11 @@ where
                         groups.len(),
                         having.as_ref(),
                         group_key_encoder,
-                        crate::catalog_helpers::sum_rule::<E::Backend, _>(
+                        crate::catalog_helpers::fold_rule::<E::Backend, _>(
                             agg,
                             &self.database,
                             table_id,
+                            self.division_increment,
                         ),
                     ),
                 );

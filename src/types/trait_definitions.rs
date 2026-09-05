@@ -119,22 +119,28 @@ pub enum AggValue {
     Count(i64),
     /// `SUM(col)`. `None` when no row contributes a value, which every
     /// engine answers as NULL rather than as zero.
-    Sum(Option<SumValue>),
-    /// A real-valued aggregate (AVG, variance, stddev). `None` when undefined
+    Sum(Option<NumericValue>),
+    /// `AVG(col)`, in the type its engine answers. `None` when no row
+    /// contributes, which is what every engine answers for an empty set.
+    Avg(Option<NumericValue>),
+    /// A real-valued aggregate (variance and stddev). `None` when undefined
     /// for the current row count.
     Real(Option<f64>),
 }
 
-/// What a `SUM` answers, in the type its engine sums into.
+/// A number in the type its engine answers, for a total or a mean.
 ///
 /// Measured on PostgreSQL 16.15, MySQL 8.4.11 and SQLite 3.51.1: a sum
 /// over an `int` column is a `bigint` there, a `decimal(32,0)` there and
 /// an `integer` there, and none of the three sums in `f64`, so a single
-/// row of `9007199254740993` is itself rather than the nearest double.
-/// Which one a subscription answers is
-/// [`Backend::sum_rule`](crate::backend::Backend::sum_rule)'s to say.
+/// row of `9007199254740993` is itself rather than the nearest double. A
+/// mean over the same column is a `numeric`, a `decimal(14,4)` and a
+/// real. Which one a subscription answers is
+/// [`Backend::sum_rule`](crate::backend::Backend::sum_rule)'s to say for
+/// a total and [`Backend::MEAN`](crate::backend::Backend::MEAN)'s for a
+/// mean.
 #[derive(Clone, Debug, PartialEq)]
-pub enum SumValue {
+pub enum NumericValue {
     /// A 64-bit integer total: PostgreSQL's `sum(int)`, SQLite's integer
     /// sum.
     Integer(i64),
@@ -145,7 +151,7 @@ pub enum SumValue {
     Double(f64),
 }
 
-impl core::fmt::Display for SumValue {
+impl core::fmt::Display for NumericValue {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::Integer(value) => write!(f, "{value}"),
@@ -159,9 +165,9 @@ impl core::fmt::Display for AggValue {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::Count(c) => write!(f, "{c}"),
-            Self::Sum(Some(s)) => write!(f, "{s}"),
+            Self::Sum(Some(s)) | Self::Avg(Some(s)) => write!(f, "{s}"),
             Self::Real(Some(v)) => write!(f, "{v}"),
-            Self::Sum(None) | Self::Real(None) => f.write_str("-"),
+            Self::Sum(None) | Self::Avg(None) | Self::Real(None) => f.write_str("-"),
         }
     }
 }

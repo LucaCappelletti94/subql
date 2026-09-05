@@ -10,12 +10,14 @@
 
 #![allow(clippy::unwrap_used)]
 
+use bigdecimal::BigDecimal;
+use core::str::FromStr as _;
 use sql_traits::structs::ParserDB;
 use sqlparser::dialect::{MySqlDialect, PostgreSqlDialect};
 use subql::backend::{BuiltinKind, MySql, Postgres, Value};
 use subql::testing::TestEvent;
 use subql::{
-    AggValue, AggregateBootstrap, DefaultIds, SubscriptionEngine, SubscriptionRequest, SumValue,
+    AggValue, AggregateBootstrap, DefaultIds, NumericValue, SubscriptionEngine, SubscriptionRequest,
 };
 
 const DDL: &str = "CREATE TABLE t (id INT PRIMARY KEY, amount INT, status TEXT);";
@@ -155,7 +157,9 @@ fn bootstrap_kinds_per_aggspec() {
         // `amount` is an `INT`, whose sum is a `bigint` on Postgres, so the
         // total component decodes exactly rather than as a double.
         ("SELECT SUM(amount) FROM t", vec![int, int]),
-        ("SELECT AVG(amount) FROM t", vec![float, int]),
+        // `AVG` holds the same exact total `SUM` does, so its total
+        // component decodes exactly too.
+        ("SELECT AVG(amount) FROM t", vec![int, int]),
         ("SELECT VAR_POP(amount) FROM t", vec![float, float, int]),
         ("SELECT VAR_SAMP(amount) FROM t", vec![float, float, int]),
         ("SELECT STDDEV_POP(amount) FROM t", vec![float, float, int]),
@@ -197,22 +201,26 @@ fn a_seed_row_decodes_into_the_value_it_describes() {
             "SELECT SUM(amount) FROM t",
             &[Value::Int(10), Value::Int(1)]
         ),
-        AggValue::Sum(Some(SumValue::Integer(10))),
+        AggValue::Sum(Some(NumericValue::Integer(10))),
     );
     assert_eq!(
         seeded_value(
             "SELECT SUM(amount) FROM t",
             &[Value::Int(-4), Value::Int(2)]
         ),
-        AggValue::Sum(Some(SumValue::Integer(-4))),
+        AggValue::Sum(Some(NumericValue::Integer(-4))),
     );
     // AVG: `(s, c)` components.
     assert_eq!(
         seeded_value(
             "SELECT AVG(amount) FROM t",
-            &[Value::Float(10.0), Value::Int(4)],
+            &[Value::Int(10), Value::Int(4)],
         ),
-        AggValue::Real(Some(2.5)),
+        // A mean is PostgreSQL's own numeric division of the total by the
+        // count: sixteen significant digits.
+        AggValue::Avg(Some(NumericValue::Decimal(
+            BigDecimal::from_str("2.5000000000000000").unwrap()
+        ))),
     );
     // VAR_POP: `(s, sq, c)`. amounts [2, 4, 6] -> sum=12, sum_sq=56, n=3.
     // var_pop = 56/3 - (12/3)^2 = 2.6666666666666665.
@@ -246,7 +254,7 @@ fn a_seed_over_an_empty_table_is_the_empty_value() {
     );
     assert_eq!(
         seeded_value("SELECT AVG(amount) FROM t", &[Value::Null, Value::Int(0)],),
-        AggValue::Real(None),
+        AggValue::Avg(None),
     );
     assert_eq!(
         seeded_value(
@@ -277,7 +285,7 @@ fn reseed_matches_recompute() {
         &mut engine,
         subscription,
         subql::AggregateSeedInstall {
-            rows: vec![vec![Value::Float(3.0), Value::Int(1)]],
+            rows: vec![vec![Value::Int(3), Value::Int(1)]],
             read_at: None,
         },
     )
@@ -290,13 +298,18 @@ fn reseed_matches_recompute() {
         &mut engine,
         subscription,
         subql::AggregateSeedInstall {
-            rows: vec![vec![Value::Float(12.0), Value::Int(3)]],
+            rows: vec![vec![Value::Int(12), Value::Int(3)]],
             read_at: None,
         },
     )
     .expect("the new starting numbers land");
     assert_eq!(updates.len(), 1);
-    assert_eq!(updates[0].folded_value(), Some(AggValue::Real(Some(4.0))));
+    assert_eq!(
+        updates[0].folded_value(),
+        Some(AggValue::Avg(Some(NumericValue::Decimal(
+            BigDecimal::from_str("4.0000000000000000").unwrap()
+        ))))
+    );
 }
 
 /// A table whose group column name carries the dialect's own identifier

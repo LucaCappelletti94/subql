@@ -33,8 +33,8 @@ use sqlparser::dialect::PostgreSqlDialect;
 use subql::backend::{Postgres, Value};
 use subql::testing::TestEvent;
 use subql::{
-    catalog_helpers, AggValue, DefaultIds, PgLsn, SubscriptionEngine, SubscriptionRequest,
-    SumValue, TableId, Tier,
+    catalog_helpers, AggValue, DefaultIds, NumericValue, PgLsn, SubscriptionEngine,
+    SubscriptionRequest, TableId, Tier,
 };
 
 const DDL: &str = "CREATE TABLE t (id INT PRIMARY KEY, amount NUMERIC, \
@@ -110,7 +110,7 @@ fn decimal_column_sum_folds() {
     );
     assert_eq!(
         inserted(&mut engine, table, decimal("10.25"), 10),
-        Some(AggValue::Sum(Some(SumValue::Decimal(
+        Some(AggValue::Sum(Some(NumericValue::Decimal(
             BigDecimal::from_str("10.25").unwrap()
         )))),
         "measured: the server answers 10.25, so silence is not an answer"
@@ -128,7 +128,7 @@ fn a_second_decimal_row_moves_the_total() {
     inserted(&mut engine, table, decimal("10.25"), 10);
     assert_eq!(
         inserted(&mut engine, table, decimal("2.5"), 20),
-        Some(AggValue::Sum(Some(SumValue::Decimal(
+        Some(AggValue::Sum(Some(NumericValue::Decimal(
             BigDecimal::from_str("12.75").unwrap()
         )))),
         "measured: 12.75 at scale two"
@@ -148,7 +148,7 @@ fn a_decimal_row_folds_exactly() {
     );
     assert_eq!(
         inserted(&mut engine, table, decimal("9007199254740993.25"), 10),
-        Some(AggValue::Sum(Some(SumValue::Decimal(
+        Some(AggValue::Sum(Some(NumericValue::Decimal(
             BigDecimal::from_str("9007199254740993.25").unwrap()
         )))),
         "the cell is added as itself rather than through a double"
@@ -156,8 +156,7 @@ fn a_decimal_row_folds_exactly() {
 }
 
 /// `AVG` over the same column was ignored for the same reason, so it is
-/// pinned too. The value is exact in a double here; `AVG`'s own exactness
-/// is Phase D2.
+/// pinned too, now at the scale PostgreSQL's own division picks.
 #[test]
 fn decimal_column_avg_folds() {
     let (mut engine, table) = served(
@@ -166,8 +165,10 @@ fn decimal_column_avg_folds() {
     );
     assert_eq!(
         inserted(&mut engine, table, decimal("10.25"), 10),
-        Some(AggValue::Real(Some(10.25))),
-        "measured: PostgreSQL answers 10.25"
+        Some(AggValue::Avg(Some(subql::NumericValue::Decimal(
+            BigDecimal::from_str("10.2500000000000000").unwrap()
+        )))),
+        "measured: PostgreSQL answers 10.2500000000000000"
     );
 }
 

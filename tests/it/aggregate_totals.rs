@@ -15,8 +15,8 @@ use sqlparser::dialect::PostgreSqlDialect;
 use subql::backend::{Postgres, Value};
 use subql::testing::TestEvent;
 use subql::{
-    catalog_helpers, AggValue, AggregateInstallError, AggregateValueUpdate, DefaultIds, PgLsn,
-    SubscriptionEngine, SubscriptionRequest, SumValue, TableId,
+    catalog_helpers, AggValue, AggregateInstallError, AggregateValueUpdate, DefaultIds,
+    NumericValue, PgLsn, SubscriptionEngine, SubscriptionRequest, TableId,
 };
 
 const DDL: &str = "CREATE TABLE orders (id INT PRIMARY KEY, amount INT, status TEXT);";
@@ -429,7 +429,7 @@ fn a_seeded_sum_follows_inserts_updates_and_deletes() {
 
     assert_eq!(
         reported(&engine.aggregate_updates(&paid(orders, 1, 100, 10)).unwrap()),
-        vec![(sub, 7, AggValue::Sum(Some(SumValue::Integer(100))))],
+        vec![(sub, 7, AggValue::Sum(Some(NumericValue::Integer(100))))],
     );
 
     let raise = TestEvent::update(
@@ -442,7 +442,7 @@ fn a_seeded_sum_follows_inserts_updates_and_deletes() {
     .with_checkpoint(PgLsn(20));
     assert_eq!(
         reported(&engine.aggregate_updates(&raise).unwrap()),
-        vec![(sub, 7, AggValue::Sum(Some(SumValue::Integer(250))))],
+        vec![(sub, 7, AggValue::Sum(Some(NumericValue::Integer(250))))],
     );
 
     assert_eq!(

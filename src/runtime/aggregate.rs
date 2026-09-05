@@ -169,6 +169,24 @@ enum AggKind {
     StddevSamp,
 }
 
+/// How one subscription's fold answers, resolved once at registration.
+///
+/// Three facts that all follow from the summed column and the engine, and
+/// that a running value needs together: what a total accumulates in, what
+/// a mean answers, and how this engine divides. Carried as one descriptor
+/// because an accumulator is not generic over its backend.
+#[derive(Clone, Copy, Debug)]
+pub struct FoldRule {
+    /// What a total accumulates in.
+    pub total: crate::backend::SumRule,
+    /// What a mean answers when the total is exact.
+    pub mean: crate::backend::MeanRule,
+    /// How this engine divides, which is what a mean is. Never read by a
+    /// fold that computes no mean, and registration refuses a mean whose
+    /// engine needs a setting it was not given.
+    pub quotient: crate::compiler::bytecode::Quotient,
+}
+
 /// A running total, in the type its engine sums into.
 ///
 /// Built from [`SumRule`], so the boundary each engine raises at travels
@@ -301,26 +319,40 @@ impl Total {
         }
     }
 
-    /// The total as a caller reads it.
-    fn value(&self) -> crate::SumValue {
+    /// The rule this total was built from, for rebuilding an emptied one.
+    const fn rule(&self) -> crate::backend::SumRule {
         match self {
-            Self::Integer { value, .. } => crate::SumValue::Integer(*value),
-            Self::Decimal { value, .. } => crate::SumValue::Decimal(value.clone()),
-            Self::Double(value) => crate::SumValue::Double(*value),
+            Self::Integer { promotes: true, .. } => {
+                crate::backend::SumRule::IntegerPromotingToDouble
+            }
+            Self::Integer { .. } => crate::backend::SumRule::Integer,
+            Self::Decimal { integer_digits, .. } => crate::backend::SumRule::Decimal {
+                integer_digits: *integer_digits,
+            },
+            Self::Double(_) => crate::backend::SumRule::Double,
+        }
+    }
+
+    /// The total as a caller reads it.
+    fn value(&self) -> crate::NumericValue {
+        match self {
+            Self::Integer { value, .. } => crate::NumericValue::Integer(*value),
+            Self::Decimal { value, .. } => crate::NumericValue::Decimal(value.clone()),
+            Self::Double(value) => crate::NumericValue::Double(*value),
         }
     }
 }
 
-/// A reported total as `f64`, for the one comparison that still needs
+/// A reported total or mean as `f64`, for the one comparison that still needs
 /// one. Lossy above `2^53`, which Phase D2 removes.
 #[allow(clippy::cast_precision_loss)]
-fn sum_as_f64(total: &crate::SumValue) -> Option<f64> {
+fn numeric_as_f64(total: &crate::NumericValue) -> Option<f64> {
     match total {
-        crate::SumValue::Integer(value) => Some(*value as f64),
-        crate::SumValue::Decimal(value) => {
+        crate::NumericValue::Integer(value) => Some(*value as f64),
+        crate::NumericValue::Decimal(value) => {
             <bigdecimal::BigDecimal as bigdecimal::ToPrimitive>::to_f64(value)
         }
-        crate::SumValue::Double(value) => Some(*value),
+        crate::NumericValue::Double(value) => Some(*value),
     }
 }
 
@@ -346,16 +378,20 @@ pub struct AggAccumulator {
     sum: f64,
     sum_sq: f64,
     /// `SUM`'s own running total, exact in the type its engine sums into.
-    /// `sum` above stays beside it because `AVG`, the variance family and
-    /// a widened `HAVING` read squares and means from it, which Phase D2
-    /// makes exact in turn.
+    /// `sum` above stays beside it because the variance family and a
+    /// widened `HAVING` still read squares from it, which Phase D4 takes
+    /// up.
     total: Total,
+    /// What a mean answers on this engine.
+    mean_rule: crate::backend::MeanRule,
+    /// How this engine divides, for the mean.
+    quotient_rule: crate::compiler::bytecode::Quotient,
 }
 
 impl AggAccumulator {
     /// An empty accumulator for the aggregate described by `spec`,
-    /// totalling under `rule`.
-    pub fn from_spec(spec: &AggSpec, rule: crate::backend::SumRule) -> Self {
+    /// answering under `rule`.
+    pub fn from_spec(spec: &AggSpec, rule: FoldRule) -> Self {
         use AggSpec as S;
         let kind = match spec {
             S::CountStar | S::CountColumn { .. } => AggKind::Count,
@@ -371,7 +407,9 @@ impl AggAccumulator {
             count: 0,
             sum: 0.0,
             sum_sq: 0.0,
-            total: Total::empty(rule),
+            total: Total::empty(rule.total),
+            mean_rule: rule.mean,
+            quotient_rule: rule.quotient,
         }
     }
 
@@ -383,11 +421,7 @@ impl AggAccumulator {
     /// variance and stddev family. A zero-row result (COUNT `0`, NULL
     /// sum components) seeds the empty-aggregate state, matching the
     /// "set went empty" semantics of the re-execution family.
-    pub fn seed_from_row<B: Backend>(
-        spec: &AggSpec,
-        rule: crate::backend::SumRule,
-        row: &[Value<B>],
-    ) -> Self {
+    pub fn seed_from_row<B: Backend>(spec: &AggSpec, rule: FoldRule, row: &[Value<B>]) -> Self {
         use AggSpec as S;
         let mut acc = Self::from_spec(spec, rule);
         match spec {
@@ -402,6 +436,9 @@ impl AggAccumulator {
                 acc.count = row.get(1).and_then(|v| Self::seed_i64(v)).unwrap_or(0);
             }
             S::Avg { .. } => {
+                if let Some(cell) = row.first() {
+                    acc.total.seed(cell);
+                }
                 acc.sum = row.first().and_then(|v| Self::seed_f64(v)).unwrap_or(0.0);
                 acc.count = row.get(1).and_then(|v| Self::seed_i64(v)).unwrap_or(0);
             }
@@ -417,11 +454,7 @@ impl AggAccumulator {
     /// Seed from the complete component layout (`sum`, `sum_sq`, `count`),
     /// used when a sibling `HAVING` widens the seed regardless of the
     /// projected function.
-    pub fn seed_stats_row<B: Backend>(
-        spec: &AggSpec,
-        rule: crate::backend::SumRule,
-        row: &[Value<B>],
-    ) -> Self {
+    pub fn seed_stats_row<B: Backend>(spec: &AggSpec, rule: FoldRule, row: &[Value<B>]) -> Self {
         let mut acc = Self::from_spec(spec, rule);
         if let Some(cell) = row.first() {
             acc.total.seed(cell);
@@ -506,16 +539,7 @@ impl AggAccumulator {
         self.count = 0;
         self.sum = 0.0;
         self.sum_sq = 0.0;
-        self.total = Total::empty(match &self.total {
-            Total::Integer { promotes: true, .. } => {
-                crate::backend::SumRule::IntegerPromotingToDouble
-            }
-            Total::Integer { .. } => crate::backend::SumRule::Integer,
-            Total::Decimal { integer_digits, .. } => crate::backend::SumRule::Decimal {
-                integer_digits: *integer_digits,
-            },
-            Total::Double(_) => crate::backend::SumRule::Double,
-        });
+        self.total = Total::empty(self.total.rule());
     }
 
     /// Current aggregate value.
@@ -523,7 +547,7 @@ impl AggAccumulator {
         match self.kind {
             AggKind::Count => AggValue::Count(self.count),
             AggKind::Sum => AggValue::Sum(self.reported_total()),
-            AggKind::Avg => AggValue::Real(self.mean()),
+            AggKind::Avg => AggValue::Avg(self.mean()),
             AggKind::VarPop => AggValue::Real(self.var_pop()),
             AggKind::VarSamp => AggValue::Real(self.var_samp()),
             AggKind::StddevPop => AggValue::Real(self.var_pop().map(f64::sqrt)),
@@ -537,13 +561,56 @@ impl AggAccumulator {
     /// whose value is NULL, answers NULL, while one row worth zero answers
     /// `0`. The count is what separates them, so the total is read through
     /// it rather than reported raw.
-    fn reported_total(&self) -> Option<crate::SumValue> {
+    fn reported_total(&self) -> Option<crate::NumericValue> {
         (self.count > 0).then(|| self.total.value())
     }
 
+    /// The mean, or `None` when no row contributes one.
+    ///
+    /// A mean is a quotient, so it is the engine's own division of the
+    /// exact total by the count: measured, PostgreSQL answers
+    /// `1.5000000000000000` for 1 and 2 over an `int` column and MySQL
+    /// compares `1.666666666` for 1, 2 and 2, each being that engine's
+    /// `/` applied to the pair. SQLite answers a real, and a floating
+    /// total is a double everywhere.
     #[allow(clippy::cast_precision_loss)]
-    fn mean(&self) -> Option<f64> {
-        (self.count > 0).then(|| self.sum / self.count as f64)
+    fn mean(&self) -> Option<crate::NumericValue> {
+        if self.count <= 0 {
+            return None;
+        }
+        let double = || crate::NumericValue::Double(self.sum / self.count as f64);
+        match (&self.total, self.mean_rule) {
+            (Total::Double(total), _) => {
+                Some(crate::NumericValue::Double(total / self.count as f64))
+            }
+            (_, crate::backend::MeanRule::Double) => Some(double()),
+            (Total::Integer { value, .. }, crate::backend::MeanRule::Exact) => Some(
+                crate::NumericValue::Decimal(self.quotient(&bigdecimal::BigDecimal::from(*value))),
+            ),
+            (Total::Decimal { value, .. }, crate::backend::MeanRule::Exact) => {
+                Some(crate::NumericValue::Decimal(self.quotient(value)))
+            }
+        }
+    }
+
+    /// `total / count` as this engine divides, which registration resolved
+    /// into the quotient rule this carries.
+    fn quotient(&self, total: &bigdecimal::BigDecimal) -> bigdecimal::BigDecimal {
+        match self.quotient_rule {
+            crate::compiler::bytecode::Quotient::InWordsAt(increment) => {
+                crate::compiler::vm::arithmetic::quotient_in_words(
+                    total,
+                    &bigdecimal::BigDecimal::from(self.count),
+                    increment,
+                )
+            }
+            crate::compiler::bytecode::Quotient::FromTheOperands => {
+                crate::compiler::vm::arithmetic::quotient_at_significant_digits(
+                    total,
+                    &bigdecimal::BigDecimal::from(self.count),
+                )
+            }
+        }
     }
 
     /// The value a sibling family function reads from the held components.
@@ -553,7 +620,7 @@ impl AggAccumulator {
         match function {
             crate::HavingFunction::CountColumn => AggValue::Count(self.count),
             crate::HavingFunction::Sum => AggValue::Sum(self.reported_total()),
-            crate::HavingFunction::Avg => AggValue::Real(self.mean()),
+            crate::HavingFunction::Avg => AggValue::Avg(self.mean()),
             crate::HavingFunction::VarPop => AggValue::Real(self.var_pop()),
             crate::HavingFunction::VarSamp => AggValue::Real(self.var_samp()),
             crate::HavingFunction::StddevPop => AggValue::Real(self.var_pop().map(f64::sqrt)),
@@ -644,16 +711,15 @@ pub struct AggregateTotal<I: IdTypes, C: Checkpoint> {
     /// Which function is maintained, needed to read the sums and to decode a
     /// seed row's components.
     spec: AggSpec,
-    /// What a total accumulates in on this engine, resolved from the
-    /// summed column at registration.
-    rule: crate::backend::SumRule,
+    /// How this subscription's fold answers, resolved at registration.
+    rule: FoldRule,
     accumulator: AggAccumulator,
     /// `None` once the starting numbers have landed.
     pending: Option<Pending<C>>,
 }
 
 impl<I: IdTypes, C: Checkpoint> AggregateTotal<I, C> {
-    pub fn new(consumer: I::ConsumerId, spec: AggSpec, rule: crate::backend::SumRule) -> Self {
+    pub fn new(consumer: I::ConsumerId, spec: AggSpec, rule: FoldRule) -> Self {
         Self {
             consumer,
             accumulator: AggAccumulator::from_spec(&spec, rule),
@@ -814,7 +880,9 @@ impl GroupHaving {
                     AggValue::Count(count) => Some(count as f64),
                     // A `HAVING` compares in `f64`, which Phase D2 makes
                     // exact along with `AVG`.
-                    AggValue::Sum(sum) => sum.as_ref().and_then(sum_as_f64),
+                    AggValue::Sum(value) | AggValue::Avg(value) => {
+                        value.as_ref().and_then(numeric_as_f64)
+                    }
                     AggValue::Real(real) => real,
                 }
             }
@@ -909,7 +977,7 @@ pub enum GroupedFoldOutcome<B: Backend> {
 /// the same three facts however the fold was reached.
 struct GroupedFold<'a> {
     spec: &'a AggSpec,
-    rule: crate::backend::SumRule,
+    rule: FoldRule,
     having: Option<&'a GroupHaving>,
 }
 
@@ -926,9 +994,8 @@ pub struct GroupedAggregateTotal<I: IdTypes, B: Backend, C: Checkpoint> {
     having: Option<GroupHaving>,
     /// Whether the seed carries components needed only by `HAVING`.
     widened: bool,
-    /// What a total accumulates in on this engine, resolved from the
-    /// summed column at registration and shared by every group.
-    rule: crate::backend::SumRule,
+    /// How this subscription's fold answers, shared by every group.
+    rule: FoldRule,
 }
 
 impl<I: IdTypes, B: Backend, C: Checkpoint> GroupedAggregateTotal<I, B, C> {
@@ -938,7 +1005,7 @@ impl<I: IdTypes, B: Backend, C: Checkpoint> GroupedAggregateTotal<I, B, C> {
         group_columns: usize,
         having: Option<&crate::AggHaving>,
         group_key_encoder: crate::backend::GroupKeyEncoder<B>,
-        rule: crate::backend::SumRule,
+        rule: FoldRule,
     ) -> Self {
         let widened = having.is_some_and(|having| having.widens(&spec));
         debug_assert!(
@@ -1157,7 +1224,7 @@ impl<I: IdTypes, B: Backend, C: Checkpoint> GroupedAggregateTotal<I, B, C> {
         let components_len = if self.widened {
             3
         } else {
-            crate::compiler::sql_shape::aggregate_bootstrap_kinds(&self.spec, self.rule).len()
+            crate::compiler::sql_shape::aggregate_bootstrap_kinds(&self.spec, self.rule.total).len()
         };
         let mut groups = HashMap::with_capacity(rows.len());
         for row in rows {

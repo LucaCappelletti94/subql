@@ -769,6 +769,27 @@ pub enum SumRule {
     Double,
 }
 
+/// What `AVG` answers over a column whose total is exact.
+///
+/// Measured 2026-09-05. PostgreSQL and MySQL both answer an exact
+/// decimal, each by its own division rule: `avg(int)` of 1 and 2 is
+/// `1.5000000000000000` on PostgreSQL, sixteen significant digits, and
+/// `avg` over 1, 2, 2 compares as `1.666666666` on MySQL, nine digits
+/// truncated, whatever the `1.6667` it prints. SQLite answers a real for
+/// every column, and inexactly: `avg` of one row of `9007199254740993` is
+/// `9.00719925474099e+15`.
+///
+/// A floating column averages into a double everywhere, which follows
+/// from its total rather than from this rule.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum MeanRule {
+    /// The mean of an exact total is an exact decimal, computed the way
+    /// this engine computes a decimal quotient. PostgreSQL and MySQL.
+    Exact,
+    /// Every mean is a double. SQLite.
+    Double,
+}
+
 /// MySQL's `div_precision_increment`, as the deployment declares it.
 ///
 /// A session setting, default 4, valid from 0 through 30

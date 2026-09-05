@@ -50,6 +50,27 @@ pub enum Quotient {
     InWordsAt(crate::backend::DivisionPrecisionIncrement),
 }
 
+impl Quotient {
+    /// How this backend divides, given what the deployment declared.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::errors::Refusal::DivisionPrecisionNotDeclared`] when the
+    /// engine's rule wants a session setting this engine was not given.
+    /// Both callers refuse rather than assume: the `/` operator at
+    /// compile time and a mean at registration.
+    pub fn resolve<B: crate::backend::Backend>(
+        increment: Option<crate::backend::DivisionPrecisionIncrement>,
+    ) -> Result<Self, crate::errors::Refusal> {
+        match B::DIVISION {
+            crate::backend::DivisionRule::IntegersTruncate => Ok(Self::FromTheOperands),
+            crate::backend::DivisionRule::QuotientsAreDecimalInWords => increment
+                .map(Self::InWordsAt)
+                .ok_or(crate::errors::Refusal::DivisionPrecisionNotDeclared),
+        }
+    }
+}
+
 /// Which column's comparison facts an instruction's operands carry, as
 /// indices into [`BytecodeProgram::column_comparisons`].
 ///

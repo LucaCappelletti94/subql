@@ -102,6 +102,7 @@ fn oracle(spec: &AggSpec, amounts: &[Option<i64>]) -> AggValue {
     let numeric = i64::try_from(nums.len()).unwrap();
     let n = nums.len() as f64;
     let sum: f64 = nums.iter().sum();
+    let sum_exact: i64 = amounts.iter().flatten().sum();
     let sum_sq: f64 = nums.iter().map(|v| v * v).sum();
     let var_pop = (numeric > 0).then(|| sum_sq / n - (sum / n).powi(2));
     let var_samp = (numeric >= 2).then(|| (sum_sq - sum.powi(2) / n) / (n - 1.0));
@@ -110,9 +111,19 @@ fn oracle(spec: &AggSpec, amounts: &[Option<i64>]) -> AggValue {
         AggSpec::CountColumn { .. } => AggValue::Count(numeric),
         // SQLite sums integers as one 64-bit integer, measured.
         AggSpec::Sum { .. } => AggValue::Sum(
-            (numeric > 0).then(|| subql::SumValue::Integer(amounts.iter().flatten().sum())),
+            (numeric > 0).then(|| subql::NumericValue::Integer(amounts.iter().flatten().sum())),
         ),
-        AggSpec::Avg { .. } => AggValue::Real((numeric > 0).then(|| sum / n)),
+        // The engine here is Postgres, driven through a SQLite connector,
+        // so a mean is Postgres's own numeric division of the exact total
+        // by the count.
+        AggSpec::Avg { .. } => AggValue::Avg((numeric > 0).then(|| {
+            subql::NumericValue::Decimal(
+                subql::compiler::vm::arithmetic::quotient_at_significant_digits(
+                    &bigdecimal::BigDecimal::from(sum_exact),
+                    &bigdecimal::BigDecimal::from(numeric),
+                ),
+            )
+        })),
         AggSpec::VarPop { .. } => AggValue::Real(var_pop),
         AggSpec::VarSamp { .. } => AggValue::Real(var_samp),
         AggSpec::StddevPop { .. } => AggValue::Real(var_pop.map(f64::sqrt)),
@@ -166,12 +177,13 @@ fn execute_scalar_row_decodes_components() {
         .execute_scalar_row(&b.query.as_read_query(), &b.kinds, &())
         .unwrap();
     assert_eq!(row, vec![Value::Int(12), Value::Int(3)]);
-    // AVG: (sum, count).
+    // AVG: (the exact total, count), since a mean is that total divided
+    // by the count.
     let b = bootstrap("SELECT AVG(amount) FROM t");
     let (row, _) = connector
         .execute_scalar_row(&b.query.as_read_query(), &b.kinds, &())
         .unwrap();
-    assert_eq!(row, vec![Value::Float(12.0), Value::Int(3)]);
+    assert_eq!(row, vec![Value::Int(12), Value::Int(3)]);
     // VAR_POP: (sum, sum_sq, count) = (12, 56, 3).
     let b = bootstrap("SELECT VAR_POP(amount) FROM t");
     let (row, _) = connector
@@ -201,7 +213,7 @@ fn execute_scalar_row_empty_table_is_empty_state() {
     // The empty row seeds the empty aggregate.
     assert_eq!(
         install_seed(&mut engine, subscription, row),
-        Ok(AggValue::Real(None)),
+        Ok(AggValue::Avg(None)),
     );
 }
 

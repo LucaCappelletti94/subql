@@ -403,6 +403,16 @@ pub trait Backend: 'static {
     /// [`DivisionRule`](super::scalar_value::DivisionRule).
     const DIVISION: super::scalar_value::DivisionRule;
 
+    /// What `AVG` answers when the total it divides is exact.
+    ///
+    /// Required, and per backend, because a mean is a quotient and the
+    /// engines divide differently: measured, PostgreSQL answers
+    /// `1.5000000000000000` for the mean of 1 and 2 over an `int` column,
+    /// MySQL compares `1.666666666` for the mean of 1, 2 and 2, and
+    /// SQLite answers a real for every column. See
+    /// [`MeanRule`](super::scalar_value::MeanRule).
+    const MEAN: super::scalar_value::MeanRule;
+
     /// What `SUM` over a column of this type accumulates in, and answers.
     ///
     /// Required, and per backend, because the engines disagree at every

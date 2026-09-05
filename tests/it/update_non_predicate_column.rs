@@ -194,7 +194,7 @@ fn aggregate_subscription_sees_an_update_of_the_column_it_sums() {
         updates[0].change,
         // A `DOUBLE PRECISION` column sums into a double on every engine.
         subql::AggregateValueChange::Set(subql::AggregateResultValue::Folded(AggValue::Sum(Some(
-            subql::SumValue::Double(11.5)
+            subql::NumericValue::Double(11.5)
         )),))
     );
 }

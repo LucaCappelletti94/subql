@@ -26,8 +26,8 @@ use sqlparser::dialect::PostgreSqlDialect;
 use subql::backend::{Postgres, Value};
 use subql::testing::TestEvent;
 use subql::{
-    catalog_helpers, AggValue, AggregateInstallError, AggregateValueUpdate, DefaultIds, PgLsn,
-    SubscriptionEngine, SubscriptionRequest, SumValue, TableId,
+    catalog_helpers, AggValue, AggregateInstallError, AggregateValueUpdate, DefaultIds,
+    NumericValue, PgLsn, SubscriptionEngine, SubscriptionRequest, TableId,
 };
 
 const DDL: &str = "CREATE TABLE orders (id INT PRIMARY KEY, amount INT, status TEXT);";
@@ -107,7 +107,7 @@ fn empty_set_sums_to_null() {
 #[test]
 fn deleting_the_last_row_returns_to_null() {
     let (mut engine, orders, _subscription, value) = seeded(Value::Int(250), 1);
-    assert_eq!(value, AggValue::Sum(Some(SumValue::Integer(250))));
+    assert_eq!(value, AggValue::Sum(Some(NumericValue::Integer(250))));
 
     let updates = engine
         .aggregate_updates(&deleted(orders, 1, Value::Int(250), 20))
@@ -132,7 +132,7 @@ fn a_zero_valued_row_still_counts() {
         .unwrap();
     assert_eq!(
         folded(&updates),
-        AggValue::Sum(Some(SumValue::Integer(0))),
+        AggValue::Sum(Some(NumericValue::Integer(0))),
         "one row of zero sums to zero, which is not the same as no rows"
     );
 }
@@ -142,7 +142,7 @@ fn a_zero_valued_row_still_counts() {
 #[test]
 fn removing_a_zero_valued_row_empties_the_sum() {
     let (mut engine, orders, _subscription, value) = seeded(Value::Int(0), 1);
-    assert_eq!(value, AggValue::Sum(Some(SumValue::Integer(0))));
+    assert_eq!(value, AggValue::Sum(Some(NumericValue::Integer(0))));
 
     let updates = engine
         .aggregate_updates(&deleted(orders, 1, Value::Int(0), 20))
@@ -185,7 +185,10 @@ fn a_row_added_and_removed_returns_to_null() {
     let added = engine
         .aggregate_updates(&paid(orders, 1, Value::Int(250), 20))
         .unwrap();
-    assert_eq!(folded(&added), AggValue::Sum(Some(SumValue::Integer(250))));
+    assert_eq!(
+        folded(&added),
+        AggValue::Sum(Some(NumericValue::Integer(250)))
+    );
 
     let removed = engine
         .aggregate_updates(&deleted(orders, 1, Value::Int(250), 30))

@@ -410,12 +410,13 @@ pub(crate) fn classify_scalar_kind<B: crate::backend::Backend>(
 /// column of a custom type answers `None`, which is the honest answer to
 /// "which builtin is this", and each caller refuses it in its own terms.
 /// Use [`column_scalar_kind`] where a custom column has to be served.
-/// What a `SUM` over `spec`'s column accumulates in on this backend.
+/// How a fold over `spec`'s column answers on this backend.
 ///
 /// Resolved once at registration, because it follows the column's declared
 /// type: measured, PostgreSQL sums an `int` column into `bigint` and a
 /// `bigint` column into `numeric`, so the same statement over two integer
-/// columns answers two different types.
+/// columns answers two different types. The mean and the division rule
+/// come from the backend itself.
 ///
 /// A spec that sums nothing (`COUNT`) still needs an answer, and
 /// [`crate::backend::SumRule::Double`] is the one that carries no exact
@@ -423,18 +424,40 @@ pub(crate) fn classify_scalar_kind<B: crate::backend::Backend>(
 /// which is the same conservative reading `column_scalar_kind` gives every
 /// other caller.
 #[must_use]
-pub fn sum_rule<B: crate::backend::Backend, DB: DatabaseLike>(
+pub fn fold_rule<B: crate::backend::Backend, DB: DatabaseLike>(
+    spec: &crate::compiler::AggSpec,
+    database: &DB,
+    table_id: crate::TableId,
+    increment: Option<crate::backend::DivisionPrecisionIncrement>,
+) -> crate::runtime::aggregate::FoldRule {
+    let total = total_rule::<B, DB>(spec, database, table_id);
+    crate::runtime::aggregate::FoldRule {
+        total,
+        mean: B::MEAN,
+        // A fold that computes no mean never reads this, and one that
+        // does is refused at registration when the setting is missing,
+        // which `mysql_avg_without_the_declared_increment_is_refused`
+        // holds in place.
+        quotient: crate::compiler::bytecode::Quotient::resolve::<B>(increment)
+            .unwrap_or(crate::compiler::bytecode::Quotient::FromTheOperands),
+    }
+}
+
+/// What a total over `spec`'s column accumulates in, which is the half of
+/// [`fold_rule`] a seed's decode kinds need.
+#[must_use]
+pub fn total_rule<B: crate::backend::Backend, DB: DatabaseLike>(
     spec: &crate::compiler::AggSpec,
     database: &DB,
     table_id: crate::TableId,
 ) -> crate::backend::SumRule {
-    let Some(column) = spec.column() else {
-        return crate::backend::SumRule::Double;
-    };
-    column_scalar_kind::<B, DB>(database, table_id, column)
-        .as_ref()
-        .and_then(crate::backend::ScalarKind::builtin)
-        .map_or(crate::backend::SumRule::Double, B::sum_rule)
+    spec.column()
+        .map_or(crate::backend::SumRule::Double, |column| {
+            column_scalar_kind::<B, DB>(database, table_id, column)
+                .as_ref()
+                .and_then(crate::backend::ScalarKind::builtin)
+                .map_or(crate::backend::SumRule::Double, B::sum_rule)
+        })
 }
 
 #[must_use]

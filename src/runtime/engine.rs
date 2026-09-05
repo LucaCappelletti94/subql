@@ -428,6 +428,30 @@ fn table_context<'a, I: IdTypes, B: Backend>(
     Ok((partition, consumer_dict))
 }
 
+/// Whether this projection's fold divides, which is what a mean is.
+///
+/// `AVG` obviously, and a grouped `HAVING` over `AVG`, which reads a mean
+/// from the same components whatever the projected function is.
+fn projection_computes_a_mean(projection: &crate::compiler::sql_shape::QueryProjection) -> bool {
+    use crate::compiler::sql_shape::QueryProjection;
+
+    let mean_spec =
+        |spec: &crate::compiler::AggSpec| matches!(spec, crate::compiler::AggSpec::Avg { .. });
+    match projection {
+        QueryProjection::Rows => false,
+        QueryProjection::Aggregate(spec) => mean_spec(spec),
+        QueryProjection::GroupedAggregate { agg, having, .. } => {
+            mean_spec(agg)
+                || having.as_ref().is_some_and(|having| {
+                    matches!(
+                        having.subject,
+                        crate::HavingSubject::Aggregate(crate::HavingFunction::Avg)
+                    )
+                })
+        }
+    }
+}
+
 impl<E: CdcEvent, I: IdTypes, DB: DatabaseLike + 'static> SubscriptionEngine<E, I, DB>
 where
     E::Backend: SqlLiteralParse,
@@ -566,6 +590,15 @@ where
             projection,
             terms,
         } = compiled;
+
+        // A mean is a quotient, so an aggregate that computes one needs the
+        // same declared setting the `/` operator needs. Refused here
+        // rather than answered from a guess, which drops the registration
+        // to a re-read tier carrying the reason.
+        if projection_computes_a_mean(&projection) {
+            crate::compiler::bytecode::Quotient::resolve::<E::Backend>(self.division_increment)
+                .map_err(RegisterError::NotServedInProcess)?;
+        }
 
         let (term_subscriber, term_seeds) = self.settle_term_seeds(&terms, table_id, &spec)?;
 

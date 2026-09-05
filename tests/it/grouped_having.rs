@@ -9,7 +9,7 @@ use subql::backend::{BuiltinKind, Postgres, Value};
 use subql::testing::TestEvent;
 use subql::{
     catalog_helpers, AggValue, AggregateSeedInstall, AggregateValueChange, DefaultIds, Install,
-    PgLsn, SubscriptionEngine, SubscriptionRequest, SumValue, TableId, Tier,
+    NumericValue, PgLsn, SubscriptionEngine, SubscriptionRequest, TableId, Tier,
 };
 
 const DDL: &str = "CREATE TABLE orders (id INT PRIMARY KEY, region TEXT, amount INT, status TEXT);";
@@ -148,7 +148,7 @@ mod registration {
         assert_eq!(opening.len(), 1, "sum 20 is greater than 10");
         assert_eq!(
             opening[0].change,
-            folded(AggValue::Sum(Some(SumValue::Integer(20))))
+            folded(AggValue::Sum(Some(NumericValue::Integer(20))))
         );
     }
 
@@ -243,7 +243,7 @@ mod crossing {
         assert_eq!(opening.len(), 1, "only the passing group is announced");
         assert_eq!(
             opening[0].change,
-            folded(AggValue::Sum(Some(SumValue::Integer(20))))
+            folded(AggValue::Sum(Some(NumericValue::Integer(20))))
         );
         let south = opening[0].group.clone().expect("south key");
 
@@ -254,7 +254,7 @@ mod crossing {
         assert_ne!(entering.updates[0].group.as_ref(), Some(&south));
         assert_eq!(
             entering.updates[0].change,
-            folded(AggValue::Sum(Some(SumValue::Integer(13))))
+            folded(AggValue::Sum(Some(NumericValue::Integer(13))))
         );
 
         let leaving = engine
@@ -294,7 +294,7 @@ mod crossing {
             .expect("insert folds");
         assert_eq!(
             entering.updates[0].change,
-            folded(AggValue::Sum(Some(SumValue::Integer(11)))),
+            folded(AggValue::Sum(Some(NumericValue::Integer(11)))),
             "the entering value carries every silently folded row"
         );
     }
@@ -349,7 +349,7 @@ mod crossing {
             .expect("insert folds");
         assert_eq!(
             entering.updates[0].change,
-            folded(AggValue::Sum(Some(SumValue::Integer(7)))),
+            folded(AggValue::Sum(Some(NumericValue::Integer(7)))),
             "the third row crosses the row-count threshold without moving the sum"
         );
     }
@@ -376,7 +376,7 @@ mod crossing {
         assert_eq!(opening.len(), 1, "average 4 passes");
         assert_eq!(
             opening[0].change,
-            folded(AggValue::Sum(Some(SumValue::Integer(8))))
+            folded(AggValue::Sum(Some(NumericValue::Integer(8))))
         );
 
         let leaving = engine
@@ -488,7 +488,7 @@ mod crossing {
         assert_eq!(output.updates.len(), 1);
         assert_eq!(
             output.updates[0].change,
-            folded(AggValue::Sum(Some(SumValue::Integer(5))))
+            folded(AggValue::Sum(Some(NumericValue::Integer(5))))
         );
     }
 
@@ -635,7 +635,7 @@ mod crossing {
         );
         assert_eq!(
             entering.updates[0].change,
-            folded(AggValue::Sum(Some(SumValue::Integer(13)))),
+            folded(AggValue::Sum(Some(NumericValue::Integer(13)))),
             "the north-paid group crosses on the fifth added unit"
         );
     }

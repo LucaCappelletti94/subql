@@ -60,9 +60,9 @@ pub use scalar_value::widen_i64_to_f64;
 pub use scalar_value::{
     BuiltinKind, BuiltinType, Carried, CollationFacts, CollationName, ColumnComparison,
     ColumnComparisonOf, ComparisonContext, CustomScalars, DivisionPrecisionIncrement, DivisionRule,
-    FloatWidth, GroupKeyEncoder, IntWidth, NoCustom, NoCustomScalars, NumericWidening, ScalarKind,
-    ScalarKindOf, SumRule, TextCase, TextOperation, TextRule, TextWidth, TrailingSpacePadding,
-    TrailingSpaces, Value, ValueKind, ValueKindOf,
+    FloatWidth, GroupKeyEncoder, IntWidth, MeanRule, NoCustom, NoCustomScalars, NumericWidening,
+    ScalarKind, ScalarKindOf, SumRule, TextCase, TextOperation, TextRule, TextWidth,
+    TrailingSpacePadding, TrailingSpaces, Value, ValueKind, ValueKindOf,
 };
 pub use scalars_and_backend::{
     Backend, JsonDocument, ScalarCore, ScalarKey, ScalarText, ScalarTruth, SqliteJson,

@@ -111,6 +111,10 @@ impl<V: postgres_jsonb_canonical::PgVersion + 'static> Backend for Postgres<V> {
     const DIVISION_BY_ZERO: crate::compiler::vm::refusal::DivisionByZero =
         crate::compiler::vm::refusal::DivisionByZero::Fails;
 
+    /// Measured: `avg(int)` of 1 and 2 is `1.5000000000000000`, which is
+    /// this engine's own `numeric` division of the total by the count.
+    const MEAN: super::scalar_value::MeanRule = super::scalar_value::MeanRule::Exact;
+
     /// Measured: `sum(smallint)` and `sum(int)` are `bigint`, `sum(bigint)`
     /// and `sum(numeric)` are `numeric`, and `sum(double precision)` is a
     /// double. `numeric` stops at 131072 integer digits.
@@ -405,6 +409,11 @@ impl Backend for MySql {
     const DIVISION_BY_ZERO: crate::compiler::vm::refusal::DivisionByZero =
         crate::compiler::vm::refusal::DivisionByZero::IsNull;
 
+    /// Measured: `avg` over 1, 2 and 2 compares as `1.666666666`, which is
+    /// this engine's own `/` applied to the total and the count, and it
+    /// follows the declared increment exactly as `/` does.
+    const MEAN: super::scalar_value::MeanRule = super::scalar_value::MeanRule::Exact;
+
     /// Measured: every integer width and every decimal sums into a decimal,
     /// `decimal(32,0)` for an `int` column and `decimal(41,0)` for a
     /// `bigint` one, and a floating column sums into a double. No bound is
@@ -632,6 +641,12 @@ impl Backend for SQLite {
     /// Measured: SQLite answers `NULL`.
     const DIVISION_BY_ZERO: crate::compiler::vm::refusal::DivisionByZero =
         crate::compiler::vm::refusal::DivisionByZero::IsNull;
+
+    /// Measured: `typeof(avg(x))` is `real` for every column, and
+    /// `avg` of one row of `9007199254740993` is `9.00719925474099e+15`,
+    /// so the mean is inexact there and reproducing it means staying in
+    /// `f64`.
+    const MEAN: super::scalar_value::MeanRule = super::scalar_value::MeanRule::Double;
 
     /// Measured: integers sum as one 64-bit integer, answering `integer
     /// overflow` past it, and the total turns real as soon as a

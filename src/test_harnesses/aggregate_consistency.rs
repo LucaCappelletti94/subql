@@ -310,13 +310,18 @@ fn agg_components(virt: &BTreeMap<i64, VirtRow>) -> AggComponents {
     c
 }
 
-/// The rule Postgres states for the fixtures' `i16` amount column: its
-/// sum is a `bigint`.
-const SUM_RULE: crate::backend::SumRule = crate::backend::SumRule::Integer;
+/// How Postgres folds the fixtures' `i16` amount column: its sum is a
+/// `bigint`, its mean an exact `numeric`, and its division needs no
+/// declared setting.
+const FOLD_RULE: crate::runtime::aggregate::FoldRule = crate::runtime::aggregate::FoldRule {
+    total: crate::backend::SumRule::Integer,
+    mean: crate::backend::MeanRule::Exact,
+    quotient: crate::compiler::bytecode::Quotient::FromTheOperands,
+};
 
 /// The oracle's exact total, in the type that rule answers.
-const fn exact_total(sum: i64) -> crate::SumValue {
-    crate::SumValue::Integer(sum)
+const fn exact_total(sum: i64) -> crate::NumericValue {
+    crate::NumericValue::Integer(sum)
 }
 
 /// Textbook aggregate value over the components, using the same formulas
@@ -334,7 +339,15 @@ fn oracle_agg_value(spec: &AggSpec, c: &AggComponents) -> AggValue {
         // The fixtures sum an `i16` column under Postgres, whose sum is a
         // `bigint`, so the oracle's exact total is an integer.
         AggSpec::Sum { .. } => AggValue::Sum((c.numeric > 0).then(|| exact_total(c.sum))),
-        AggSpec::Avg { .. } => AggValue::Real((c.numeric > 0).then(|| sum / n)),
+        // Postgres divides the exact total by the count as `numeric`.
+        AggSpec::Avg { .. } => AggValue::Avg((c.numeric > 0).then(|| {
+            crate::NumericValue::Decimal(
+                crate::compiler::vm::arithmetic::quotient_at_significant_digits(
+                    &bigdecimal::BigDecimal::from(c.sum),
+                    &bigdecimal::BigDecimal::from(c.numeric),
+                ),
+            )
+        })),
         AggSpec::VarPop { .. } => AggValue::Real(var_pop),
         AggSpec::VarSamp { .. } => AggValue::Real(var_samp),
         AggSpec::StddevPop { .. } => AggValue::Real(var_pop.map(f64::sqrt)),
@@ -358,6 +371,10 @@ fn agg_values_agree(engine: &AggValue, oracle: &AggValue, c: &AggComponents) -> 
         (AggValue::Sum(None), AggValue::Sum(None)) => true,
         // An exact total agrees exactly, which is the whole point of it.
         (AggValue::Sum(Some(a)), AggValue::Sum(Some(b))) => a == b,
+        (AggValue::Avg(None), AggValue::Avg(None)) => true,
+        // A mean is exact here too, being the engine's own division of the
+        // exact total by the count.
+        (AggValue::Avg(Some(a)), AggValue::Avg(Some(b))) => a == b,
         (AggValue::Real(None), AggValue::Real(None)) => true,
         (AggValue::Real(Some(a)), AggValue::Real(Some(b))) => {
             (a - b).abs() <= 1e-3_f64.max(c.sum_sq_f64().abs().sqrt() * 1e-5)
@@ -400,7 +417,7 @@ fn assert_seed_matches_oracle(c: &AggComponents) {
     ];
     for spec in specs {
         assert_eq!(
-            AggAccumulator::seed_from_row(&spec, SUM_RULE, &seed_row(&spec, c)).value(),
+            AggAccumulator::seed_from_row(&spec, FOLD_RULE, &seed_row(&spec, c)).value(),
             oracle_agg_value(&spec, c),
             "seed decode drift for {spec:?}",
         );

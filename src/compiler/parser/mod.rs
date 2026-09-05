@@ -64,17 +64,8 @@ impl<B: Backend> Compiling<B> {
     /// to under this backend, or the refusal when its rule needs a setting
     /// this engine was not given.
     fn quotient(&self) -> Result<crate::compiler::bytecode::Quotient, RegisterError> {
-        match B::DIVISION {
-            crate::backend::DivisionRule::IntegersTruncate => {
-                Ok(crate::compiler::bytecode::Quotient::FromTheOperands)
-            }
-            crate::backend::DivisionRule::QuotientsAreDecimalInWords => self
-                .increment
-                .map(crate::compiler::bytecode::Quotient::InWordsAt)
-                .ok_or(RegisterError::NotServedInProcess(
-                    crate::errors::Refusal::DivisionPrecisionNotDeclared,
-                )),
-        }
+        crate::compiler::bytecode::Quotient::resolve::<B>(self.increment)
+            .map_err(RegisterError::NotServedInProcess)
     }
 
     /// The slot for `expr`, assigning the next one if this term is new.

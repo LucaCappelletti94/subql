@@ -93,9 +93,17 @@ fn oracle(spec: &AggSpec, c: &Components) -> AggValue {
         // The fixture sums an `INT` column under Postgres, whose sum is a
         // `bigint`, so the oracle's total is an exact integer.
         AggSpec::Sum { .. } => {
-            AggValue::Sum((c.numeric > 0).then_some(subql::SumValue::Integer(c.sum)))
+            AggValue::Sum((c.numeric > 0).then_some(subql::NumericValue::Integer(c.sum)))
         }
-        AggSpec::Avg { .. } => AggValue::Real((c.numeric > 0).then(|| sum / n)),
+        // Postgres divides the exact total by the count as `numeric`.
+        AggSpec::Avg { .. } => AggValue::Avg((c.numeric > 0).then(|| {
+            subql::NumericValue::Decimal(
+                subql::compiler::vm::arithmetic::quotient_at_significant_digits(
+                    &bigdecimal::BigDecimal::from(c.sum),
+                    &bigdecimal::BigDecimal::from(c.numeric),
+                ),
+            )
+        })),
         AggSpec::VarPop { .. } => AggValue::Real(var_pop),
         AggSpec::VarSamp { .. } => AggValue::Real(var_samp),
         AggSpec::StddevPop { .. } => AggValue::Real(var_pop.map(f64::sqrt)),

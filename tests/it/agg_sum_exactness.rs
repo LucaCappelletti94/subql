@@ -38,8 +38,8 @@ use sqlparser::dialect::{MySqlDialect, PostgreSqlDialect, SQLiteDialect};
 use subql::backend::{Backend, MySql, Postgres, SQLite, Value};
 use subql::testing::TestEvent;
 use subql::{
-    catalog_helpers, AggValue, DefaultIds, MaintenanceStopReason, PgLsn, SubscriptionEngine,
-    SubscriptionRequest, SumValue, TableId,
+    catalog_helpers, AggValue, DefaultIds, MaintenanceStopReason, NumericValue, PgLsn,
+    SubscriptionEngine, SubscriptionRequest, TableId,
 };
 
 const PG_DDL: &str = "CREATE TABLE t (id INT PRIMARY KEY, small INT, big BIGINT, \
@@ -179,8 +179,8 @@ fn sqlite(column: &str) -> Folding<SQLite> {
     folding(SQLITE_DDL, SQLiteDialect {}, column, 4)
 }
 
-fn decimal(text: &str) -> SumValue {
-    SumValue::Decimal(BigDecimal::from_str(text).unwrap())
+fn decimal(text: &str) -> NumericValue {
+    NumericValue::Decimal(BigDecimal::from_str(text).unwrap())
 }
 
 /// The finding, on every engine: one row above `2^53` is itself, not the
@@ -199,7 +199,7 @@ fn bigint_sum_past_2_53_is_exact() {
     );
     assert_eq!(
         sqlite("big").fold(BIG, Value::Int(9_007_199_254_740_993)),
-        Some(AggValue::Sum(Some(SumValue::Integer(
+        Some(AggValue::Sum(Some(NumericValue::Integer(
             9_007_199_254_740_993
         )))),
         "SQLite sums integers as integers"
@@ -225,7 +225,7 @@ fn pg_bigint_sum_past_i64_max_is_exact() {
 fn pg_int_sum_is_a_bigint() {
     assert_eq!(
         pg("small").fold(SMALL, Value::Int(2_147_483_647)),
-        Some(AggValue::Sum(Some(SumValue::Integer(2_147_483_647)))),
+        Some(AggValue::Sum(Some(NumericValue::Integer(2_147_483_647)))),
         "measured: pg_typeof(sum(int)) is bigint"
     );
 }
@@ -295,11 +295,11 @@ fn sqlite_integer_sum_promotes_on_a_real_value() {
     let mut folding = sqlite("big");
     assert_eq!(
         folding.fold(BIG, Value::Int(2)),
-        Some(AggValue::Sum(Some(SumValue::Integer(2))))
+        Some(AggValue::Sum(Some(NumericValue::Integer(2))))
     );
     assert_eq!(
         folding.fold(BIG, Value::Float(0.5)),
-        Some(AggValue::Sum(Some(SumValue::Double(2.5)))),
+        Some(AggValue::Sum(Some(NumericValue::Double(2.5)))),
         "measured: typeof(sum(v)) is real once a real participates"
     );
 }
@@ -316,7 +316,7 @@ fn numeric_sum_keeps_its_scale() {
         Some(AggValue::Sum(Some(decimal("0.30")))),
         "the total is 0.30"
     );
-    let AggValue::Sum(Some(SumValue::Decimal(value))) = total.unwrap() else {
+    let AggValue::Sum(Some(NumericValue::Decimal(value))) = total.unwrap() else {
         panic!("a numeric sum reports a decimal")
     };
     assert_eq!(value.as_bigint_and_exponent().1, 2, "at scale two");
@@ -327,11 +327,11 @@ fn numeric_sum_keeps_its_scale() {
 fn float_sum_stays_double() {
     assert_eq!(
         pg("approx").fold(4, Value::Float(1.5)),
-        Some(AggValue::Sum(Some(SumValue::Double(1.5))))
+        Some(AggValue::Sum(Some(NumericValue::Double(1.5))))
     );
     assert_eq!(
         sqlite("approx").fold(3, Value::Float(1.5)),
-        Some(AggValue::Sum(Some(SumValue::Double(1.5))))
+        Some(AggValue::Sum(Some(NumericValue::Double(1.5))))
     );
 }
 

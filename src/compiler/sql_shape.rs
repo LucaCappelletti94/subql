@@ -1304,7 +1304,7 @@ pub(crate) fn render_aggregate_bootstrap<B: crate::backend::Backend, DB: Databas
         kinds.extend([
             aggregate_bootstrap_kinds(
                 spec,
-                crate::catalog_helpers::sum_rule::<B, DB>(spec, database, table_id),
+                crate::catalog_helpers::total_rule::<B, DB>(spec, database, table_id),
             )
             .first()
             .copied()
@@ -1315,7 +1315,7 @@ pub(crate) fn render_aggregate_bootstrap<B: crate::backend::Backend, DB: Databas
     } else {
         kinds.extend(aggregate_bootstrap_kinds(
             spec,
-            crate::catalog_helpers::sum_rule::<B, DB>(spec, database, table_id),
+            crate::catalog_helpers::total_rule::<B, DB>(spec, database, table_id),
         ));
     }
     if !groups.is_empty() {
@@ -1343,7 +1343,10 @@ pub(crate) fn aggregate_bootstrap_kinds(
     rule: crate::backend::SumRule,
 ) -> Vec<crate::backend::BuiltinKind> {
     let total = match spec {
-        AggSpec::Sum { .. } => match rule {
+        // `AVG` holds the same exact total `SUM` does, since a mean is
+        // that total divided by the count, so its seed component decodes
+        // in the same type.
+        AggSpec::Sum { .. } | AggSpec::Avg { .. } => match rule {
             crate::backend::SumRule::Integer
             | crate::backend::SumRule::IntegerPromotingToDouble => crate::backend::BuiltinKind::Int,
             crate::backend::SumRule::Decimal { .. } => crate::backend::BuiltinKind::Decimal,

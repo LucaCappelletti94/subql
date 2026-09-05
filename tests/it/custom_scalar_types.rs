@@ -137,6 +137,9 @@ impl Backend for Custom {
         None
     }
 
+    /// And average like it: an exact total's mean is an exact decimal.
+    const MEAN: subql::backend::MeanRule = subql::backend::MeanRule::Exact;
+
     /// The fixtures sum like PostgreSQL: a narrow integer column totals
     /// into a 64-bit integer and everything exact totals into a decimal.
     fn sum_rule(column: subql::backend::BuiltinType) -> subql::backend::SumRule {
