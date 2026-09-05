@@ -249,3 +249,275 @@ fn mysql_refuses_a_non_finite_double() {
         "measured: `Illegal double '1e400' value found during parsing`, got {message}"
     );
 }
+
+/// One change in a stream: a row arriving, or the same row leaving.
+#[derive(Clone, Copy)]
+enum Change {
+    Inserted(f64),
+    Deleted(f64),
+    /// One row's value replaced, which reaches the fold as a single event
+    /// carrying both contributions, so the two deltas merge before the
+    /// total sees either.
+    Updated(f64, f64),
+}
+
+/// Fold `changes` in order against `sql` and answer the value the engine
+/// last reported, so a removal can be asked about as well as an arrival.
+fn pg_stream(sql: &str, changes: &[Change], components: usize) -> Option<AggValue> {
+    let database = ParserDB::parse::<PostgreSqlDialect>(PG_DDL).unwrap();
+    let table: TableId = catalog_helpers::table_id(&database, "t").unwrap();
+    let mut engine: SubscriptionEngine<TestEvent<Postgres, PgLsn>, DefaultIds, ParserDB> =
+        SubscriptionEngine::new(database, PostgreSqlDialect {});
+    let registered = engine.register(SubscriptionRequest::new(7, sql)).unwrap();
+    assert!(registered.not_served_because.is_none());
+    let mut seed: Vec<Value<Postgres>> = (0..components).map(|_| Value::Null).collect();
+    if let Some(last) = seed.last_mut() {
+        *last = Value::Int(0);
+    }
+    subql::Install::install(
+        &mut engine,
+        registered.subscription_id,
+        subql::AggregateSeedInstall {
+            rows: vec![seed],
+            read_at: Some(PgLsn(5)),
+        },
+    )
+    .expect("the empty seed lands");
+
+    let mut last = None;
+    for (index, change) in changes.iter().enumerate() {
+        let lsn = 10 + u64::try_from(index).unwrap() * 10;
+        let row = |value: f64| vec![Value::Int(i64::try_from(lsn).unwrap()), Value::Float(value)];
+        let event = match *change {
+            Change::Inserted(value) => TestEvent::insert(table, row(value)),
+            Change::Deleted(value) => TestEvent::delete(table, row(value)),
+            Change::Updated(old, new) => TestEvent::update(table, row(old), row(new)),
+        }
+        .with_pk_columns([0u16])
+        .with_checkpoint(PgLsn(lsn));
+        let output = engine.aggregate_updates(&event).expect("the event folds");
+        assert!(
+            output.transitions.is_empty(),
+            "every answer here is representable, so no tier changes"
+        );
+        if let Some(value) = output
+            .updates
+            .first()
+            .and_then(subql::AggregateValueUpdate::folded_value)
+        {
+            last = Some(value);
+        }
+    }
+    last
+}
+
+/// A non-finite contribution that leaves takes its effect with it.
+///
+/// The delta path represents a removal as the negated value, so removing
+/// an `Infinity` computed `Infinity + -Infinity`, which is `NaN`, and no
+/// later row escaped it. Measured on PostgreSQL 16.15 with a
+/// `double precision` column:
+///
+/// ```text
+/// rows                              SUM        AVG       VAR_POP
+/// Infinity, 1, 2                    Infinity   Infinity  NaN
+/// after the Infinity is deleted     3          1.5       0.25
+/// ```
+///
+/// So the engine simply answers over the rows that remain, and an
+/// in-process total has to as well.
+#[test]
+fn pg_sum_recovers_when_an_infinity_leaves() {
+    assert_eq!(
+        pg_stream(
+            "SELECT SUM(approx) FROM t",
+            &[
+                Change::Inserted(f64::INFINITY),
+                Change::Inserted(1.0),
+                Change::Inserted(2.0),
+                Change::Deleted(f64::INFINITY),
+            ],
+            2,
+        ),
+        Some(AggValue::Sum(Some(NumericValue::Double(3.0)))),
+        "measured: PostgreSQL answers 3 over the rows that remain"
+    );
+}
+
+/// A `NaN` that leaves does the same, and this is the direction the old
+/// arithmetic could not express at all: `NaN + -NaN` is `NaN`.
+#[test]
+fn pg_sum_recovers_when_a_nan_leaves() {
+    assert_eq!(
+        pg_stream(
+            "SELECT SUM(approx) FROM t",
+            &[
+                Change::Inserted(f64::NAN),
+                Change::Inserted(1.0),
+                Change::Inserted(2.0),
+                Change::Deleted(f64::NAN),
+            ],
+            2,
+        ),
+        Some(AggValue::Sum(Some(NumericValue::Double(3.0)))),
+        "measured: PostgreSQL answers 3, and NaN cannot be subtracted back out"
+    );
+}
+
+/// Two infinities, one leaving: the total is still infinite, because the
+/// other one still stands.
+///
+/// Measured: `Infinity, Infinity, 1` sums to `Infinity`, and after one
+/// infinity is deleted it is still `Infinity`. So the state is a count of
+/// live non-finite contributions, not a flag.
+#[test]
+fn pg_one_of_two_infinities_leaving_stays_infinite() {
+    assert_eq!(
+        pg_stream(
+            "SELECT SUM(approx) FROM t",
+            &[
+                Change::Inserted(f64::INFINITY),
+                Change::Inserted(f64::INFINITY),
+                Change::Inserted(1.0),
+                Change::Deleted(f64::INFINITY),
+            ],
+            2,
+        ),
+        Some(AggValue::Sum(Some(NumericValue::Double(f64::INFINITY)))),
+        "measured: PostgreSQL still answers Infinity"
+    );
+}
+
+/// An infinity of each sign is `NaN` while both are live, and the total
+/// recovers when one leaves.
+///
+/// Measured: `{Infinity, -Infinity}` sums to `NaN` on PostgreSQL, which
+/// is IEEE, and deleting the negative one leaves `Infinity`.
+#[test]
+fn pg_opposite_infinities_are_nan_until_one_leaves() {
+    let both = pg_stream(
+        "SELECT SUM(approx) FROM t",
+        &[
+            Change::Inserted(f64::INFINITY),
+            Change::Inserted(f64::NEG_INFINITY),
+        ],
+        2,
+    );
+    let Some(AggValue::Sum(Some(NumericValue::Double(value)))) = both else {
+        panic!("expected a double total, got {both:?}")
+    };
+    assert!(value.is_nan(), "both signs live is NaN, measured");
+
+    assert_eq!(
+        pg_stream(
+            "SELECT SUM(approx) FROM t",
+            &[
+                Change::Inserted(f64::INFINITY),
+                Change::Inserted(f64::NEG_INFINITY),
+                Change::Deleted(f64::NEG_INFINITY),
+            ],
+            2,
+        ),
+        Some(AggValue::Sum(Some(NumericValue::Double(f64::INFINITY)))),
+        "and one leaving restores the other's infinity"
+    );
+}
+
+/// The mean recovers too, since it divides the same total.
+///
+/// Measured: `Infinity, 1, 2` averages to `Infinity`, and after the
+/// infinity leaves, to `1.5`.
+#[test]
+fn pg_mean_recovers_when_an_infinity_leaves() {
+    assert_eq!(
+        pg_stream(
+            "SELECT AVG(approx) FROM t",
+            &[
+                Change::Inserted(f64::INFINITY),
+                Change::Inserted(1.0),
+                Change::Inserted(2.0),
+                Change::Deleted(f64::INFINITY),
+            ],
+            2,
+        ),
+        Some(AggValue::Avg(Some(NumericValue::Double(1.5)))),
+        "measured: PostgreSQL answers 1.5"
+    );
+}
+
+/// The spread recovers as well, so a variance answers over the rows
+/// that remain.
+///
+/// Measured on PostgreSQL 16.15: `Infinity, 1, 2` gives `VAR_POP` of
+/// `NaN`, and after the infinity is deleted, `0.25`. The spread
+/// accumulates squared deviations, and a non-finite row makes each of
+/// them non-finite, so it is the same irreversibility the total had.
+#[test]
+fn pg_variance_recovers_when_an_infinity_leaves() {
+    let after = pg_stream(
+        "SELECT VAR_POP(approx) FROM t",
+        &[
+            Change::Inserted(f64::INFINITY),
+            Change::Inserted(1.0),
+            Change::Inserted(2.0),
+            Change::Deleted(f64::INFINITY),
+        ],
+        3,
+    );
+    assert_eq!(
+        after,
+        Some(AggValue::Real(Some(0.25))),
+        "measured: PostgreSQL answers 0.25 over the two rows that remain"
+    );
+}
+
+/// An update away from a non-finite value recovers too, and this is the
+/// case where both contributions arrive in one event.
+///
+/// The two deltas merge before the total sees either, so the merge has to
+/// keep the parts apart as well: collapsing them to a number first gives
+/// `-Infinity + 4`, which is `-Infinity`. The mutation battery is why
+/// this test exists, since deleting and inserting in separate events
+/// never exercises the merge.
+///
+/// Measured on PostgreSQL 16.15: `Infinity, 1, 2` with the infinity
+/// updated to `4` answers `SUM` 7, `AVG` 2.3333333333333335 and
+/// `VAR_POP` 1.5555555555555556.
+#[test]
+fn pg_sum_recovers_when_an_infinity_is_updated_away() {
+    assert_eq!(
+        pg_stream(
+            "SELECT SUM(approx) FROM t",
+            &[
+                Change::Inserted(f64::INFINITY),
+                Change::Inserted(1.0),
+                Change::Inserted(2.0),
+                Change::Updated(f64::INFINITY, 4.0),
+            ],
+            2,
+        ),
+        Some(AggValue::Sum(Some(NumericValue::Double(7.0)))),
+        "measured: PostgreSQL answers 7"
+    );
+}
+
+/// And the mean over the same stream, which divides that total.
+#[test]
+fn pg_mean_recovers_when_an_infinity_is_updated_away() {
+    assert_eq!(
+        pg_stream(
+            "SELECT AVG(approx) FROM t",
+            &[
+                Change::Inserted(f64::INFINITY),
+                Change::Inserted(1.0),
+                Change::Inserted(2.0),
+                Change::Updated(f64::INFINITY, 4.0),
+            ],
+            2,
+        ),
+        Some(AggValue::Avg(Some(NumericValue::Double(
+            2.333_333_333_333_333_5
+        )))),
+        "measured: PostgreSQL answers 2.3333333333333335"
+    );
+}

@@ -50,7 +50,12 @@ impl AggCellRead {
             Self::Decimal(value) => Some(TotalDelta::Decimal(
                 value * bigdecimal::BigDecimal::from(weight),
             )),
-            Self::Real(value) => Some(TotalDelta::Real(*value * weight as f64)),
+            // The weight is applied to the parts rather than to the
+            // number, so removing an infinity removes it instead of
+            // adding the opposite one.
+            Self::Real(value) => Some(TotalDelta::Real(crate::runtime::aggregate::FloatParts::of(
+                *value, weight,
+            ))),
             Self::Missing | Self::Null | Self::NonNumeric => None,
         }
     }

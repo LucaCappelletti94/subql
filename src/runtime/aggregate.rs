@@ -63,8 +63,115 @@ pub enum TotalDelta {
     Integer(i128),
     /// An exact decimal cell.
     Decimal(bigdecimal::BigDecimal),
-    /// A floating cell, which no engine sums exactly.
-    Real(f64),
+    /// A floating change, held as its parts so that it can be undone.
+    ///
+    /// Not one `f64`. A removal reaches the accumulator as the negated
+    /// value, and negating an infinity produces the other infinity, so
+    /// `Infinity + -Infinity` is `NaN` and nothing later escapes it.
+    /// Measured, PostgreSQL simply answers over the rows that remain: an
+    /// `Infinity` deleted from `Infinity, 1, 2` leaves `3`. Counting the
+    /// live non-finite contributions instead makes a removal ordinary
+    /// arithmetic, and makes the delta and the total members of the same
+    /// commutative group, added componentwise.
+    Real(FloatParts),
+}
+
+/// A floating quantity as its parts: what the finite contributions sum
+/// to, and how many non-finite ones are live.
+///
+/// Signed counts, because a delta removing an infinity carries `-1`
+/// where a total holding one carries `1`. Both are the same type so that
+/// applying a delta is componentwise addition and needs no case
+/// analysis.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct FloatParts {
+    finite: f64,
+    positive_infinities: i64,
+    negative_infinities: i64,
+    nans: i64,
+}
+
+impl FloatParts {
+    /// Nothing contributed.
+    pub const EMPTY: Self = Self {
+        finite: 0.0,
+        positive_infinities: 0,
+        negative_infinities: 0,
+        nans: 0,
+    };
+
+    /// One cell contributing with `weight`, which is `1` for a row
+    /// arriving and `-1` for one leaving.
+    #[must_use]
+    #[allow(clippy::cast_precision_loss)]
+    pub(crate) fn of(value: f64, weight: i64) -> Self {
+        if value.is_nan() {
+            return Self {
+                nans: weight,
+                ..Self::EMPTY
+            };
+        }
+        if value.is_infinite() {
+            return if value.is_sign_positive() {
+                Self {
+                    positive_infinities: weight,
+                    ..Self::EMPTY
+                }
+            } else {
+                Self {
+                    negative_infinities: weight,
+                    ..Self::EMPTY
+                }
+            };
+        }
+        Self {
+            finite: value * weight as f64,
+            ..Self::EMPTY
+        }
+    }
+
+    /// A quantity that is only its finite part, for a seed or a cast.
+    const fn finite(value: f64) -> Self {
+        Self {
+            finite: value,
+            ..Self::EMPTY
+        }
+    }
+
+    /// Add `other` in, componentwise.
+    fn add(&mut self, other: Self) {
+        self.finite += other.finite;
+        self.positive_infinities += other.positive_infinities;
+        self.negative_infinities += other.negative_infinities;
+        self.nans += other.nans;
+    }
+
+    /// Whether this moves nothing.
+    fn is_zero(&self) -> bool {
+        self.finite == 0.0
+            && self.positive_infinities == 0
+            && self.negative_infinities == 0
+            && self.nans == 0
+    }
+
+    /// The number these parts describe, which is what a caller reads.
+    ///
+    /// Measured on PostgreSQL 16.15: a `NaN` anywhere makes the sum
+    /// `NaN`, infinities of both signs together make it `NaN`, one sign
+    /// alone makes it that infinity however many finite rows there are,
+    /// and otherwise it is the finite sum.
+    const fn value(self) -> f64 {
+        if self.nans != 0 || (self.positive_infinities != 0 && self.negative_infinities != 0) {
+            return f64::NAN;
+        }
+        if self.positive_infinities != 0 {
+            return f64::INFINITY;
+        }
+        if self.negative_infinities != 0 {
+            return f64::NEG_INFINITY;
+        }
+        self.finite
+    }
 }
 
 impl TotalDelta {
@@ -77,7 +184,16 @@ impl TotalDelta {
             Self::Decimal(value) => {
                 <bigdecimal::BigDecimal as bigdecimal::ToPrimitive>::to_f64(value).unwrap_or(0.0)
             }
-            Self::Real(value) => *value,
+            Self::Real(parts) => parts.value(),
+        }
+    }
+
+    /// This change as floating parts, for a total that accumulates in
+    /// `f64`. An exact carrier contributes only a finite part.
+    fn float_parts(&self) -> FloatParts {
+        match self {
+            Self::Real(parts) => *parts,
+            other => FloatParts::finite(other.as_f64()),
         }
     }
 
@@ -92,7 +208,12 @@ impl TotalDelta {
             (Self::Integer(a), Self::Decimal(b)) => {
                 *self = Self::Decimal(bigdecimal::BigDecimal::from(*a) + b);
             }
-            (left, right) => *left = Self::Real(left.as_f64() + right.as_f64()),
+            // Two floating changes merge as their parts, so a batch that
+            // both adds and removes an infinity nets to neither.
+            (Self::Real(a), Self::Real(b)) => a.add(*b),
+            (left, right) => {
+                *left = Self::Real(FloatParts::finite(left.as_f64() + right.as_f64()));
+            }
         }
     }
 
@@ -101,7 +222,7 @@ impl TotalDelta {
         match self {
             Self::Integer(value) => *value == 0,
             Self::Decimal(value) => value == &bigdecimal::BigDecimal::from(0),
-            Self::Real(value) => *value == 0.0,
+            Self::Real(parts) => parts.is_zero(),
         }
     }
 }
@@ -122,12 +243,22 @@ impl TotalDelta {
 /// [`Spread::combine`] is for.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Spread {
-    /// Rows in this set.
+    /// Rows in this set whose value is finite.
     pub rows: i64,
     /// Their sum.
     pub sum: f64,
     /// Their sum of squared deviations from their own mean.
     pub squared_deviations: f64,
+    /// How many rows in this set hold a non-finite value.
+    ///
+    /// Counted apart rather than accumulated, for the reason the total
+    /// keeps its parts apart: a squared deviation from a non-finite row
+    /// is non-finite, so it destroys every finite deviation already
+    /// accumulated and no removal can bring them back. Measured on
+    /// PostgreSQL 16.15, `VAR_POP` over `Infinity, 1, 2` is `NaN` and,
+    /// once the infinity is deleted, `0.25`, which is the spread of the
+    /// two rows that remain.
+    pub non_finite: i64,
 }
 
 impl Spread {
@@ -136,15 +267,35 @@ impl Spread {
         rows: 0,
         sum: 0.0,
         squared_deviations: 0.0,
+        non_finite: 0,
     };
 
     /// One row on its own, which deviates from its own mean by nothing.
+    ///
+    /// A non-finite row joins the count instead of the sum, so that
+    /// taking it back out is subtraction rather than an attempt to undo
+    /// an arithmetic that has no inverse.
     pub const fn of_one(value: f64) -> Self {
-        Self {
-            rows: 1,
-            sum: value,
-            squared_deviations: 0.0,
+        if value.is_finite() {
+            Self {
+                rows: 1,
+                sum: value,
+                squared_deviations: 0.0,
+                non_finite: 0,
+            }
+        } else {
+            Self {
+                non_finite: 1,
+                ..Self::EMPTY
+            }
         }
+    }
+
+    /// Whether any row here holds a non-finite value, in which case every
+    /// deviation is non-finite and so is the answer.
+    #[must_use]
+    pub const fn has_non_finite(&self) -> bool {
+        self.non_finite != 0
     }
 
     /// Two sets read as one.
@@ -166,11 +317,15 @@ impl Spread {
     #[must_use]
     #[allow(clippy::cast_precision_loss, clippy::suboptimal_flops)]
     pub fn combine(self, other: Self) -> Self {
+        let non_finite = self.non_finite + other.non_finite;
         if self.rows == 0 {
-            return other;
+            return Self {
+                non_finite,
+                ..other
+            };
         }
         if other.rows == 0 {
-            return self;
+            return Self { non_finite, ..self };
         }
         let rows = self.rows + other.rows;
         let sum = self.sum + other.sum;
@@ -181,6 +336,7 @@ impl Spread {
                 sum,
                 squared_deviations: self.squared_deviations
                     + deviation * deviation / (rows as f64 * self.rows as f64),
+                non_finite,
             };
         }
         let between = self.sum / self.rows as f64 - other.sum / other.rows as f64;
@@ -190,6 +346,7 @@ impl Spread {
             squared_deviations: self.squared_deviations
                 + other.squared_deviations
                 + between * between * (self.rows as f64) * (other.rows as f64) / rows as f64,
+            non_finite,
         }
     }
 
@@ -209,12 +366,16 @@ impl Spread {
     #[must_use]
     #[allow(clippy::cast_precision_loss, clippy::suboptimal_flops)]
     pub fn without(self, other: Self) -> Self {
+        let non_finite = self.non_finite - other.non_finite;
         if other.rows == 0 {
-            return self;
+            return Self { non_finite, ..self };
         }
         let rows = self.rows - other.rows;
         if rows <= 0 {
-            return Self::EMPTY;
+            return Self {
+                non_finite,
+                ..Self::EMPTY
+            };
         }
         let sum = self.sum - other.sum;
         if other.rows == 1 {
@@ -224,6 +385,7 @@ impl Spread {
                 sum,
                 squared_deviations: self.squared_deviations
                     - deviation * deviation / (self.rows as f64 * rows as f64),
+                non_finite,
             };
         }
         let between = sum / rows as f64 - other.sum / other.rows as f64;
@@ -233,6 +395,7 @@ impl Spread {
             squared_deviations: self.squared_deviations
                 - other.squared_deviations
                 - between * between * (rows as f64) * (other.rows as f64) / self.rows as f64,
+            non_finite,
         }
     }
 }
@@ -339,11 +502,12 @@ enum Total {
         integer_digits: Option<u32>,
     },
     /// Single precision, which is what PostgreSQL's `sum(real)`
-    /// accumulates in. Every addition rounds, so the total is held as
-    /// `f32` rather than rounded once on the way out.
-    Single(f32),
+    /// accumulates in. Every addition rounds the finite part, so the
+    /// total is held at that width rather than rounded once on the way
+    /// out.
+    Single(FloatParts),
     /// A double.
-    Double(f64),
+    Double(FloatParts),
 }
 
 /// The total cannot be represented as this engine would represent it, so
@@ -371,8 +535,8 @@ impl Total {
                 value: bigdecimal::BigDecimal::from(0),
                 integer_digits,
             },
-            crate::backend::SumRule::Single => Self::Single(0.0),
-            crate::backend::SumRule::Double => Self::Double(0.0),
+            crate::backend::SumRule::Single => Self::Single(FloatParts::EMPTY),
+            crate::backend::SumRule::Double => Self::Double(FloatParts::EMPTY),
         }
     }
 
@@ -396,7 +560,9 @@ impl Total {
                 _ if *promotes => {
                     #[allow(clippy::cast_precision_loss)]
                     let promoted = *value as f64;
-                    *self = Self::Double(promoted + delta.as_f64());
+                    let mut parts = FloatParts::finite(promoted);
+                    parts.add(delta.float_parts());
+                    *self = Self::Double(parts);
                     Ok(())
                 }
                 _ => Err(SumOutOfRange),
@@ -408,9 +574,15 @@ impl Total {
                 *value += match delta {
                     TotalDelta::Integer(change) => bigdecimal::BigDecimal::from(*change),
                     TotalDelta::Decimal(change) => change.clone(),
+                    // A floating change joining an exact total has to be
+                    // representable as a decimal, which a non-finite one
+                    // is not: that is the engine's own out-of-range, not
+                    // a rounding choice.
                     TotalDelta::Real(change) => {
-                        <bigdecimal::BigDecimal as bigdecimal::FromPrimitive>::from_f64(*change)
-                            .ok_or(SumOutOfRange)?
+                        <bigdecimal::BigDecimal as bigdecimal::FromPrimitive>::from_f64(
+                            change.value(),
+                        )
+                        .ok_or(SumOutOfRange)?
                     }
                 };
                 match integer_digits {
@@ -424,22 +596,25 @@ impl Total {
             // this wide and a total rounded only once at the end is a
             // different number: measured, `16777216 + 1 + 1` keeps both
             // units in double and loses both in single.
-            Self::Single(value) => {
+            Self::Single(parts) => {
+                let change = delta.float_parts();
+                let previous = parts.finite;
+                parts.add(change);
                 #[allow(clippy::cast_possible_truncation)]
-                let change = delta.as_f64() as f32;
-                let total = *value + change;
+                let rounded = parts.finite as f32;
                 // Two finite operands whose total is not finite is where
                 // PostgreSQL answers `value out of range: overflow`. A
-                // non-finite operand is a different matter and folds
-                // through, which Phase c003686 measured.
-                if !total.is_finite() && value.is_finite() && change.is_finite() {
+                // non-finite *operand* is a different matter and folds
+                // through, which Phase c003686 measured, and which the
+                // parts now carry separately from the finite sum.
+                if !rounded.is_finite() && previous.is_finite() && change.finite.is_finite() {
                     return Err(SumOutOfRange);
                 }
-                *value = total;
+                parts.finite = f64::from(rounded);
                 Ok(())
             }
-            Self::Double(value) => {
-                *value += delta.as_f64();
+            Self::Double(parts) => {
+                parts.add(delta.float_parts());
                 Ok(())
             }
         }
@@ -471,13 +646,13 @@ impl Total {
                 }
                 _ => {}
             },
-            Self::Single(value) => {
+            Self::Single(parts) => {
                 #[allow(clippy::cast_possible_truncation)]
                 let seeded = AggAccumulator::seed_f64(cell).unwrap_or(0.0) as f32;
-                *value = seeded;
+                *parts = FloatParts::finite(f64::from(seeded));
             }
-            Self::Double(value) => {
-                *value = AggAccumulator::seed_f64(cell).unwrap_or(0.0);
+            Self::Double(parts) => {
+                *parts = FloatParts::finite(AggAccumulator::seed_f64(cell).unwrap_or(0.0));
             }
         }
     }
@@ -505,8 +680,7 @@ impl Total {
             // Reported as a double, because that is the carrier a caller
             // reads a floating total through. The width belongs to the
             // accumulation, and widening an `f32` is exact.
-            Self::Single(value) => crate::NumericValue::Double(f64::from(*value)),
-            Self::Double(value) => crate::NumericValue::Double(*value),
+            Self::Single(parts) | Self::Double(parts) => crate::NumericValue::Double(parts.value()),
         }
     }
 }
@@ -661,6 +835,10 @@ impl AggAccumulator {
             rows: self.count,
             sum: self.sum,
             squared_deviations,
+            // A seed read from the engine reports over rows the engine
+            // has already folded, so nothing here is pending as
+            // non-finite: whatever it answered is the answer.
+            non_finite: 0,
         };
     }
 
@@ -779,16 +957,14 @@ impl AggAccumulator {
         }
         let double = || crate::NumericValue::Double(self.sum / self.count as f64);
         match (&self.total, self.mean_rule) {
-            (Total::Double(total), _) => {
-                Some(crate::NumericValue::Double(total / self.count as f64))
-            }
             // A mean never holds a single-precision total, because
             // `catalog_helpers::total_rule` gives one only to a `SUM`:
             // measured, PostgreSQL's `avg(real)` is `double precision`
             // and answers the double quotient of the double sum. Read
-            // through the widened total, which is what that quotient is.
-            (Total::Single(total), _) => Some(crate::NumericValue::Double(
-                f64::from(*total) / self.count as f64,
+            // through the widened total, which is what that quotient is,
+            // so both widths answer alike here.
+            (Total::Double(total) | Total::Single(total), _) => Some(crate::NumericValue::Double(
+                total.value() / self.count as f64,
             )),
             (_, crate::backend::MeanRule::Double) => Some(double()),
             (Total::Integer { value, .. }, crate::backend::MeanRule::Exact) => Some(
@@ -836,8 +1012,18 @@ impl AggAccumulator {
     }
 
     /// The population variance, which is the spread divided by the rows.
+    ///
+    /// A live non-finite row answers `NaN` whatever the finite rows
+    /// hold, because every deviation from a non-finite mean is
+    /// non-finite: measured, PostgreSQL's `var_pop` over `1.0` and
+    /// `Infinity` is `NaN`. Those rows are counted rather than
+    /// accumulated, so the answer asks the count and the finite spread
+    /// stays intact underneath, ready for when the last one leaves.
     #[allow(clippy::cast_precision_loss)]
     fn var_pop(&self) -> Option<f64> {
+        if self.spread.has_non_finite() {
+            return Some(f64::NAN);
+        }
         (self.spread.rows > 0).then(|| self.deviations() / self.spread.rows as f64)
     }
 
@@ -845,6 +1031,11 @@ impl AggAccumulator {
     /// every engine answers there.
     #[allow(clippy::cast_precision_loss)]
     fn var_samp(&self) -> Option<f64> {
+        if self.spread.has_non_finite() {
+            // Two rows are still needed for the answer to exist at all,
+            // and a non-finite row is one of them.
+            return (self.spread.rows + self.spread.non_finite >= 2).then_some(f64::NAN);
+        }
         (self.spread.rows >= 2).then(|| self.deviations() / (self.spread.rows - 1) as f64)
     }
 
