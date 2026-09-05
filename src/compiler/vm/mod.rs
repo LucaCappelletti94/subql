@@ -364,9 +364,20 @@ impl<B: Backend> Vm<B> {
                 self.stack.push(StackValue::Tri(result));
             }
 
+            // A null test reads absence as its answer, which is why it is
+            // the one operator that must tell `Missing` from `Null`
+            // rather than folding them. `NULL IS NULL` is `TRUE`, and a
+            // cell the source did not carry is not `NULL`: the row may
+            // hold anything, so the verdict is unknown and the caller is
+            // told which column to read. Answering `TRUE` would notify a
+            // subscription about a row the database would not have
+            // selected, and answering `FALSE` for `IS NOT NULL` would
+            // lose one it would.
             Instruction::IsNull => {
                 let value = self.pop_value()?;
-                let result = if value.is_absent() {
+                let result = if value.is_missing() {
+                    Tri::Unknown
+                } else if value.is_null() {
                     Tri::True
                 } else {
                     Tri::False
@@ -376,7 +387,9 @@ impl<B: Backend> Vm<B> {
 
             Instruction::IsNotNull => {
                 let value = self.pop_value()?;
-                let result = if value.is_absent() {
+                let result = if value.is_missing() {
+                    Tri::Unknown
+                } else if value.is_null() {
                     Tri::False
                 } else {
                     Tri::True

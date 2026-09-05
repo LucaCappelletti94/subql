@@ -26,6 +26,9 @@ struct AggregateStops {
     group_limit: Vec<SubscriptionId>,
     /// Subscriptions whose total left what the engine can represent.
     sum_out_of_range: Vec<SubscriptionId>,
+    /// Subscriptions whose filter read a cell the event did not carry,
+    /// with that column.
+    unanswered_filter: Vec<(SubscriptionId, crate::ColumnId)>,
 }
 
 impl<E: CdcEvent, I: IdTypes, DB: DatabaseLike + 'static> SubscriptionEngine<E, I, DB>
@@ -90,6 +93,14 @@ where
         Ok((transition, trigger))
     }
 
+    /// Stop one aggregate, unless this event already stopped it.
+    ///
+    /// One event can satisfy two stop conditions for the same
+    /// subscription: an UPDATE with an empty old image both omits the
+    /// old row and leaves the filter unanswerable. The first stop
+    /// unregisters the subscription, so a second attempt would fail
+    /// looking for registration metadata that is deliberately gone.
+    /// A subscription stops once, for the first reason found.
     fn push_aggregate_stop(
         &mut self,
         subscription: SubscriptionId,
@@ -97,6 +108,13 @@ where
         checkpoint: Option<&E::Checkpoint>,
         output: &mut crate::AggregateMaintenanceOutput<I, E::Backend, E::Checkpoint>,
     ) -> Result<(), DispatchError> {
+        if output
+            .transitions
+            .iter()
+            .any(|transition| transition.subscription_id == subscription)
+        {
+            return Ok(());
+        }
         let (transition, trigger) =
             self.transition_aggregate_to_whole(subscription, reason, checkpoint)?;
         output.transitions.push(transition);
@@ -117,6 +135,7 @@ where
             evaluation_refused,
             mut group_limit,
             mut sum_out_of_range,
+            unanswered_filter,
         } = stops;
         for subscription in missing_old {
             self.push_aggregate_stop(
@@ -129,6 +148,17 @@ where
         // A refused evaluation is not a tier change: a read would raise
         // the same error, so it is reported and nothing else happens.
         output.evaluation_failures.extend(evaluation_refused);
+        // An absent cell is the opposite: a read is exactly what answers
+        // it, so the subscription leaves in-process maintenance rather
+        // than folding a delta it could only compute for one side.
+        for (subscription, column) in unanswered_filter {
+            self.push_aggregate_stop(
+                subscription,
+                crate::MaintenanceStopReason::FilterCellMissing { table_id, column },
+                checkpoint,
+                output,
+            )?;
+        }
         for subscription in group_key_failed {
             self.push_aggregate_stop(
                 subscription,
@@ -354,6 +384,7 @@ where
                 evaluation_refused: computation.evaluation_refused,
                 group_limit,
                 sum_out_of_range,
+                unanswered_filter: computation.unanswered_filter,
             },
             at.as_ref(),
             &mut output,

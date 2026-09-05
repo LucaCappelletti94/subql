@@ -593,6 +593,22 @@ pub enum MaintenanceStopReason {
         /// Source table whose column is summed.
         table_id: TableId,
     },
+    /// The event omitted a cell the aggregate's filter reads, so whether
+    /// the row belongs cannot be decided from the event.
+    ///
+    /// Distinct from [`Self::MissingOldRow`], which is about the old
+    /// image being incomplete. This one is about the filter: an UPDATE
+    /// can carry a complete old row and omit an unchanged TOASTed column
+    /// the filter names, and then the old row's removal is decidable
+    /// while the new row's membership is not. Folding one side alone
+    /// would leave the total permanently wrong, so maintenance stops and
+    /// a read answers instead.
+    FilterCellMissing {
+        /// Source table whose event omitted the cell.
+        table_id: TableId,
+        /// The column the filter could not read.
+        column: ColumnId,
+    },
     /// A keyed row read received a CDC change with no readable primary key.
     KeyedChangeWithoutKey {
         /// Source table whose event lacked the key.

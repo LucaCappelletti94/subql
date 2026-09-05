@@ -231,6 +231,91 @@ fn missing_old_row_transitions_only_the_filtered_aggregate() {
     assert_ne!(row_subscription.subscription_id, aggregate.subscription_id);
 }
 
+/// An UPDATE whose new image omits a column the aggregate's filter reads
+/// stops maintenance instead of applying a one-sided delta.
+///
+/// The worst shape in this whole family. The old image is complete, so
+/// the old row is evaluated and contributes its removal; the new image
+/// omits `status`, so the new evaluation cannot say whether the row
+/// still belongs. Applying the removal alone leaves the count one too
+/// low **forever**: nothing later corrects it, because every subsequent
+/// event folds from the corrupted total. A refused evaluation already
+/// drops its deltas here (`refused_subscriptions`), and an unanswerable
+/// cell has to do the same, except that a read *can* answer it, so the
+/// subscription changes tier and gets a trigger rather than only a
+/// report.
+#[test]
+fn an_unanswerable_filter_cell_stops_maintenance_instead_of_half_folding() {
+    let (mut engine, orders) = engine(8);
+    let row_subscription = engine
+        .register(SubscriptionRequest::new(
+            99u64,
+            "SELECT * FROM orders WHERE id > 0",
+        ))
+        .expect("row subscription registers");
+    let aggregate = engine
+        .register(SubscriptionRequest::new(7u64, FILTERED_SQL))
+        .expect("filtered count registers");
+    Install::install(
+        &mut engine,
+        aggregate.subscription_id,
+        AggregateSeedInstall {
+            rows: vec![vec![Value::Int(1)]],
+            read_at: None,
+        },
+    )
+    .expect("seed aggregate");
+
+    // The old image is complete and matches `status = 'paid'`. The new
+    // image carries every column except `status`, which is exactly what
+    // an unchanged TOASTed column looks like off the wire.
+    let mut new_row = row(1, "north", "paid");
+    new_row[3] = Value::Missing;
+    // No `changed_columns`: the trait documents them as a hint sources
+    // vary on, and Maxwell reports none at all, so the aggregate has to
+    // consider every candidate and actually evaluate the filter. An
+    // event that *did* name only `region` as changed would rightly skip
+    // this aggregate, because the source would be asserting that
+    // `status` did not move.
+    let event = TestEvent::update(orders, row(1, "north", "paid"), new_row)
+        .with_pk_columns([0u16])
+        .with_checkpoint(PgLsn(41));
+    let output = engine.dispatch(&event).expect("dispatch succeeds");
+
+    assert!(
+        output.aggregate_updates().is_empty(),
+        "a half-folded count is never reported: {:?}",
+        output.aggregate_updates()
+    );
+    assert_eq!(
+        output.transitions().len(),
+        1,
+        "the aggregate leaves in-process maintenance, because a read can answer this"
+    );
+    assert_eq!(
+        output.transitions()[0].subscription_id,
+        aggregate.subscription_id
+    );
+    assert_eq!(
+        output.transitions()[0].reason,
+        MaintenanceStopReason::FilterCellMissing {
+            table_id: orders,
+            column: 3,
+        },
+        "the reason names the column, so the caller knows what the event lacked"
+    );
+    assert_eq!(
+        output.triggers()[0].subscription_id,
+        aggregate.subscription_id,
+        "and a re-execution trigger, since the total has to be re-seeded"
+    );
+    assert!(
+        output.notified().contains(&99),
+        "the row subscription beside it is answered as usual"
+    );
+    assert_ne!(row_subscription.subscription_id, aggregate.subscription_id);
+}
+
 #[test]
 fn unfiltered_count_needs_no_old_row_and_stays_in_process() {
     let (mut engine, orders) = engine(8);

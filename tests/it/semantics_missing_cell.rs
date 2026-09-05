@@ -133,6 +133,119 @@ fn a_null_cell_is_not_reported() {
     assert!(notifications.inserted().is_empty());
 }
 
+/// `IS NULL` over a cell the event did not carry is unanswerable, not
+/// true.
+///
+/// The distinction the whole module rests on, reached through the one
+/// operator that reads absence as its answer. `NULL IS NULL` is `TRUE`
+/// and a missing cell is not `NULL`: the row may hold any value, so the
+/// only honest verdict is unknown and the only honest outcome is a read.
+/// Answering `TRUE` here notifies a subscription about a row the
+/// database would not have selected, which is worse than the silent
+/// non-notification `d4e07bc` corrected, because it is a wrong row
+/// rather than a lost one.
+#[test]
+fn a_null_test_on_a_missing_cell_is_unanswered() {
+    let (mut engine, table) = engine();
+    let subscription = engine
+        .register(SubscriptionRequest::new(
+            1u64,
+            "SELECT * FROM docs WHERE body IS NULL",
+        ))
+        .expect("the predicate registers")
+        .subscription_id;
+
+    let notifications = engine
+        .consumers(&TestEvent::insert(
+            table,
+            vec![Value::Int(1), Value::Missing, Value::String("t".into())],
+        ))
+        .expect("dispatch succeeds");
+
+    assert_eq!(
+        notifications
+            .unanswered()
+            .iter()
+            .map(|entry| (entry.subscription_id, entry.consumer_id, entry.column))
+            .collect::<Vec<_>>(),
+        vec![(subscription, 1u64, 1)],
+        "the absent cell is named, so the caller can read it"
+    );
+    assert!(
+        notifications.inserted().is_empty(),
+        "an unanswerable predicate never selects the row"
+    );
+}
+
+/// `IS NOT NULL` over an absent cell is unanswerable for the same
+/// reason, and this is the direction that loses a row rather than
+/// inventing one.
+#[test]
+fn a_not_null_test_on_a_missing_cell_is_unanswered() {
+    let (mut engine, table) = engine();
+    let subscription = engine
+        .register(SubscriptionRequest::new(
+            1u64,
+            "SELECT * FROM docs WHERE body IS NOT NULL",
+        ))
+        .expect("the predicate registers")
+        .subscription_id;
+
+    let notifications = engine
+        .consumers(&TestEvent::insert(
+            table,
+            vec![Value::Int(1), Value::Missing, Value::String("t".into())],
+        ))
+        .expect("dispatch succeeds");
+
+    assert_eq!(
+        notifications
+            .unanswered()
+            .iter()
+            .map(|entry| (entry.subscription_id, entry.column))
+            .collect::<Vec<_>>(),
+        vec![(subscription, 1)],
+        "the same absent cell, reported through the opposite operator"
+    );
+    assert!(notifications.inserted().is_empty());
+}
+
+/// A null test over a cell the event carried as SQL `NULL` still
+/// answers, in both directions.
+///
+/// The guard on the fix above: making absence unknown must not make
+/// `NULL` unknown, or every `IS NULL` subscription becomes a database
+/// read and the operator stops being served at all.
+#[test]
+fn a_null_test_on_a_null_cell_still_answers() {
+    for (predicate, selects) in [("body IS NULL", true), ("body IS NOT NULL", false)] {
+        let (mut engine, table) = engine();
+        engine
+            .register(SubscriptionRequest::new(
+                1u64,
+                format!("SELECT * FROM docs WHERE {predicate}"),
+            ))
+            .expect("the predicate registers");
+
+        let notifications = engine
+            .consumers(&TestEvent::insert(
+                table,
+                vec![Value::Int(1), Value::Null, Value::String("t".into())],
+            ))
+            .expect("dispatch succeeds");
+
+        assert!(
+            notifications.unanswered().is_empty(),
+            "`{predicate}` over a NULL cell is answered, not read"
+        );
+        assert_eq!(
+            !notifications.inserted().is_empty(),
+            selects,
+            "`{predicate}` over a NULL cell selects the row: {selects}"
+        );
+    }
+}
+
 /// Only a subscription whose predicate actually reads the absent cell is
 /// reported. One reading another column is answered as usual, which is the
 /// same per-subscription precision the arithmetic failures have.

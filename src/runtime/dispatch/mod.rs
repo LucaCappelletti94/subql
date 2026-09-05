@@ -1068,6 +1068,32 @@ fn refused_subscriptions<B: crate::backend::Backend>(
     refused
 }
 
+/// Drop every delta belonging to a subscription whose filter could not
+/// read a cell, and report those subscriptions with the column.
+///
+/// Mirrors [`refused_subscriptions`]: an aggregate's delta is only sound
+/// when both sides of the transition were decidable, so a subscription
+/// that could not answer one of them contributes nothing at all.
+fn unanswered_subscriptions<B: crate::backend::Backend>(
+    unanswered: Vec<(ConsumerOrdinal, SubscriptionId, crate::ColumnId)>,
+    deltas: &mut Vec<AggregateDelta<B>>,
+) -> Vec<(SubscriptionId, crate::ColumnId)> {
+    let mut absent: Vec<(SubscriptionId, crate::ColumnId)> = unanswered
+        .into_iter()
+        .map(|(_, subscription, column)| (subscription, column))
+        .collect();
+    absent.sort_unstable();
+    absent.dedup_by_key(|(subscription, _)| *subscription);
+    if !absent.is_empty() {
+        deltas.retain(|delta| {
+            absent
+                .binary_search_by_key(&delta.subscription, |(subscription, _)| *subscription)
+                .is_err()
+        });
+    }
+    absent
+}
+
 pub(crate) struct AggregateComputation<B: crate::backend::Backend> {
     pub deltas: Vec<AggregateDelta<B>>,
     pub missing_old: Vec<SubscriptionId>,
@@ -1076,6 +1102,14 @@ pub(crate) struct AggregateComputation<B: crate::backend::Backend> {
     /// event. An aggregate emits maintenance rather than rows, so these
     /// surface as maintenance stops rather than in a notification set.
     pub evaluation_refused: Vec<(SubscriptionId, EvaluationRefusal)>,
+    /// Subscriptions whose filter read a cell the event did not carry,
+    /// with that column.
+    ///
+    /// Kept apart from [`Self::evaluation_refused`] because the outcomes
+    /// differ: a refusal is final, since a read would raise the same
+    /// error, while an absent cell is answerable by a read and so the
+    /// subscription changes tier and gets a trigger.
+    pub unanswered_filter: Vec<(SubscriptionId, crate::ColumnId)>,
 }
 
 type AggregateNet<B> = HashMap<
@@ -1322,12 +1356,17 @@ where
     let mut group_key_failed: Vec<_> = group_key_failed.into_iter().collect();
     group_key_failed.sort_unstable();
     let evaluation_refused = refused_subscriptions(reports.refusals, &mut deltas);
+    // The same treatment as a refusal, for the same reason: a delta the
+    // event could only compute for one side of the transition is worse
+    // than no delta, because the error never washes out.
+    let unanswered_filter = unanswered_subscriptions(reports.unanswered, &mut deltas);
 
     Ok(AggregateComputation {
         deltas,
         missing_old,
         group_key_failed,
         evaluation_refused,
+        unanswered_filter,
     })
 }
 
