@@ -700,7 +700,7 @@ impl Total {
                     // exactly that set.
                     Value::Float(_) => {
                         *value = 0;
-                        *reals = FloatParts::finite(AggAccumulator::seed_f64(cell).unwrap_or(0.0));
+                        *reals = FloatParts::of(AggAccumulator::seed_f64(cell).unwrap_or(0.0), 1);
                     }
                     _ => {}
                 }
@@ -723,10 +723,10 @@ impl Total {
             Self::Single(parts, _) => {
                 #[allow(clippy::cast_possible_truncation)]
                 let seeded = AggAccumulator::seed_f64(cell).unwrap_or(0.0) as f32;
-                *parts = FloatParts::finite(f64::from(seeded));
+                *parts = FloatParts::of(f64::from(seeded), 1);
             }
             Self::Double(parts, _) => {
-                *parts = FloatParts::finite(AggAccumulator::seed_f64(cell).unwrap_or(0.0));
+                *parts = FloatParts::of(AggAccumulator::seed_f64(cell).unwrap_or(0.0), 1);
             }
         }
     }
@@ -965,10 +965,14 @@ impl AggAccumulator {
             // the same bounded loss the delta path (`probe_column_for_agg`)
             // already does for realistic aggregate magnitudes.
             Value::Int(i) => (i as &dyn Any).downcast_ref::<i64>().map(|x| *x as f64),
-            Value::Float(f) => (f as &dyn Any)
-                .downcast_ref::<f64>()
-                .copied()
-                .filter(|x| x.is_finite()),
+            // Not filtered on finiteness. A seed comes from the engine's
+            // own answer to the bootstrap query, and measured on
+            // PostgreSQL 16 that answer is `Infinity` for a `SUM` over a
+            // column holding one. Dropping it here seeded zero, so a
+            // subscription starting against such a table reported the
+            // wrong total until a delta happened to move it. The callers
+            // route the value by its kind rather than assuming it finite.
+            Value::Float(f) => (f as &dyn Any).downcast_ref::<f64>().copied(),
             // NUMERIC/DECIMAL sums (e.g. Postgres `SUM(int_col)`) arrive as
             // BigDecimal; parse through its decimal string to avoid a
             // num-traits import.

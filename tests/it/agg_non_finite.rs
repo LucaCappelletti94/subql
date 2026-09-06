@@ -619,3 +619,81 @@ fn a_widened_count_counts_a_non_finite_float() {
         "the finite row is all that remains, so the count is 1"
     );
 }
+
+/// A bootstrap seed carrying a non-finite total keeps it.
+///
+/// The module header records the measurement: `SUM` over a `double
+/// precision` column holding `1.0` and `Infinity` is `Infinity` on
+/// PostgreSQL. The bootstrap query asks the server for exactly that, so
+/// the seed row can carry an infinity, and the seed dropped it: `seed_f64`
+/// filtered non-finite values out and every caller substituted `0.0`, so
+/// a subscription that started against such a table reported a total of
+/// zero and stayed wrong until a delta happened to move it.
+///
+/// Found by two review bots on the pull request, independently, after a
+/// maintainer review had declared the aggregate paths clean. It is the
+/// same defect the delta path already had: fixed there, never here.
+#[test]
+fn a_seed_keeps_a_non_finite_total() {
+    for (seeded, expected) in [
+        (f64::INFINITY, f64::INFINITY),
+        (f64::NEG_INFINITY, f64::NEG_INFINITY),
+    ] {
+        let database = ParserDB::parse::<PostgreSqlDialect>(PG_DDL).unwrap();
+        let mut engine: SubscriptionEngine<TestEvent<Postgres, PgLsn>, DefaultIds, ParserDB> =
+            SubscriptionEngine::new(database, PostgreSqlDialect {});
+        let registered = engine
+            .register(SubscriptionRequest::new(7u64, "SELECT SUM(approx) FROM t"))
+            .expect("the fold registers");
+        let updates = subql::Install::install(
+            &mut engine,
+            registered.subscription_id,
+            subql::AggregateSeedInstall {
+                rows: vec![vec![Value::Float(seeded), Value::Int(1)]],
+                read_at: Some(PgLsn(5)),
+            },
+        )
+        .expect("the seed lands")
+        .updates;
+        assert_eq!(
+            updates.into_iter().next_back().map(|update| update.change),
+            Some(subql::AggregateValueChange::Set(
+                subql::AggregateResultValue::Folded(AggValue::Sum(Some(NumericValue::Double(
+                    expected
+                ))))
+            )),
+            "the server answered {seeded}, so the seed holds {expected}"
+        );
+    }
+}
+
+/// A NaN total survives the seed too, and is not confused with an infinity.
+#[test]
+fn a_seed_keeps_a_nan_total() {
+    let database = ParserDB::parse::<PostgreSqlDialect>(PG_DDL).unwrap();
+    let mut engine: SubscriptionEngine<TestEvent<Postgres, PgLsn>, DefaultIds, ParserDB> =
+        SubscriptionEngine::new(database, PostgreSqlDialect {});
+    let registered = engine
+        .register(SubscriptionRequest::new(7u64, "SELECT SUM(approx) FROM t"))
+        .expect("the fold registers");
+    let updates = subql::Install::install(
+        &mut engine,
+        registered.subscription_id,
+        subql::AggregateSeedInstall {
+            rows: vec![vec![Value::Float(f64::NAN), Value::Int(1)]],
+            read_at: Some(PgLsn(5)),
+        },
+    )
+    .expect("the seed lands")
+    .updates;
+    let Some(subql::AggregateValueChange::Set(subql::AggregateResultValue::Folded(AggValue::Sum(
+        Some(NumericValue::Double(total)),
+    )))) = updates.into_iter().next_back().map(|update| update.change)
+    else {
+        panic!("a seeded sum reports a double")
+    };
+    assert!(
+        total.is_nan(),
+        "measured: PostgreSQL answers NaN, got {total}"
+    );
+}
