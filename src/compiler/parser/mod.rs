@@ -16,7 +16,8 @@ use super::{
     prefilter::build_prefilter_plan,
     sql_shape, BytecodeProgram, Instruction, PredicateHash, PrefilterPlan,
 };
-use crate::backend::{Backend, BuiltinKind, Value};
+use crate::backend::{Backend, ScalarFamily, Value};
+use crate::compiler::bytecode::ComparisonRef;
 use crate::compiler::sql_shape::{AggSpec, QueryProjection};
 use crate::table_resolution::{resolve_table_reference, TableResolutionError};
 use crate::term::CompiledTerm;
@@ -40,14 +41,31 @@ use sqlparser_canonicalize::Canonicalizer;
 struct Compiling<B: Backend> {
     out: Vec<Instruction<B>>,
     terms: Vec<CompiledTerm>,
+    /// Comparison facts interned as they are needed, addressed by
+    /// [`crate::compiler::bytecode::ComparisonRef`] index.
+    comparisons: Vec<crate::backend::ColumnComparisonOf<B>>,
+    /// MySQL's `div_precision_increment` as the deployment declared it, or
+    /// `None` when it did not. Only an engine whose `/` answers a decimal
+    /// reads it, and that engine refuses the operator without it.
+    increment: Option<crate::backend::DivisionPrecisionIncrement>,
 }
 
 impl<B: Backend> Compiling<B> {
-    const fn new() -> Self {
+    const fn new(increment: Option<crate::backend::DivisionPrecisionIncrement>) -> Self {
         Self {
             out: Vec::new(),
             terms: Vec::new(),
+            comparisons: Vec::new(),
+            increment,
         }
+    }
+
+    /// The [`Quotient`](crate::compiler::bytecode::Quotient) a `/` compiles
+    /// to under this backend, or the refusal when its rule needs a setting
+    /// this engine was not given.
+    fn quotient(&self) -> Result<crate::compiler::bytecode::Quotient, RegisterError> {
+        crate::compiler::bytecode::Quotient::resolve::<B>(self.increment)
+            .map_err(RegisterError::NotServedInProcess)
     }
 
     /// The slot for `expr`, assigning the next one if this term is new.
@@ -76,6 +94,150 @@ impl<B: Backend> Compiling<B> {
             expr: expr.clone(),
         });
         Ok(slot)
+    }
+
+    /// The slot holding `expr`'s comparison facts, interning them on first
+    /// use, or `None` when `expr` names no single column or the catalog
+    /// cannot classify it.
+    ///
+    /// Facts are deduplicated by value: two columns declaring the same type
+    /// and collation compare the same way, so they share a slot.
+    fn intern_comparison<DB: DatabaseLike>(
+        &mut self,
+        expr: &Expr,
+        table_id: TableId,
+        database: &DB,
+    ) -> Option<u16> {
+        let column = crate::compiler::literals::resolve_column_ref(expr, table_id, database)?;
+        let facts = crate::catalog_helpers::column_comparison::<B, DB>(database, table_id, column)?;
+        if let Some(slot) = self.comparisons.iter().position(|held| *held == facts) {
+            return u16::try_from(slot).ok();
+        }
+        let slot = u16::try_from(self.comparisons.len()).ok()?;
+        self.comparisons.push(facts);
+        Some(slot)
+    }
+
+    /// The facts of both operands of one comparison, with its text rule
+    /// resolved for `operation`, or the refusal that sends the statement
+    /// to a database read.
+    ///
+    /// Two reasons a comparison cannot be answered in process, both
+    /// resolved here so the decision is taken once, at registration:
+    ///
+    /// * The operand kind has no order this build reproduces. `jsonb` is
+    ///   that kind: PostgreSQL's order over it is not the order of the
+    ///   canonical binary form. Its equality is fine, being equivalence of
+    ///   that form.
+    /// * The operands' collations describe a text comparison this build
+    ///   cannot reproduce, which the backend decides per operation. A
+    ///   locale ordering and a case-insensitive equality are both in that
+    ///   set, and answering them by byte would answer wrongly.
+    fn comparison_for<DB: DatabaseLike>(
+        &mut self,
+        left: &Expr,
+        right: &Expr,
+        table_id: TableId,
+        database: &DB,
+        operation: crate::backend::TextOperation,
+    ) -> Result<ComparisonRef, RegisterError> {
+        use crate::backend::TextOperation;
+
+        let mut text_column = None;
+        let mut columns = alloc::vec::Vec::with_capacity(2);
+        for side in [left, right] {
+            let Some(column) =
+                crate::compiler::literals::resolve_column_ref(side, table_id, database)
+            else {
+                continue;
+            };
+            let kind = crate::catalog_helpers::column_scalar_family(database, table_id, column);
+            columns.push((column, kind));
+            match kind {
+                Some(crate::backend::ScalarFamily::Jsonb)
+                    if operation == TextOperation::Ordering =>
+                {
+                    return Err(RegisterError::NotServedInProcess(
+                        crate::errors::Refusal::OrderNotReproducible {
+                            column,
+                            kind: crate::backend::ScalarFamily::Jsonb,
+                        },
+                    ));
+                }
+                Some(crate::backend::ScalarFamily::String) => text_column = Some(column),
+                _ => {}
+            }
+        }
+
+        // Two columns of different kinds: served only where this backend
+        // has a widening for the pair. Nothing coerces silently, because a
+        // coercion the engine does not perform is a wrong answer, and the
+        // engines differ on which pairs they widen and how.
+        if let [(left_column, Some(left_kind)), (right_column, Some(right_kind))] = columns[..] {
+            if left_kind != right_kind && B::numeric_widening(left_kind, right_kind).is_none() {
+                return Err(RegisterError::NotServedInProcess(
+                    crate::errors::Refusal::CrossKindComparison {
+                        left: left_column,
+                        left_kind,
+                        right: right_column,
+                        right_kind,
+                    },
+                ));
+            }
+        }
+
+        let reference = ComparisonRef::new(
+            self.intern_comparison(left, table_id, database),
+            self.intern_comparison(right, table_id, database),
+        );
+        let Some(column) = text_column else {
+            return Ok(reference);
+        };
+
+        let context = crate::backend::ComparisonContext {
+            left: reference
+                .left
+                .and_then(|slot| self.comparisons.get(usize::from(slot))),
+            right: reference
+                .right
+                .and_then(|slot| self.comparisons.get(usize::from(slot))),
+            // The rule is what this call resolves; it is not an input.
+            text: None,
+        };
+        let rule = match B::text_rule(&context, operation) {
+            crate::backend::TextResolution::Rule(rule) => rule,
+            // The engine will not run the statement, so neither an
+            // in-process answer nor a read produces one. Reporting this
+            // as not-served would promise a read that raises.
+            crate::backend::TextResolution::Refused { reason } => {
+                return Err(RegisterError::RefusedByEngine {
+                    engine: core::any::type_name::<B>(),
+                    reason: reason.to_string(),
+                });
+            }
+            crate::backend::TextResolution::NeedsRead => {
+                // The named collation, when a side has one to name. No
+                // `expect` here: a text column whose facts were never
+                // interned is a refusal like any other, and panicking in
+                // `register` would be worse than the refusal it sits
+                // beside.
+                let collation = reference
+                    .left
+                    .or(reference.right)
+                    .and_then(|slot| self.comparisons.get(usize::from(slot)))
+                    .and_then(|facts| match &facts.collation {
+                        crate::backend::CollationFacts::Named { name, .. } => {
+                            Some(name.name.clone())
+                        }
+                        crate::backend::CollationFacts::DatabaseDefault
+                        | crate::backend::CollationFacts::Unknown => None,
+                    });
+                return Err(RegisterError::NotServedInProcess(
+                    crate::errors::Refusal::CollationNotReproducible { column, collation },
+                ));
+            }
+        };
+        Ok(reference.with_text(Some(rule)))
     }
 }
 
@@ -234,7 +396,7 @@ where
     B: Backend + SqlLiteralParse,
     DB: DatabaseLike,
 {
-    parse_compile_normalize_and_prefilter_with_binds(sql, dialect, database, &[])
+    parse_compile_normalize_and_prefilter_with_binds(sql, dialect, database, &[], None)
 }
 
 /// Like [`parse_compile_normalize_and_prefilter`], but first resolves `$N`/`?`
@@ -248,6 +410,7 @@ pub fn parse_compile_normalize_and_prefilter_with_binds<B, DB>(
     dialect: &B::Dialect,
     database: &DB,
     binds: &[Value<B>],
+    increment: Option<crate::backend::DivisionPrecisionIncrement>,
 ) -> Result<CompiledQuery<B>, RegisterError>
 where
     B: Backend + SqlLiteralParse,
@@ -263,6 +426,7 @@ where
                 pq.table_id,
                 database,
                 &Canonicalizer::new(dialect as &dyn Dialect),
+                increment,
             )?
         } else {
             // No WHERE clause matches every row. Feed the bare `true` literal
@@ -270,9 +434,9 @@ where
             // so the VM sees a Tri-typed result at TOS.
             let mut instructions = alloc::vec![Instruction::PushLiteral(B::parse_literal(
                 &SqlValue::Boolean(true),
-                BuiltinKind::Bool.into(),
+                ScalarFamily::Bool.into(),
             )?)];
-            wrap_bare_value_as_tri::<B>(&mut instructions)?;
+            wrap_bare_value_as_tri::<B>(&mut instructions, ComparisonRef::NONE)?;
             (BytecodeProgram::new(instructions), Vec::new())
         };
 
@@ -319,6 +483,7 @@ pub(crate) fn parse_table_and_where_deps<B, DB>(
     dialect: &B::Dialect,
     database: &DB,
     binds: &[Value<B>],
+    increment: Option<crate::backend::DivisionPrecisionIncrement>,
 ) -> Result<TableAndWhereDeps<B>, RegisterError>
 where
     B: Backend + SqlLiteralParse,
@@ -334,6 +499,7 @@ where
             table_id,
             database,
             &Canonicalizer::new(dialect as &dyn Dialect),
+            increment,
         )?;
         // This path serves the queries the engine itself rejects, which are the
         // scalar aggregates. One in-process accumulator is shared by every
@@ -355,9 +521,9 @@ where
         // so the VM sees a Tri-typed result at TOS.
         let mut instructions = alloc::vec![Instruction::PushLiteral(B::parse_literal(
             &SqlValue::Boolean(true),
-            BuiltinKind::Bool.into(),
+            ScalarFamily::Bool.into(),
         )?)];
-        wrap_bare_value_as_tri::<B>(&mut instructions)?;
+        wrap_bare_value_as_tri::<B>(&mut instructions, ComparisonRef::NONE)?;
         BytecodeProgram::new(instructions)
     };
     let where_dependency_columns = where_program.dependency_columns.clone();
@@ -667,7 +833,7 @@ mod tests {
     //! here yet. These pin the `Value::Bytes` placeholder path added
     //! alongside the existing `SqlLiteralParse::parse_literal` decode leg.
     use super::{value_to_sql_value, SqlLiteralParse};
-    use crate::backend::{Backend, BuiltinKind, MySql, Postgres, SQLite, Value};
+    use crate::backend::{Backend, MySql, Postgres, SQLite, ScalarFamily, Value};
     use crate::RegisterError;
     use alloc::vec::Vec;
     use sqlparser::ast::Value as SqlValue;
@@ -683,7 +849,7 @@ mod tests {
         let value = Value::<B>::Bytes(B::Bytes::from(bytes.clone()));
         let sql = value_to_sql_value(&value).unwrap();
         assert!(matches!(sql, SqlValue::HexStringLiteral(_)));
-        let decoded = B::parse_literal(&sql, BuiltinKind::Bytes.into()).unwrap();
+        let decoded = B::parse_literal(&sql, ScalarFamily::Bytes.into()).unwrap();
         assert_eq!(decoded, Value::<B>::Bytes(B::Bytes::from(bytes)));
     }
 

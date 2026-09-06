@@ -7,6 +7,7 @@
 extern crate alloc;
 
 // Re-export public API
+pub use compiler::vm::refusal::EvaluationRefusal;
 pub use compiler::{AggHaving, AggSpec, HavingFunction, HavingOp, HavingSubject, QueryProjection};
 pub use errors::*;
 #[cfg(feature = "pg-sqlite-emu")]
@@ -14,7 +15,7 @@ pub use pg_sqlite_emu::{PgSqliteEmuError, PgSqliteEmuSource};
 #[cfg(feature = "pg-streaming")]
 pub use polling::{PollingPgCdcConfig, PollingPgCdcError, PollingPgCdcSource};
 pub use runtime::aggregate::{
-    DEFAULT_MAX_CHANGES_DURING_AGGREGATE_READ, DEFAULT_MAX_GROUPS_PER_AGGREGATE,
+    AggKind, DEFAULT_MAX_CHANGES_DURING_AGGREGATE_READ, DEFAULT_MAX_GROUPS_PER_AGGREGATE,
 };
 pub use runtime::SubscriptionEngine;
 #[cfg(feature = "sqlite-cdc")]
@@ -124,6 +125,15 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 ///
 /// [`TransitionError::IncompletePreviousImage`](crate::visibility::transition::TransitionError::IncompletePreviousImage)
 /// is the per-event counterpart, for a table altered after this ran.
+///
+/// This audit does not cover an unchanged TOASTed column. PostgreSQL omits
+/// one from a logical replication message whatever the replica identity
+/// is, so `REPLICA IDENTITY FULL` does not restore it and a passing audit
+/// does not mean every cell arrives. Such a cell reads as
+/// [`Value::Missing`](crate::backend::Value::Missing), and the
+/// subscriptions whose predicate read it are reported through
+/// [`ConsumerNotifications::unanswered`](crate::ConsumerNotifications::unanswered)
+/// rather than silently not notified.
 pub const REPLICA_IDENTITY_AUDIT_SQL: &str = "SELECT n.nspname, c.relname, c.relreplident \
      FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
      WHERE c.relkind IN ('r', 'p') \

@@ -46,13 +46,24 @@ pub(crate) mod scalar_value;
 pub(crate) mod scalars_and_backend;
 pub(crate) mod shipped;
 
+pub use crate::compiler::value_cmp::cross_kind_numeric_ordering;
 pub(crate) use cdc_event::ResolvedEvent;
-pub use cdc_event::{decode_cell, encode_value_key, CdcEvent};
+pub use cdc_event::{decode_cell, encode_value_key, CdcEvent, CellPresence};
 pub use row_kind::RowKind;
+pub use scalar_value::at_float4;
+pub use scalar_value::declared_type_of;
+pub use scalar_value::declares_fixed_width_text;
+pub use scalar_value::declares_sixty_four_bit_int;
 pub(crate) use scalar_value::jsonb_payloads_equal;
+pub use scalar_value::single_column_rule;
+pub use scalar_value::widen_i64_to_f64;
 pub use scalar_value::{
-    BuiltinKind, Carried, CustomScalars, GroupKeyCollation, GroupKeyCollationName, GroupKeyColumn,
-    GroupKeyColumnOf, GroupKeyEncoder, NoCustom, NoCustomScalars, ScalarKind, ScalarKindOf, Value,
+    Carried, CollationFacts, CollationName, ColumnComparison, ColumnComparisonOf,
+    ComparisonContext, CustomScalars, DeclaredType, DivisionPrecisionIncrement, DivisionRule,
+    FloatOrder, FloatSumOverflow, FloatWidth, GroupKeyEncoder, IntWidth, MeanRule, NoCustom,
+    NoCustomScalars, NumericWidening, ScalarFamily, ScalarKind, ScalarKindOf, SumRule, TextCase,
+    TextOperation, TextResolution, TextRule, TextWidth, TrailingSpacePadding, TrailingSpaces,
+    Value, ValueKind, ValueKindOf, VarianceSeed,
 };
 pub use scalars_and_backend::{
     Backend, JsonDocument, ScalarCore, ScalarKey, ScalarText, ScalarTruth, SqliteJson,

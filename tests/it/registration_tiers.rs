@@ -78,7 +78,7 @@ fn every_shape_reports_the_tier_that_maintains_it() {
     match scalar {
         Tier::Scalar { column_kind, .. } => assert_eq!(
             column_kind,
-            subql::backend::BuiltinKind::Float,
+            subql::backend::ScalarFamily::Float,
             "the extreme is re-read and decoded as its column's kind"
         ),
         other => panic!("expected a scalar re-read, got {other:?}"),
@@ -228,5 +228,98 @@ fn every_tier_draws_its_identity_from_one_counter() {
         unique.len(),
         ids.len(),
         "six registrations, six identities, got {ids:?}"
+    );
+}
+
+/// A cause a caller can branch on, rather than prose it must parse.
+#[test]
+fn not_served_because_carries_structured_operands() {
+    let catalog = ParserDB::parse::<PostgreSqlDialect>(DDL).expect("parse DDL");
+    let orders = subql::catalog_helpers::table_id(&catalog, "orders").expect("orders is known");
+    let status =
+        subql::catalog_helpers::column_id(&catalog, orders, "status").expect("status column");
+    let mut engine: Engine = SubscriptionEngine::new(catalog, PostgreSqlDialect {});
+    let registered = engine
+        .register(SubscriptionRequest::new(
+            1u64,
+            "SELECT SUM(status) FROM orders WHERE id > 0",
+        ))
+        .expect("the aggregate registers on a read tier");
+
+    let reason = registered
+        .not_served_because
+        .as_ref()
+        .expect("a read tier reports why it is not served in process");
+    assert_eq!(
+        reason,
+        &subql::NotServed::UnfoldableAggregate {
+            column: status,
+            kind: subql::backend::ScalarFamily::String.into(),
+            function: "SUM".to_string(),
+        },
+        "the cause names its column and that column's kind"
+    );
+    assert_eq!(
+        reason.to_string(),
+        format!(
+            "SUM requires a numeric column (Int, Float, or Decimal), \
+             but column {status} has type String"
+        ),
+        "Display keeps rendering the sentence callers log today"
+    );
+}
+
+/// Row security forces a per-consumer read, and the cause names the table.
+#[test]
+fn a_row_security_read_names_its_table() {
+    let catalog = ParserDB::parse::<PostgreSqlDialect>(
+        "CREATE TABLE guarded (id INT PRIMARY KEY, amount INT);\
+         ALTER TABLE guarded ENABLE ROW LEVEL SECURITY;",
+    )
+    .expect("parse DDL");
+    let table = subql::catalog_helpers::table_id(&catalog, "guarded").expect("guarded is known");
+    let mut engine: Engine = SubscriptionEngine::new(catalog, PostgreSqlDialect {});
+    let registered = engine
+        .register(
+            SubscriptionRequest::new(1u64, "SELECT SUM(amount) FROM guarded WHERE id > 0")
+                .database_reads_per_consumer(),
+        )
+        .expect("a per-consumer read registers");
+
+    assert_eq!(
+        registered.not_served_because,
+        Some(subql::NotServed::RowSecurityNeedsPerConsumerRead { table }),
+        "the engine routes on this cause, so it must be typed"
+    );
+    // The cause is what selects the tier: this one reads the whole answer
+    // rather than folding or reading by key.
+    assert!(
+        matches!(&registered.tier, Tier::WholeRows { tables, .. } if tables == &vec![table]),
+        "the row-security cause routes to a whole-rows read, got {:?}",
+        registered.tier
+    );
+}
+
+/// A cause with no structured operands still reports its own words.
+#[test]
+fn an_unsupported_form_reports_its_own_words() {
+    let mut engine = engine();
+    let registered = engine
+        .register(SubscriptionRequest::new(
+            1u64,
+            "SELECT MIN(price) FROM orders WHERE id > 0",
+        ))
+        .expect("the aggregate registers on a read tier");
+    let reason = registered
+        .not_served_because
+        .as_ref()
+        .expect("a read tier reports a reason");
+    assert!(
+        matches!(reason, subql::NotServed::UnsupportedSql(_)),
+        "an unsupported form carries its prose, got {reason:?}"
+    );
+    assert!(
+        reason.to_string().contains("MIN"),
+        "the prose still names the function, got {reason}"
     );
 }

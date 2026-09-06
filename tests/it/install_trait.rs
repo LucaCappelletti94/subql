@@ -4,7 +4,7 @@
 
 use sql_traits::structs::ParserDB;
 use sqlparser::dialect::PostgreSqlDialect;
-use subql::backend::{BuiltinKind, Postgres, Value};
+use subql::backend::{Postgres, ScalarFamily, Value};
 use subql::testing::TestEvent;
 use subql::{
     catalog_helpers, AggValue, AggregateSeedInstall, DefaultIds, Install, InstallError,
@@ -39,7 +39,7 @@ fn scalar_install_returns_the_typed_scalar_update() {
     assert!(matches!(
         registered.tier,
         Tier::Scalar {
-            column_kind: BuiltinKind::Float,
+            column_kind: ScalarFamily::Float,
             ..
         }
     ));
@@ -149,7 +149,9 @@ fn aggregate_seed_install_keeps_its_own_output_and_error_type() {
     assert_eq!(updates.len(), 1);
     assert_eq!(
         updates[0].change,
-        subql::AggregateValueChange::Set(subql::AggregateResultValue::Folded(AggValue::Count(2),))
+        subql::AggregateValueChange::Set(subql::AggregateResultValue::Folded(AggValue::CountStar(
+            2
+        ),))
     );
 }
 
@@ -224,7 +226,9 @@ fn a_seeded_aggregate_updates_without_a_trigger() {
     assert!(output.triggers().is_empty());
     assert_eq!(
         output.aggregate_updates()[0].change,
-        subql::AggregateValueChange::Set(subql::AggregateResultValue::Folded(AggValue::Count(1),))
+        subql::AggregateValueChange::Set(subql::AggregateResultValue::Folded(AggValue::CountStar(
+            1
+        ),))
     );
 }
 

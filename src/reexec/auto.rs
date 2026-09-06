@@ -11,7 +11,7 @@
 
 use super::connector::{Connector, ReExecError};
 use super::engine::{ReExecNotifications, RowDelta, RowsUpdate};
-use crate::backend::{Backend, BuiltinKind, CdcEvent, Value};
+use crate::backend::{Backend, CdcEvent, ScalarFamily, Value};
 use crate::clock::{duration_between, ClockHandle};
 use crate::compiler::literals::SqlLiteralParse;
 #[cfg(test)]
@@ -113,7 +113,7 @@ pub(super) struct ResolveContext<I: IdTypes, B: Backend, A> {
     pub(super) query: super::BoundQuery<B>,
     /// Decode kind for the scalar result. Meaningless for a whole re-read,
     /// which has no single column.
-    pub(super) column_kind: BuiltinKind,
+    pub(super) column_kind: ScalarFamily,
     /// Initial grouped extreme read, present only for that tier.
     pub(super) grouped_bootstrap: Option<crate::AggregateBootstrap<B>>,
     /// Whether resolving means reading one scalar or re-reading every row.
@@ -121,12 +121,10 @@ pub(super) struct ResolveContext<I: IdTypes, B: Backend, A> {
     pub(super) whole_result: bool,
     /// Whether resolving means asking only about the rows that changed.
     pub(super) keyed: bool,
-    /// Whether this is a still-folding in-process aggregate. Such a context
-    /// carries only the auth and session for a possible demotion to a whole
-    /// re-read (an UPDATE without its old row image demotes an ungrouped
-    /// SUM/AVG). The fold itself runs in the engine, so snapshot skips it and
-    /// no read is issued until a demotion sets `whole_result`.
-    pub(super) aggregate: bool,
+    /// Set when the engine, not a read, maintains this subscription, in
+    /// which case the stored query is held for one contingency rather than
+    /// being how the answer is produced. `None` for every read tier.
+    pub(super) in_process: Option<InProcessKind>,
     /// Which re-read the next page belongs to, so a consumer can tell a new
     /// answer from a continuation of the old one.
     pub(super) generation: u64,
@@ -135,6 +133,43 @@ pub(super) struct ResolveContext<I: IdTypes, B: Backend, A> {
     pub(super) session: Option<I::SessionId>,
     /// Per-subscription auth state, passed verbatim to the connector.
     pub(super) auth: A,
+}
+
+impl<I: IdTypes, B: Backend, A> ResolveContext<I, B, A> {
+    /// Whether a snapshot has nothing to prime for this subscription.
+    ///
+    /// One predicate, read by both the sync and the async engine, rather
+    /// than a check spelled once in each. Spelled twice it was spelled
+    /// once: the async engine never had it, and because a
+    /// [`InProcessKind::StreamServedFilter`] context sets `whole_result`,
+    /// the async path reached its whole-result branch and issued a read
+    /// its twin never issues, answering
+    /// [`ReExecError::Cursor`](super::ReExecError::Cursor) where the sync
+    /// engine answers `Ok(None)`.
+    ///
+    /// The retained query answers a report, not a snapshot: it exists for
+    /// the one case the stream cannot answer, a cell the event did not
+    /// carry.
+    pub(super) fn stream_answers_the_filter(&self) -> bool {
+        self.in_process == Some(InProcessKind::StreamServedFilter)
+    }
+}
+
+/// Why an in-process subscription holds a resolve context at all, since
+/// neither kind is resolved by a read while it stays in process.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum InProcessKind {
+    /// A still-folding aggregate, keeping the auth and session for a
+    /// possible demotion to a whole re-read: an update without its old row
+    /// image demotes an ungrouped `SUM`/`AVG`. The fold runs in the engine,
+    /// so snapshot skips it and no read is issued until a demotion sets
+    /// `whole_result`.
+    FoldingAggregate,
+    /// A row filter the stream answers, keeping its own query for the one
+    /// case the stream cannot answer: a cell the event did not carry. That
+    /// is a report-driven read, not a snapshot, so priming such a
+    /// subscription from the database still reads nothing.
+    StreamServedFilter,
 }
 
 /// Connector execution mode used by [`AutoResolvingEngine`].
@@ -375,21 +410,21 @@ where
                         .kinds
                         .get(bootstrap.group_columns)
                         .copied()
-                        .unwrap_or(BuiltinKind::String);
+                        .unwrap_or(ScalarFamily::String);
                     context.grouped_bootstrap = Some(bootstrap.clone());
                     context.whole_result = false;
                     context.keyed = false;
                 }
                 Tier::KeyedRows { query, .. } => {
                     context.query = query.clone();
-                    context.column_kind = BuiltinKind::String;
+                    context.column_kind = ScalarFamily::String;
                     context.whole_result = false;
                     context.keyed = true;
                     context.grouped_bootstrap = None;
                 }
                 Tier::WholeRows { query, .. } => {
                     context.query = query.clone();
-                    context.column_kind = BuiltinKind::String;
+                    context.column_kind = ScalarFamily::String;
                     context.whole_result = true;
                     context.keyed = false;
                     context.grouped_bootstrap = None;
@@ -547,6 +582,7 @@ where
         for trigger in triggers {
             self.enqueue_read(trigger);
         }
+        self.enqueue_unanswered(&engine, event);
         Ok(ReExecNotifications {
             engine,
             aggregate_updates,
@@ -556,6 +592,28 @@ where
             triggers: Vec::new(),
             transitions,
         })
+    }
+
+    /// Queue a read for every subscription the event could not answer.
+    ///
+    /// The core reports these and stops there: it holds no connector, so a
+    /// cell the stream did not carry leaves it with no answer to give. Here
+    /// the query is retained and the connector is owned, so the report
+    /// becomes the read that answers it, deduplicated and debounced like
+    /// every other discovered read.
+    fn enqueue_unanswered(
+        &mut self,
+        notifications: &crate::ConsumerNotifications<I, E::Checkpoint, E::Backend>,
+        event: &E,
+    ) {
+        for entry in notifications.unanswered() {
+            self.enqueue_read(super::ReExecutionTrigger {
+                subscription_id: entry.subscription_id,
+                consumer_id: entry.consumer_id,
+                read: super::ReExecutionRead::Subscription,
+                checkpoint: event.checkpoint(),
+            });
+        }
     }
 
     /// Register a subscription. `auth` is stored alongside the captured
@@ -577,6 +635,10 @@ where
             SubscriptionScope::Session(s) => Some(s),
             SubscriptionScope::Durable => None,
         };
+        // Retained before the spec is consumed, for the one case that needs
+        // it: an in-process filter the stream later cannot answer, whose
+        // report has to become a read. Nothing reads it per event.
+        let source_query = crate::reexec::BoundQuery::new(spec.sql.clone(), spec.binds.clone());
         let result = self
             .inner
             .register_request(spec, database_reads_per_consumer)?;
@@ -590,7 +652,7 @@ where
                         grouped_bootstrap: None,
                         whole_result: false,
                         keyed: false,
-                        aggregate: false,
+                        in_process: None,
                         generation: 0,
                         session,
                         auth,
@@ -606,11 +668,11 @@ where
                             .kinds
                             .get(bootstrap.group_columns)
                             .copied()
-                            .unwrap_or(BuiltinKind::String),
+                            .unwrap_or(ScalarFamily::String),
                         grouped_bootstrap: Some(bootstrap.clone()),
                         whole_result: false,
                         keyed: false,
-                        aggregate: false,
+                        in_process: None,
                         generation: 0,
                         session,
                         auth,
@@ -624,7 +686,7 @@ where
                         query: query.clone(),
                         // No single column to decode: the rows carry their own
                         // shape, which is why `RowPage` reports column names.
-                        column_kind: BuiltinKind::String,
+                        column_kind: ScalarFamily::String,
                         grouped_bootstrap: None,
                         // The tier decides which read serves a change, so it
                         // comes from the registration rather than a default.
@@ -634,7 +696,7 @@ where
                         // so.
                         whole_result: matches!(result.tier, Tier::WholeRows { .. }),
                         keyed: matches!(result.tier, Tier::KeyedRows { .. }),
-                        aggregate: false,
+                        in_process: None,
                         generation: 0,
                         session,
                         auth,
@@ -645,24 +707,37 @@ where
                 // A still-folding in-process aggregate keeps only its auth and
                 // session, so a later demotion to a whole re-read resolves with
                 // the caller's own auth. The fold runs in the engine; nothing is
-                // read here. A plain row subscription (no bootstrap) stores
-                // nothing, as before.
-                if let Some(bootstrap) = &served.aggregate_bootstrap {
-                    self.contexts.insert(
-                        result.subscription_id,
-                        ResolveContext {
-                            query: bootstrap.query.clone(),
-                            column_kind: BuiltinKind::String,
-                            grouped_bootstrap: None,
-                            whole_result: false,
-                            keyed: false,
-                            aggregate: true,
-                            generation: 0,
-                            session,
-                            auth,
-                        },
-                    );
-                }
+                // read here.
+                //
+                // A plain row filter keeps its own query as a whole read. It
+                // is never executed while the stream can answer the filter,
+                // and exists for the case where the stream cannot: a cell the
+                // event did not carry has no answer in memory, and the read is
+                // the only way to give the subscriber one.
+                let (query, whole_result, kind) = served.aggregate_bootstrap.as_ref().map_or(
+                    (source_query, true, InProcessKind::StreamServedFilter),
+                    |bootstrap| {
+                        (
+                            bootstrap.query.clone(),
+                            false,
+                            InProcessKind::FoldingAggregate,
+                        )
+                    },
+                );
+                self.contexts.insert(
+                    result.subscription_id,
+                    ResolveContext {
+                        query,
+                        column_kind: ScalarFamily::String,
+                        grouped_bootstrap: None,
+                        whole_result,
+                        keyed: false,
+                        in_process: Some(kind),
+                        generation: 0,
+                        session,
+                        auth,
+                    },
+                );
             }
         }
         Ok(result)
@@ -722,9 +797,9 @@ where
         }
         let removed = self.inner.unregister_subscription(subscription_id);
         if removed {
-            // Drop an in-process aggregate's stored context (auth for a
-            // possible demotion) and any queued read. A plain row
-            // subscription has neither and this is a no-op.
+            // Drop the stored context and any queued read: an in-process
+            // aggregate's auth for a possible demotion, or a row filter's
+            // retained query for a report the stream could not answer.
             self.contexts.remove(&subscription_id);
             self.purge_unregistered_reads();
         }
@@ -926,6 +1001,10 @@ where
         let Some(context) = self.contexts.get(&subscription_id) else {
             return Ok(None);
         };
+        // A subscription the stream maintains has nothing to prime.
+        if context.stream_answers_the_filter() {
+            return Ok(None);
+        }
         let grouped_bootstrap = context.grouped_bootstrap.clone();
         if let Some(bootstrap) = grouped_bootstrap {
             let (_, mut rows, checkpoint) = self.read_whole(&context.query, subscription_id)?;
@@ -992,7 +1071,7 @@ where
         // A still-folding in-process aggregate is seeded through Install, not
         // read here. After a demotion the context is `whole_result` and handled
         // above, so this only fires before any demotion.
-        if context.aggregate {
+        if context.in_process == Some(InProcessKind::FoldingAggregate) {
             return Ok(None);
         }
         let (value, checkpoint) = self
@@ -1235,7 +1314,7 @@ where
         subscription_id: SubscriptionId,
         group: &[u8],
         query: &super::BoundQuery<E::Backend>,
-        _column_kinds: [BuiltinKind; 2],
+        _column_kinds: [ScalarFamily; 2],
         checkpoint: Option<E::Checkpoint>,
     ) -> Result<
         crate::AggregateMaintenanceOutput<I, E::Backend, E::Checkpoint>,
@@ -1253,19 +1332,7 @@ where
                 subscription: subscription_id,
                 error,
             })?;
-        if snapshot.value.more || snapshot.value.rows.len() != 1 {
-            return Err(crate::AggregateInstallError::RowCount {
-                subscription: subscription_id,
-                rows: snapshot.value.rows.len(),
-            }
-            .into());
-        }
-        let row = snapshot
-            .value
-            .rows
-            .into_iter()
-            .next()
-            .expect("the row count was checked");
+        let row = one_grouped_row(subscription_id, snapshot.value)?;
         crate::Install::install(
             &mut self.inner,
             subscription_id,
@@ -1364,10 +1431,6 @@ where
         let Some(mut page_sql) = render(scoped, batch)? else {
             return Ok(());
         };
-        // Accumulated across pages, not per page. Resetting it would let a key
-        // answered on an earlier page back into the next statement, which
-        // delivers it twice and, with a stable row order, never terminates:
-        // the remaining sets oscillate between the halves of the batch.
         let mut seen: SeenKeys<E::Backend> = SeenKeys::new();
         loop {
             let page = self
@@ -1382,36 +1445,17 @@ where
                     subscription: subscription_id,
                     error,
                 })?;
-            if columns.is_empty() {
-                columns.clone_from(&page.value.columns);
-            }
-            let before = seen.recorded();
-            for row in page.value.rows {
-                let key: Vec<Value<E::Backend>> = key_positions
-                    .iter()
-                    .filter_map(|i| row.get(*i).cloned())
-                    .collect();
-                seen.record(&key);
-                present.push((key, row));
-            }
-            // A page with no rows ends the read whatever it claims about there
-            // being more. Our own reader cannot report that combination, but
-            // this trait has outside implementors, and without this a connector
-            // that did would loop here forever.
-            if !page.value.more || seen.recorded() == before {
-                return Ok(());
-            }
-            // Resume within the batch, excluding the keys already returned, so
-            // the statement stays bounded by the batch. `seen` accumulates
-            // across pages, so `remaining` strictly shrinks and the loop ends.
-            let remaining: Vec<Vec<Value<E::Backend>>> = batch
-                .iter()
-                .filter(|k| !seen.contains(k))
-                .cloned()
-                .collect();
-            if remaining.is_empty() {
-                return Ok(());
-            }
+            let remaining = match absorb_keyed_page(
+                page.value,
+                batch,
+                key_positions,
+                columns,
+                &mut seen,
+                present,
+            ) {
+                KeyedPage::Answered => return Ok(()),
+                KeyedPage::Resume(remaining) => remaining,
+            };
             match render(scoped, &remaining)? {
                 Some(next) => page_sql = next,
                 None => return Ok(()),
@@ -1420,14 +1464,108 @@ where
     }
 }
 
+/// What a keyed batch read does after one page.
+///
+/// Named rather than returned as a bare `Option`, because both outcomes
+/// are ordinary and the empty one is not a failure: a batch whose keys
+/// all came back is answered.
+pub(super) enum KeyedPage<B: Backend> {
+    /// This batch is answered. Stop reading it.
+    Answered,
+    /// Read this batch again for the keys that have not come back.
+    Resume(Vec<Vec<Value<B>>>),
+}
+
+/// Absorb one page of a keyed batch read, and say whether to read again.
+///
+/// Shared by both engines, which differ only in how they obtain the page:
+/// the synchronous one calls `read_page`, the asynchronous one awaits it.
+/// Everything after that is this function, and it holds no borrow of
+/// either engine, so neither has to change shape to use it.
+///
+/// Three rules live here, and each was written twice before:
+///
+/// - `seen` accumulates across pages, never per page. Resetting it would
+///   let a key answered on an earlier page back into the next statement,
+///   which delivers it twice and, with a stable row order, never
+///   terminates: the remaining sets oscillate between the halves of the
+///   batch.
+/// - A page with no new keys ends the read whatever it claims about
+///   there being more. This crate's own readers cannot report that
+///   combination, but the connector trait has outside implementors, and
+///   without this a connector that did would loop forever.
+/// - Resumption is inside the batch, so the statement stays bounded by
+///   it. Because `seen` accumulates, the remaining set strictly shrinks
+///   and the loop ends.
+pub(super) fn absorb_keyed_page<B: Backend>(
+    page: super::RowPage<B>,
+    batch: &[Vec<Value<B>>],
+    key_positions: &[usize],
+    columns: &mut Vec<String>,
+    seen: &mut SeenKeys<B>,
+    present: &mut Vec<(Vec<Value<B>>, Vec<Value<B>>)>,
+) -> KeyedPage<B> {
+    if columns.is_empty() {
+        columns.clone_from(&page.columns);
+    }
+    let before = seen.recorded();
+    for row in page.rows {
+        let key: Vec<Value<B>> = key_positions
+            .iter()
+            .filter_map(|position| row.get(*position).cloned())
+            .collect();
+        seen.record(&key);
+        present.push((key, row));
+    }
+    if !page.more || seen.recorded() == before {
+        return KeyedPage::Answered;
+    }
+    let remaining: Vec<Vec<Value<B>>> = batch
+        .iter()
+        .filter(|key| !seen.contains(key))
+        .cloned()
+        .collect();
+    if remaining.is_empty() {
+        return KeyedPage::Answered;
+    }
+    KeyedPage::Resume(remaining)
+}
+
+/// The one row a grouped scalar read has to answer with.
+///
+/// # Errors
+///
+/// [`crate::AggregateInstallError::RowCount`] when the read answered
+/// anything else. A grouped scalar reads one group's aggregate, so more
+/// than one row, no row, or a first page that claims a second all mean
+/// the statement was not the one this tier thinks it sent, and guessing
+/// which row to install would install an aggregate for the wrong group.
+pub(super) fn one_grouped_row<B: Backend, Err>(
+    subscription: SubscriptionId,
+    page: super::RowPage<B>,
+) -> Result<Vec<Value<B>>, ReExecError<Err>> {
+    if page.more || page.rows.len() != 1 {
+        return Err(crate::AggregateInstallError::RowCount {
+            subscription,
+            rows: page.rows.len(),
+        }
+        .into());
+    }
+    Ok(page
+        .rows
+        .into_iter()
+        .next()
+        .expect("the row count was just checked"))
+}
+
 pub(super) fn decode_grouped_seed_rows<B: Backend>(
     rows: &mut [Vec<Value<B>>],
-    kinds: &[BuiltinKind],
+    kinds: &[ScalarFamily],
 ) {
     for row in rows {
         for (value, kind) in row.iter_mut().zip(kinds) {
             let raw = core::mem::replace(value, Value::Missing);
-            *value = B::decode_group_value(crate::backend::ScalarKind::from(*kind), raw)
+            *value = B::decode_group_value(crate::backend::ValueKind::from(*kind), raw)
                 .unwrap_or(Value::Missing);
         }
     }
@@ -1718,6 +1856,9 @@ where
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
+    use super::super::test_fixtures::{
+        catalog, delete_event, insert_event, row, update_status_only,
+    };
     use super::*;
     use crate::backend::Postgres;
     use crate::testing::TestEvent;
@@ -1727,18 +1868,11 @@ mod tests {
     use sql_traits::structs::ParserDB;
     use sqlparser::dialect::PostgreSqlDialect;
 
-    fn catalog() -> ParserDB {
-        ParserDB::parse::<PostgreSqlDialect>(
-            "CREATE TABLE orders (id INT PRIMARY KEY, price FLOAT, quantity INT, status TEXT);",
-        )
-        .unwrap()
-    }
-
     /// Records every call and serves a programmed value queue. Errors are
     /// modeled by leaving the queue empty when `panic_on_empty` is false.
     struct MockConnector {
         values: RefCell<alloc::vec::Vec<Value<Postgres>>>,
-        calls: RefCell<alloc::vec::Vec<(String, BuiltinKind)>>,
+        calls: RefCell<alloc::vec::Vec<(String, ScalarFamily)>>,
         scalar_queries: RefCell<alloc::vec::Vec<super::super::ReadQuery<'static, Postgres>>>,
         page_queries: RefCell<alloc::vec::Vec<super::super::ReadQuery<'static, Postgres>>>,
         cursor_queries: RefCell<alloc::vec::Vec<super::super::ReadQuery<'static, Postgres>>>,
@@ -1748,6 +1882,13 @@ mod tests {
         /// Pages `read_page` serves, popped from the back like `values`.
         /// Empty keeps the historic refusal, which the scalar tests rely on.
         pages: RefCell<alloc::vec::Vec<super::super::RowPage<Postgres>>>,
+        /// Which `fetch_cursor` call fails, zero-based, if any. The async
+        /// mock suspends at a fetch to model an abandoned read; the sync
+        /// path has no suspension, so a read is left part way by a fetch
+        /// that raises.
+        fail_fetch_at: RefCell<Option<usize>>,
+        /// How many times `fetch_cursor` has been called.
+        fetches: RefCell<usize>,
         /// Interleaving log shared with the test's sink.
         log: alloc::rc::Rc<RefCell<alloc::vec::Vec<&'static str>>>,
     }
@@ -1762,6 +1903,8 @@ mod tests {
                 cursor_queries: RefCell::new(alloc::vec::Vec::new()),
                 cursor_pages: RefCell::new(alloc::vec::Vec::new()),
                 pages: RefCell::new(alloc::vec::Vec::new()),
+                fail_fetch_at: RefCell::new(None),
+                fetches: RefCell::new(0),
                 log: alloc::rc::Rc::new(RefCell::new(alloc::vec::Vec::new())),
             }
         }
@@ -1791,7 +1934,7 @@ mod tests {
         fn execute_scalar(
             &self,
             query: &super::super::ReadQuery<'_, Postgres>,
-            column_kind: BuiltinKind,
+            column_kind: ScalarFamily,
             _auth: &(),
         ) -> Result<(Value<Postgres>, Option<Self::Checkpoint>), Self::Error> {
             self.calls
@@ -1860,6 +2003,11 @@ mod tests {
             super::super::CursorError<Self::Error>,
         > {
             self.log.borrow_mut().push("fetch");
+            let fetch = *self.fetches.borrow();
+            *self.fetches.borrow_mut() = fetch + 1;
+            if *self.fail_fetch_at.borrow() == Some(fetch) {
+                return Err(super::super::CursorError::Unsupported);
+            }
             let page = self.cursor_pages.borrow_mut().remove(0);
             Ok(super::super::connector::Snapshot {
                 value: page,
@@ -1884,30 +2032,6 @@ mod tests {
         fn into_request(self) -> SubscriptionRequest<DefaultIds, Postgres> {
             self.0
         }
-    }
-
-    /// orders columns: id=0, price=1, quantity=2, status=3.
-    fn row(id: i64, price: f64) -> Vec<Value<Postgres>> {
-        alloc::vec![
-            Value::Int(id),
-            Value::Float(price),
-            Value::Int(1),
-            Value::String("paid".into()),
-        ]
-    }
-
-    fn insert_event(table_id: TableId, id: i64, price: f64) -> TestEvent<Postgres> {
-        TestEvent::<Postgres>::insert(table_id, row(id, price)).with_pk_columns([0u16])
-    }
-
-    fn delete_event(table_id: TableId, id: i64, price: f64) -> TestEvent<Postgres> {
-        TestEvent::<Postgres>::delete(table_id, row(id, price)).with_pk_columns([0u16])
-    }
-
-    fn update_status_only(table_id: TableId, id: i64, price: f64) -> TestEvent<Postgres> {
-        TestEvent::<Postgres>::update(table_id, row(id, price), row(id, price))
-            .with_pk_columns([0u16])
-            .with_changed_columns([3u16])
     }
 
     fn engine_with_values(
@@ -1977,7 +2101,7 @@ mod tests {
         assert_eq!(e.connector().call_count(), 1);
         let (sql, kind) = e.connector().calls.borrow()[0].clone();
         assert!(sql.contains("MIN"));
-        assert_eq!(kind, BuiltinKind::Float);
+        assert_eq!(kind, ScalarFamily::Float);
     }
 
     #[test]
@@ -2181,6 +2305,45 @@ mod tests {
             "SELECT * FROM orders WHERE (lower(status) = $1) AND \"id\" IN (1)"
         );
         assert_eq!(queries[0].binds(), &[Value::String("paid".into())]);
+    }
+
+    /// A keyed read asks about the row the event says is its own.
+    ///
+    /// The key is built from the columns the event declares as its
+    /// primary key, in `KeyedQuery::on_event`, so a declaration naming
+    /// the wrong column asks the database about the wrong row. Two
+    /// inserts are used rather than one, and their ids differ, because
+    /// one insert cannot tell a correct declaration from one naming a
+    /// column that happens to hold the same value in every fixture row:
+    /// `quantity` is always 1 here, so pointing the key at it collapses
+    /// both rows onto a single key and the read asks about half of what
+    /// changed.
+    ///
+    /// The delete path was already covered by
+    /// `sync_keyed_event_scopes_registration_binds`. This is the insert
+    /// path, which nothing depended on: pointing the shared fixture's
+    /// insert at another column reddened no test in the suite.
+    #[test]
+    fn sync_keyed_insert_asks_about_the_declared_key() {
+        let (mut engine, table) = engine_with_values(alloc::vec![]);
+        engine
+            .register(
+                SubscriptionRequest::new(1u64, "SELECT * FROM orders WHERE lower(status) = 'paid'"),
+                (),
+            )
+            .expect("keyed read registers");
+
+        engine.apply(&insert_event(table, 1, 5.0)).unwrap();
+        engine.apply(&insert_event(table, 2, 6.0)).unwrap();
+        let _ = engine.resolve_collect();
+
+        let queries = engine.connector().page_queries.borrow();
+        assert_eq!(queries.len(), 1, "both keys are asked in one read");
+        assert_eq!(
+            queries[0].sql(),
+            "SELECT * FROM orders WHERE (lower(status) = 'paid') AND \"id\" IN (1, 2)",
+            "the read names the id column and both ids"
+        );
     }
 
     #[test]
@@ -2817,12 +2980,12 @@ mod tests {
         let first = super::super::ReExecutionRead::GroupedScalar {
             group: vec![1],
             query: super::super::BoundQuery::new(String::new(), Vec::new()),
-            column_kinds: [BuiltinKind::Int, BuiltinKind::Int],
+            column_kinds: [ScalarFamily::Int, ScalarFamily::Int],
         };
         let second = super::super::ReExecutionRead::GroupedScalar {
             group: vec![2],
             query: super::super::BoundQuery::new(String::new(), Vec::new()),
-            column_kinds: [BuiltinKind::Int, BuiltinKind::Int],
+            column_kinds: [ScalarFamily::Int, ScalarFamily::Int],
         };
         engine.stamp_reexec(7, &first);
         assert!(engine.debounce_skip(7, &first));
@@ -3232,7 +3395,7 @@ mod tests {
         );
         assert_eq!(
             n.aggregate_updates[0].folded_value(),
-            Some(crate::AggValue::Count(6)),
+            Some(crate::AggValue::CountStar(6)),
             "the incremented total"
         );
         assert_eq!(
@@ -3276,7 +3439,7 @@ mod tests {
         let last_fold = folds.last();
         assert_eq!(
             last_fold.unwrap().folded_value(),
-            Some(crate::AggValue::Count(7)),
+            Some(crate::AggValue::CountStar(7)),
             "the running total after both inserts"
         );
     }
@@ -3522,7 +3685,7 @@ mod tests {
         assert_eq!(applied.aggregate_updates.len(), 1);
         assert_eq!(
             applied.aggregate_updates[0].folded_value(),
-            Some(crate::AggValue::Count(4)),
+            Some(crate::AggValue::CountStar(4)),
             "the delete folds exactly once, at apply time"
         );
         assert_eq!(e.pending_read_count(), 1, "the displaced MIN queues a read");
@@ -3615,6 +3778,331 @@ mod tests {
             *e.connector().log.borrow(),
             ["open", "fetch", "deliver", "fetch", "deliver", "close"],
             "a page is delivered before the next one is fetched"
+        );
+    }
+
+    /// A whole read that fails part way delivers its retry under a higher
+    /// generation, exactly as the async path does.
+    ///
+    /// The async side has pinned this since it was written
+    /// (`dropped_stream_is_superseded_by_a_higher_generation`), and the
+    /// sync side has carried the same bump since the read tier was added
+    /// without a test naming it. That is the drift this phase is about:
+    /// two copies of one rule, one of them unpinned, so a change to the
+    /// sync copy is caught by nothing. The consumer contract is the same
+    /// on both: a generation with no final page is partial, and a higher
+    /// generation is the signal to discard it.
+    #[test]
+    fn sync_whole_read_bumps_the_generation_like_the_async_path() {
+        let (mut e, tid) = engine_with_values(alloc::vec![]);
+        e.register(
+            SubscriptionRequest::new(1u64, "SELECT DISTINCT status FROM orders"),
+            (),
+        )
+        .expect("whole read registers");
+        e.connector().cursor_pages.borrow_mut().extend([
+            super::super::RowPage {
+                columns: alloc::vec![String::from("status")],
+                rows: alloc::vec![alloc::vec![Value::String("paid".into())]],
+                more: true,
+            },
+            super::super::RowPage {
+                columns: alloc::vec![String::from("status")],
+                rows: alloc::vec![alloc::vec![Value::String("void".into())]],
+                more: false,
+            },
+        ]);
+        e.apply(&insert_event(tid, 1, 5.0)).unwrap();
+
+        // The second fetch raises, so one partial page was delivered and
+        // the generation it carried has no final page.
+        *e.connector().fail_fetch_at.borrow_mut() = Some(1);
+        let partial = alloc::rc::Rc::new(RefCell::new(alloc::vec::Vec::new()));
+        {
+            let partial = alloc::rc::Rc::clone(&partial);
+            let outcome = e.resolve(move |delivery| {
+                if let crate::reexec::ReadDelivery::Rows(page) = delivery {
+                    partial.borrow_mut().push(page.generation);
+                }
+            });
+            assert!(outcome.is_err(), "the read failed part way through");
+        }
+        assert_eq!(partial.borrow().len(), 1, "one partial page was delivered");
+
+        // The retry serves a complete answer under a higher generation.
+        *e.connector().fail_fetch_at.borrow_mut() = None;
+        e.connector()
+            .cursor_pages
+            .borrow_mut()
+            .push(super::super::RowPage {
+                columns: alloc::vec![String::from("status")],
+                rows: alloc::vec![alloc::vec![Value::String("paid".into())]],
+                more: false,
+            });
+        e.apply(&insert_event(tid, 2, 6.0)).unwrap();
+        let retried = e.resolve_collect().expect("the retry reads");
+        assert!(!retried.rows_updates.is_empty(), "the retry delivered rows");
+        let partial_generation = partial.borrow()[0];
+        assert!(
+            retried
+                .rows_updates
+                .iter()
+                .all(|page| page.generation > partial_generation),
+            "the complete answer supersedes the partial generation"
+        );
+        assert!(
+            !retried.rows_updates.last().unwrap().more,
+            "the retry ends its generation"
+        );
+    }
+
+    /// An in-process row subscription whose predicate read a cell the event
+    /// did not carry is re-executed against the database, which is the half
+    /// of the missing-cell work the core cannot do: it holds no connector.
+    ///
+    /// The core reports; the wrapper owns the connector and turns the report
+    /// into a read, which is the same ladder every other unresolvable
+    /// maintenance takes.
+    #[test]
+    fn an_unanswered_cell_is_re_executed_by_the_auto_engine() {
+        let (mut e, tid) = engine_with_values(alloc::vec![]);
+        e.register(
+            SubscriptionRequest::new(1u64, "SELECT * FROM orders WHERE status = 'paid'"),
+            (),
+        )
+        .expect("the filter is served in process");
+        e.connector()
+            .cursor_pages
+            .borrow_mut()
+            .push(super::super::RowPage {
+                columns: alloc::vec![String::from("id"), String::from("status")],
+                rows: alloc::vec![alloc::vec![Value::Int(1), Value::String("paid".into())]],
+                more: false,
+            });
+
+        // The row image omits `status`, which the predicate reads, so the
+        // event cannot answer it: an unchanged TOASTed column arrives this
+        // way.
+        let mut cells = row(1, 5.0);
+        cells[3] = Value::Missing;
+        let event = TestEvent::<Postgres>::update(tid, row(1, 5.0), cells)
+            .with_pk_columns([0u16])
+            .with_changed_columns([1u16]);
+
+        let applied = e.apply(&event).expect("the event applies");
+        assert_eq!(
+            applied.engine.unanswered().len(),
+            1,
+            "the core reports the subscription it could not answer"
+        );
+        assert_eq!(
+            e.pending_read_count(),
+            1,
+            "and the wrapper queues a read for it"
+        );
+
+        let resolved = e.resolve_collect().expect("the read resolves");
+        assert_eq!(
+            resolved.rows_updates.len(),
+            1,
+            "the subscriber is given the answer the database holds"
+        );
+        assert_eq!(
+            resolved.rows_updates[0].subscription_id,
+            applied.engine.unanswered()[0].subscription_id
+        );
+    }
+
+    /// Retaining the query does not make an in-process filter snapshottable.
+    /// The stream is how that answer is produced, so priming it from the
+    /// database was never part of its contract and still reads nothing.
+    #[test]
+    fn a_stream_served_filter_is_not_snapshotted() {
+        let (mut e, _) = engine_with_values(alloc::vec![]);
+        let id = e
+            .register(
+                SubscriptionRequest::new(1u64, "SELECT * FROM orders WHERE status = 'paid'"),
+                (),
+            )
+            .expect("the filter is served in process")
+            .subscription_id;
+
+        assert!(
+            e.snapshot(id).unwrap().is_none(),
+            "the stream answers this subscription, so there is nothing to prime"
+        );
+        assert_eq!(
+            e.connector().call_count(),
+            0,
+            "and no read is issued for it"
+        );
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod shared_read_tests {
+    use super::{absorb_keyed_page, one_grouped_row, KeyedPage, SeenKeys};
+    use crate::backend::Postgres;
+    use crate::backend::Value;
+    use crate::reexec::RowPage;
+    use alloc::string::String;
+    use alloc::vec::Vec;
+
+    /// The subscription these reads belong to. Which one it is does not
+    /// matter here; it only travels into the refusal.
+    const SUBSCRIPTION: crate::SubscriptionId = 1;
+
+    /// One page holding `rows`, each row being one key column and one payload.
+    fn page(rows: &[i64], more: bool) -> RowPage<Postgres> {
+        RowPage {
+            columns: alloc::vec![String::from("id"), String::from("status")],
+            rows: rows
+                .iter()
+                .map(|id| alloc::vec![Value::Int(*id), Value::String("paid".into())])
+                .collect(),
+            more,
+        }
+    }
+
+    /// The keys `ids` name, as a batch.
+    fn batch(ids: &[i64]) -> Vec<Vec<Value<Postgres>>> {
+        ids.iter().map(|id| alloc::vec![Value::Int(*id)]).collect()
+    }
+
+    /// A page that answers every key in the batch ends the read.
+    #[test]
+    fn a_complete_page_answers_the_batch() {
+        let keys = batch(&[1, 2]);
+        let mut columns = Vec::new();
+        let mut seen = SeenKeys::new();
+        let mut present = Vec::new();
+        let outcome = absorb_keyed_page(
+            page(&[1, 2], false),
+            &keys,
+            &[0],
+            &mut columns,
+            &mut seen,
+            &mut present,
+        );
+        assert!(matches!(outcome, KeyedPage::Answered));
+        assert_eq!(present.len(), 2, "both rows were kept");
+        assert_eq!(columns, ["id", "status"], "the column names were adopted");
+    }
+
+    /// A page that claims more and answers some keys resumes on the rest.
+    #[test]
+    fn a_partial_page_resumes_on_the_keys_left() {
+        let keys = batch(&[1, 2, 3]);
+        let mut columns = Vec::new();
+        let mut seen = SeenKeys::new();
+        let mut present = Vec::new();
+        let outcome = absorb_keyed_page(
+            page(&[1], true),
+            &keys,
+            &[0],
+            &mut columns,
+            &mut seen,
+            &mut present,
+        );
+        let KeyedPage::Resume(remaining) = outcome else {
+            panic!("a page claiming more with keys left resumes");
+        };
+        assert_eq!(
+            remaining,
+            batch(&[2, 3]),
+            "only the unanswered keys go back"
+        );
+    }
+
+    /// The remaining set strictly shrinks across pages, which is what ends
+    /// the loop.
+    ///
+    /// `seen` accumulates rather than resetting per page. Resetting it
+    /// would let a key answered on an earlier page back into the next
+    /// statement, which delivers it twice and, with a stable row order,
+    /// never terminates: the remaining sets oscillate between the halves
+    /// of the batch.
+    #[test]
+    fn seen_keys_accumulate_across_pages() {
+        let keys = batch(&[1, 2, 3]);
+        let mut columns = Vec::new();
+        let mut seen = SeenKeys::new();
+        let mut present = Vec::new();
+        let first = absorb_keyed_page(
+            page(&[1], true),
+            &keys,
+            &[0],
+            &mut columns,
+            &mut seen,
+            &mut present,
+        );
+        assert!(matches!(first, KeyedPage::Resume(_)));
+        let second = absorb_keyed_page(
+            page(&[2], true),
+            &keys,
+            &[0],
+            &mut columns,
+            &mut seen,
+            &mut present,
+        );
+        let KeyedPage::Resume(remaining) = second else {
+            panic!("one key is still unanswered");
+        };
+        assert_eq!(
+            remaining,
+            batch(&[3]),
+            "the key answered on the first page does not come back"
+        );
+    }
+
+    /// A page with no new keys ends the read whatever it claims about
+    /// there being more.
+    ///
+    /// This crate's own readers cannot report that combination, but the
+    /// connector trait has outside implementors, and without this rule a
+    /// connector that did would loop forever.
+    #[test]
+    fn a_page_with_no_new_keys_ends_the_read() {
+        let keys = batch(&[1, 2]);
+        let mut columns = Vec::new();
+        let mut seen = SeenKeys::new();
+        let mut present = Vec::new();
+        let outcome = absorb_keyed_page(
+            page(&[], true),
+            &keys,
+            &[0],
+            &mut columns,
+            &mut seen,
+            &mut present,
+        );
+        assert!(
+            matches!(outcome, KeyedPage::Answered),
+            "an empty page that claims more still ends the read"
+        );
+    }
+
+    /// A grouped scalar read answers exactly one row, and anything else is
+    /// refused rather than guessed at.
+    #[test]
+    fn a_grouped_read_takes_exactly_one_row() {
+        let one = one_grouped_row::<Postgres, ()>(SUBSCRIPTION, page(&[7], false));
+        assert_eq!(
+            one.unwrap(),
+            alloc::vec![Value::Int(7), Value::String("paid".into())],
+            "one row is the answer"
+        );
+        assert!(
+            one_grouped_row::<Postgres, ()>(SUBSCRIPTION, page(&[7, 8], false)).is_err(),
+            "two rows are not one group's aggregate"
+        );
+        assert!(
+            one_grouped_row::<Postgres, ()>(SUBSCRIPTION, page(&[], false)).is_err(),
+            "no row is not one group's aggregate either"
+        );
+        assert!(
+            one_grouped_row::<Postgres, ()>(SUBSCRIPTION, page(&[7], true)).is_err(),
+            "a first page claiming a second was not the statement this tier sent"
         );
     }
 }

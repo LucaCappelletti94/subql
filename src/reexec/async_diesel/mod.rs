@@ -40,7 +40,7 @@ use super::connector::LogStatusRow;
 use super::connector::{FloatRow, IntRow, ReadQuery, TextRow};
 #[cfg(feature = "executor-diesel-async-mysql")]
 use super::connector::{ScalarRowError, SessionSetup, Snapshot};
-use crate::backend::{Backend, BuiltinKind, ScalarKind, Value};
+use crate::backend::{Backend, ScalarFamily, Value};
 use alloc::vec::Vec;
 #[cfg(feature = "executor-diesel-async-mysql")]
 use core::future::Future;
@@ -109,10 +109,10 @@ pub enum DieselAsyncError {
 pub(super) async fn load_scalar_postgres_async(
     conn: &mut diesel_async::AsyncPgConnection,
     query: &ReadQuery<'_, crate::backend::Postgres>,
-    kind: BuiltinKind,
+    kind: ScalarFamily,
 ) -> diesel::QueryResult<Value<crate::backend::Postgres>> {
     let value = match kind {
-        BuiltinKind::Int => {
+        ScalarFamily::Int => {
             let sql = alloc::format!("SELECT CAST(({}) AS BIGINT) AS v", query.sql());
             let query = ReadQuery::borrowed(&sql, query.binds());
             boxed_postgres_read_query_owned(&query)?
@@ -121,7 +121,7 @@ pub(super) async fn load_scalar_postgres_async(
                 .v
                 .map_or(Value::Null, Value::Int)
         }
-        BuiltinKind::Float => boxed_postgres_read_query_owned(query)?
+        ScalarFamily::Float => boxed_postgres_read_query_owned(query)?
             .get_result::<FloatRow>(conn)
             .await?
             .v
@@ -139,10 +139,10 @@ pub(super) async fn load_scalar_postgres_async(
 pub(super) async fn load_scalar_mysql_async(
     conn: &mut diesel_async::AsyncMysqlConnection,
     query: &ReadQuery<'_, crate::backend::MySql>,
-    kind: BuiltinKind,
+    kind: ScalarFamily,
 ) -> diesel::QueryResult<Value<crate::backend::MySql>> {
     let value = match kind {
-        BuiltinKind::Int => {
+        ScalarFamily::Int => {
             let sql = alloc::format!("SELECT CAST(({}) AS SIGNED) AS v", query.sql());
             let query = ReadQuery::borrowed(&sql, query.binds());
             boxed_mysql_read_query_owned(&query)?
@@ -151,7 +151,7 @@ pub(super) async fn load_scalar_mysql_async(
                 .v
                 .map_or(Value::Null, Value::Int)
         }
-        BuiltinKind::Float => boxed_mysql_read_query_owned(query)?
+        ScalarFamily::Float => boxed_mysql_read_query_owned(query)?
             .get_result::<FloatRow>(conn)
             .await?
             .v
@@ -169,7 +169,7 @@ pub(super) async fn load_scalar_mysql_async(
 pub(super) async fn load_scalar_row_postgres_async(
     conn: &mut diesel_async::AsyncPgConnection,
     query: &ReadQuery<'_, crate::backend::Postgres>,
-    kinds: &[BuiltinKind],
+    kinds: &[ScalarFamily],
 ) -> diesel::QueryResult<Vec<Value<crate::backend::Postgres>>> {
     let row = boxed_postgres_read_query_owned(query)?
         .get_result::<crate::diesel_decode::DynamicRow<crate::backend::Postgres>>(conn)
@@ -184,8 +184,11 @@ pub(super) async fn load_scalar_row_postgres_async(
         .into_iter()
         .zip(kinds)
         .map(|(value, kind)| {
-            crate::backend::Postgres::decode_group_value(ScalarKind::from(*kind), value)
-                .unwrap_or(Value::Missing)
+            crate::backend::Postgres::decode_group_value(
+                crate::backend::ValueKind::from(*kind),
+                value,
+            )
+            .unwrap_or(Value::Missing)
         })
         .collect())
 }
@@ -194,7 +197,7 @@ pub(super) async fn load_scalar_row_postgres_async(
 pub(super) async fn load_scalar_row_mysql_async(
     conn: &mut diesel_async::AsyncMysqlConnection,
     query: &ReadQuery<'_, crate::backend::MySql>,
-    kinds: &[BuiltinKind],
+    kinds: &[ScalarFamily],
 ) -> diesel::QueryResult<Vec<Value<crate::backend::MySql>>> {
     let row = boxed_mysql_read_query_owned(query)?
         .get_result::<crate::diesel_decode::DynamicRow<crate::backend::MySql>>(conn)
@@ -209,7 +212,7 @@ pub(super) async fn load_scalar_row_mysql_async(
         .into_iter()
         .zip(kinds)
         .map(|(value, kind)| {
-            crate::backend::MySql::decode_group_value(ScalarKind::from(*kind), value)
+            crate::backend::MySql::decode_group_value(crate::backend::ValueKind::from(*kind), value)
                 .unwrap_or(Value::Missing)
         })
         .collect())
@@ -309,7 +312,7 @@ impl<S: SessionSetup + Send + Sync> AsyncConnector for MysqlAsyncDieselConnector
     fn execute_scalar(
         &self,
         query: &ReadQuery<'_, Self::Backend>,
-        kind: BuiltinKind,
+        kind: ScalarFamily,
         auth: &S,
     ) -> impl Future<Output = Result<(Value<Self::Backend>, Option<Self::Checkpoint>), Self::Error>> + Send
     {
@@ -383,7 +386,7 @@ impl<S: SessionSetup + Send + Sync> AsyncConnector for MysqlAsyncDieselConnector
     fn execute_scalar_row(
         &self,
         query: &ReadQuery<'_, Self::Backend>,
-        kinds: &[BuiltinKind],
+        kinds: &[ScalarFamily],
         auth: &S,
     ) -> impl Future<
         Output = Result<

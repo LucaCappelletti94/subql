@@ -1,7 +1,8 @@
 //! Expression compilation helpers split out of the parser.
 
 use super::{Compiling, MAX_TERMS_PER_FILTER};
-use crate::backend::{Backend, BuiltinKind, ScalarKindOf, Value};
+use crate::backend::{Backend, ScalarFamily, Value, ValueKindOf};
+use crate::compiler::bytecode::{ComparisonRef, FloatResult};
 use crate::compiler::literals::{resolve_column_ref, SqlLiteralParse};
 use crate::compiler::{canonicalize, sql_shape, BytecodeProgram, Instruction};
 use crate::term::{term_columns, CompiledTerm};
@@ -12,16 +13,21 @@ use sql_traits::prelude::DatabaseLike;
 use sqlparser::ast::{BinaryOperator, Expr, UnaryOperator, Value as SqlValue};
 use sqlparser_canonicalize::Canonicalizer;
 
-/// If `expr` is a bare column reference, return the [`crate::backend::ScalarKind`] of that
-/// column via the catalog. Otherwise `None`. Used to derive the target
-/// type for a paired literal in a comparison or an IN list.
+/// If `expr` is a bare column reference, return what a value of that column
+/// is, via the catalog. Otherwise `None`. Used to derive the target for a
+/// paired literal in a comparison or an IN list.
+///
+/// A value kind rather than the column's declared type, because that is what
+/// a literal can be parsed at: the spelling `'0.1'` says nothing about the
+/// width the column declares.
 fn column_scalar_of<B: Backend, DB: DatabaseLike>(
     expr: &Expr,
     table_id: TableId,
     database: &DB,
-) -> Option<ScalarKindOf<B>> {
+) -> Option<ValueKindOf<B>> {
     let col = resolve_column_ref(expr, table_id, database)?;
     crate::catalog_helpers::column_scalar_kind::<B, DB>(database, table_id, col)
+        .map(|kind| kind.value_kind())
 }
 
 /// The [`crate::backend::ScalarKind`] of the first column `expr` names, looking
@@ -39,7 +45,7 @@ fn nested_column_scalar_of<B: Backend, DB: DatabaseLike>(
     table_id: TableId,
     database: &DB,
     depth: usize,
-) -> Option<ScalarKindOf<B>> {
+) -> Option<ValueKindOf<B>> {
     if let Some(kind) = column_scalar_of::<B, DB>(expr, table_id, database) {
         return Some(kind);
     }
@@ -47,9 +53,10 @@ fn nested_column_scalar_of<B: Backend, DB: DatabaseLike>(
         return None;
     }
     match expr {
-        Expr::BinaryOp { left, right, .. } => {
-            nested_column_scalar_of::<B, DB>(left, table_id, database, depth + 1)
-                .or_else(|| nested_column_scalar_of::<B, DB>(right, table_id, database, depth + 1))
+        Expr::BinaryOp { left, op, right } => {
+            let operand = nested_column_scalar_of::<B, DB>(left, table_id, database, depth + 1)
+                .or_else(|| nested_column_scalar_of::<B, DB>(right, table_id, database, depth + 1));
+            quotient_kind::<B>(op, operand)
         }
         Expr::UnaryOp { expr, .. } | Expr::Nested(expr) => {
             nested_column_scalar_of::<B, DB>(expr, table_id, database, depth + 1)
@@ -58,25 +65,50 @@ fn nested_column_scalar_of<B: Backend, DB: DatabaseLike>(
     }
 }
 
+/// The kind a binary operation answers, given the kind its operands carry.
+///
+/// Only `/` moves it, and only where the engine's `/` answers a decimal:
+/// MySQL's `qty / 3` is a decimal even though `qty` is an integer, so a
+/// literal compared against it has to be read as a decimal too. A float
+/// operand keeps its own kind, since a float divided there stays a double
+/// rather than becoming a decimal.
+fn quotient_kind<B: Backend>(
+    op: &BinaryOperator,
+    operand: Option<ValueKindOf<B>>,
+) -> Option<ValueKindOf<B>> {
+    if !matches!(op, BinaryOperator::Divide)
+        || !matches!(
+            B::DIVISION,
+            crate::backend::DivisionRule::QuotientsAreDecimalInWords
+        )
+    {
+        return operand;
+    }
+    if operand == Some(ScalarFamily::Float.into()) {
+        return operand;
+    }
+    Some(ScalarFamily::Decimal.into())
+}
+
 /// Return `true` if `instr` produces a [`crate::compiler::Tri`] on the
 /// stack. Used to detect whether a top-level WHERE program leaves a
 /// boolean at TOS or needs to be wrapped with `= true`.
 const fn instruction_is_tri_typed<B: Backend>(instr: &Instruction<B>) -> bool {
     matches!(
         instr,
-        Instruction::Equal
-            | Instruction::NotEqual
-            | Instruction::LessThan
-            | Instruction::LessThanOrEqual
-            | Instruction::GreaterThan
-            | Instruction::GreaterThanOrEqual
+        Instruction::Equal(_)
+            | Instruction::NotEqual(_)
+            | Instruction::LessThan(_)
+            | Instruction::LessThanOrEqual(_)
+            | Instruction::GreaterThan(_)
+            | Instruction::GreaterThanOrEqual(_)
             | Instruction::IsNull
             | Instruction::IsNotNull
             | Instruction::And
             | Instruction::Or
             | Instruction::Not
-            | Instruction::In(_)
-            | Instruction::Between
+            | Instruction::In { .. }
+            | Instruction::Between { .. }
             | Instruction::Like { .. }
             | Instruction::JumpIfFalse(_)
             | Instruction::JumpIfTrue(_)
@@ -91,6 +123,7 @@ const fn instruction_is_tri_typed<B: Backend>(instr: &Instruction<B>) -> bool {
 /// A no-op when the trailing instruction already produces a Tri.
 pub(super) fn wrap_bare_value_as_tri<B>(
     instructions: &mut Vec<Instruction<B>>,
+    comparison: ComparisonRef,
 ) -> Result<(), RegisterError>
 where
     B: Backend + SqlLiteralParse,
@@ -100,9 +133,9 @@ where
         Some(_) => {
             instructions.push(Instruction::PushLiteral(B::parse_literal(
                 &SqlValue::Boolean(true),
-                BuiltinKind::Bool.into(),
+                ScalarFamily::Bool.into(),
             )?));
-            instructions.push(Instruction::Equal);
+            instructions.push(Instruction::Equal(comparison));
             Ok(())
         }
         None => Err(RegisterError::UnsupportedSql(
@@ -126,24 +159,29 @@ pub(super) fn compile_expression<B, DB>(
     table_id: TableId,
     database: &DB,
     canonicalizer: &Canonicalizer<'_>,
+    increment: Option<crate::backend::DivisionPrecisionIncrement>,
 ) -> Result<(BytecodeProgram<B>, Vec<CompiledTerm>), RegisterError>
 where
     B: Backend + SqlLiteralParse,
     DB: DatabaseLike,
 {
-    let mut compiling: Compiling<B> = Compiling::new();
+    let mut compiling: Compiling<B> = Compiling::new(increment);
     compile_expr_recursive::<B, DB>(
         expr,
         table_id,
         database,
         &mut compiling,
         0,
-        BuiltinKind::String.into(),
+        ScalarFamily::String.into(),
     )?;
-    wrap_bare_value_as_tri::<B>(&mut compiling)?;
+    let bare = ComparisonRef::new(compiling.intern_comparison(expr, table_id, database), None);
+    wrap_bare_value_as_tri::<B>(&mut compiling.out, bare)?;
     let terms = canonicalize_term_slots(&mut compiling, canonicalizer)?;
     let columns = term_columns(&terms);
-    Ok((BytecodeProgram::with_terms(compiling.out, columns), terms))
+    Ok((
+        BytecodeProgram::with_comparisons(compiling.out, columns, compiling.comparisons),
+        terms,
+    ))
 }
 
 /// Renumber the term slots into normalized-text order and rewrite the
@@ -194,10 +232,56 @@ fn canonicalize_term_slots<B: Backend>(
     Ok(sorted)
 }
 
+/// The width an expression's float result is held at, or `None` when it is
+/// not float arithmetic.
+///
+/// Resolved bottom-up from the columns the expression names, because the
+/// engines decide it per operation rather than per operand: measured,
+/// PostgreSQL computes `real + real` in float4 and promotes `real * 3` to
+/// double precision. A literal carries no declared width and so lands in
+/// the promoting arm, which is what the server does with `3`.
+///
+/// Stops at [`sql_shape::MAX_EXPR_DEPTH`], the ceiling compilation itself
+/// refuses past.
+fn float_result_width<B: Backend, DB: DatabaseLike>(
+    expr: &Expr,
+    table_id: TableId,
+    database: &DB,
+    depth: usize,
+) -> FloatResult {
+    if let Some(column) = resolve_column_ref(expr, table_id, database) {
+        return crate::catalog_helpers::column_comparison::<B, DB>(database, table_id, column)
+            .and_then(|facts| facts.kind.declared_type())
+            .and_then(crate::backend::DeclaredType::float_width);
+    }
+    if depth >= sql_shape::MAX_EXPR_DEPTH {
+        return None;
+    }
+    match expr {
+        Expr::Nested(inner) | Expr::UnaryOp { expr: inner, .. } => {
+            float_result_width::<B, DB>(inner, table_id, database, depth + 1)
+        }
+        Expr::BinaryOp {
+            left,
+            op:
+                BinaryOperator::Plus
+                | BinaryOperator::Minus
+                | BinaryOperator::Multiply
+                | BinaryOperator::Divide
+                | BinaryOperator::Modulo,
+            right,
+        } => B::float_arithmetic_width(
+            float_result_width::<B, DB>(left, table_id, database, depth + 1),
+            float_result_width::<B, DB>(right, table_id, database, depth + 1),
+        ),
+        _ => None,
+    }
+}
+
 /// Recursive helper for expression compilation.
 ///
 /// Compiles an expression to leave its result on top of stack. The
-/// `target_kind` argument names the [`crate::backend::ScalarKind`] a standalone literal
+/// `target_kind` argument names the [`crate::backend::ValueKind`] a standalone literal
 /// leaf should coerce to; comparison / arithmetic / IN / BETWEEN /
 /// LIKE arms override this per-child by peeking at whichever sibling is
 /// a column reference.
@@ -208,7 +292,7 @@ fn compile_expr_recursive<B, DB>(
     database: &DB,
     out: &mut Compiling<B>,
     depth: usize,
-    target_kind: ScalarKindOf<B>,
+    target_kind: ValueKindOf<B>,
 ) -> Result<(), RegisterError>
 where
     B: Backend + SqlLiteralParse,
@@ -232,7 +316,7 @@ where
                         database,
                         out,
                         depth + 1,
-                        BuiltinKind::String.into(),
+                        ScalarFamily::String.into(),
                     )?;
 
                     let jump_idx = out.len();
@@ -245,7 +329,7 @@ where
                         database,
                         out,
                         depth + 1,
-                        BuiltinKind::String.into(),
+                        ScalarFamily::String.into(),
                     )?;
                     out.push(Instruction::And);
 
@@ -259,7 +343,7 @@ where
                         database,
                         out,
                         depth + 1,
-                        BuiltinKind::String.into(),
+                        ScalarFamily::String.into(),
                     )?;
 
                     let jump_idx = out.len();
@@ -272,7 +356,7 @@ where
                         database,
                         out,
                         depth + 1,
-                        BuiltinKind::String.into(),
+                        ScalarFamily::String.into(),
                     )?;
                     out.push(Instruction::Or);
 
@@ -311,7 +395,7 @@ where
                             .or_else(|| {
                                 nested_column_scalar_of::<B, DB>(right, table_id, database, depth)
                             })
-                            .unwrap_or_else(|| BuiltinKind::String.into());
+                            .unwrap_or_else(|| ScalarFamily::String.into());
                     compile_expr_recursive::<B, DB>(
                         left,
                         table_id,
@@ -329,19 +413,92 @@ where
                         child_target,
                     )?;
 
+                    // Interned inside the comparison arms only: an
+                    // arithmetic instruction cannot reference a descriptor, so
+                    // resolving one for its operands would persist facts no
+                    // comparison reads.
                     match op {
-                        BinaryOperator::Eq => out.push(Instruction::Equal),
-                        BinaryOperator::NotEq => out.push(Instruction::NotEqual),
-                        BinaryOperator::Lt => out.push(Instruction::LessThan),
-                        BinaryOperator::LtEq => out.push(Instruction::LessThanOrEqual),
-                        BinaryOperator::Gt => out.push(Instruction::GreaterThan),
-                        BinaryOperator::GtEq => out.push(Instruction::GreaterThanOrEqual),
+                        BinaryOperator::Eq => {
+                            let cmp = out.comparison_for(
+                                left,
+                                right,
+                                table_id,
+                                database,
+                                crate::backend::TextOperation::Equality,
+                            )?;
+                            out.push(Instruction::Equal(cmp));
+                        }
+                        BinaryOperator::NotEq => {
+                            let cmp = out.comparison_for(
+                                left,
+                                right,
+                                table_id,
+                                database,
+                                crate::backend::TextOperation::Equality,
+                            )?;
+                            out.push(Instruction::NotEqual(cmp));
+                        }
+                        BinaryOperator::Lt => {
+                            let cmp = out.comparison_for(
+                                left,
+                                right,
+                                table_id,
+                                database,
+                                crate::backend::TextOperation::Ordering,
+                            )?;
+                            out.push(Instruction::LessThan(cmp));
+                        }
+                        BinaryOperator::LtEq => {
+                            let cmp = out.comparison_for(
+                                left,
+                                right,
+                                table_id,
+                                database,
+                                crate::backend::TextOperation::Ordering,
+                            )?;
+                            out.push(Instruction::LessThanOrEqual(cmp));
+                        }
+                        BinaryOperator::Gt => {
+                            let cmp = out.comparison_for(
+                                left,
+                                right,
+                                table_id,
+                                database,
+                                crate::backend::TextOperation::Ordering,
+                            )?;
+                            out.push(Instruction::GreaterThan(cmp));
+                        }
+                        BinaryOperator::GtEq => {
+                            let cmp = out.comparison_for(
+                                left,
+                                right,
+                                table_id,
+                                database,
+                                crate::backend::TextOperation::Ordering,
+                            )?;
+                            out.push(Instruction::GreaterThanOrEqual(cmp));
+                        }
 
-                        BinaryOperator::Plus => out.push(Instruction::Add),
-                        BinaryOperator::Minus => out.push(Instruction::Subtract),
-                        BinaryOperator::Multiply => out.push(Instruction::Multiply),
-                        BinaryOperator::Divide => out.push(Instruction::Divide),
-                        BinaryOperator::Modulo => out.push(Instruction::Modulo),
+                        BinaryOperator::Plus
+                        | BinaryOperator::Minus
+                        | BinaryOperator::Multiply
+                        | BinaryOperator::Divide
+                        | BinaryOperator::Modulo => {
+                            let width = B::float_arithmetic_width(
+                                float_result_width::<B, DB>(left, table_id, database, depth),
+                                float_result_width::<B, DB>(right, table_id, database, depth),
+                            );
+                            let instruction = match op {
+                                BinaryOperator::Plus => Instruction::Add(width),
+                                BinaryOperator::Minus => Instruction::Subtract(width),
+                                BinaryOperator::Multiply => Instruction::Multiply(width),
+                                BinaryOperator::Divide => {
+                                    Instruction::Divide(width, out.quotient()?)
+                                }
+                                _ => Instruction::Modulo(width),
+                            };
+                            out.push(instruction);
+                        }
 
                         _ => {
                             return Err(RegisterError::UnsupportedSql(format!(
@@ -398,7 +555,7 @@ where
             // Derive target from the tested expression if it's a column
             // reference; fall back to String otherwise (best-effort).
             let list_target = column_scalar_of::<B, DB>(expr, table_id, database)
-                .unwrap_or_else(|| BuiltinKind::String.into());
+                .unwrap_or_else(|| ScalarFamily::String.into());
 
             compile_expr_recursive::<B, DB>(expr, table_id, database, out, depth + 1, list_target)?;
 
@@ -416,7 +573,11 @@ where
                 }
             }
 
-            out.push(Instruction::In(literals));
+            let tested = out.intern_comparison(expr, table_id, database);
+            out.push(Instruction::In {
+                literals,
+                comparison: ComparisonRef::new(tested, None),
+            });
 
             if *negated {
                 out.push(Instruction::Not);
@@ -492,7 +653,7 @@ where
             negated,
         } => {
             let range_target = column_scalar_of::<B, DB>(expr, table_id, database)
-                .unwrap_or_else(|| BuiltinKind::String.into());
+                .unwrap_or_else(|| ScalarFamily::String.into());
 
             // Stack order: value, lower, upper.
             compile_expr_recursive::<B, DB>(
@@ -513,7 +674,36 @@ where
                 range_target,
             )?;
 
-            out.push(Instruction::Between);
+            // Two ordered comparisons, and each resolves its own rule.
+            // The upper bound used to be built from the lower's left
+            // operand and the upper's own facts with no text rule at all,
+            // so it compared bytes while the lower bound compared as the
+            // engine does.
+            //
+            // Copying the lower's rule across is not the fix either, and
+            // the mutation battery is what established that. The two
+            // bounds can resolve differently: measured on PostgreSQL
+            // 16.15 with `free` a `text` holding `ab   `, `loose` a
+            // `varchar` holding the same, and `code` a `char(5)` holding
+            // `ab`, `free >= loose` is true and `free <= code` is false,
+            // because converting the `char` to `text` strips its padding.
+            // `free BETWEEN loose AND code` is therefore false, and only
+            // a rule resolved per bound answers that.
+            let lower = out.comparison_for(
+                expr,
+                low,
+                table_id,
+                database,
+                crate::backend::TextOperation::Ordering,
+            )?;
+            let upper = out.comparison_for(
+                expr,
+                high,
+                table_id,
+                database,
+                crate::backend::TextOperation::Ordering,
+            )?;
+            out.push(Instruction::Between { lower, upper });
 
             if *negated {
                 out.push(Instruction::Not);
@@ -528,7 +718,7 @@ where
                 database,
                 out,
                 depth + 1,
-                BuiltinKind::String.into(),
+                ScalarFamily::String.into(),
             )?;
             out.push(Instruction::IsNull);
         }
@@ -540,7 +730,7 @@ where
                 database,
                 out,
                 depth + 1,
-                BuiltinKind::String.into(),
+                ScalarFamily::String.into(),
             )?;
             out.push(Instruction::IsNotNull);
         }
@@ -576,7 +766,9 @@ where
                     // Unary + is no-op.
                 }
                 UnaryOperator::Minus => {
-                    out.push(Instruction::Negate);
+                    out.push(Instruction::Negate(float_result_width::<B, DB>(
+                        expr, table_id, database, depth,
+                    )));
                 }
                 _ => {
                     return Err(RegisterError::UnsupportedSql(format!(
@@ -606,7 +798,7 @@ where
                 database,
                 out,
                 depth + 1,
-                BuiltinKind::String.into(),
+                ScalarFamily::String.into(),
             )?;
             compile_expr_recursive::<B, DB>(
                 pattern,
@@ -614,12 +806,17 @@ where
                 database,
                 out,
                 depth + 1,
-                BuiltinKind::String.into(),
+                ScalarFamily::String.into(),
             )?;
 
-            out.push(Instruction::Like {
-                case_sensitive: true,
-            });
+            let cmp = out.comparison_for(
+                expr,
+                pattern,
+                table_id,
+                database,
+                crate::backend::TextOperation::Pattern,
+            )?;
+            out.push(Instruction::Like { comparison: cmp });
 
             if *negated {
                 out.push(Instruction::Not);
@@ -645,7 +842,7 @@ where
                 database,
                 out,
                 depth + 1,
-                BuiltinKind::String.into(),
+                ScalarFamily::String.into(),
             )?;
             compile_expr_recursive::<B, DB>(
                 pattern,
@@ -653,12 +850,17 @@ where
                 database,
                 out,
                 depth + 1,
-                BuiltinKind::String.into(),
+                ScalarFamily::String.into(),
             )?;
 
-            out.push(Instruction::Like {
-                case_sensitive: false,
-            });
+            let cmp = out.comparison_for(
+                expr,
+                pattern,
+                table_id,
+                database,
+                crate::backend::TextOperation::CaseInsensitivePattern,
+            )?;
+            out.push(Instruction::Like { comparison: cmp });
 
             if *negated {
                 out.push(Instruction::Not);

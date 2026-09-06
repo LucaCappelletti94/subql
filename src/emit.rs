@@ -14,7 +14,7 @@
 //! [`WireSchema`] and decoding each column payload through a
 //! [`WireAdapter`]. The schema declares one
 //! [`WireType`] per column, a source-independent semantic type that
-//! selects the decoder. subql's catalog is [`BuiltinKind`]-based, and
+//! selects the decoder. subql's catalog is [`ScalarFamily`]-based, and
 //! [`scalar_kind_to_wire_type`] maps one to the other, so a single
 //! [`WireCatalog`] over any [`DatabaseLike`] drives every wire source.
 //!
@@ -51,31 +51,31 @@ use sqlite_diff_rs::{
     WireSchema, WireType,
 };
 
-use crate::backend::BuiltinKind;
+use crate::backend::ScalarFamily;
 use crate::catalog_helpers;
 use crate::types::{ColumnId, TableId};
 
-/// Map a subql catalog [`BuiltinKind`] to the source-independent
+/// Map a subql catalog [`ScalarFamily`] to the source-independent
 /// [`WireType`] that selects a decoder in `sqlite-diff-rs`'s `digest`.
 ///
-/// The mapping is total: every `BuiltinKind` has a `WireType`. subql has
+/// The mapping is total: every `ScalarFamily` has a `WireType`. subql has
 /// no interval scalar, so [`WireType::Interval`] is never produced here.
 #[must_use]
-pub const fn scalar_kind_to_wire_type(kind: BuiltinKind) -> WireType {
+pub const fn scalar_kind_to_wire_type(kind: ScalarFamily) -> WireType {
     match kind {
-        BuiltinKind::Bool => WireType::Bool,
-        BuiltinKind::Int => WireType::Int,
-        BuiltinKind::Float => WireType::Real,
-        BuiltinKind::String => WireType::Text,
-        BuiltinKind::Bytes => WireType::Bytes,
-        BuiltinKind::Uuid => WireType::Uuid,
-        BuiltinKind::Timestamp => WireType::Timestamp,
-        BuiltinKind::TimestampTz => WireType::TimestampTz,
-        BuiltinKind::Date => WireType::Date,
-        BuiltinKind::Time => WireType::Time,
-        BuiltinKind::Decimal => WireType::Decimal,
-        BuiltinKind::Json => WireType::Json,
-        BuiltinKind::Jsonb => WireType::Jsonb,
+        ScalarFamily::Bool => WireType::Bool,
+        ScalarFamily::Int => WireType::Int,
+        ScalarFamily::Float => WireType::Real,
+        ScalarFamily::String => WireType::Text,
+        ScalarFamily::Bytes => WireType::Bytes,
+        ScalarFamily::Uuid => WireType::Uuid,
+        ScalarFamily::Timestamp => WireType::Timestamp,
+        ScalarFamily::TimestampTz => WireType::TimestampTz,
+        ScalarFamily::Date => WireType::Date,
+        ScalarFamily::Time => WireType::Time,
+        ScalarFamily::Decimal => WireType::Decimal,
+        ScalarFamily::Json => WireType::Json,
+        ScalarFamily::Jsonb => WireType::Jsonb,
     }
 }
 
@@ -167,7 +167,7 @@ pub struct WireCatalog {
 impl WireCatalog {
     /// Build a catalog over every table in `database`.
     ///
-    /// Columns whose declared SQL type does not map to a [`BuiltinKind`]
+    /// Columns whose declared SQL type does not map to a [`ScalarFamily`]
     /// fall back to [`WireType::Text`], the lossless affinity for an
     /// unmodeled type on the SQLite side.
     ///
@@ -238,7 +238,7 @@ fn build_wire_table<DB: DatabaseLike>(
     for ordinal in 0..arity {
         let column_id = ColumnId::try_from(ordinal)
             .map_err(|_| crate::CatalogError::UnknownColumn { table_id, ordinal })?;
-        let wire_type = catalog_helpers::column_builtin_kind(database, table_id, column_id)
+        let wire_type = catalog_helpers::column_scalar_family(database, table_id, column_id)
             .map_or(WireType::Text, scalar_kind_to_wire_type);
         wire_types.push(wire_type);
     }
@@ -484,7 +484,7 @@ pub fn pgoutput_changeset<DB: DatabaseLike>(
 /// The Maxwell decoder registry subql feeds to `digest`.
 ///
 /// MySQL has no native UUID type, so a UUID stored as `BINARY(16)`
-/// classifies as [`BuiltinKind::Bytes`] and rides [`WireType::Bytes`],
+/// classifies as [`ScalarFamily::Bytes`] and rides [`WireType::Bytes`],
 /// which the default `MySqlBinaryDecoder` base64-decodes to a compact
 /// 16-byte `Value::Blob`. That matches the SQLite client's blob storage
 /// and the way subql's `MysqlAdapter` rebinds the blob as MySQL binary,
@@ -602,7 +602,7 @@ pub fn pgbinary_adapter() -> TypeMap<PgBinary, String, Vec<u8>> {
 ///
 /// [`ConversionError::TableNotFound`] when `table` is not in the catalog,
 /// [`ConversionError::UnsupportedType`] when a catalog column's declared
-/// type has no [`BuiltinKind`], [`ConversionError::MissingColumns`] when a
+/// type has no [`ScalarFamily`], [`ConversionError::MissingColumns`] when a
 /// row's width does not match `column_names`, and
 /// [`ConversionError::Decode`] when a column's bytes do not decode for its
 /// type.
@@ -630,7 +630,7 @@ pub fn pgbinary_patchset_builder<DB: DatabaseLike>(
             .column_name(ordinal)
             .ok_or_else(|| ConversionError::TableNotFound(table.to_string()))?
             .to_string();
-        let wire_type = catalog_helpers::column_builtin_kind(database, table_id, column_id)
+        let wire_type = catalog_helpers::column_scalar_family(database, table_id, column_id)
             .map(scalar_kind_to_wire_type)
             .ok_or_else(|| ConversionError::UnsupportedType(name.clone()))?;
         columns.push((name, wire_type));
@@ -710,13 +710,16 @@ mod tests {
 
     #[test]
     fn scalar_kind_maps_cover_every_kind() {
-        // A change to `BuiltinKind` must be reflected here. The match in
+        // A change to `ScalarFamily` must be reflected here. The match in
         // `scalar_kind_to_wire_type` is exhaustive, so this only pins the
         // representative mappings the wal2json decoders depend on.
-        assert_eq!(scalar_kind_to_wire_type(BuiltinKind::Uuid), WireType::Uuid);
-        assert_eq!(scalar_kind_to_wire_type(BuiltinKind::Float), WireType::Real);
+        assert_eq!(scalar_kind_to_wire_type(ScalarFamily::Uuid), WireType::Uuid);
         assert_eq!(
-            scalar_kind_to_wire_type(BuiltinKind::Jsonb),
+            scalar_kind_to_wire_type(ScalarFamily::Float),
+            WireType::Real
+        );
+        assert_eq!(
+            scalar_kind_to_wire_type(ScalarFamily::Jsonb),
             WireType::Jsonb
         );
     }

@@ -10,7 +10,7 @@
 //!
 //! Functions: [`table_id`], [`table_name`], [`column_id`], [`resolve_table`],
 //! [`table_arity`], [`schema_fingerprint`], [`primary_key_columns`],
-//! [`column_scalar_kind`], [`group_key_column`], [`table_has_rls`].
+//! [`column_scalar_kind`], [`column_comparison`], [`table_has_rls`].
 
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
@@ -24,8 +24,7 @@ use sql_traits::{
 use sqlite_diff_rs::SimpleTable;
 
 use crate::backend::{
-    GroupKeyCollation, GroupKeyCollationName, GroupKeyColumn, GroupKeyColumnOf, ScalarKind,
-    ScalarKindOf,
+    CollationFacts, CollationName, ColumnComparison, ColumnComparisonOf, ScalarKind, ScalarKindOf,
 };
 use crate::types::{ColumnId, TableId};
 
@@ -350,11 +349,11 @@ pub fn column_scalar_kind<B: crate::backend::Backend, DB: DatabaseLike>(
 
 /// Returns the scalar and comparison facts for one group-key column.
 #[must_use]
-pub fn group_key_column<B: crate::backend::Backend, DB: DatabaseLike>(
+pub fn column_comparison<B: crate::backend::Backend, DB: DatabaseLike>(
     database: &DB,
     table_id: TableId,
     column_id: ColumnId,
-) -> Option<GroupKeyColumnOf<B>> {
+) -> Option<ColumnComparisonOf<B>> {
     let table_index = usize::try_from(table_id).ok()?;
     let table = database.table_by_id(table_index)?;
     let column = table
@@ -363,23 +362,23 @@ pub fn group_key_column<B: crate::backend::Backend, DB: DatabaseLike>(
     let declared_type = column.data_type(database).into_owned();
     let kind = classify_scalar_kind::<B>(&declared_type)?;
     let collation = match column.collation(database).ok()? {
-        sql_traits::traits::ColumnCollation::DatabaseDefault => GroupKeyCollation::DatabaseDefault,
+        sql_traits::traits::ColumnCollation::DatabaseDefault => CollationFacts::DatabaseDefault,
         sql_traits::traits::ColumnCollation::Named(collation) => {
             let target = collation.name();
-            GroupKeyCollation::Named {
-                name: GroupKeyCollationName {
+            CollationFacts::Named {
+                name: CollationName {
                     name: target.name().to_string(),
                     name_is_quoted: target.name_is_quoted(),
                     schema: target.schema().map(ToString::to_string),
                     schema_is_quoted: target.schema_is_quoted(),
                 },
                 postgres_deterministic: collation.postgres_deterministic(),
-                mysql_padding: collation.mysql_padding(),
+                padding: collation.mysql_padding().map(Into::into),
             }
         }
-        sql_traits::traits::ColumnCollation::Unknown => GroupKeyCollation::Unknown,
+        sql_traits::traits::ColumnCollation::Unknown => CollationFacts::Unknown,
     };
-    Some(GroupKeyColumn {
+    Some(ColumnComparison {
         kind,
         declared_type,
         collation,
@@ -393,7 +392,13 @@ pub(crate) fn classify_scalar_kind<B: crate::backend::Backend>(
     declared_type: &str,
 ) -> Option<ScalarKindOf<B>> {
     if let Some(family) = scalar_family(declared_type) {
-        return Some(family.into());
+        // The family is upstream's coarse answer; the refinements the
+        // declaration fixes are the backend's, because the spellings differ
+        // per engine.
+        return Some(ScalarKind::Builtin(B::refine_declared_type(
+            family,
+            declared_type,
+        )));
     }
     <B::Custom as crate::backend::CustomScalars>::classify(declared_type).map(ScalarKind::Custom)
 }
@@ -405,12 +410,77 @@ pub(crate) fn classify_scalar_kind<B: crate::backend::Backend>(
 /// column of a custom type answers `None`, which is the honest answer to
 /// "which builtin is this", and each caller refuses it in its own terms.
 /// Use [`column_scalar_kind`] where a custom column has to be served.
+/// How a fold over `spec`'s column answers on this backend.
+///
+/// Resolved once at registration, because it follows the column's declared
+/// type: measured, PostgreSQL sums an `int` column into `bigint` and a
+/// `bigint` column into `numeric`, so the same statement over two integer
+/// columns answers two different types. The mean and the division rule
+/// come from the backend itself.
+///
+/// A spec that sums nothing (`COUNT`) still needs an answer, and
+/// [`crate::backend::SumRule::Double`] is the one that carries no exact
+/// total to disagree about. A column the catalog cannot type takes it too,
+/// which is the same conservative reading `column_scalar_kind` gives every
+/// other caller.
 #[must_use]
-pub fn column_builtin_kind<DB: DatabaseLike>(
+pub fn fold_rule<B: crate::backend::Backend, DB: DatabaseLike>(
+    spec: &crate::compiler::AggSpec,
+    database: &DB,
+    table_id: crate::TableId,
+    increment: Option<crate::backend::DivisionPrecisionIncrement>,
+) -> crate::runtime::aggregate::FoldRule {
+    let total = total_rule::<B, DB>(spec, database, table_id);
+    crate::runtime::aggregate::FoldRule {
+        total,
+        mean: B::MEAN,
+        variance_seed: B::VARIANCE_SEED,
+        float_overflow: B::FLOAT_SUM_OVERFLOW,
+        // A fold that computes no mean never reads this, and one that
+        // does is refused at registration when the setting is missing,
+        // which `mysql_avg_without_the_declared_increment_is_refused`
+        // holds in place.
+        quotient: crate::compiler::bytecode::Quotient::resolve::<B>(increment)
+            .unwrap_or(crate::compiler::bytecode::Quotient::FromTheOperands),
+    }
+}
+
+/// What a total over `spec`'s column accumulates in, which is the half of
+/// [`fold_rule`] a seed's decode kinds need.
+#[must_use]
+pub fn total_rule<B: crate::backend::Backend, DB: DatabaseLike>(
+    spec: &crate::compiler::AggSpec,
+    database: &DB,
+    table_id: crate::TableId,
+) -> crate::backend::SumRule {
+    let rule = spec
+        .column()
+        .map_or(crate::backend::SumRule::Double, |column| {
+            column_scalar_kind::<B, DB>(database, table_id, column)
+                .as_ref()
+                .and_then(crate::backend::ScalarKind::declared_type)
+                .map_or(crate::backend::SumRule::Double, B::sum_rule)
+        });
+    // The accumulator's width belongs to the aggregate, not only to the
+    // column. Measured on PostgreSQL 16.15 over a `real` column:
+    // `pg_typeof(SUM(v))` is `real`, while `pg_typeof(AVG(v))` and
+    // `pg_typeof(VAR_POP(v))` are both `double precision`, and
+    // `AVG` over three `0.1`s answers `0.10000000149011612`, which is
+    // the double sum divided by three rather than the single one. So a
+    // narrower total is a `SUM`'s alone.
+    match (rule, spec) {
+        (crate::backend::SumRule::Single, crate::compiler::AggSpec::Sum { .. }) => rule,
+        (crate::backend::SumRule::Single, _) => crate::backend::SumRule::Double,
+        _ => rule,
+    }
+}
+
+#[must_use]
+pub fn column_scalar_family<DB: DatabaseLike>(
     database: &DB,
     table_id: TableId,
     column_id: ColumnId,
-) -> Option<crate::backend::BuiltinKind> {
+) -> Option<crate::backend::ScalarFamily> {
     let table = database.table_by_id(table_id as usize)?;
     let column = table.column_by_id(column_id as usize, database).ok()??;
     scalar_family(&column.data_type(database))
@@ -443,7 +513,7 @@ pub fn table_has_rls<DB: DatabaseLike>(
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use crate::backend::{BuiltinKind, Postgres};
+    use crate::backend::{Postgres, ScalarFamily};
     use sql_traits::structs::ParserDB;
     use sqlparser::dialect::GenericDialect;
 
@@ -649,19 +719,19 @@ mod tests {
         let tid = table_id(&pg, "e").unwrap();
         assert_eq!(
             column_scalar_kind::<Postgres, _>(&pg, tid, 1),
-            Some(BuiltinKind::Timestamp.into())
+            Some(ScalarFamily::Timestamp.into())
         );
         assert_eq!(
             column_scalar_kind::<Postgres, _>(&pg, tid, 2),
-            Some(BuiltinKind::TimestampTz.into())
+            Some(ScalarFamily::TimestampTz.into())
         );
         assert_eq!(
             column_scalar_kind::<Postgres, _>(&pg, tid, 3),
-            Some(BuiltinKind::Date.into())
+            Some(ScalarFamily::Date.into())
         );
         assert_eq!(
             column_scalar_kind::<Postgres, _>(&pg, tid, 4),
-            Some(BuiltinKind::Time.into())
+            Some(ScalarFamily::Time.into())
         );
 
         // MySQL spellings, including `DATETIME` and `BIGINT UNSIGNED`.
@@ -674,29 +744,29 @@ mod tests {
         let tid = table_id(&my, "e").unwrap();
         assert_eq!(
             column_scalar_kind::<Postgres, _>(&my, tid, 1),
-            Some(BuiltinKind::Timestamp.into())
+            Some(ScalarFamily::Timestamp.into())
         );
         assert_eq!(
             column_scalar_kind::<Postgres, _>(&my, tid, 2),
-            Some(BuiltinKind::Timestamp.into())
+            Some(ScalarFamily::Timestamp.into())
         );
         assert_eq!(
             column_scalar_kind::<Postgres, _>(&my, tid, 3),
-            Some(BuiltinKind::Date.into())
+            Some(ScalarFamily::Date.into())
         );
         assert_eq!(
             column_scalar_kind::<Postgres, _>(&my, tid, 4),
-            Some(BuiltinKind::Time.into())
+            Some(ScalarFamily::Time.into())
         );
         assert_eq!(
             column_scalar_kind::<Postgres, _>(&my, tid, 5),
-            Some(BuiltinKind::Int.into())
+            Some(ScalarFamily::Int.into())
         );
     }
 
     #[test]
-    fn group_key_column_preserves_postgres_collation_facts() {
-        use crate::backend::{GroupKeyCollation, GroupKeyColumnOf};
+    fn column_comparison_preserves_postgres_collation_facts() {
+        use crate::backend::{CollationFacts, ColumnComparisonOf};
 
         let db = ParserDB::parse::<sqlparser::dialect::PostgreSqlDialect>(
             "CREATE COLLATION ci (provider = icu, locale = 'und-u-ks-level2', deterministic = false);
@@ -705,11 +775,11 @@ mod tests {
         .unwrap();
         let table = table_id(&db, "labels").unwrap();
 
-        let column: GroupKeyColumnOf<Postgres> =
-            group_key_column::<Postgres, _>(&db, table, 0).unwrap();
-        assert_eq!(column.kind, BuiltinKind::String.into());
+        let column: ColumnComparisonOf<Postgres> =
+            column_comparison::<Postgres, _>(&db, table, 0).unwrap();
+        assert_eq!(column.kind, ScalarFamily::String.into());
         assert_eq!(column.declared_type, "TEXT");
-        let GroupKeyCollation::Named {
+        let CollationFacts::Named {
             name,
             postgres_deterministic,
             ..
@@ -722,25 +792,25 @@ mod tests {
     }
 
     #[test]
-    fn group_key_column_distinguishes_default_and_unknown_collations() {
-        use crate::backend::{GroupKeyCollation, GroupKeyColumnOf};
+    fn column_comparison_distinguishes_default_and_unknown_collations() {
+        use crate::backend::{CollationFacts, ColumnComparisonOf};
 
         let default_db = ParserDB::parse::<sqlparser::dialect::SQLiteDialect>(
             "CREATE TABLE labels (name TEXT);",
         )
         .unwrap();
         let table = table_id(&default_db, "labels").unwrap();
-        let column: GroupKeyColumnOf<crate::backend::SQLite> =
-            group_key_column::<crate::backend::SQLite, _>(&default_db, table, 0).unwrap();
-        assert_eq!(column.collation, GroupKeyCollation::DatabaseDefault);
+        let column: ColumnComparisonOf<crate::backend::SQLite> =
+            column_comparison::<crate::backend::SQLite, _>(&default_db, table, 0).unwrap();
+        assert_eq!(column.collation, CollationFacts::DatabaseDefault);
 
         let unknown_db = ParserDB::parse::<sqlparser::dialect::MySqlDialect>(
             "CREATE TABLE labels (name TEXT CHARACTER SET utf8mb4);",
         )
         .unwrap();
         let table = table_id(&unknown_db, "labels").unwrap();
-        let column: GroupKeyColumnOf<crate::backend::MySql> =
-            group_key_column::<crate::backend::MySql, _>(&unknown_db, table, 0).unwrap();
-        assert_eq!(column.collation, GroupKeyCollation::Unknown);
+        let column: ColumnComparisonOf<crate::backend::MySql> =
+            column_comparison::<crate::backend::MySql, _>(&unknown_db, table, 0).unwrap();
+        assert_eq!(column.collation, CollationFacts::Unknown);
     }
 }

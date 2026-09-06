@@ -29,7 +29,7 @@ use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::AsyncMysqlConnection;
 use sql_traits::structs::ParserDB;
 use sqlparser::dialect::MySqlDialect;
-use subql::backend::{BuiltinKind, MySql, Value};
+use subql::backend::{MySql, ScalarFamily, Value};
 use subql::reexec::{
     AsyncConnector, AsyncMode, AutoResolvingEngine, MysqlAsyncDieselConnector, SessionSetup,
     SnapshotResult,
@@ -275,9 +275,16 @@ fn execute_scalar_row_decodes_integer_aggregate_seed_async() {
             .execute_scalar_row(&bundle.query.as_read_query(), &bundle.kinds, &())
             .await
             .expect("execute_scalar_row");
+        // (sum, squared deviations, count) = (12, 8, 3). Eight because
+        // the seed reads the engine's own `VAR_POP(amount) * COUNT(amount)`
+        // rather than a sum of squares, which would be 56.
         assert_eq!(
             row,
-            vec![Value::Float(12.0), Value::Float(56.0), Value::Int(3)]
+            vec![
+                Value::Decimal(bigdecimal::BigDecimal::from(12)),
+                Value::Float(8.0),
+                Value::Int(3)
+            ]
         );
     });
 }
@@ -316,7 +323,7 @@ fn every_read_reports_a_position_taken_before_its_snapshot() {
             on.block_on(async move {
                 held.execute_scalar(
                     &subql::reexec::ReadQuery::without_binds(sql),
-                    BuiltinKind::Int,
+                    ScalarFamily::Int,
                     &(),
                 )
                 .await
@@ -341,7 +348,7 @@ fn every_read_reports_a_position_taken_before_its_snapshot() {
             on.block_on(async move {
                 held.execute_scalar_row(
                     &subql::reexec::ReadQuery::without_binds(sql),
-                    &[BuiltinKind::Int],
+                    &[ScalarFamily::Int],
                     &(),
                 )
                 .await

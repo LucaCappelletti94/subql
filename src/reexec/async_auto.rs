@@ -105,7 +105,7 @@ enum ResolveJob<B: Backend> {
     /// A scalar the connector reads in one call.
     Scalar {
         query: super::BoundQuery<B>,
-        column_kind: crate::backend::BuiltinKind,
+        column_kind: crate::backend::ScalarFamily,
     },
     /// One grouped extreme and its source-row count.
     GroupedScalar {
@@ -258,6 +258,12 @@ where
         let Some(context) = self.contexts.get(&subscription_id) else {
             return Ok(None);
         };
+        // A subscription the stream maintains has nothing to prime. Ahead
+        // of every branch below, because such a context carries
+        // `whole_result` and would otherwise be read as one.
+        if context.stream_answers_the_filter() {
+            return Ok(None);
+        }
         let grouped_bootstrap = context.grouped_bootstrap.clone();
         if let Some(bootstrap) = grouped_bootstrap {
             let (pages, checkpoint) = Self::read_whole_with(
@@ -296,24 +302,13 @@ where
                                 subscription: subscription_id,
                                 error,
                             })?;
-                        if page.value.more || page.value.rows.len() != 1 {
-                            return Err(crate::AggregateInstallError::RowCount {
-                                subscription: subscription_id,
-                                rows: page.value.rows.len(),
-                            }
-                            .into());
-                        }
+                        let row = super::auto::one_grouped_row(subscription_id, page.value)?;
                         let resolved = crate::Install::install(
                             &mut self.inner,
                             subscription_id,
                             crate::GroupedScalarInstall {
                                 group: group.clone(),
-                                row: page
-                                    .value
-                                    .rows
-                                    .into_iter()
-                                    .next()
-                                    .expect("the row count was checked"),
+                                row,
                                 checkpoint: trigger.checkpoint.clone(),
                             },
                         )?;
@@ -383,7 +378,7 @@ where
         // A still-folding in-process aggregate is seeded through Install, not
         // read here. After a demotion the context is `whole_result` and handled
         // above, so this only fires before any demotion.
-        if context.aggregate {
+        if context.in_process == Some(super::auto::InProcessKind::FoldingAggregate) {
             return Ok(None);
         }
         let (value, checkpoint) = self
@@ -774,22 +769,8 @@ where
                         subscription,
                         error,
                     })?;
-                if page.value.more || page.value.rows.len() != 1 {
-                    return Err(crate::AggregateInstallError::RowCount {
-                        subscription,
-                        rows: page.value.rows.len(),
-                    }
-                    .into());
-                }
-                Ok(Resolved::GroupedScalar {
-                    group,
-                    row: page
-                        .value
-                        .rows
-                        .into_iter()
-                        .next()
-                        .expect("the row count was checked"),
-                })
+                let row = super::auto::one_grouped_row(subscription, page.value)?;
+                Ok(Resolved::GroupedScalar { group, row })
             }
             ResolveJob::Keyed(job) => {
                 let KeyedJob {
@@ -815,10 +796,6 @@ where
                         continue;
                     };
                     let mut page_sql = sql;
-                    // Accumulated across pages, not per page. Resetting it
-                    // would let a key answered on an earlier page back into the
-                    // next statement, which delivers it twice and, with a
-                    // stable row order, never terminates.
                     let mut seen_in_batch: super::auto::SeenKeys<E::Backend> =
                         super::auto::SeenKeys::new();
                     loop {
@@ -833,39 +810,20 @@ where
                                 subscription,
                                 error,
                             })?;
-                        if columns.is_empty() {
-                            columns.clone_from(&page.value.columns);
-                        }
-                        let before = seen_in_batch.recorded();
-                        for row in page.value.rows {
-                            let key: Vec<Value<E::Backend>> = plan
-                                .key_positions
-                                .iter()
-                                .filter_map(|i| row.get(*i).cloned())
-                                .collect();
-                            seen_in_batch.record(&key);
-                            present.push((key, row));
-                        }
-                        // A page with no rows ends the read whatever it claims
-                        // about there being more. Our own reader cannot report
-                        // that combination, but this trait has outside
-                        // implementors, and without this a connector that did
-                        // would loop here forever.
-                        if !page.value.more || seen_in_batch.recorded() == before {
-                            break;
-                        }
-                        // A batch whose rows do not fit one page resumes inside
-                        // the batch, so the statement stays bounded. No cursor
-                        // is needed, which is what keeps this tier
-                        // cancellation-safe with no server-side state to strand.
-                        let remaining: Vec<Vec<Value<E::Backend>>> = batch
-                            .iter()
-                            .filter(|k| !seen_in_batch.contains(k))
-                            .cloned()
-                            .collect();
-                        if remaining.is_empty() {
-                            break;
-                        }
+                        // Resuming inside the batch needs no cursor, which is
+                        // what keeps this tier cancellation-safe with no
+                        // server-side state to strand.
+                        let remaining = match super::auto::absorb_keyed_page(
+                            page.value,
+                            batch,
+                            &plan.key_positions,
+                            &mut columns,
+                            &mut seen_in_batch,
+                            &mut present,
+                        ) {
+                            super::auto::KeyedPage::Answered => break,
+                            super::auto::KeyedPage::Resume(remaining) => remaining,
+                        };
                         let Some(next) = scoped.render::<E::Backend>(&remaining).map_err(|e| {
                             ReExecError::Dispatch(crate::DispatchError::VmError(alloc::format!(
                                 "{e}"
@@ -1058,8 +1016,11 @@ where
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::super::connector::Snapshot;
+    use super::super::test_fixtures::{
+        catalog, delete_event, insert_event, row, update_status_only,
+    };
     use super::*;
-    use crate::backend::{BuiltinKind, Postgres};
+    use crate::backend::{Postgres, ScalarFamily};
     use crate::testing::TestEvent;
     use crate::{
         DefaultIds, NoCheckpoint, Registered, SubscriptionEngine, SubscriptionRequest, TableId,
@@ -1097,13 +1058,6 @@ mod tests {
                 return v;
             }
         }
-    }
-
-    fn catalog() -> ParserDB {
-        ParserDB::parse::<PostgreSqlDialect>(
-            "CREATE TABLE orders (id INT PRIMARY KEY, price FLOAT, quantity INT, status TEXT);",
-        )
-        .unwrap()
     }
 
     /// `parking_lot::Mutex`-backed mock so the futures are `Send`.
@@ -1193,7 +1147,7 @@ mod tests {
         fn execute_scalar(
             &self,
             query: &super::super::ReadQuery<'_, Postgres>,
-            _kind: BuiltinKind,
+            _kind: ScalarFamily,
             _auth: &(),
         ) -> impl Future<Output = Result<(Value<Postgres>, Option<Self::Checkpoint>), Self::Error>> + Send
         {
@@ -1284,29 +1238,6 @@ mod tests {
             self.log.lock().push("close");
             core::future::ready(Ok(()))
         }
-    }
-
-    fn row(id: i64, price: f64) -> Vec<Value<Postgres>> {
-        alloc::vec![
-            Value::Int(id),
-            Value::Float(price),
-            Value::Int(1),
-            Value::String("paid".into()),
-        ]
-    }
-
-    fn insert_event(table_id: TableId, id: i64, price: f64) -> TestEvent<Postgres> {
-        TestEvent::<Postgres>::insert(table_id, row(id, price)).with_pk_columns([0u16])
-    }
-
-    fn delete_event(table_id: TableId, id: i64, price: f64) -> TestEvent<Postgres> {
-        TestEvent::<Postgres>::delete(table_id, row(id, price)).with_pk_columns([0u16])
-    }
-
-    fn update_status_only(table_id: TableId, id: i64, price: f64) -> TestEvent<Postgres> {
-        TestEvent::<Postgres>::update(table_id, row(id, price), row(id, price))
-            .with_pk_columns([0u16])
-            .with_changed_columns([3u16])
     }
 
     fn engine_with_values(
@@ -2165,12 +2096,12 @@ mod tests {
         let first = super::super::ReExecutionRead::GroupedScalar {
             group: vec![1],
             query: super::super::BoundQuery::new(String::new(), Vec::new()),
-            column_kinds: [BuiltinKind::Int, BuiltinKind::Int],
+            column_kinds: [ScalarFamily::Int, ScalarFamily::Int],
         };
         let second = super::super::ReExecutionRead::GroupedScalar {
             group: vec![2],
             query: super::super::BoundQuery::new(String::new(), Vec::new()),
-            column_kinds: [BuiltinKind::Int, BuiltinKind::Int],
+            column_kinds: [ScalarFamily::Int, ScalarFamily::Int],
         };
         engine.stamp_reexec(7, &first);
         assert!(engine.debounce_skip(7, &first));
@@ -2467,7 +2398,7 @@ mod tests {
         );
         assert_eq!(
             n.aggregate_updates[0].folded_value(),
-            Some(crate::AggValue::Count(6)),
+            Some(crate::AggValue::CountStar(6)),
             "the incremented total"
         );
         assert_eq!(
@@ -2510,7 +2441,7 @@ mod tests {
         assert_eq!(aggregate_updates.len(), 2, "each insert folds");
         assert_eq!(
             aggregate_updates.last().unwrap().folded_value(),
-            Some(crate::AggValue::Count(7)),
+            Some(crate::AggValue::CountStar(7)),
             "the running total after both inserts"
         );
     }

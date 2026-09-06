@@ -10,6 +10,27 @@ use super::{
 };
 use crate::backend::Backend;
 
+/// The per-subscription reasons one event stops an aggregate's
+/// stream maintenance, gathered so the reporting takes one argument.
+struct AggregateStops {
+    /// Subscriptions whose UPDATE omitted an old-row column they read.
+    missing_old: Vec<SubscriptionId>,
+    /// Subscriptions whose group key could not be encoded.
+    group_key_failed: Vec<SubscriptionId>,
+    /// Subscriptions whose filter the engine refuses to evaluate.
+    evaluation_refused: Vec<(
+        SubscriptionId,
+        crate::compiler::vm::refusal::EvaluationRefusal,
+    )>,
+    /// Subscriptions that would exceed the configured group limit.
+    group_limit: Vec<SubscriptionId>,
+    /// Subscriptions whose total left what the engine can represent.
+    sum_out_of_range: Vec<SubscriptionId>,
+    /// Subscriptions whose filter read a cell the event did not carry,
+    /// with that column.
+    unanswered_filter: Vec<(SubscriptionId, crate::ColumnId)>,
+}
+
 impl<E: CdcEvent, I: IdTypes, DB: DatabaseLike + 'static> SubscriptionEngine<E, I, DB>
 where
     E::Backend: SqlLiteralParse,
@@ -72,6 +93,14 @@ where
         Ok((transition, trigger))
     }
 
+    /// Stop one aggregate, unless this event already stopped it.
+    ///
+    /// One event can satisfy two stop conditions for the same
+    /// subscription: an UPDATE with an empty old image both omits the
+    /// old row and leaves the filter unanswerable. The first stop
+    /// unregisters the subscription, so a second attempt would fail
+    /// looking for registration metadata that is deliberately gone.
+    /// A subscription stops once, for the first reason found.
     fn push_aggregate_stop(
         &mut self,
         subscription: SubscriptionId,
@@ -79,6 +108,13 @@ where
         checkpoint: Option<&E::Checkpoint>,
         output: &mut crate::AggregateMaintenanceOutput<I, E::Backend, E::Checkpoint>,
     ) -> Result<(), DispatchError> {
+        if output
+            .transitions
+            .iter()
+            .any(|transition| transition.subscription_id == subscription)
+        {
+            return Ok(());
+        }
         let (transition, trigger) =
             self.transition_aggregate_to_whole(subscription, reason, checkpoint)?;
         output.transitions.push(transition);
@@ -89,12 +125,18 @@ where
     fn push_aggregate_stops(
         &mut self,
         table_id: TableId,
-        missing_old: Vec<SubscriptionId>,
-        group_key_failed: Vec<SubscriptionId>,
-        mut group_limit: Vec<SubscriptionId>,
+        stops: AggregateStops,
         checkpoint: Option<&E::Checkpoint>,
         output: &mut crate::AggregateMaintenanceOutput<I, E::Backend, E::Checkpoint>,
     ) -> Result<(), DispatchError> {
+        let AggregateStops {
+            missing_old,
+            group_key_failed,
+            evaluation_refused,
+            mut group_limit,
+            mut sum_out_of_range,
+            unanswered_filter,
+        } = stops;
         for subscription in missing_old {
             self.push_aggregate_stop(
                 subscription,
@@ -103,10 +145,34 @@ where
                 output,
             )?;
         }
+        // A refused evaluation is not a tier change: a read would raise
+        // the same error, so it is reported and nothing else happens.
+        output.evaluation_failures.extend(evaluation_refused);
+        // An absent cell is the opposite: a read is exactly what answers
+        // it, so the subscription leaves in-process maintenance rather
+        // than folding a delta it could only compute for one side.
+        for (subscription, column) in unanswered_filter {
+            self.push_aggregate_stop(
+                subscription,
+                crate::MaintenanceStopReason::FilterCellMissing { table_id, column },
+                checkpoint,
+                output,
+            )?;
+        }
         for subscription in group_key_failed {
             self.push_aggregate_stop(
                 subscription,
                 crate::MaintenanceStopReason::GroupKeyUnencodable { table_id },
+                checkpoint,
+                output,
+            )?;
+        }
+        sum_out_of_range.sort_unstable();
+        sum_out_of_range.dedup();
+        for subscription in sum_out_of_range {
+            self.push_aggregate_stop(
+                subscription,
+                crate::MaintenanceStopReason::SumOutOfRange { table_id },
                 checkpoint,
                 output,
             )?;
@@ -197,7 +263,7 @@ where
     /// assert_eq!(
     ///     updates[0].change,
     ///     subql::AggregateValueChange::Set(subql::AggregateResultValue::Folded(
-    ///         AggValue::Count(5),
+    ///         AggValue::CountStar(5),
     ///     ))
     /// );
     ///
@@ -254,6 +320,7 @@ where
         let mut output: crate::AggregateMaintenanceOutput<I, E::Backend, E::Checkpoint> =
             crate::AggregateMaintenanceOutput::empty();
         let mut group_limit = Vec::new();
+        let mut sum_out_of_range = Vec::new();
         for delta in computation.deltas {
             if let Some(group) = delta.group {
                 let Some(total) = self.grouped_aggregates.get_mut(&delta.subscription) else {
@@ -279,6 +346,9 @@ where
                     crate::runtime::aggregate::GroupedFoldOutcome::GroupLimit => {
                         group_limit.push(delta.subscription);
                     }
+                    crate::runtime::aggregate::GroupedFoldOutcome::SumOutOfRange => {
+                        sum_out_of_range.push(delta.subscription);
+                    }
                 }
                 continue;
             }
@@ -287,23 +357,35 @@ where
             else {
                 continue;
             };
-            if let Some(value) = total.fold(change, at.as_ref(), cap) {
-                output.updates.push(crate::AggregateValueUpdate {
+            match total.fold(change, at.as_ref(), cap) {
+                Ok(Some(value)) => output.updates.push(crate::AggregateValueUpdate {
                     subscription: delta.subscription,
                     consumer: total.consumer(),
                     group: None,
                     change: crate::AggregateValueChange::Set(crate::AggregateResultValue::Folded(
                         value,
                     )),
-                });
+                }),
+                Ok(None) => {}
+                // The total left what this engine can represent, which is
+                // where the engine itself raises, so the tier changes
+                // rather than the number drifting.
+                Err(crate::runtime::aggregate::SumOutOfRange) => {
+                    sum_out_of_range.push(delta.subscription);
+                }
             }
         }
 
         self.push_aggregate_stops(
             table_id,
-            computation.missing_old,
-            computation.group_key_failed,
-            group_limit,
+            AggregateStops {
+                missing_old: computation.missing_old,
+                group_key_failed: computation.group_key_failed,
+                evaluation_refused: computation.evaluation_refused,
+                group_limit,
+                sum_out_of_range,
+                unanswered_filter: computation.unanswered_filter,
+            },
             at.as_ref(),
             &mut output,
         )?;
@@ -353,7 +435,16 @@ where
             crate::compiler::sql_shape::QueryProjection::Aggregate(spec) => {
                 self.aggregates.insert(
                     subscription,
-                    crate::runtime::aggregate::AggregateTotal::new(consumer, spec.clone()),
+                    crate::runtime::aggregate::AggregateTotal::new(
+                        consumer,
+                        spec.clone(),
+                        crate::catalog_helpers::fold_rule::<E::Backend, _>(
+                            spec,
+                            &self.database,
+                            table_id,
+                            self.division_increment,
+                        ),
+                    ),
                 );
                 true
             }
@@ -365,7 +456,7 @@ where
                 let columns = groups
                     .iter()
                     .map(|column| {
-                        crate::catalog_helpers::group_key_column::<E::Backend, _>(
+                        crate::catalog_helpers::column_comparison::<E::Backend, _>(
                             &self.database,
                             table_id,
                             *column,
@@ -383,6 +474,12 @@ where
                         groups.len(),
                         having.as_ref(),
                         group_key_encoder,
+                        crate::catalog_helpers::fold_rule::<E::Backend, _>(
+                            agg,
+                            &self.database,
+                            table_id,
+                            self.division_increment,
+                        ),
                     ),
                 );
                 true

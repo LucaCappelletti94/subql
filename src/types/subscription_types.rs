@@ -1,8 +1,8 @@
 //! Subscription request, registration, and install types.
 
-use super::domain_id_types::TableId;
+use super::domain_id_types::{ColumnId, TableId};
 use super::generic_id_types::{IdTypes, SubscriptionId, SubscriptionScope};
-use crate::backend::{Backend, BuiltinKind, Value};
+use crate::backend::{Backend, ScalarFamily, Value, ValueKind, ValueKindOf};
 use crate::checkpoint::{Checkpoint, NoCheckpoint};
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -622,8 +622,8 @@ impl<'a, I: IdTypes> IntoIterator for &'a SubscriptionsView<'_, I> {
 /// consumes them, and
 /// [`kinds`](Self::kinds) gives the decode kind for every column in that same
 /// order. `COUNT` components are
-/// [`BuiltinKind::Int`](crate::backend::BuiltinKind::Int); `SUM` and `SUM(x*x)`
-/// components are [`BuiltinKind::Float`](crate::backend::BuiltinKind::Float),
+/// [`ScalarFamily::Int`](crate::backend::ScalarFamily::Int); `SUM` and `SUM(x*x)`
+/// components are [`ScalarFamily::Float`](crate::backend::ScalarFamily::Float),
 /// decoded as double to match the `f64` accumulator (since `SUM` promotes to
 /// `bigint`/`numeric`/`DECIMAL` depending on the backend).
 ///
@@ -635,7 +635,7 @@ pub struct AggregateBootstrap<B: Backend = crate::backend::Postgres> {
     /// Runnable seed query with positionally-aliased component columns.
     pub query: crate::reexec::BoundQuery<B>,
     /// Per-column decode kinds, in column order, group columns included.
-    pub kinds: Vec<BuiltinKind>,
+    pub kinds: Vec<ScalarFamily>,
     /// How many leading columns of each row are group values.
     ///
     /// Zero for an ungrouped aggregate, in which case every column is a
@@ -649,6 +649,148 @@ impl<B: Backend> Clone for AggregateBootstrap<B> {
             query: self.query.clone(),
             kinds: self.kinds.clone(),
             group_columns: self.group_columns,
+        }
+    }
+}
+
+/// Why an answer is maintained by a database read instead of in process.
+///
+/// Typed so a caller branches rather than parsing prose: "your column's
+/// collation is not reproducible in process, so this query now costs a round
+/// trip" is a deployment decision, while "this comparison mixes two column
+/// types" is a query fix, and the two used to arrive as the same `String`.
+///
+/// Generic over the backend because a cause names a column's scalar kind, and
+/// a custom backend kind is not a [`ScalarFamily`].
+///
+/// [`Display`](core::fmt::Display) renders the sentence a caller logs today,
+/// so migrating is a match arm rather than a message change.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum NotServed<B: Backend> {
+    /// A shared in-process answer over a row-security table would be one
+    /// viewer's answer served to another, so the read happens per consumer.
+    RowSecurityNeedsPerConsumerRead {
+        /// The table whose row security forces the read.
+        table: TableId,
+    },
+    /// The aggregate reads a column the fold cannot carry.
+    UnfoldableAggregate {
+        /// The aggregated column.
+        column: ColumnId,
+        /// What a value of the column is, which is what the compiler knew
+        /// when it refused: a family, or one custom type.
+        kind: ValueKindOf<B>,
+        /// The aggregate function, as the statement spelled it.
+        function: String,
+    },
+    /// The comparison orders a kind whose order this build cannot
+    /// reproduce. `jsonb` is the one such kind today: PostgreSQL's order
+    /// over it is not the order of the canonical binary form, and its
+    /// string arm follows the database collation.
+    OrderNotReproducible {
+        /// The compared column.
+        column: ColumnId,
+        /// What a value of the column is, which is what the compiler knew
+        /// when it refused: a family, or one custom type.
+        kind: ValueKindOf<B>,
+    },
+    /// The column's collation is one the in-process comparator cannot
+    /// reproduce, so only the database can answer comparisons on it.
+    CollationNotReproducible {
+        /// The compared column.
+        column: ColumnId,
+        /// The collation as the catalog names it, or `None` when the catalog
+        /// reports the rules changed without naming them.
+        collation: Option<String>,
+    },
+    /// `/` on this engine answers a decimal whose scale depends on a
+    /// session setting the engine was not told, so only the database can
+    /// answer the quotient.
+    DivisionPrecisionNotDeclared,
+    /// The comparison mixes two column types the in-process comparator does
+    /// not reconcile, so the database's own coercion decides it.
+    CrossKindComparison {
+        /// Left operand column.
+        left: ColumnId,
+        /// What a value of the left operand is.
+        left_kind: ValueKindOf<B>,
+        /// Right operand column.
+        right: ColumnId,
+        /// What a value of the right operand is.
+        right_kind: ValueKindOf<B>,
+    },
+    /// A form with no structured cause to report, carrying the compiler's own
+    /// words.
+    UnsupportedSql(String),
+}
+
+/// Renders a scalar kind the way a refusal message names it: the builtin's
+/// own name, without the wrapper `Debug` would print.
+struct ScalarKindName<'a, B: Backend>(&'a ValueKindOf<B>);
+
+impl<B: Backend> core::fmt::Display for ScalarKindName<'_, B> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self.0 {
+            ValueKind::Builtin(family) => write!(f, "{family:?}"),
+            ValueKind::Custom(custom) => write!(f, "{custom:?}"),
+        }
+    }
+}
+
+impl<B: Backend> core::fmt::Display for NotServed<B> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::RowSecurityNeedsPerConsumerRead { .. } => {
+                f.write_str("aggregate on RLS table requires database re-execution")
+            }
+            Self::UnfoldableAggregate {
+                column,
+                kind,
+                function,
+            } => write!(
+                f,
+                "{function} requires a numeric column (Int, Float, or Decimal), \
+                 but column {column} has type {kind}",
+                kind = ScalarKindName::<B>(kind)
+            ),
+            Self::OrderNotReproducible { column, kind } => write!(
+                f,
+                "column {column} has type {kind}, whose ordered comparison \
+                 subql cannot reproduce in process",
+                kind = ScalarKindName::<B>(kind)
+            ),
+            Self::DivisionPrecisionNotDeclared => write!(
+                f,
+                "division on this engine answers a decimal whose scale follows its \
+                 div_precision_increment, which this engine was not given: supply it with \
+                 with_division_precision_increment"
+            ),
+            Self::CollationNotReproducible { column, collation } => match collation {
+                Some(name) => write!(
+                    f,
+                    "column {column} declares collation {name}, whose comparison \
+                     subql cannot reproduce in process"
+                ),
+                None => write!(
+                    f,
+                    "column {column} declares a collation the catalog cannot name, \
+                     so subql cannot reproduce its comparison in process"
+                ),
+            },
+            Self::CrossKindComparison {
+                left,
+                left_kind,
+                right,
+                right_kind,
+            } => write!(
+                f,
+                "column {left} has type {left_name} and column {right} has type \
+                 {right_name}, and subql does not reconcile the two in process",
+                left_name = ScalarKindName::<B>(left_kind),
+                right_name = ScalarKindName::<B>(right_kind)
+            ),
+            Self::UnsupportedSql(message) => f.write_str(message),
         }
     }
 }
@@ -673,7 +815,7 @@ pub struct Registered<B: Backend = crate::backend::Postgres> {
     /// tier this is what the in-process evaluator said it could not do, which
     /// is the only thing telling a caller why its query costs a read per
     /// change rather than being answered from memory.
-    pub not_served_because: Option<String>,
+    pub not_served_because: Option<NotServed<B>>,
 }
 
 impl<B: Backend> Registered<B> {
@@ -723,7 +865,7 @@ pub enum Tier<B: Backend = crate::backend::Postgres> {
         /// Bound query for the initial value and later triggers.
         query: crate::reexec::BoundQuery<B>,
         /// Decode hint for the scalar result.
-        column_kind: BuiltinKind,
+        column_kind: ScalarFamily,
     },
     /// Grouped extrema seeded together and re-read one displaced group at a time.
     GroupedScalar {
@@ -996,6 +1138,14 @@ pub enum InstallError {
 /// database read.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum AggregateInstallError {
+    /// A change held through the read window put the total outside what
+    /// the engine can represent, so there is no seeded value to install.
+    ///
+    /// Measured: SQLite answers `integer overflow` past 64 bits and
+    /// PostgreSQL answers `value overflows numeric format` past 131072
+    /// integer digits.
+    #[error("subscription {0}: the total leaves what this engine can represent")]
+    SumOutOfRange(crate::SubscriptionId),
     /// No aggregate subscription with this id, or it was unregistered.
     #[error("subscription {0} is not a live aggregate subscription")]
     UnknownAggregate(SubscriptionId),

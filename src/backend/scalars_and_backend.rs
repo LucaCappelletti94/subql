@@ -2,7 +2,7 @@
 //! rather than a banner comment.
 
 use super::scalar_value::default_group_key_encoder;
-use super::{Cow, CustomScalars, GroupKeyColumnOf, GroupKeyEncoder, ScalarKindOf, Value};
+use super::{ColumnComparisonOf, Cow, CustomScalars, GroupKeyEncoder, Value};
 use alloc::string::ToString;
 
 /// Trait bounds every [`Backend`] associated scalar type must satisfy.
@@ -246,7 +246,7 @@ pub trait Backend: 'static {
     /// Selects a canonical encoder for resolved group columns.
     #[must_use]
     fn group_key_encoder(
-        columns: alloc::vec::Vec<GroupKeyColumnOf<Self>>,
+        columns: alloc::vec::Vec<ColumnComparisonOf<Self>>,
     ) -> Option<GroupKeyEncoder<Self>>
     where
         Self: Sized,
@@ -256,18 +256,325 @@ pub trait Backend: 'static {
 
     /// Reinterprets a database row field using the planned group-column kind.
     #[must_use]
-    fn decode_group_value(_kind: ScalarKindOf<Self>, value: Value<Self>) -> Option<Value<Self>>
+    fn decode_group_value(
+        _kind: super::scalar_value::ValueKindOf<Self>,
+        value: Value<Self>,
+    ) -> Option<Value<Self>>
     where
         Self: Sized,
     {
         (!value.is_missing()).then_some(value)
     }
+
+    /// The default `LIKE` escape for this engine, or `None` when it gives
+    /// `LIKE` no default escape.
+    ///
+    /// Required rather than defaulted, because there is no rule that is
+    /// right for an unknown engine: PostgreSQL and MySQL escape with a
+    /// backslash, SQLite escapes with nothing, and guessing either way
+    /// answers some pattern wrongly.
+    ///
+    /// One answer rather than two constants: an engine with no default
+    /// escape cannot have a dangling one, so the two facts belong together.
+    const LIKE_ESCAPE: Option<crate::compiler::vm::refusal::LikeEscape>;
+
+    /// The width an arithmetic result is held at, given each operand's
+    /// width, or `None` when the operation is not on floats.
+    ///
+    /// Required rather than defaulted, because the engines disagree.
+    /// Measured on PostgreSQL 16.11: `real + real + real` is computed in
+    /// float4 and answers `0.3`, while `real * 3` has no operator and
+    /// promotes, answering the double product. Measured on MySQL 8.4.11:
+    /// `FLOAT + FLOAT + FLOAT` answers the double sum, so MySQL narrows
+    /// nothing, and SQLite has no float4 column to narrow.
+    #[must_use]
+    fn float_arithmetic_width(
+        left: Option<super::scalar_value::FloatWidth>,
+        right: Option<super::scalar_value::FloatWidth>,
+    ) -> Option<super::scalar_value::FloatWidth>
+    where
+        Self: Sized;
+
+    /// One float value put on the float4 grid, for a result this backend
+    /// holds at single width.
+    ///
+    /// Required rather than defaulted, and deliberately so: a default of
+    /// "unchanged" lets this and
+    /// [`Backend::float_arithmetic_width`](Backend::float_arithmetic_width)
+    /// disagree in silence, so a backend could resolve a float4 result and
+    /// then not hold it at float4. A backend on the standard carrier
+    /// delegates to [`crate::backend::at_float4`]; one whose float is not
+    /// `f64` has no float4 grid this crate can compute and says so by
+    /// returning the value.
+    #[must_use]
+    fn hold_float_at_single(value: Self::Float) -> Self::Float
+    where
+        Self: Sized;
+
+    /// The exact type a declaration of `family` names on this engine.
+    ///
+    /// Required rather than defaulted, because the spellings differ: `real`
+    /// and `float4` are single width on PostgreSQL, `FLOAT` is on MySQL, and
+    /// SQLite's one `REAL` is double. Guessing a width is the defect this
+    /// replaces, so each backend states its own.
+    #[must_use]
+    fn refine_declared_type(
+        family: super::scalar_value::ScalarFamily,
+        declared_type: &str,
+    ) -> super::scalar_value::DeclaredType
+    where
+        Self: Sized;
+
+    /// How this backend answers one text comparison: in process, by a
+    /// database read, or not at all, per
+    /// [`TextResolution`](super::scalar_value::TextResolution).
+    ///
+    /// Asked per operation because reproducibility does not factor per
+    /// column: PostgreSQL's default collation has byte equality and locale
+    /// ordering at once. Resolved once per comparison at registration and
+    /// carried in the compiled program, so no row consults a collation.
+    ///
+    /// Required rather than defaulted: byte comparison is right for some
+    /// engines and silently wrong for others, and guessing is the defect
+    /// this answers.
+    #[must_use]
+    fn text_rule(
+        comparison: &super::scalar_value::ComparisonContext<'_, Self>,
+        operation: crate::backend::TextOperation,
+    ) -> crate::backend::TextResolution
+    where
+        Self: Sized;
+
+    /// How this backend reads a numeric pair whose operands are two
+    /// different scalars, or `None` when it does not compare that pair at
+    /// all, which classifies the comparison as a database read.
+    ///
+    /// Required, and per backend, because the engines disagree: measured,
+    /// PostgreSQL and MySQL cast the other operand to `double precision`
+    /// against a float and compare exactly against a decimal, while SQLite
+    /// compares an integer against a real exactly. Both kinds are builtin,
+    /// since only the numeric builtins have a widening.
+    ///
+    /// The compiler asks this at registration to decide whether to serve
+    /// the comparison, and the comparator asks it to answer one, so the
+    /// two cannot disagree.
+    #[must_use]
+    fn numeric_widening(
+        left: super::scalar_value::ScalarFamily,
+        right: super::scalar_value::ScalarFamily,
+    ) -> Option<super::scalar_value::NumericWidening>
+    where
+        Self: Sized;
+
+    /// How a numeric pair of two different scalars orders under this
+    /// backend's widening, or `None` when there is none.
+    ///
+    /// Defaults to `None`, which classifies every cross-kind comparison as
+    /// a database read: a backend carrying its numbers in types other than
+    /// `i64`, `f64` and `BigDecimal` has no widening this crate can
+    /// perform. A backend on the standard carriers delegates to
+    /// [`crate::backend::cross_kind_numeric_ordering`], which
+    /// reads the policy from [`Backend::numeric_widening`].
+    ///
+    /// # Errors
+    ///
+    /// [`crate::EvaluationRefusal`] when the engine raises rather than
+    /// answering. The standard widening raises when an exact operand has
+    /// no `double precision` to be cast to.
+    fn compare_cross_kind_numeric(
+        _left: &Value<Self>,
+        _right: &Value<Self>,
+    ) -> Result<Option<core::cmp::Ordering>, crate::EvaluationRefusal>
+    where
+        Self: Sized,
+    {
+        Ok(None)
+    }
+
+    /// What this backend answers when a divisor is zero.
+    ///
+    /// Required, and per backend, because the engines disagree: measured,
+    /// PostgreSQL raises `division by zero` for `/` and `%` alike and for
+    /// every numeric type, while MySQL and SQLite answer `NULL`.
+    const DIVISION_BY_ZERO: crate::compiler::vm::refusal::DivisionByZero;
+
+    /// What `/` answers on this backend: whether two integers divide to an
+    /// integer, and what scale a decimal quotient carries.
+    ///
+    /// Required, and per backend, because the engines disagree at every
+    /// input rather than at a boundary: measured, `7 / 2 > 3` is false on
+    /// PostgreSQL and SQLite and true on MySQL, whose `/` is decimal
+    /// division whatever its operands are. See
+    /// [`DivisionRule`](super::scalar_value::DivisionRule).
+    const DIVISION: super::scalar_value::DivisionRule;
+
+    /// What this engine answers when a floating total leaves its range.
+    ///
+    /// Required, and per backend, because no two agree: measured,
+    /// PostgreSQL raises, MySQL answers `0` and stays there, and SQLite
+    /// saturates to an infinity. See
+    /// [`FloatSumOverflow`](super::scalar_value::FloatSumOverflow).
+    const FLOAT_SUM_OVERFLOW: super::scalar_value::FloatSumOverflow;
+
+    /// How this engine orders a float against another number.
+    ///
+    /// Required, and per backend, because PostgreSQL defines its own
+    /// total order where IEEE defines none: measured,
+    /// `'NaN'::float8 > 1` is true, and stays true when the other
+    /// operand is an `int` or a `numeric` the engine widens. See
+    /// [`FloatOrder`](super::scalar_value::FloatOrder).
+    const FLOAT_ORDER: super::scalar_value::FloatOrder;
+
+    /// Which shape this engine can hand a variance seed back in.
+    ///
+    /// Required, and per backend, because it is a question of what the
+    /// engine can be asked: PostgreSQL and MySQL answer
+    /// `VAR_POP(x) * COUNT(x)`, while SQLite has no variance function and
+    /// its seed query fails with `no such function: VAR_POP`. See
+    /// [`VarianceSeed`](super::scalar_value::VarianceSeed).
+    const VARIANCE_SEED: super::scalar_value::VarianceSeed;
+
+    /// What `AVG` answers when the total it divides is exact.
+    ///
+    /// Required, and per backend, because a mean is a quotient and the
+    /// engines divide differently: measured, PostgreSQL answers
+    /// `1.5000000000000000` for the mean of 1 and 2 over an `int` column,
+    /// MySQL compares `1.666666666` for the mean of 1, 2 and 2, and
+    /// SQLite answers a real for every column. See
+    /// [`MeanRule`](super::scalar_value::MeanRule).
+    const MEAN: super::scalar_value::MeanRule;
+
+    /// What `SUM` over a column of this type accumulates in, and answers.
+    ///
+    /// Required, and per backend, because the engines disagree at every
+    /// input: measured, `SUM` over an `int` column is a `bigint` on
+    /// PostgreSQL, a `decimal(32,0)` on MySQL and an `integer` on SQLite,
+    /// and over a `bigint` column PostgreSQL switches to `numeric` while
+    /// SQLite keeps a 64-bit integer that can overflow. See
+    /// [`SumRule`](super::scalar_value::SumRule).
+    #[must_use]
+    fn sum_rule(column: super::scalar_value::DeclaredType) -> super::scalar_value::SumRule;
+
+    /// Two decimals divided at the scale this backend's
+    /// [`Backend::DIVISION`] computes it to.
+    ///
+    /// Required rather than defaulted, for the reason
+    /// [`Backend::hold_float_at_single`] is: a default would let the rule
+    /// and the arithmetic disagree in silence. A backend on the standard
+    /// `bigdecimal` carrier delegates to
+    /// [`crate::compiler::vm::arithmetic::quotient_in_words`] or
+    /// [`crate::compiler::vm::arithmetic::quotient_at_significant_digits`]
+    /// according to the rule it states.
+    #[must_use]
+    fn decimal_quotient(
+        dividend: Self::Decimal,
+        divisor: Self::Decimal,
+        quotient: crate::compiler::bytecode::Quotient,
+    ) -> Self::Decimal
+    where
+        Self: Sized;
+
+    /// Two integers divided to a decimal, for a backend whose `/` answers
+    /// one.
+    ///
+    /// Called only under
+    /// [`DivisionRule::QuotientsAreDecimalInWords`](super::scalar_value::DivisionRule::QuotientsAreDecimalInWords),
+    /// where `7 / 2` is `3.5000` rather than `3`. A backend on the
+    /// standard carriers widens both sides and delegates to
+    /// [`crate::compiler::vm::arithmetic::quotient_in_words`].
+    #[must_use]
+    fn integer_quotient(
+        dividend: Self::Int,
+        divisor: Self::Int,
+        increment: super::scalar_value::DivisionPrecisionIncrement,
+    ) -> Self::Decimal
+    where
+        Self: Sized;
+
+    /// Integer `+`, `-` or `*` as this backend answers it, including what
+    /// it answers when the result does not fit.
+    ///
+    /// Required, and per backend, because the engines disagree: measured,
+    /// PostgreSQL and MySQL raise `out of range` while SQLite promotes the
+    /// result to a real. A backend on the standard `i64` carrier delegates
+    /// to [`crate::compiler::vm::arithmetic::checked_integer_binary`].
+    ///
+    /// # Errors
+    ///
+    /// The failure this backend's engine raises, which the caller reports
+    /// per subscription rather than folding into `Value::Null`.
+    fn integer_binary(
+        operation: crate::compiler::vm::refusal::ArithmeticOp,
+        left: Self::Int,
+        right: Self::Int,
+    ) -> Result<Value<Self>, crate::compiler::vm::refusal::EvaluationRefusal>
+    where
+        Self: Sized;
+
+    /// Integer unary `-`, same contract as [`Backend::integer_binary`].
+    ///
+    /// # Errors
+    ///
+    /// The failure this backend's engine raises.
+    fn integer_negate(
+        value: Self::Int,
+    ) -> Result<Value<Self>, crate::compiler::vm::refusal::EvaluationRefusal>
+    where
+        Self: Sized;
+
+    /// Whether two scalars are equal for this backend, given both operands'
+    /// catalog facts.
+    ///
+    /// The default is the structural same-scalar rule and reads no facts. A
+    /// backend whose engine disagrees (PostgreSQL NaN, a collation the
+    /// comparator can reproduce, `char(n)` padding, a cross-width numeric
+    /// pair) overrides this and reads the context, which is why the context
+    /// carries both sides rather than one.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::EvaluationRefusal`] when the engine raises for this pair
+    /// rather than answering it.
+    fn scalars_equal(
+        comparison: super::scalar_value::ComparisonContext<'_, Self>,
+        left: &Value<Self>,
+        right: &Value<Self>,
+    ) -> Result<bool, crate::EvaluationRefusal>
+    where
+        Self: Sized,
+    {
+        crate::compiler::value_cmp::structural_equality(comparison, left, right)
+    }
+
+    /// How two scalars order for this backend, or `None` when the pair has
+    /// no defined order, which the caller lifts to `Tri::Unknown`.
+    ///
+    /// Same contract as [`Backend::scalars_equal`].
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Backend::scalars_equal`].
+    fn compare_scalars(
+        comparison: super::scalar_value::ComparisonContext<'_, Self>,
+        left: &Value<Self>,
+        right: &Value<Self>,
+    ) -> Result<Option<core::cmp::Ordering>, crate::EvaluationRefusal>
+    where
+        Self: Sized,
+    {
+        crate::compiler::value_cmp::structural_ordering(comparison, left, right)
+    }
+
     /// SQL parser dialect for this backend.
     type Dialect: sqlparser::dialect::Dialect;
 
-    /// SQL `BOOL` representation. Only equality-shaped operations are
-    /// applied to booleans, so truth is the extra row-side capability.
-    type Bool: ScalarKey + ScalarTruth;
+    /// SQL `BOOL` representation.
+    ///
+    /// `PartialOrd` is required because SQL orders booleans, and the order
+    /// has to be the carrier's own: a backend whose boolean really is an
+    /// integer, as SQLite's is, reports `2` above `1`, which deriving the
+    /// order from [`ScalarTruth`] would flatten to equal.
+    type Bool: ScalarKey + ScalarTruth + PartialOrd;
     /// The embedder's own scalar types, or [`crate::backend::NoCustomScalars`] for a backend
     /// serving none. One rule classifies a declared type name into this set
     /// and both the read and the write side consult it, so a column cannot

@@ -504,7 +504,20 @@ fn literal_index_key<B: SqlLiteralParse, DB: DatabaseLike>(
         return None;
     };
     let kind = catalog_helpers::column_scalar_kind::<B, DB>(database, table_id, column_id)?;
-    PlannerValue::from_value(&B::parse_literal(&value.value, kind).ok()?)
+    // The equality index is probed by exact key, so a column whose
+    // comparison is not byte-exact cannot be indexed by one: a `char(n)`
+    // cell carries padding the comparison ignores, and a case-insensitive
+    // or trailing-space-insensitive collation has the same problem. Such a
+    // predicate stays unindexed and the comparator answers it, rather than
+    // the probe pruning a row the comparator would have matched.
+    if kind.family() == Some(crate::backend::ScalarFamily::String) {
+        let facts = catalog_helpers::column_comparison::<B, DB>(database, table_id, column_id)?;
+        let rule = crate::backend::single_column_rule::<B>(&facts);
+        if rule != Some(crate::backend::TextRule::EXACT) {
+            return None;
+        }
+    }
+    PlannerValue::from_value(&B::parse_literal(&value.value, kind.value_kind()).ok()?)
 }
 
 /// An integer bound for a range atom. Range entries hold `i64` bounds and

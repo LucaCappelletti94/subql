@@ -19,30 +19,61 @@
 //! [`compare_ordered_values`] is defined for the ten scalar variants whose
 //! [`Backend`](crate::backend::Backend) associated types carry a
 //! [`PartialOrd`] bound (`Int`, `Float`, `String`, `Bytes`, `Uuid`,
-//! `Timestamp`, `TimestampTz`, `Date`, `Time`, `Decimal`). `Bool`, `Json`,
-//! and `Jsonb` intentionally lack ordering in the backend trait; ordered
-//! comparison on those variants collapses to `Tri::Unknown` (same as SQL
-//! `<`/`>` on boolean/json values).
+//! `Timestamp`, `TimestampTz`, `Date`, `Time`, `Decimal`, `Bool`). SQL
+//! orders booleans, so `flag > false` is a row rather than an unknown, and
+//! the order is the carrier's: integer order where a backend's boolean is
+//! an integer. `Json` and `Jsonb` have no order here, and ordered
+//! comparison on them collapses to `Tri::Unknown`.
 //!
 //! # NaN
 //!
-//! `PartialOrd::partial_cmp` returns `None` on NaN operands; the helper
-//! propagates that as `Tri::Unknown` rather than crashing.
+//! `PartialOrd::partial_cmp` returns `None` on NaN operands, which is the
+//! IEEE rule and not the SQL one. It is the default here, and a backend
+//! whose engine disagrees overrides it: PostgreSQL orders NaN equal to
+//! itself and above every non-NaN value, so both helpers below are only the
+//! structural starting point, never the answer. Ask through
+//! [`Backend::scalars_equal`](crate::backend::Backend::scalars_equal) and
+//! [`Backend::compare_scalars`](crate::backend::Backend::compare_scalars).
 
-use crate::backend::{Backend, Value};
+use crate::backend::{Backend, ComparisonContext, Value};
+use crate::compiler::vm::refusal::EvaluationRefusal;
 use crate::compiler::Tri;
 
-/// Structural equality between two same-scalar [`Value`]s.
+/// Structural equality between two same-scalar [`Value`]s: the default a
+/// backend inherits from [`Backend::scalars_equal`].
 ///
-/// * Both operands carrying the same scalar variant with equal payload -> `true`.
-/// * Both operands carrying the same scalar variant with unequal payload -> `false`.
+/// * Same scalar variant, equal payload -> `true`; unequal payload -> `false`.
 /// * Cross-scalar mismatch -> `false`.
 /// * Either operand `Missing` or `Null` -> `false` (the VM lifts those to
-///   `Tri::Unknown` before calling this helper; this function itself never
-///   returns tri-state).
-/// * `Value::Float(NaN)` == anything -> `false` (SQL/IEEE rule; `NaN != NaN`).
-pub fn values_equal<B: Backend>(a: &Value<B>, b: &Value<B>) -> bool {
-    match (a, b) {
+///   `Tri::Unknown` before asking; this function never returns tri-state).
+/// * `Value::Float(NaN)` against anything -> `false`, the IEEE rule.
+///   PostgreSQL disagrees, which is why a backend can override it.
+///
+/// Text is the one scalar whose equality is not its payload's: the rule the
+/// compiler resolved says whether case or trailing spaces count. Every
+/// other variant compares by payload.
+///
+/// # Errors
+///
+/// [`EvaluationRefusal`] when the backend's widening raises rather than
+/// answering. Before this was fallible the refusal reached the wildcard
+/// arm below and answered `false`, so a pair the engine will not evaluate
+/// was reported as a definite no-match.
+pub fn structural_equality<B: Backend>(
+    comparison: ComparisonContext<'_, B>,
+    a: &Value<B>,
+    b: &Value<B>,
+) -> Result<bool, EvaluationRefusal> {
+    if let (Value::String(x), Value::String(y)) = (a, b) {
+        return Ok(comparison
+            .text
+            .unwrap_or(crate::backend::TextRule::EXACT)
+            .equal(x.as_ref(), y.as_ref()));
+    }
+    if let Some(ordering) = B::compare_cross_kind_numeric(a, b)? {
+        return Ok(ordering == core::cmp::Ordering::Equal);
+    }
+    Ok(match (a, b) {
         (Value::Bool(x), Value::Bool(y)) => x == y,
         (Value::Int(x), Value::Int(y)) => x == y,
         (Value::Float(x), Value::Float(y)) => x == y,
@@ -63,30 +94,41 @@ pub fn values_equal<B: Backend>(a: &Value<B>, b: &Value<B>) -> bool {
         (Value::Custom(x), Value::Custom(y)) => x == y,
         // Missing/Null and cross-scalar pairs are never equal here.
         _ => false,
-    }
+    })
 }
 
-/// Ordered comparison between two same-scalar [`Value`]s under a caller
-/// predicate on [`core::cmp::Ordering`].
+/// Structural ordering between two same-scalar [`Value`]s: the default a
+/// backend inherits from [`Backend::compare_scalars`].
 ///
-/// * Either operand `Missing` or `Null` -> `Tri::Unknown`.
-/// * Cross-scalar mismatch -> `Tri::Unknown`.
-/// * Variant lacks a `PartialOrd` bound in [`Backend`] (`Bool`, `Json`,
-///   `Jsonb`) -> `Tri::Unknown`.
-/// * `partial_cmp` returns `None` (NaN operand on `Float`) -> `Tri::Unknown`.
-/// * Otherwise the predicate is invoked on the resolved `Ordering` and the
-///   result is lifted to `Tri::True` / `Tri::False`.
-pub fn compare_ordered_values<B, F>(lhs: &Value<B>, rhs: &Value<B>, predicate: F) -> Tri
-where
-    B: Backend,
-    F: FnOnce(core::cmp::Ordering) -> bool,
-{
-    // Missing / Null -> Unknown.
+/// `None` means the pair has no defined order: `Missing`, `Null`, a
+/// cross-scalar pair, a variant with no order at all (`Json`, `Jsonb`), or
+/// a NaN operand.
+///
+/// `Bool` orders by its carrier: `false` below `true` for a real boolean,
+/// and integer order where the boolean is an integer, as SQLite's is. SQL
+/// orders booleans, so collapsing the pair to `Tri::Unknown` answered
+/// `flag > false` wrongly.
+pub fn structural_ordering<B: Backend>(
+    comparison: ComparisonContext<'_, B>,
+    lhs: &Value<B>,
+    rhs: &Value<B>,
+) -> Result<Option<core::cmp::Ordering>, EvaluationRefusal> {
     if lhs.is_absent() || rhs.is_absent() {
-        return Tri::Unknown;
+        return Ok(None);
     }
-
-    let ord = match (lhs, rhs) {
+    if let (Value::String(x), Value::String(y)) = (lhs, rhs) {
+        return Ok(Some(
+            comparison
+                .text
+                .unwrap_or(crate::backend::TextRule::EXACT)
+                .compare(x.as_ref(), y.as_ref()),
+        ));
+    }
+    if let Some(ordering) = B::compare_cross_kind_numeric(lhs, rhs)? {
+        return Ok(Some(ordering));
+    }
+    Ok(match (lhs, rhs) {
+        (Value::Bool(x), Value::Bool(y)) => x.partial_cmp(y),
         (Value::Int(x), Value::Int(y)) => x.partial_cmp(y),
         (Value::Float(x), Value::Float(y)) => x.partial_cmp(y),
         (Value::String(x), Value::String(y)) => x.partial_cmp(y),
@@ -97,15 +139,544 @@ where
         (Value::Date(x), Value::Date(y)) => x.partial_cmp(y),
         (Value::Time(x), Value::Time(y)) => x.partial_cmp(y),
         (Value::Decimal(x), Value::Decimal(y)) => x.partial_cmp(y),
-        // Bool / Json / Jsonb have no PartialOrd bound in Backend.
-        // Cross-scalar mismatch also lands here.
-        _ => return Tri::Unknown,
-    };
+        // Json / Jsonb have no order here; a cross-scalar mismatch also
+        // lands on this arm.
+        _ => None,
+    })
+}
 
-    match ord {
-        Some(o) if predicate(o) => Tri::True,
+/// The builtin kind a runtime numeric scalar carries, or `None` when the
+/// value is not numeric.
+const fn numeric_kind<B: Backend>(value: &Value<B>) -> Option<crate::backend::ScalarFamily> {
+    match value {
+        Value::Int(_) => Some(crate::backend::ScalarFamily::Int),
+        Value::Float(_) => Some(crate::backend::ScalarFamily::Float),
+        Value::Decimal(_) => Some(crate::backend::ScalarFamily::Decimal),
+        _ => None,
+    }
+}
+
+/// How a numeric pair of two different scalars orders, or `None` when the
+/// pair is not one this backend widens.
+///
+/// The widening is the backend's, because the engines disagree: measured,
+/// PostgreSQL and MySQL cast the other operand to `double precision`
+/// against a float and compare exactly against a decimal, while SQLite
+/// compares an integer against a real exactly.
+///
+/// Bounded on the standard numeric carriers rather than written for every
+/// `Backend`, because `B::Int` and `B::Float` are associated types with no
+/// conversion to `i64` and `f64`. A backend carrying its numbers otherwise
+/// implements the comparison itself.
+///
+/// # Errors
+///
+/// [`EvaluationRefusal::DecimalOutsideFloatRange`] when the widening is to
+/// a double and an exact operand does not fit one. The engine raises there
+/// rather than answering, so neither an ordering nor an absence of one is
+/// the truth.
+pub fn cross_kind_numeric_ordering<B>(
+    left: &Value<B>,
+    right: &Value<B>,
+) -> Result<Option<core::cmp::Ordering>, EvaluationRefusal>
+where
+    B: Backend<Int = i64, Float = f64, Decimal = bigdecimal::BigDecimal>,
+{
+    use crate::backend::NumericWidening;
+
+    let (Some(left_kind), Some(right_kind)) = (numeric_kind(left), numeric_kind(right)) else {
+        return Ok(None);
+    };
+    if left_kind == right_kind {
+        // Same scalar on both sides: not this function's question.
+        return Ok(None);
+    }
+    let Some(widening) = B::numeric_widening(left_kind, right_kind) else {
+        return Ok(None);
+    };
+    Ok(match widening {
+        // Widened to a double on both sides, so this is a float pair and
+        // the engine's float order governs it. Asking IEEE here is what
+        // dropped a NaN row whose other operand was an `int`.
+        NumericWidening::AtFloatWidth => {
+            let (Some(left), Some(right)) = (at_float_width(left)?, at_float_width(right)?) else {
+                return Ok(None);
+            };
+            B::FLOAT_ORDER.compare(left, right)
+        }
+        // An exact comparison still has to order an infinity, which has
+        // no decimal to be exact about: `BigDecimal::from_f64` answers
+        // `None` for one, the `?` propagated it, and the row was dropped
+        // as unknown. Measured on SQLite 3.51.1, which is the engine
+        // this arm serves: a `REAL` column holding `9e307 * 10` stores
+        // `inf`, and `r > i` is 1 while `i > r` is 0.
+        //
+        // Widening loses nothing in that case. An infinity outranks
+        // every finite number whatever the other side's precision, which
+        // is the only reason this arm exists.
+        NumericWidening::Exact
+            if matches!(left, Value::Float(value) if !value.is_finite())
+                || matches!(right, Value::Float(value) if !value.is_finite()) =>
+        {
+            let (Some(left), Some(right)) = (at_float_width(left)?, at_float_width(right)?) else {
+                return Ok(None);
+            };
+            B::FLOAT_ORDER.compare(left, right)
+        }
+        NumericWidening::Exact => {
+            let (Some(left), Some(right)) = (exactly(left), exactly(right)) else {
+                return Ok(None);
+            };
+            left.partial_cmp(&right)
+        }
+    })
+}
+
+/// One numeric operand as `f64`, reproducing a cast to `double precision`.
+///
+/// `Ok(None)` means the value is not numeric, which is a structural
+/// absence of order rather than a failure.
+///
+/// # Errors
+///
+/// [`EvaluationRefusal::DecimalOutsideFloatRange`] when an exact value has
+/// no double to be cast to. Measured on PostgreSQL 16, the server raises
+/// `out of range for type double precision` at either sign rather than
+/// answering, so this is neither an order nor the absence of one.
+///
+/// The conversion saturates rather than failing, so this answered an
+/// ordering against an infinity and reported the row as a match. Both the
+/// review that found it and the first reading of it here described the
+/// opposite mechanism, a dropped row; the row was matching.
+fn at_float_width<B>(value: &Value<B>) -> Result<Option<f64>, EvaluationRefusal>
+where
+    B: Backend<Int = i64, Float = f64, Decimal = bigdecimal::BigDecimal>,
+{
+    match value {
+        Value::Int(int) => Ok(Some(crate::backend::widen_i64_to_f64(*int))),
+        Value::Float(float) => Ok(Some(*float)),
+        // `to_f64` saturates rather than failing: a decimal past the
+        // double range converts to an infinity and answers `Some`. So the
+        // check is finiteness, not `None`. A decimal is never itself
+        // infinite, so an infinite conversion can only mean the value did
+        // not fit, which is the cast PostgreSQL refuses to perform.
+        Value::Decimal(decimal) => {
+            match <bigdecimal::BigDecimal as bigdecimal::ToPrimitive>::to_f64(decimal) {
+                Some(widened) if widened.is_finite() => Ok(Some(widened)),
+                _ => Err(EvaluationRefusal::DecimalOutsideFloatRange),
+            }
+        }
+        _ => Ok(None),
+    }
+}
+
+/// One numeric operand with every digit kept.
+///
+/// A non-finite float has no decimal to compare against, so such a pair has
+/// no order, which is the same answer the structural rule gives.
+fn exactly<B>(value: &Value<B>) -> Option<bigdecimal::BigDecimal>
+where
+    B: Backend<Int = i64, Float = f64, Decimal = bigdecimal::BigDecimal>,
+{
+    match value {
+        Value::Int(int) => Some(bigdecimal::BigDecimal::from(*int)),
+        Value::Float(float) => {
+            <bigdecimal::BigDecimal as bigdecimal::FromPrimitive>::from_f64(*float)
+        }
+        Value::Decimal(decimal) => Some(decimal.clone()),
+        _ => None,
+    }
+}
+
+/// Equality as backend `B` answers it for this pair of operands.
+///
+/// Every evaluation path (VM, prefilter, re-execution maintenance) asks
+/// here, so one backend rule serves them all.
+pub fn values_equal<B: Backend>(
+    comparison: ComparisonContext<'_, B>,
+    a: &Value<B>,
+    b: &Value<B>,
+) -> Result<bool, EvaluationRefusal> {
+    B::scalars_equal(comparison, a, b)
+}
+
+/// Ordered comparison as backend `B` answers it, lifted to [`Tri`] under a
+/// caller predicate on [`core::cmp::Ordering`].
+///
+/// `Tri::Unknown` whenever the backend reports no defined order.
+pub fn compare_ordered_values<B, F>(
+    comparison: ComparisonContext<'_, B>,
+    lhs: &Value<B>,
+    rhs: &Value<B>,
+    predicate: F,
+) -> Result<Tri, EvaluationRefusal>
+where
+    B: Backend,
+    F: FnOnce(core::cmp::Ordering) -> bool,
+{
+    Ok(match B::compare_scalars(comparison, lhs, rhs)? {
+        Some(ordering) if predicate(ordering) => Tri::True,
         Some(_) => Tri::False,
         None => Tri::Unknown,
+    })
+}
+
+/// The descriptor the compiler resolves per compared column, and the backend
+/// trait that consults it.
+#[cfg(all(test, feature = "std"))]
+#[allow(clippy::unwrap_used)]
+mod comparison_descriptor_tests {
+    use crate::backend::{
+        Backend, ColumnComparisonOf, ComparisonContext, Postgres, TextOperation, TextRule,
+    };
+    use sql_traits::structs::ParserDB;
+    use sqlparser::dialect::PostgreSqlDialect;
+
+    fn comparison(ddl: &str, column: &str) -> ColumnComparisonOf<Postgres> {
+        let db = ParserDB::parse::<PostgreSqlDialect>(ddl).expect("the DDL parses");
+        let table = crate::catalog_helpers::table_id(&db, "t").expect("t is cataloged");
+        let column_id = crate::catalog_helpers::column_id(&db, table, column).expect("the column");
+        crate::catalog_helpers::column_comparison::<Postgres, _>(&db, table, column_id)
+            .expect("the column classifies")
+    }
+
+    #[test]
+    fn descriptor_reports_a_char_type_from_the_declared_type() {
+        for ddl in [
+            "CREATE TABLE t (code CHAR(5));",
+            "CREATE TABLE t (code CHARACTER(5));",
+        ] {
+            assert!(
+                comparison(ddl, "code").declares_char_type(),
+                "a declared char type is fixed width: {ddl}"
+            );
+        }
+        for ddl in [
+            "CREATE TABLE t (code VARCHAR(5));",
+            "CREATE TABLE t (code TEXT);",
+        ] {
+            assert!(
+                !comparison(ddl, "code").declares_char_type(),
+                "a varying type keeps trailing spaces: {ddl}"
+            );
+        }
+    }
+
+    /// A float column's declared type fixes its width, and the type says so
+    /// rather than a later layer re-deriving it from the spelling.
+    ///
+    /// PostgreSQL's `real` is float4 and `double precision` is float8, and
+    /// the wire text for a float4 column is the shortest round-trip text of
+    /// the float4 value, so a decoder that cannot tell them apart parses the
+    /// wrong value.
+    #[test]
+    fn a_declared_float_type_carries_its_width() {
+        use crate::backend::{DeclaredType, FloatWidth};
+
+        for (ddl, width) in [
+            ("CREATE TABLE t (v REAL);", FloatWidth::Single),
+            ("CREATE TABLE t (v FLOAT4);", FloatWidth::Single),
+            ("CREATE TABLE t (v DOUBLE PRECISION);", FloatWidth::Double),
+            ("CREATE TABLE t (v FLOAT8);", FloatWidth::Double),
+        ] {
+            assert_eq!(
+                comparison(ddl, "v").kind.declared_type(),
+                Some(DeclaredType::Float(width)),
+                "the type carries the width the declaration fixes: {ddl}"
+            );
+        }
+    }
+
+    /// The same for text: a fixed-width character type is a different type
+    /// from a varying one, which the padding rule reads off the type instead
+    /// of matching the declared spelling itself.
+    #[test]
+    fn a_declared_char_type_is_fixed_width() {
+        use crate::backend::{DeclaredType, TextWidth};
+
+        assert_eq!(
+            comparison("CREATE TABLE t (code CHAR(5));", "code")
+                .kind
+                .declared_type(),
+            Some(DeclaredType::Text(TextWidth::Fixed))
+        );
+        assert_eq!(
+            comparison("CREATE TABLE t (code TEXT);", "code")
+                .kind
+                .declared_type(),
+            Some(DeclaredType::Text(TextWidth::Varying))
+        );
+    }
+
+    /// A compiled program persists the kinds of the columns it loads, so the
+    /// refinements have to survive the stored form: a `real` column that
+    /// reloads as float8 would answer differently after a restart.
+    #[test]
+    fn a_persisted_kind_round_trips_its_refinements() {
+        use crate::backend::{DeclaredType, FloatWidth, ScalarKindOf, TextWidth};
+
+        for kind in [
+            DeclaredType::Float(FloatWidth::Single),
+            DeclaredType::Float(FloatWidth::Double),
+            DeclaredType::Text(TextWidth::Fixed),
+            DeclaredType::Text(TextWidth::Varying),
+            DeclaredType::Int(crate::backend::IntWidth::SixtyFour),
+        ] {
+            let stored: ScalarKindOf<Postgres> = kind.into();
+            let bytes = postcard::to_allocvec(&stored).expect("the kind serializes");
+            assert_eq!(
+                postcard::from_bytes::<ScalarKindOf<Postgres>>(&bytes)
+                    .expect("the kind deserializes"),
+                stored,
+                "{kind:?} must reload as itself"
+            );
+        }
+    }
+
+    #[test]
+    fn descriptor_refuses_a_nondeterministic_collation() {
+        let ci = comparison(
+            "CREATE COLLATION ci (provider = icu, locale = 'und-u-ks-level2', \
+             deterministic = false); CREATE TABLE t (name TEXT COLLATE ci);",
+            "name",
+        );
+        assert_eq!(
+            crate::backend::single_column_rule::<Postgres>(&ci),
+            None,
+            "a nondeterministic collation folds case in equality itself"
+        );
+        let plain = comparison("CREATE TABLE t (name TEXT);", "name");
+        assert_eq!(
+            crate::backend::single_column_rule::<Postgres>(&plain),
+            Some(TextRule::EXACT),
+            "equality under a deterministic collation is byte equality"
+        );
+    }
+
+    /// Reproducibility does not factor per column: the same column has
+    /// byte equality and unreproducible ordering under PostgreSQL's
+    /// default collation, which is why the backend is asked per operation.
+    #[test]
+    fn one_column_answers_differently_per_operation() {
+        let plain = comparison("CREATE TABLE t (name TEXT);", "name");
+        let context = ComparisonContext {
+            left: Some(&plain),
+            right: None,
+            text: None,
+        };
+        assert_eq!(
+            <Postgres as Backend>::text_rule(&context, TextOperation::Equality).rule(),
+            Some(TextRule::EXACT)
+        );
+        assert_eq!(
+            <Postgres as Backend>::text_rule(&context, TextOperation::Ordering).rule(),
+            None,
+            "the server answers 'a' < 'B' true, which byte order does not"
+        );
+
+        let c = comparison("CREATE TABLE t (name TEXT COLLATE \"C\");", "name");
+        let context = ComparisonContext {
+            left: Some(&c),
+            right: None,
+            text: None,
+        };
+        assert_eq!(
+            <Postgres as Backend>::text_rule(&context, TextOperation::Ordering).rule(),
+            Some(TextRule::EXACT),
+            "C orders by byte, measured"
+        );
+    }
+
+    /// Compile `sql` against `ddl` and return the program.
+    fn compiled(ddl: &str, sql: &str) -> crate::compiler::BytecodeProgram<Postgres> {
+        let db = ParserDB::parse::<PostgreSqlDialect>(ddl).expect("the DDL parses");
+        crate::compiler::parse_compile_normalize_and_prefilter::<Postgres, _>(
+            sql,
+            &PostgreSqlDialect {},
+            &db,
+        )
+        .expect("the query compiles")
+        .program
+    }
+
+    /// The declared type at one interned slot.
+    fn declared_at(
+        program: &crate::compiler::BytecodeProgram<Postgres>,
+        slot: Option<u16>,
+    ) -> Option<alloc::string::String> {
+        Some(
+            program
+                .comparison_at(slot)
+                .expect("the slot exists")?
+                .declared_type
+                .clone(),
+        )
+    }
+
+    #[test]
+    fn a_column_to_column_comparison_interns_both_sides_in_order() {
+        let program = compiled(
+            "CREATE TABLE t (id INT PRIMARY KEY, small INT, wide BIGINT);",
+            "SELECT * FROM t WHERE small = wide",
+        );
+        let Some(crate::compiler::Instruction::Equal(reference)) = program
+            .instructions
+            .iter()
+            .find(|instruction| matches!(instruction, crate::compiler::Instruction::Equal(_)))
+        else {
+            panic!("the comparison compiled to an Equal instruction");
+        };
+        assert_eq!(
+            declared_at(&program, reference.left).as_deref(),
+            Some("INT"),
+            "the left operand's facts, not the right's"
+        );
+        assert_eq!(
+            declared_at(&program, reference.right).as_deref(),
+            Some("BIGINT")
+        );
+    }
+
+    #[test]
+    fn between_interns_the_value_against_each_bound() {
+        let program = compiled(
+            "CREATE TABLE t (id INT PRIMARY KEY, v INT, lo BIGINT, hi SMALLINT);",
+            "SELECT * FROM t WHERE v BETWEEN lo AND hi",
+        );
+        let Some(crate::compiler::Instruction::Between { lower, upper }) =
+            program.instructions.iter().find(|instruction| {
+                matches!(instruction, crate::compiler::Instruction::Between { .. })
+            })
+        else {
+            panic!("the range compiled to a Between instruction");
+        };
+        assert_eq!(declared_at(&program, lower.left).as_deref(), Some("INT"));
+        assert_eq!(
+            declared_at(&program, lower.right).as_deref(),
+            Some("BIGINT")
+        );
+        assert_eq!(
+            declared_at(&program, upper.left).as_deref(),
+            Some("INT"),
+            "both contexts compare the same value"
+        );
+        assert_eq!(
+            declared_at(&program, upper.right).as_deref(),
+            Some("SMALLINT")
+        );
+    }
+
+    #[test]
+    fn like_interns_the_string_and_the_pattern() {
+        let program = compiled(
+            "CREATE TABLE t (id INT PRIMARY KEY, body TEXT, needle VARCHAR(8));",
+            "SELECT * FROM t WHERE body LIKE needle",
+        );
+        let Some(crate::compiler::Instruction::Like { comparison, .. }) = program
+            .instructions
+            .iter()
+            .find(|instruction| matches!(instruction, crate::compiler::Instruction::Like { .. }))
+        else {
+            panic!("the pattern match compiled to a Like instruction");
+        };
+        assert_eq!(
+            declared_at(&program, comparison.left).as_deref(),
+            Some("TEXT")
+        );
+        assert_eq!(
+            declared_at(&program, comparison.right).as_deref(),
+            Some("VARCHAR"),
+            "a pattern can be a column, so the right side carries facts too"
+        );
+    }
+
+    #[test]
+    fn an_in_list_interns_only_the_tested_operand() {
+        let program = compiled(
+            "CREATE TABLE t (id INT PRIMARY KEY, status TEXT);",
+            "SELECT * FROM t WHERE status IN ('a', 'b')",
+        );
+        let Some(crate::compiler::Instruction::In { comparison, .. }) = program
+            .instructions
+            .iter()
+            .find(|instruction| matches!(instruction, crate::compiler::Instruction::In { .. }))
+        else {
+            panic!("the set test compiled to an In instruction");
+        };
+        assert_eq!(
+            declared_at(&program, comparison.left).as_deref(),
+            Some("TEXT")
+        );
+        assert_eq!(
+            comparison.right, None,
+            "the set holds literals, which carry no column"
+        );
+    }
+
+    #[test]
+    fn arithmetic_operands_intern_nothing() {
+        let program = compiled(
+            "CREATE TABLE t (id INT PRIMARY KEY, amount INT, quantity INT);",
+            "SELECT * FROM t WHERE amount + quantity > 100",
+        );
+        assert!(
+            program.column_comparisons.is_empty(),
+            "an arithmetic operand has no declared type to carry, so nothing is \
+             interned: {:?}",
+            program.column_comparisons
+        );
+    }
+
+    #[test]
+    fn a_comparison_naming_a_slot_the_program_lacks_is_refused() {
+        use crate::backend::Value;
+        use crate::compiler::{bytecode::ComparisonRef, BytecodeProgram, Instruction, Vm};
+        use crate::testing::TestEvent;
+
+        let db = ParserDB::parse::<PostgreSqlDialect>("CREATE TABLE t (id INT PRIMARY KEY);")
+            .expect("the DDL parses");
+        // A program carrying no facts, whose comparison names slot 0 anyway:
+        // what a truncated or corrupt stored program looks like.
+        let program: BytecodeProgram<Postgres> = BytecodeProgram::new(alloc::vec![
+            Instruction::LoadColumn(0),
+            Instruction::PushLiteral(Value::Int(1)),
+            Instruction::Equal(ComparisonRef::new(Some(0), None)),
+        ]);
+        let event =
+            TestEvent::<Postgres>::insert(0, alloc::vec![Value::Int(1)]).with_pk_columns([0u16]);
+        let mut vm: Vm<Postgres> = Vm::new();
+        assert_eq!(
+            vm.eval(&program, &event, crate::backend::RowKind::New, &db),
+            Err(crate::compiler::VmError::MalformedProgram),
+            "a dangling slot must refuse, not compare as though the column had no facts"
+        );
+    }
+
+    #[test]
+    fn bytecode_carries_the_resolved_descriptor() {
+        let db =
+            ParserDB::parse::<PostgreSqlDialect>("CREATE TABLE t (id INT PRIMARY KEY, name TEXT);")
+                .expect("the DDL parses");
+        let compiled = crate::compiler::parse_compile_normalize_and_prefilter::<Postgres, _>(
+            "SELECT * FROM t WHERE name = 'x'",
+            &PostgreSqlDialect {},
+            &db,
+        )
+        .expect("the query compiles");
+        let Some(crate::compiler::Instruction::Equal(reference)) = compiled
+            .program
+            .instructions
+            .iter()
+            .find(|instruction| matches!(instruction, crate::compiler::Instruction::Equal(_)))
+        else {
+            panic!("the comparison compiled to an Equal instruction");
+        };
+        let carried = compiled
+            .program
+            .comparison_at(reference.left)
+            .expect("the interned slot exists")
+            .expect("the compiler interned the compared column's descriptor");
+        assert_eq!(carried.declared_type, "TEXT");
     }
 }
 
@@ -124,16 +695,19 @@ mod tests {
     //! Properties covered
     //! 1. **Equality is symmetric.** `values_equal(a, b) == values_equal(b, a)`.
     //! 2. **Present-cell reflexivity.** `values_equal(x, x)` is `true` for
-    //!    any concrete non-NaN scalar `Value`.
-    //! 3. **`Missing` / `Null` / `Float(NaN)` are not self-equal.**
-    //! 4. **Cross-scalar equality is always false.** No coercion — SQL
-    //!    semantics is that mixed scalar comparisons never satisfy `=`
-    //!    without an explicit cast.
+    //!    any concrete present scalar `Value`, NaN included: this backend
+    //!    is PostgreSQL, which answers `NaN = NaN` true.
+    //! 3. **`Missing` and `Null` are not self-equal.**
+    //! 4. **Cross-scalar equality is false outside the numeric family.**
+    //!    A numeric pair is widened as the engine widens it; nothing else
+    //!    coerces.
     //! 5. **Ordered comparison collapses on `Missing` / `Null`.**
-    //! 6. **Ordered comparison collapses on NaN.**
-    //! 7. **Ordered comparison collapses on cross-scalar and on scalars
-    //!    without a `PartialOrd` bound (`Bool`, `Json`, `Jsonb`).**
-    //! 8. **Strict + non-strict are consistent.** `<` and `>=` partition
+    //! 6. **NaN follows PostgreSQL's float order**, above every non-NaN
+    //!    value and equal to another NaN, rather than IEEE's no-order.
+    //! 7. **Booleans are ordered**, `false` below `true`.
+    //! 8. **Ordered comparison collapses on non-numeric cross-scalar
+    //!    pairs** and on `Json` / `Jsonb`, which carry no order here.
+    //! 9. **Strict + non-strict are consistent.** `<` and `>=` partition
     //!    the `Tri::True` / `Tri::False` outcomes whenever the resolved
     //!    ordering is defined.
 
@@ -168,15 +742,16 @@ mod tests {
         !v.is_absent()
     }
 
-    fn is_nan(v: &Value<Postgres>) -> bool {
-        matches!(v, Value::Float(f) if f.is_nan())
+    /// Whether both values are numeric, which is the one cross-scalar
+    /// family this backend widens rather than refuses.
+    fn numeric_pair(a: &Value<Postgres>, b: &Value<Postgres>) -> bool {
+        let numeric =
+            |v: &Value<Postgres>| matches!(v, Value::Int(_) | Value::Float(_) | Value::Decimal(_));
+        numeric(a) && numeric(b)
     }
 
-    /// Two values are "same scalar variant" when they can meaningfully
-    /// participate in a same-scalar comparison. Missing/Null pairs are
-    /// excluded (they collapse to Unknown regardless).
-    fn same_variant(a: &Value<Postgres>, b: &Value<Postgres>) -> bool {
-        core::mem::discriminant(a) == core::mem::discriminant(b) && is_present(a)
+    fn is_nan(v: &Value<Postgres>) -> bool {
+        matches!(v, Value::Float(f) if f.is_nan())
     }
 
     proptest! {
@@ -188,29 +763,34 @@ mod tests {
         /// Equality is symmetric in both arguments.
         #[test]
         fn values_equal_is_symmetric(a in arb_value(), b in arb_value()) {
-            prop_assert_eq!(values_equal(&a, &b), values_equal(&b, &a));
+            prop_assert_eq!(values_equal(ComparisonContext::none(), &a, &b), values_equal(ComparisonContext::none(), &b, &a));
         }
 
-        /// Reflexivity for present, non-NaN values.
+        /// Reflexivity for every present value. NaN is included: PostgreSQL
+        /// answers `NaN = NaN` true, so `WHERE value = value` returns the
+        /// row.
         #[test]
-        fn values_equal_is_reflexive_for_present_non_nan(v in arb_value()) {
-            if is_present(&v) && !is_nan(&v) {
+        fn values_equal_is_reflexive_for_present_values(v in arb_value()) {
+            if is_present(&v) {
                 prop_assert!(
-                    values_equal(&v, &v),
-                    "present non-NaN value {:?} not equal to itself",
+                    values_equal(ComparisonContext::none(), &v, &v)
+                        .expect("reflexivity check: present value cannot refuse"),
+                    "present value {:?} not equal to itself",
                     v,
                 );
             }
         }
 
-        /// `Missing`, `Null`, and `Float(NaN)` are never self-equal. These
-        /// three shapes are the ones the VM lifts to `Tri::Unknown`.
+        /// `Missing` and `Null` are never self-equal: those are the shapes
+        /// the VM lifts to `Tri::Unknown`. A NaN is not one of them under
+        /// this backend.
         #[test]
-        fn null_missing_nan_are_not_self_equal(v in arb_value()) {
-            if !is_present(&v) || is_nan(&v) {
+        fn null_and_missing_are_not_self_equal(v in arb_value()) {
+            if !is_present(&v) {
                 prop_assert!(
-                    !values_equal(&v, &v),
-                    "non-present-or-NaN value {:?} unexpectedly self-equal",
+                    !values_equal(ComparisonContext::none(), &v, &v)
+                        .expect("absent-value check: missing/null cannot refuse"),
+                    "absent value {:?} unexpectedly self-equal",
                     v,
                 );
             }
@@ -221,9 +801,11 @@ mod tests {
         fn cross_scalar_pairs_are_never_equal(a in arb_value(), b in arb_value()) {
             if is_present(&a) && is_present(&b)
                 && core::mem::discriminant(&a) != core::mem::discriminant(&b)
+                && !numeric_pair(&a, &b)
             {
                 prop_assert!(
-                    !values_equal(&a, &b),
+                    !values_equal(ComparisonContext::none(), &a, &b)
+                        .expect("cross-scalar equality: cannot refuse for non-numeric pair"),
                     "cross-scalar pair ({:?}, {:?}) reported equal",
                     a,
                     b,
@@ -244,7 +826,8 @@ mod tests {
                     Ordering::is_ge,
                 ];
                 for pred in preds {
-                    let got = compare_ordered_values(&a, &b, pred);
+                    let got = compare_ordered_values(ComparisonContext::none(), &a, &b, pred)
+                        .expect("null/missing ordered comparison: cannot refuse");
                     prop_assert_eq!(
                         got,
                         Tri::Unknown,
@@ -257,40 +840,77 @@ mod tests {
             }
         }
 
-        /// Ordered comparison collapses to `Unknown` whenever either
-        /// `Float` operand is NaN.
+        /// A NaN is ordered under this backend, not unknown: PostgreSQL puts
+        /// it above every non-NaN number and equal to another NaN, so
+        /// `a < b` holds exactly when `a` is the non-NaN side.
+        ///
+        /// That holds across kinds too, and this model used to say
+        /// otherwise. Measured on 16.15, `'NaN'::float8 > 1::int` and
+        /// `'NaN'::float8 > 1::numeric` are both true, because the engine
+        /// widens the other operand to a double and then applies this
+        /// order. A pair the backend does not widen at all, a float
+        /// against a string say, is still a cross-scalar pair and stays
+        /// `Unknown`.
         #[test]
-        fn ordered_cmp_unknown_on_nan(a in arb_value(), b in arb_value()) {
+        fn ordered_cmp_follows_postgres_nan_order(a in arb_value(), b in arb_value()) {
             if (is_nan(&a) || is_nan(&b)) && is_present(&a) && is_present(&b) {
-                let got = compare_ordered_values(&a, &b, Ordering::is_lt);
+            let got = compare_ordered_values(ComparisonContext::none(), &a, &b, Ordering::is_lt)
+                .expect("NaN ordering check: cannot refuse for numeric pair");
+                let widened = |value: &Value<Postgres>| {
+                    matches!(value, Value::Float(_) | Value::Int(_) | Value::Decimal(_))
+                };
+                let expected = if widened(&a) && widened(&b) {
+                    if is_nan(&a) { Tri::False } else { Tri::True }
+                } else {
+                    Tri::Unknown
+                };
+                prop_assert_eq!(
+                    got,
+                    expected,
+                    "expected {:?} for ({:?}, {:?}), got {:?}",
+                    expected,
+                    a,
+                    b,
+                    got,
+                );
+            }
+        }
+
+        /// Cross-scalar pairs collapse to `Tri::Unknown`: there is no
+        /// coercion between scalars, so no order across them either.
+        #[test]
+        fn ordered_cmp_unknown_on_incomparable(a in arb_value(), b in arb_value()) {
+            if !is_present(&a) || !is_present(&b) || is_nan(&a) || is_nan(&b) {
+                return Ok(());
+            }
+            if core::mem::discriminant(&a) != core::mem::discriminant(&b)
+                && !numeric_pair(&a, &b)
+            {
+                let got = compare_ordered_values(ComparisonContext::none(), &a, &b, Ordering::is_lt)
+                    .expect("incomparable-pair ordered comparison: cannot refuse");
                 prop_assert_eq!(
                     got,
                     Tri::Unknown,
-                    "expected Unknown for NaN operand, got {:?} for ({:?}, {:?})",
-                    got,
+                    "cross-scalar pair ({:?}, {:?}) did not yield Unknown",
                     a,
                     b,
                 );
             }
         }
 
-        /// Cross-scalar pairs, and same-scalar pairs on variants without a
-        /// `PartialOrd` bound (`Bool`, `Json`, `Jsonb`), collapse to
-        /// `Tri::Unknown`.
+        /// Booleans are ordered: `false` below `true` for this backend's
+        /// `bool` carrier, which is what SQL answers.
         #[test]
-        fn ordered_cmp_unknown_on_incomparable(a in arb_value(), b in arb_value()) {
-            if !is_present(&a) || !is_present(&b) || is_nan(&a) || is_nan(&b) {
-                return Ok(());
-            }
-            let cross_scalar =
-                core::mem::discriminant(&a) != core::mem::discriminant(&b);
-            let no_partial_ord = matches!(&a, Value::Bool(_)) && same_variant(&a, &b);
-            if cross_scalar || no_partial_ord {
-                let got = compare_ordered_values(&a, &b, Ordering::is_lt);
+        fn ordered_cmp_orders_booleans(a in arb_value(), b in arb_value()) {
+            if let (Value::Bool(x), Value::Bool(y)) = (&a, &b) {
+                let got = compare_ordered_values(ComparisonContext::none(), &a, &b, Ordering::is_lt)
+                    .expect("bool ordering check: cannot refuse");
+                let expected = if !x && *y { Tri::True } else { Tri::False };
                 prop_assert_eq!(
                     got,
-                    Tri::Unknown,
-                    "incomparable pair ({:?}, {:?}) did not yield Unknown",
+                    expected,
+                    "expected {:?} for ({:?}, {:?})",
+                    expected,
                     a,
                     b,
                 );
@@ -303,8 +923,10 @@ mod tests {
         /// mutually vacuous).
         #[test]
         fn lt_and_ge_partition_defined_pairs(a in arb_value(), b in arb_value()) {
-            let lt = compare_ordered_values(&a, &b, Ordering::is_lt);
-            let ge = compare_ordered_values(&a, &b, Ordering::is_ge);
+            let lt = compare_ordered_values(ComparisonContext::none(), &a, &b, Ordering::is_lt)
+                .expect("lt partition check: cannot refuse");
+            let ge = compare_ordered_values(ComparisonContext::none(), &a, &b, Ordering::is_ge)
+                .expect("ge partition check: cannot refuse");
             if lt != Tri::Unknown && ge != Tri::Unknown {
                 prop_assert_ne!(lt, ge, "`<` and `>=` agreed on ({:?}, {:?})", a, b);
             }
@@ -314,29 +936,38 @@ mod tests {
     /// Sanity check: cross-scalar equality on hand-picked concrete values
     /// returns `false` (no coercion).
     #[test]
-    fn cross_scalar_equality_is_false_for_concrete_values() {
+    fn cross_scalar_equality_is_false_outside_the_numeric_family() {
         let int_one = Value::<Postgres>::Int(1);
-        let float_one = Value::<Postgres>::Float(1.0);
-        assert!(!values_equal(&int_one, &float_one));
-        assert!(!values_equal(&float_one, &int_one));
 
+        // A numeric pair is compared under the backend's widening, which
+        // is what the engine does: `1 = 1.0` is a row.
+        let float_one = Value::<Postgres>::Float(1.0);
+        assert!(values_equal(ComparisonContext::none(), &int_one, &float_one).unwrap());
+        assert!(values_equal(ComparisonContext::none(), &float_one, &int_one).unwrap());
+
+        // Outside it, nothing coerces: PostgreSQL has no operator for this
+        // pair, so there is nothing to reproduce.
         let str_one = Value::<Postgres>::String("1".to_string());
-        assert!(!values_equal(&int_one, &str_one));
+        assert!(!values_equal(ComparisonContext::none(), &int_one, &str_one).unwrap());
     }
 
-    /// Sanity check: ordered comparison on `Bool` is `Unknown` because
-    /// `Backend::Bool` has no `PartialOrd` bound.
+    /// Ordered comparison on `Bool` follows SQL's boolean order rather
+    /// than the absent `PartialOrd` bound on `Backend::Bool`.
     #[test]
-    fn bool_ordered_comparison_is_unknown() {
+    fn bool_ordered_comparison_puts_false_below_true() {
         let f = Value::<Postgres>::Bool(false);
         let t = Value::<Postgres>::Bool(true);
         assert_eq!(
-            compare_ordered_values(&f, &t, Ordering::is_lt),
-            Tri::Unknown
+            compare_ordered_values(ComparisonContext::none(), &f, &t, Ordering::is_lt).unwrap(),
+            Tri::True
         );
         assert_eq!(
-            compare_ordered_values(&t, &f, Ordering::is_lt),
-            Tri::Unknown
+            compare_ordered_values(ComparisonContext::none(), &t, &f, Ordering::is_lt).unwrap(),
+            Tri::False
+        );
+        assert_eq!(
+            compare_ordered_values(ComparisonContext::none(), &t, &t, Ordering::is_le).unwrap(),
+            Tri::True
         );
     }
 
@@ -346,7 +977,13 @@ mod tests {
     fn bytes_ordered_comparison_is_lexicographic() {
         let a = Value::<Postgres>::Bytes(vec![0, 1, 2]);
         let b = Value::<Postgres>::Bytes(vec![0, 1, 3]);
-        assert_eq!(compare_ordered_values(&a, &b, Ordering::is_lt), Tri::True);
-        assert_eq!(compare_ordered_values(&b, &a, Ordering::is_lt), Tri::False);
+        assert_eq!(
+            compare_ordered_values(ComparisonContext::none(), &a, &b, Ordering::is_lt).unwrap(),
+            Tri::True
+        );
+        assert_eq!(
+            compare_ordered_values(ComparisonContext::none(), &b, &a, Ordering::is_lt).unwrap(),
+            Tri::False
+        );
     }
 }

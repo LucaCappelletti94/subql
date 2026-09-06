@@ -5,7 +5,7 @@
 //! only runs for rejected queries and produces a [`QueryPlan`] describing how
 //! the re-execution layer should maintain it.
 
-use crate::backend::{Backend, BuiltinKind, Value};
+use crate::backend::{Backend, ScalarFamily, Value};
 use crate::compiler::literals::SqlLiteralParse;
 use crate::compiler::parser;
 use crate::compiler::sql_shape::{
@@ -67,7 +67,7 @@ pub struct MinMaxPlan<B: Backend> {
     /// column. Not consumed by in-process maintenance (MIN/MAX compares
     /// `Value` variants directly), but returned to the materializer via
     /// [`Tier::Scalar`](crate::Tier::Scalar) as a decode hint.
-    pub agg_kind: crate::backend::BuiltinKind,
+    pub agg_kind: crate::backend::ScalarFamily,
     /// Columns whose change can alter the result: the aggregated column
     /// plus every column the WHERE clause reads (UPDATE routing
     /// optimization).
@@ -88,7 +88,7 @@ pub struct GroupedMinMaxPlan<B: Backend> {
     pub table_id: TableId,
     pub kind: ScalarAggKind,
     pub agg_column: ColumnId,
-    pub agg_kind: crate::backend::BuiltinKind,
+    pub agg_kind: crate::backend::ScalarFamily,
     pub group_columns: Vec<ColumnId>,
     pub group_idents: Vec<Ident>,
     pub dependency_columns: Vec<ColumnId>,
@@ -126,6 +126,7 @@ pub fn build_plan<B, DB>(
     query: &crate::reexec::BoundQuery<B>,
     dialect: &B::Dialect,
     database: &DB,
+    increment: Option<crate::backend::DivisionPrecisionIncrement>,
 ) -> Result<QueryPlan<B>, RegisterError>
 where
     B: Backend + SqlLiteralParse,
@@ -136,11 +137,11 @@ where
     // re-read for everything else. An intermediate tier's error only means the
     // query belongs to the next tier, so it surfaces only when every tier
     // refused, where each tier's own reason is the whole diagnosis.
-    let grouped = match grouped_scalar_plan::<B, DB>(query, dialect, database) {
+    let grouped = match grouped_scalar_plan::<B, DB>(query, dialect, database, increment) {
         Ok(plan) => return Ok(plan),
         Err(error) => error,
     };
-    let scalar = match scalar_plan::<B, DB>(query, dialect, database) {
+    let scalar = match scalar_plan::<B, DB>(query, dialect, database, increment) {
         Ok(plan) => return Ok(plan),
         Err(error) => error,
     };
@@ -258,13 +259,19 @@ fn grouped_scalar_plan<B, DB>(
     query: &crate::reexec::BoundQuery<B>,
     dialect: &B::Dialect,
     database: &DB,
+    increment: Option<crate::backend::DivisionPrecisionIncrement>,
 ) -> Result<QueryPlan<B>, RegisterError>
 where
     B: Backend + SqlLiteralParse,
     DB: DatabaseLike,
 {
-    let parsed =
-        parser::parse_table_and_where_deps::<B, DB>(query.sql(), dialect, database, query.binds())?;
+    let parsed = parser::parse_table_and_where_deps::<B, DB>(
+        query.sql(),
+        dialect,
+        database,
+        query.binds(),
+        increment,
+    )?;
     let projection =
         extract_grouped_extreme::<B, DB>(&parsed.statement, parsed.table_id, database)?
             .ok_or_else(|| {
@@ -273,18 +280,18 @@ where
                 )
             })?;
     let agg_kind =
-        crate::catalog_helpers::column_builtin_kind(database, parsed.table_id, projection.column)
+        crate::catalog_helpers::column_scalar_family(database, parsed.table_id, projection.column)
             .ok_or_else(|| {
-            RegisterError::UnsupportedSql(
-                "the grouped extreme column has no supported decode kind".to_string(),
-            )
-        })?;
+                RegisterError::UnsupportedSql(
+                    "the grouped extreme column has no supported decode kind".to_string(),
+                )
+            })?;
     let having = planned_having::<B>(projection.having.as_ref(), agg_kind)?;
     let group_key_columns = projection
         .groups
         .iter()
         .map(|column| {
-            crate::catalog_helpers::group_key_column::<B, _>(database, parsed.table_id, *column)
+            crate::catalog_helpers::column_comparison::<B, _>(database, parsed.table_id, *column)
         })
         .collect::<Option<Vec<_>>>()
         .ok_or_else(|| {
@@ -313,7 +320,7 @@ where
         dialect,
     )?;
     let mut bootstrap_kinds = group_kinds;
-    bootstrap_kinds.extend([agg_kind, crate::backend::BuiltinKind::Int]);
+    bootstrap_kinds.extend([agg_kind, crate::backend::ScalarFamily::Int]);
     let bootstrap = crate::AggregateBootstrap {
         query: bootstrap_query,
         kinds: bootstrap_kinds,
@@ -363,7 +370,7 @@ fn grouped_column_metadata<B, DB>(
     table_id: crate::TableId,
     dialect: &B::Dialect,
     database: &DB,
-) -> Result<(Vec<crate::backend::BuiltinKind>, Vec<Ident>), RegisterError>
+) -> Result<(Vec<crate::backend::ScalarFamily>, Vec<Ident>), RegisterError>
 where
     B: Backend,
     DB: DatabaseLike,
@@ -371,7 +378,7 @@ where
     let mut kinds = Vec::with_capacity(columns.len());
     let mut idents = Vec::with_capacity(columns.len());
     for column in columns {
-        let kind = crate::catalog_helpers::column_builtin_kind(database, table_id, *column)
+        let kind = crate::catalog_helpers::column_scalar_family(database, table_id, *column)
             .ok_or_else(|| {
                 RegisterError::UnsupportedSql(
                     "a grouped extreme column has no supported decode kind".to_string(),
@@ -397,7 +404,7 @@ where
 /// value comparison, to a plain integer for a row count.
 fn planned_having<B: Backend + SqlLiteralParse>(
     having: Option<&crate::compiler::sql_shape::ExtremeHaving>,
-    agg_kind: crate::backend::BuiltinKind,
+    agg_kind: crate::backend::ScalarFamily,
 ) -> Result<Option<GroupedHavingCheck<B>>, RegisterError> {
     let Some(having) = having else {
         return Ok(None);
@@ -407,7 +414,7 @@ fn planned_having<B: Backend + SqlLiteralParse>(
             op: having.op,
             threshold: B::parse_literal(
                 &having.literal,
-                crate::backend::ScalarKind::from(agg_kind),
+                crate::backend::ValueKind::from(agg_kind),
             )?,
         },
         crate::compiler::sql_shape::ExtremeHavingSubject::RowCount => {
@@ -581,13 +588,19 @@ fn scalar_plan<B, DB>(
     query: &crate::reexec::BoundQuery<B>,
     dialect: &B::Dialect,
     database: &DB,
+    increment: Option<crate::backend::DivisionPrecisionIncrement>,
 ) -> Result<QueryPlan<B>, RegisterError>
 where
     B: Backend + SqlLiteralParse,
     DB: DatabaseLike,
 {
-    let parsed =
-        parser::parse_table_and_where_deps::<B, DB>(query.sql(), dialect, database, query.binds())?;
+    let parsed = parser::parse_table_and_where_deps::<B, DB>(
+        query.sql(),
+        dialect,
+        database,
+        query.binds(),
+        increment,
+    )?;
     // The shared parse admits `HAVING` because the grouped plan serves it.
     // A scalar read takes one value and cannot honour the clause, so a
     // statement carrying one falls through to the whole re-read, which
@@ -609,7 +622,7 @@ where
     };
 
     let agg_kind =
-        crate::catalog_helpers::column_builtin_kind(database, parsed.table_id, agg_column)
+        crate::catalog_helpers::column_scalar_family(database, parsed.table_id, agg_column)
         .ok_or_else(|| {
             RegisterError::UnsupportedSql(format!(
                 "aggregated column {agg_column} of table {table_id} has an unsupported SQL type for the maintenance layer",
@@ -752,7 +765,7 @@ where
     // fail on every single change. Refused here so it falls to a tier that
     // needs no key.
     for column in &key_columns {
-        let kind = crate::catalog_helpers::column_builtin_kind(database, table, *column);
+        let kind = crate::catalog_helpers::column_scalar_family(database, table, *column);
         if !key_kind_has_literal_spelling(kind) {
             return Err(RegisterError::UnsupportedSql(alloc::format!(
                 "a keyed read renders its key as a SQL literal, and {kind:?} has no literal \
@@ -801,9 +814,9 @@ where
 /// actually renders it. Exhaustive rather than a wildcard, so a new kind has to
 /// be classified here instead of silently joining whichever side is the
 /// default.
-const fn key_kind_has_literal_spelling(kind: Option<crate::backend::BuiltinKind>) -> bool {
+const fn key_kind_has_literal_spelling(kind: Option<crate::backend::ScalarFamily>) -> bool {
     match kind {
-        Some(BuiltinKind::Int | BuiltinKind::String | BuiltinKind::Bytes) => true,
+        Some(ScalarFamily::Int | ScalarFamily::String | ScalarFamily::Bytes) => true,
         // Float is refused despite being spellable, because it cannot identify
         // a row: Infinity and negative infinity have no literal spelling, and
         // `{f:?}` renders them as bare tokens no backend parses as numerics,
@@ -813,16 +826,16 @@ const fn key_kind_has_literal_spelling(kind: Option<crate::backend::BuiltinKind>
         // render through typed constructors rather than literals. An unknown
         // column type is not a licence to guess, so `None` joins them.
         Some(
-            BuiltinKind::Float
-            | BuiltinKind::Bool
-            | BuiltinKind::Uuid
-            | BuiltinKind::Timestamp
-            | BuiltinKind::TimestampTz
-            | BuiltinKind::Date
-            | BuiltinKind::Time
-            | BuiltinKind::Decimal
-            | BuiltinKind::Json
-            | BuiltinKind::Jsonb,
+            ScalarFamily::Float
+            | ScalarFamily::Bool
+            | ScalarFamily::Uuid
+            | ScalarFamily::Timestamp
+            | ScalarFamily::TimestampTz
+            | ScalarFamily::Date
+            | ScalarFamily::Time
+            | ScalarFamily::Decimal
+            | ScalarFamily::Json
+            | ScalarFamily::Jsonb,
         )
         | None => false,
     }

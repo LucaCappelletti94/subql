@@ -214,7 +214,7 @@ impl DemoState {
                 entry.agg = match &update.change {
                     subql::AggregateValueChange::Set(subql::AggregateResultValue::Folded(
                         value,
-                    )) => Some(*value),
+                    )) => Some(value.clone()),
                     subql::AggregateValueChange::Set(subql::AggregateResultValue::Scalar(_))
                     | subql::AggregateValueChange::Remove => None,
                 };

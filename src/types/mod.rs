@@ -10,8 +10,8 @@ pub use generic_id_types::{DefaultIds, Id, IdTypes, SubscriptionId, Subscription
 pub use subscription_types::{
     AggregateBootstrap, AggregateInstallError, AggregateSeedInstall, DropReason, DroppedRead,
     EvictionPolicy, GroupedScalarInstall, GroupedScalarSeedInstall, Install, InstallError,
-    InstalledPage, InstalledRowDelta, KeyedRowsInstall, PerConsumerDatabaseReads, ReadTier,
-    Registered, RegistrationRequest, RestoredRead, RestoredReads, ScalarInstall, Served,
+    InstalledPage, InstalledRowDelta, KeyedRowsInstall, NotServed, PerConsumerDatabaseReads,
+    ReadTier, Registered, RegistrationRequest, RestoredRead, RestoredReads, ScalarInstall, Served,
     StatedTermValues, SubscriptionMetadata, SubscriptionRequest, SubscriptionsView, Tier, TierKind,
     UnregisterReport, WholeRowsInstall,
 };
@@ -20,9 +20,9 @@ pub use subscription_types::{DurabilityMode, MergeReport};
 pub use trait_definitions::{
     AggValue, AggregateDispatch, AggregateMaintenanceOutput, AggregateResultValue,
     AggregateValueChange, AggregateValueUpdate, AsyncSubscriptionDispatch, ConsumerNotifications,
-    ConsumerNotificationsIter, DispatchOutput, GroupIdentity, MaintenanceStopReason,
-    MaintenanceTransition, SubscriptionDispatch, SubscriptionRegistration,
-    SubscriptionUnregistration, TermNarrowing,
+    ConsumerNotificationsIter, DispatchOutput, EvaluationFailure, GroupIdentity,
+    MaintenanceStopReason, MaintenanceTransition, NumericValue, SubscriptionDispatch,
+    SubscriptionRegistration, SubscriptionUnregistration, TermNarrowing, UnansweredCell,
 };
 #[cfg(feature = "std")]
 pub use trait_definitions::{DurableShardMerge, DurableShardStore};

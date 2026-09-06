@@ -273,6 +273,19 @@ criterion = { version = "0.8", features = ["html_reports"] }
 # Temporary directories for shard tests
 tempfile = "3"
 
+# subql, depending on itself, so every test target is built against a
+# library that has `testing` on.
+#
+# `#[cfg(test)]` covers the library's own unit tests and nothing else: an
+# integration test compiles against the library as an ordinary dependency,
+# built without that cfg. So a fixture-only item gated on
+# `any(test, feature = "testing")` is reachable from `src/**/mod tests` and
+# unreachable from `tests/`, which is how the family-to-type conversion in
+# `src/backend/scalar_value.rs` compiled under `--all-features` and failed
+# under the default set. This makes the gate mean what it says while
+# keeping the item out of any build a downstream crate produces.
+subql = { path = ".", features = ["testing"] }
+
 # Structured fuzzing (needed by regression tests)
 arbitrary = { version = "1", features = ["derive"] }
 

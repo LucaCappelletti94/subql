@@ -58,6 +58,8 @@ mod async_connector;
 mod async_diesel;
 mod auto;
 mod connector;
+#[cfg(test)]
+mod test_fixtures;
 
 pub use async_auto::AsyncMode;
 pub use async_connector::AsyncConnector;

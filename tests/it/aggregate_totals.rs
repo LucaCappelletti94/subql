@@ -15,8 +15,8 @@ use sqlparser::dialect::PostgreSqlDialect;
 use subql::backend::{Postgres, Value};
 use subql::testing::TestEvent;
 use subql::{
-    catalog_helpers, AggValue, AggregateInstallError, AggregateValueUpdate, DefaultIds, PgLsn,
-    SubscriptionEngine, SubscriptionRequest, TableId,
+    catalog_helpers, AggValue, AggregateInstallError, AggregateValueUpdate, DefaultIds,
+    NumericValue, PgLsn, SubscriptionEngine, SubscriptionRequest, TableId,
 };
 
 const DDL: &str = "CREATE TABLE orders (id INT PRIMARY KEY, amount INT, status TEXT);";
@@ -72,7 +72,7 @@ fn reported(updates: &[AggregateValueUpdate<DefaultIds>]) -> Vec<(u64, u64, AggV
             else {
                 panic!("ungrouped aggregate cannot remove a group")
             };
-            (u.subscription, u.consumer, *value)
+            (u.subscription, u.consumer, value.clone())
         })
         .collect();
     out.sort_by_key(|(sub, consumer, _)| (*sub, *consumer));
@@ -141,7 +141,7 @@ fn a_change_already_in_the_starting_numbers_is_not_counted_twice() {
     let value = install_seed(&mut engine, sub, vec![Value::Int(1)], Some(PgLsn(20))).unwrap();
     assert_eq!(
         value,
-        AggValue::Count(2),
+        AggValue::CountStar(2),
         "the row at position 10 is in the seed and must not be added a second time",
     );
 }
@@ -162,7 +162,7 @@ fn a_change_at_the_read_position_belongs_to_the_starting_numbers() {
     // The position is taken before the read's snapshot opens, so everything at
     // or before it is in the numbers the read returns.
     let value = install_seed(&mut engine, sub, vec![Value::Int(1)], Some(PgLsn(20))).unwrap();
-    assert_eq!(value, AggValue::Count(1));
+    assert_eq!(value, AggValue::CountStar(1));
 }
 
 #[test]
@@ -194,8 +194,8 @@ fn two_counts_under_one_consumer_report_separately_rather_than_merged() {
     assert_eq!(
         reported(&updates),
         vec![
-            (by_status, 7, AggValue::Count(1)),
-            (by_amount, 7, AggValue::Count(1)),
+            (by_status, 7, AggValue::CountStar(1)),
+            (by_amount, 7, AggValue::CountStar(1)),
         ],
     );
 }
@@ -257,7 +257,7 @@ fn a_quiet_read_is_installed_without_any_position() {
 
     assert_eq!(
         install_seed(&mut engine, sub, vec![Value::Int(5)], None),
-        Ok(AggValue::Count(5)),
+        Ok(AggValue::CountStar(5)),
         "nothing was folded, so there is nothing to line the numbers up against",
     );
 }
@@ -311,7 +311,7 @@ fn a_truncate_zeroes_a_held_total_and_reports_it() {
         .unwrap();
     assert_eq!(
         reported(&updates),
-        vec![(sub, 7, AggValue::Count(0))],
+        vec![(sub, 7, AggValue::CountStar(0))],
         "the table is empty afterwards, so the answer is known without a re-read",
     );
 }
@@ -337,7 +337,7 @@ fn a_truncate_during_the_read_supersedes_the_starting_numbers() {
     let value = install_seed(&mut engine, sub, vec![Value::Int(1)], Some(PgLsn(15))).unwrap();
     assert_eq!(
         value,
-        AggValue::Count(1),
+        AggValue::CountStar(1),
         "the truncate wipes the starting numbers it followed, leaving only the row after it",
     );
 }
@@ -363,7 +363,7 @@ fn a_reset_zeroes_the_total_and_reports_nothing_until_the_next_seed() {
     );
 
     let value = install_seed(&mut engine, sub, vec![Value::Int(0)], Some(PgLsn(35))).unwrap();
-    assert_eq!(value, AggValue::Count(1));
+    assert_eq!(value, AggValue::CountStar(1));
 }
 
 #[test]
@@ -424,11 +424,12 @@ fn a_seeded_sum_follows_inserts_updates_and_deletes() {
         ))
         .unwrap()
         .subscription_id;
-    install_seed(&mut engine, sub, vec![Value::Int(0)], None).unwrap();
+    // An empty table: a NULL sum over no contributing rows.
+    install_seed(&mut engine, sub, vec![Value::Null, Value::Int(0)], None).unwrap();
 
     assert_eq!(
         reported(&engine.aggregate_updates(&paid(orders, 1, 100, 10)).unwrap()),
-        vec![(sub, 7, AggValue::Sum(100.0))],
+        vec![(sub, 7, AggValue::Sum(Some(NumericValue::Integer(100))))],
     );
 
     let raise = TestEvent::update(
@@ -441,7 +442,7 @@ fn a_seeded_sum_follows_inserts_updates_and_deletes() {
     .with_checkpoint(PgLsn(20));
     assert_eq!(
         reported(&engine.aggregate_updates(&raise).unwrap()),
-        vec![(sub, 7, AggValue::Sum(250.0))],
+        vec![(sub, 7, AggValue::Sum(Some(NumericValue::Integer(250))))],
     );
 
     assert_eq!(
@@ -450,6 +451,7 @@ fn a_seeded_sum_follows_inserts_updates_and_deletes() {
                 .aggregate_updates(&unpaid_delete(orders, 1, 250, 30))
                 .unwrap()
         ),
-        vec![(sub, 7, AggValue::Sum(0.0))],
+        vec![(sub, 7, AggValue::Sum(None))],
+        "the only contributing row left, so the sum is NULL again rather than zero",
     );
 }

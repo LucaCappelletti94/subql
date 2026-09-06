@@ -26,7 +26,7 @@ use diesel::r2d2::ConnectionManager;
 use diesel::{sql_query, ExpressionMethods, PgConnection, QueryDsl, RunQueryDsl};
 use sql_traits::structs::ParserDB;
 use sqlparser::dialect::PostgreSqlDialect;
-use subql::backend::{BuiltinKind, CdcEvent, Postgres, Value};
+use subql::backend::{CdcEvent, Postgres, ScalarFamily, Value};
 use subql::reexec::{
     AutoResolvingEngine, Connector, PgR2D2DieselConnector, SessionSetup, SnapshotResult, SyncMode,
 };
@@ -635,7 +635,7 @@ fn every_read_reports_a_position_taken_before_its_snapshot() {
     let ((value, position), after_commit) = common::park_a_read(port, &insert(2), move || {
         held.execute_scalar(
             &subql::reexec::ReadQuery::without_binds(&sql),
-            BuiltinKind::Int,
+            ScalarFamily::Int,
             &(),
         )
         .expect("scalar read")
@@ -671,7 +671,7 @@ fn every_read_reports_a_position_taken_before_its_snapshot() {
     let ((values, position), after_commit) = common::park_a_read(port, &insert(4), move || {
         held.execute_scalar_row(
             &subql::reexec::ReadQuery::without_binds(&sql),
-            &[BuiltinKind::Int],
+            &[ScalarFamily::Int],
             &(),
         )
         .expect("seed read")
@@ -836,7 +836,7 @@ impl Connector for PanicMidRead {
     fn execute_scalar(
         &self,
         query: &subql::reexec::ReadQuery<'_, Postgres>,
-        kind: subql::backend::BuiltinKind,
+        kind: subql::backend::ScalarFamily,
         auth: &(),
     ) -> Result<(Value<Postgres>, Option<Self::Checkpoint>), Self::Error> {
         self.inner.execute_scalar(query, kind, auth)
@@ -857,7 +857,7 @@ impl Connector for PanicMidRead {
     fn execute_scalar_row(
         &self,
         query: &subql::reexec::ReadQuery<'_, Postgres>,
-        kinds: &[subql::backend::BuiltinKind],
+        kinds: &[subql::backend::ScalarFamily],
         auth: &(),
     ) -> Result<
         (Vec<Value<Postgres>>, Option<Self::Checkpoint>),
@@ -1220,7 +1220,7 @@ fn a_scalar_over_a_narrow_integer_column_decodes() {
     let (value, _) = connector
         .execute_scalar(
             &subql::reexec::ReadQuery::without_binds("SELECT MIN(quantity) FROM orders"),
-            BuiltinKind::Int,
+            ScalarFamily::Int,
             &(),
         )
         .expect("INT column decodes");
@@ -1228,7 +1228,7 @@ fn a_scalar_over_a_narrow_integer_column_decodes() {
     let (value, _) = connector
         .execute_scalar(
             &subql::reexec::ReadQuery::without_binds("SELECT MIN(small) FROM probe"),
-            BuiltinKind::Int,
+            ScalarFamily::Int,
             &(),
         )
         .expect("INT column decodes");
@@ -1236,7 +1236,7 @@ fn a_scalar_over_a_narrow_integer_column_decodes() {
     let (value, _) = connector
         .execute_scalar(
             &subql::reexec::ReadQuery::without_binds("SELECT MAX(tiny) FROM probe"),
-            BuiltinKind::Int,
+            ScalarFamily::Int,
             &(),
         )
         .expect("SMALLINT column decodes");
@@ -1274,7 +1274,7 @@ fn session_setup_runs_inside_each_read_transaction() {
     let (value, _) = connector
         .execute_scalar(
             &subql::reexec::ReadQuery::without_binds(read_marker),
-            BuiltinKind::String,
+            ScalarFamily::String,
             &setup,
         )
         .expect("scalar read");
@@ -1318,7 +1318,7 @@ fn session_setup_runs_inside_each_read_transaction() {
     let (value, _) = plain
         .execute_scalar(
             &subql::reexec::ReadQuery::without_binds(read_marker),
-            BuiltinKind::String,
+            ScalarFamily::String,
             &(),
         )
         .expect("scalar read");

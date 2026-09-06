@@ -340,7 +340,7 @@ mod tests {
             err,
             crate::ValueError::Builtin {
                 column: 1,
-                kind: crate::backend::BuiltinKind::Int
+                kind: crate::backend::ScalarFamily::Int
             }
         );
     }

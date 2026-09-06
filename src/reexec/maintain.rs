@@ -6,6 +6,7 @@
 //! touches the database: it only reads cells through the event's `value_at`
 //! accessor and evaluates the query's WHERE clause via the engine VM.
 
+use crate::backend::ComparisonContext;
 use crate::backend::{Backend, CdcEvent, RowKind, ScalarText, Value};
 use crate::compiler::literals::SqlLiteralParse;
 use crate::compiler::sql_shape::ScalarAggKind;
@@ -140,8 +141,13 @@ impl<B: Backend> MinMaxQuery<B> {
             ScalarAggKind::Min => |o| o == Ordering::Less,
             ScalarAggKind::Max => |o| o == Ordering::Greater,
         };
+        // A refusal is undecidable, which is exactly what `None` already
+        // means here: the caller reads the database instead. Cross-kind
+        // cannot arise on one column's own values, so this is a guard
+        // rather than a live path, and a guard is the point: assuming it
+        // unreachable is how the comparison came to drop rows in silence.
         Some(matches!(
-            compare_ordered_values(candidate, current, wins),
+            compare_ordered_values(ComparisonContext::none(), candidate, current, wins).ok()?,
             Tri::True
         ))
     }
@@ -202,7 +208,11 @@ impl<B: Backend> MinMaxQuery<B> {
             return Maintenance::NeedsReexecution;
         };
         let value = self.agg_value(event, row, db);
-        if !value.is_absent() && values_equal(&value, current) {
+        // A refusal cannot say whether the extreme left, so the safe answer
+        // is the one that asks the database.
+        if !value.is_absent()
+            && values_equal(ComparisonContext::none(), &value, current).unwrap_or(true)
+        {
             // The current extreme (or a tie of it) was removed, the next
             // extreme is unknown without a scan.
             Maintenance::NeedsReexecution
@@ -329,7 +339,7 @@ enum ObservedRow<B: Backend> {
 pub struct GroupedRead<B: Backend, C: Checkpoint> {
     pub group: Vec<u8>,
     pub query: crate::reexec::BoundQuery<B>,
-    pub column_kinds: [crate::backend::BuiltinKind; 2],
+    pub column_kinds: [crate::backend::ScalarFamily; 2],
     pub checkpoint: Option<C>,
 }
 
@@ -470,7 +480,10 @@ impl<B: Backend + SqlLiteralParse, C: Checkpoint> GroupedMinMaxQuery<B, C> {
             ScalarAggKind::Min => |ordering| ordering == Ordering::Less,
             ScalarAggKind::Max => |ordering| ordering == Ordering::Greater,
         };
-        matches!(compare_ordered_values(candidate, current, wins), Tri::True)
+        matches!(
+            compare_ordered_values(ComparisonContext::none(), candidate, current, wins),
+            Ok(Tri::True)
+        )
     }
 
     /// Whether a group with this extreme and row count belongs to the
@@ -486,8 +499,13 @@ impl<B: Backend + SqlLiteralParse, C: Checkpoint> GroupedMinMaxQuery<B, C> {
             Some(crate::reexec::plan::GroupedHavingCheck::Extreme { op, threshold }) => {
                 let op = *op;
                 matches!(
-                    compare_ordered_values(current, threshold, move |ordering| op.admits(ordering)),
-                    Tri::True
+                    compare_ordered_values(
+                        ComparisonContext::none(),
+                        current,
+                        threshold,
+                        move |ordering| op.admits(ordering),
+                    ),
+                    Ok(Tri::True)
                 )
             }
             Some(crate::reexec::plan::GroupedHavingCheck::RowCount { op, threshold }) => {
@@ -506,10 +524,9 @@ impl<B: Backend + SqlLiteralParse, C: Checkpoint> GroupedMinMaxQuery<B, C> {
         group: &mut GroupedExtreme<B>,
     ) -> Option<crate::AggregateValueChange<B>> {
         if Self::passes(having, &group.current, group.rows) {
-            let repeat = group
-                .announced
-                .as_ref()
-                .is_some_and(|seen| values_equal(seen, &group.current));
+            let repeat = group.announced.as_ref().is_some_and(|seen| {
+                values_equal(ComparisonContext::none(), seen, &group.current).unwrap_or(false)
+            });
             group.announced = Some(group.current.clone());
             return (!repeat).then(|| {
                 crate::AggregateValueChange::Set(crate::AggregateResultValue::Scalar(
@@ -573,7 +590,10 @@ impl<B: Backend + SqlLiteralParse, C: Checkpoint> GroupedMinMaxQuery<B, C> {
                                 ));
                             }
                         }
-                    } else if !row.value.is_absent() && values_equal(&row.value, &group.current) {
+                    } else if !row.value.is_absent()
+                        && values_equal(ComparisonContext::none(), &row.value, &group.current)
+                            .unwrap_or(true)
+                    {
                         refresh.insert(row.key.clone(), row.values.clone());
                     } else {
                         touch(&mut touched, &row.key);
@@ -614,7 +634,7 @@ impl<B: Backend + SqlLiteralParse, C: Checkpoint> GroupedMinMaxQuery<B, C> {
             output.reads.push(GroupedRead {
                 group: key,
                 query,
-                column_kinds: [self.plan.agg_kind, crate::backend::BuiltinKind::Int],
+                column_kinds: [self.plan.agg_kind, crate::backend::ScalarFamily::Int],
                 checkpoint: checkpoint.cloned(),
             });
         }

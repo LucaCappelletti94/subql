@@ -11,7 +11,7 @@ use super::{
     load_page_postgres_async, load_scalar_postgres_async, load_scalar_row_postgres_async,
     run_setup_statements_async, DieselAsyncError,
 };
-use crate::backend::{BuiltinKind, Value};
+use crate::backend::{ScalarFamily, Value};
 use alloc::vec::Vec;
 use core::future::Future;
 use diesel::sql_query;
@@ -262,7 +262,7 @@ impl<S: SessionSetup + Send + Sync> AsyncConnector for PgAsyncDieselConnector<S>
     fn execute_scalar(
         &self,
         query: &ReadQuery<'_, Self::Backend>,
-        kind: BuiltinKind,
+        kind: ScalarFamily,
         auth: &S,
     ) -> impl Future<Output = Result<(Value<Self::Backend>, Option<Self::Checkpoint>), Self::Error>> + Send
     {
@@ -528,7 +528,7 @@ impl<S: SessionSetup + Send + Sync> AsyncConnector for PgAsyncDieselConnector<S>
     fn execute_scalar_row(
         &self,
         query: &ReadQuery<'_, Self::Backend>,
-        kinds: &[BuiltinKind],
+        kinds: &[ScalarFamily],
         auth: &S,
     ) -> impl Future<
         Output = Result<

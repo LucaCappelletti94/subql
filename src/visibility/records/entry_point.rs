@@ -8,7 +8,7 @@ use rls2fga_types::{
 use rls2fga_types::{AttributeLiteral, AttributeOperator, AttributePredicate};
 use sql_traits::prelude::DatabaseLike;
 
-use crate::backend::{BuiltinKind, ScalarKindOf};
+use crate::backend::{ScalarFamily, ScalarKindOf};
 use crate::catalog_helpers;
 use crate::visibility::RowView;
 use crate::TableId;
@@ -263,18 +263,18 @@ pub(super) fn column_kind_from_scalar<B: crate::backend::Backend>(
     // A custom type has no column kind here on purpose: rendering it would
     // mean asserting a text form subql cannot prove matches the loading SQL
     // (R1), so a shape that renders such a column is reported uncovered.
-    Some(match kind.as_builtin()? {
-        BuiltinKind::Bool => ColumnKind::Bool,
-        BuiltinKind::Int => ColumnKind::Integer,
-        BuiltinKind::Float => ColumnKind::Unsupported,
-        BuiltinKind::String => ColumnKind::Text,
-        BuiltinKind::Bytes => ColumnKind::Bytea,
-        BuiltinKind::Uuid => ColumnKind::Uuid,
-        BuiltinKind::Timestamp => ColumnKind::Timestamp,
-        BuiltinKind::TimestampTz => ColumnKind::TimestampTz,
-        BuiltinKind::Date => ColumnKind::Date,
-        BuiltinKind::Time => ColumnKind::Time,
-        BuiltinKind::Decimal => ColumnKind::Decimal,
-        BuiltinKind::Json | BuiltinKind::Jsonb => ColumnKind::Json,
+    Some(match kind.family()? {
+        ScalarFamily::Bool => ColumnKind::Bool,
+        ScalarFamily::Int => ColumnKind::Integer,
+        ScalarFamily::Float => ColumnKind::Unsupported,
+        ScalarFamily::String => ColumnKind::Text,
+        ScalarFamily::Bytes => ColumnKind::Bytea,
+        ScalarFamily::Uuid => ColumnKind::Uuid,
+        ScalarFamily::Timestamp => ColumnKind::Timestamp,
+        ScalarFamily::TimestampTz => ColumnKind::TimestampTz,
+        ScalarFamily::Date => ColumnKind::Date,
+        ScalarFamily::Time => ColumnKind::Time,
+        ScalarFamily::Decimal => ColumnKind::Decimal,
+        ScalarFamily::Json | ScalarFamily::Jsonb => ColumnKind::Json,
     })
 }

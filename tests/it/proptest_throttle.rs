@@ -32,7 +32,7 @@ use parking_lot::Mutex;
 use proptest::prelude::*;
 use sql_traits::structs::ParserDB;
 use sqlparser::dialect::PostgreSqlDialect;
-use subql::backend::{BuiltinKind, Postgres, Value};
+use subql::backend::{Postgres, ScalarFamily, Value};
 use subql::reexec::{AsyncConnector, AsyncMode, AutoResolvingEngine, RowPage, Snapshot};
 use subql::testing::TestEvent;
 use subql::{
@@ -97,7 +97,7 @@ impl AsyncConnector for ConcurrencyProbingConnector {
     fn execute_scalar(
         &self,
         _query: &subql::reexec::ReadQuery<'_, Postgres>,
-        _kind: BuiltinKind,
+        _kind: ScalarFamily,
         _auth: &(),
     ) -> impl Future<Output = Result<(Value<Postgres>, Option<Self::Checkpoint>), Self::Error>> + Send
     {

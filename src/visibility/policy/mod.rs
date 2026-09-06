@@ -798,7 +798,7 @@ ALTER TABLE ledger ENABLE ROW LEVEL SECURITY;
                 }
                 Err(ValueError::Builtin {
                     column: col,
-                    kind: crate::backend::BuiltinKind::String,
+                    kind: crate::backend::ScalarFamily::String,
                 })
             }
         }

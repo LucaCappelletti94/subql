@@ -62,14 +62,16 @@ fn seed_row(spec: &AggSpec, c: &Components) -> Vec<Value<Postgres>> {
     match spec {
         AggSpec::CountStar => vec![Value::Int(c.count_star)],
         AggSpec::CountColumn { .. } => vec![Value::Int(c.count_col)],
-        AggSpec::Sum { .. } => vec![sum_cell(c.sum, c.numeric)],
-        AggSpec::Avg { .. } => vec![sum_cell(c.sum, c.numeric), Value::Int(c.numeric)],
+        // SUM and AVG read the same pair: the total and its contributors.
+        AggSpec::Sum { .. } | AggSpec::Avg { .. } => {
+            vec![sum_cell(c.sum, c.numeric), Value::Int(c.numeric)]
+        }
         AggSpec::VarPop { .. }
         | AggSpec::VarSamp { .. }
         | AggSpec::StddevPop { .. }
         | AggSpec::StddevSamp { .. } => vec![
             sum_cell(c.sum, c.numeric),
-            sum_cell(c.sum_sq, c.numeric),
+            deviations_cell(c),
             Value::Int(c.numeric),
         ],
         _ => unreachable!("all_specs enumerates every AggSpec variant"),
@@ -78,22 +80,55 @@ fn seed_row(spec: &AggSpec, c: &Components) -> Vec<Value<Postgres>> {
 
 /// Textbook aggregate value over the components, independent of the
 /// accumulator's own arithmetic path where possible.
+/// The sum of squared deviations, which is what a Postgres seed carries:
+/// the server hands back `var_pop(x) * count(x)` rather than a sum of
+/// squares.
 #[allow(clippy::cast_precision_loss, clippy::suboptimal_flops)]
-fn oracle(spec: &AggSpec, c: &Components) -> AggValue {
+fn deviations_of(c: &Components) -> f64 {
+    if c.numeric == 0 {
+        return 0.0;
+    }
     let n = c.numeric as f64;
     let sum = c.sum as f64;
-    let sum_sq = c.sum_sq as f64;
-    let var_pop = (c.numeric > 0).then(|| sum_sq / n - (sum / n).powi(2));
-    let var_samp = (c.numeric >= 2).then(|| (sum_sq - sum.powi(2) / n) / (n - 1.0));
+    c.sum_sq as f64 - sum * sum / n
+}
+
+/// That value as a seed cell, NULL when no row contributed one.
+fn deviations_cell(c: &Components) -> Value<Postgres> {
+    if c.numeric == 0 {
+        Value::Null
+    } else {
+        Value::Float(deviations_of(c))
+    }
+}
+
+#[allow(clippy::cast_precision_loss)]
+fn oracle(spec: &AggSpec, c: &Components) -> AggValue {
+    let n = c.numeric as f64;
+    let deviations = deviations_of(c);
+    let var_pop = (c.numeric > 0).then(|| deviations / n);
+    let var_samp = (c.numeric >= 2).then(|| deviations / (n - 1.0));
     match spec {
-        AggSpec::CountStar => AggValue::Count(c.count_star),
-        AggSpec::CountColumn { .. } => AggValue::Count(c.count_col),
-        AggSpec::Sum { .. } => AggValue::Sum(sum),
-        AggSpec::Avg { .. } => AggValue::Real((c.numeric > 0).then(|| sum / n)),
-        AggSpec::VarPop { .. } => AggValue::Real(var_pop),
-        AggSpec::VarSamp { .. } => AggValue::Real(var_samp),
-        AggSpec::StddevPop { .. } => AggValue::Real(var_pop.map(f64::sqrt)),
-        AggSpec::StddevSamp { .. } => AggValue::Real(var_samp.map(f64::sqrt)),
+        AggSpec::CountStar => AggValue::CountStar(c.count_star),
+        AggSpec::CountColumn { .. } => AggValue::CountColumn(c.count_col),
+        // The fixture sums an `INT` column under Postgres, whose sum is a
+        // `bigint`, so the oracle's total is an exact integer.
+        AggSpec::Sum { .. } => {
+            AggValue::Sum((c.numeric > 0).then_some(subql::NumericValue::Integer(c.sum)))
+        }
+        // Postgres divides the exact total by the count as `numeric`.
+        AggSpec::Avg { .. } => AggValue::Avg((c.numeric > 0).then(|| {
+            subql::NumericValue::Decimal(
+                subql::compiler::vm::arithmetic::quotient_at_significant_digits(
+                    &bigdecimal::BigDecimal::from(c.sum),
+                    &bigdecimal::BigDecimal::from(c.numeric),
+                ),
+            )
+        })),
+        AggSpec::VarPop { .. } => AggValue::VarPop(var_pop),
+        AggSpec::VarSamp { .. } => AggValue::VarSamp(var_samp),
+        AggSpec::StddevPop { .. } => AggValue::StddevPop(var_pop.map(f64::sqrt)),
+        AggSpec::StddevSamp { .. } => AggValue::StddevSamp(var_samp.map(f64::sqrt)),
         _ => unreachable!("all_specs enumerates every AggSpec variant"),
     }
 }

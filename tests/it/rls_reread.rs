@@ -7,7 +7,7 @@ use hashbrown::HashMap;
 
 use sql_traits::structs::ParserDB;
 use sqlparser::dialect::PostgreSqlDialect;
-use subql::backend::{BuiltinKind, Postgres, Value};
+use subql::backend::{Postgres, ScalarFamily, Value};
 use subql::reexec::{
     AsyncConnector, AsyncMode, AutoResolvingEngine, Connector, CursorError, CursorId,
     ReExecutionRead, RowPage, Snapshot, SyncMode,
@@ -38,7 +38,7 @@ impl Connector for Recording {
     fn execute_scalar(
         &self,
         _query: &subql::reexec::ReadQuery<'_, Postgres>,
-        _kind: BuiltinKind,
+        _kind: ScalarFamily,
         _auth: &Self::AuthContext,
     ) -> Result<(Value<Postgres>, Option<NoCheckpoint>), Self::Error> {
         unreachable!("the tests register row reads")
@@ -227,7 +227,7 @@ impl Connector for AggregateRecording {
     fn execute_scalar(
         &self,
         query: &subql::reexec::ReadQuery<'_, Postgres>,
-        _kind: BuiltinKind,
+        _kind: ScalarFamily,
         auth: &Self::AuthContext,
     ) -> Result<(Value<Postgres>, Option<NoCheckpoint>), Self::Error> {
         Ok((self.state.lock().scalar_answer(query, auth), None))
@@ -298,7 +298,7 @@ impl AsyncConnector for AsyncAggregateRecording {
     fn execute_scalar(
         &self,
         query: &subql::reexec::ReadQuery<'_, Postgres>,
-        _kind: BuiltinKind,
+        _kind: ScalarFamily,
         auth: &Self::AuthContext,
     ) -> impl core::future::Future<
         Output = Result<(Value<Postgres>, Option<NoCheckpoint>), Self::Error>,
@@ -870,7 +870,7 @@ fn per_consumer_database_reads_accept_extreme_read_tiers() {
     assert!(matches!(
         scalar.tier,
         Tier::Scalar {
-            column_kind: BuiltinKind::Int,
+            column_kind: ScalarFamily::Int,
             ..
         }
     ));

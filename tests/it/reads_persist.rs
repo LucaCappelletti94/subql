@@ -6,7 +6,7 @@ use core::convert::Infallible;
 
 use sql_traits::structs::ParserDB;
 use sqlparser::dialect::PostgreSqlDialect;
-use subql::backend::{BuiltinKind, Postgres, Value};
+use subql::backend::{Postgres, ScalarFamily, Value};
 use subql::reexec::{
     Connector, CursorError, CursorId, ReExecutionRead, ReadQuery, RowPage, Snapshot,
 };
@@ -51,7 +51,7 @@ impl Connector for RecordingConnector {
     fn execute_scalar(
         &self,
         query: &ReadQuery<'_, Postgres>,
-        _kind: BuiltinKind,
+        _kind: ScalarFamily,
         _auth: &(),
     ) -> Result<(Value<Postgres>, Option<NoCheckpoint>), Self::Error> {
         self.record(query);

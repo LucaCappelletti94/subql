@@ -26,7 +26,7 @@ use rls2fga::translator::{Translator, TranslatorBuilder};
 use rls2fga::types::ConfidenceLevel;
 use sql_traits::structs::ParserDB;
 use sqlparser::dialect::PostgreSqlDialect;
-use subql::backend::{BuiltinKind, Postgres, Value};
+use subql::backend::{Postgres, ScalarFamily, Value};
 use subql::term::{MembershipTermDescription, TermDescription};
 use subql::testing::TestEvent;
 use subql::{catalog_helpers, DefaultIds, SubscriptionEngine, SubscriptionRequest, TableId};
@@ -239,7 +239,7 @@ fn the_described_seed_read_runs_and_admits_a_parent_with_no_rows_yet() {
     );
     assert_eq!(
         description.pairs[0].kind,
-        BuiltinKind::Int,
+        ScalarFamily::Int,
         "the decode kind"
     );
 

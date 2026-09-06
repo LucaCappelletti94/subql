@@ -111,24 +111,101 @@ pub trait DurableShardStore: Send {
 
 /// Current value of an aggregate subscription, as the engine reports it on
 /// [`AggregateValueUpdate`].
-#[derive(Clone, Copy, Debug, PartialEq)]
+///
+/// One variant per aggregate, so a reported value says which aggregate
+/// produced it. `Real` used to carry all four of the variance family, and
+/// that lost the question: measured on PostgreSQL 16, MySQL 8.4 and
+/// SQLite 3.51.1, the two rows 5 and 7 give a population variance of 1
+/// and a population standard deviation of 1, so the two answers were
+/// byte-identical and no care at the call site could recover which had
+/// been asked for.
+///
+/// `None` means the engine answers NULL, and what makes it NULL differs
+/// by aggregate. Measured on all three engines over an `int` column:
+///
+/// ```text
+/// rows          count(*) count(v)  sum   avg  var_pop  var_samp
+/// none                 0        0  NULL  NULL  NULL     NULL
+/// one NULL             1        0  NULL  NULL  NULL     NULL
+/// one value            1        1     5     5  0        NULL
+/// two values           2        2    12     6  1        2
+/// ```
+///
+/// So a count is never NULL, a sum and a mean are NULL until one row
+/// contributes a value, the population pair is NULL until one does and
+/// answers zero at exactly one, and the sample pair is NULL until two do.
+/// No engine distinguishes no rows from rows that are all NULL: both
+/// answer NULL, so neither does this type.
+///
+/// Not `Copy`: an exact decimal total owns its digits.
+#[derive(Clone, Debug, PartialEq)]
 pub enum AggValue {
-    /// `COUNT(*)` or `COUNT(col)`.
-    Count(i64),
-    /// `SUM(col)`.
-    Sum(f64),
-    /// A real-valued aggregate (AVG, variance, stddev). `None` when undefined
-    /// for the current row count.
-    Real(Option<f64>),
+    /// `COUNT(*)`: rows matched, NULL included. Never NULL itself.
+    CountStar(i64),
+    /// `COUNT(col)`: rows whose value is not NULL. Never NULL itself.
+    CountColumn(i64),
+    /// `SUM(col)`, in the type its engine sums into.
+    Sum(Option<NumericValue>),
+    /// `AVG(col)`, in the type its engine answers.
+    Avg(Option<NumericValue>),
+    /// `VAR_POP(col)`.
+    VarPop(Option<f64>),
+    /// `VAR_SAMP(col)`.
+    VarSamp(Option<f64>),
+    /// `STDDEV_POP(col)`.
+    StddevPop(Option<f64>),
+    /// `STDDEV_SAMP(col)`.
+    StddevSamp(Option<f64>),
+}
+
+/// A number in the type its engine answers, for a total or a mean.
+///
+/// Measured on PostgreSQL 16.15, MySQL 8.4.11 and SQLite 3.51.1: a sum
+/// over an `int` column is a `bigint` there, a `decimal(32,0)` there and
+/// an `integer` there, and none of the three sums in `f64`, so a single
+/// row of `9007199254740993` is itself rather than the nearest double. A
+/// mean over the same column is a `numeric`, a `decimal(14,4)` and a
+/// real. Which one a subscription answers is
+/// [`Backend::sum_rule`](crate::backend::Backend::sum_rule)'s to say for
+/// a total and [`Backend::MEAN`](crate::backend::Backend::MEAN)'s for a
+/// mean.
+#[derive(Clone, Debug, PartialEq)]
+pub enum NumericValue {
+    /// A 64-bit integer total: PostgreSQL's `sum(int)`, SQLite's integer
+    /// sum.
+    Integer(i64),
+    /// An exact decimal total, scale included: PostgreSQL's `numeric` and
+    /// every MySQL integer or decimal sum.
+    Decimal(bigdecimal::BigDecimal),
+    /// A double, which is what a floating column sums into everywhere.
+    Double(f64),
+}
+
+impl core::fmt::Display for NumericValue {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Integer(value) => write!(f, "{value}"),
+            Self::Decimal(value) => write!(f, "{value}"),
+            Self::Double(value) => write!(f, "{value}"),
+        }
+    }
 }
 
 impl core::fmt::Display for AggValue {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            Self::Count(c) => write!(f, "{c}"),
-            Self::Sum(s) => write!(f, "{s}"),
-            Self::Real(Some(v)) => write!(f, "{v}"),
-            Self::Real(None) => f.write_str("-"),
+            Self::CountStar(count) | Self::CountColumn(count) => write!(f, "{count}"),
+            Self::Sum(Some(number)) | Self::Avg(Some(number)) => write!(f, "{number}"),
+            Self::VarPop(Some(real))
+            | Self::VarSamp(Some(real))
+            | Self::StddevPop(Some(real))
+            | Self::StddevSamp(Some(real)) => write!(f, "{real}"),
+            Self::Sum(None)
+            | Self::Avg(None)
+            | Self::VarPop(None)
+            | Self::VarSamp(None)
+            | Self::StddevPop(None)
+            | Self::StddevSamp(None) => f.write_str("-"),
         }
     }
 }
@@ -231,7 +308,76 @@ pub struct ConsumerNotifications<
     /// than because a row they read changed. Empty for every event on a table no
     /// membership subquery reads through.
     pub(crate) narrowings: Vec<TermNarrowing<B>>,
+    /// Subscriptions whose predicate the target engine refuses to evaluate
+    /// for this row, with the cause. Reported rather than folded into a
+    /// no-match, because `Value::Null` composes through `OR` and would turn
+    /// a refusal into a silent wrong answer.
+    pub(crate) evaluation_failures: Vec<EvaluationFailure<I>>,
+    /// Subscriptions whose predicate read a cell the event does not carry,
+    /// so it has no answer for this row rather than a false one.
+    ///
+    /// Reported rather than collapsed into a no-match: `Value::Missing` is
+    /// not `Value::Null`, and a caller holding a connector can re-execute
+    /// the subscription to get the answer the stream could not give.
+    pub(crate) unanswered: Vec<UnansweredCell<I>>,
 }
+
+/// One subscription's predicate that read a cell the change stream did not
+/// carry.
+///
+/// Per subscription, like an evaluation failure: one consumer can hold
+/// several, and only those whose predicate actually read the absent cell
+/// are unanswerable.
+#[derive(Clone, Copy, Debug)]
+pub struct UnansweredCell<I: IdTypes> {
+    /// The subscription that could not be answered.
+    pub subscription_id: crate::SubscriptionId,
+    /// The consumer that subscription belongs to.
+    pub consumer_id: I::ConsumerId,
+    /// The column the event does not carry.
+    pub column: crate::ColumnId,
+}
+
+// Hand-implemented for the same reason as `EvaluationFailure`: `#[derive]`
+// would require `I: PartialEq`, which `IdTypes` does not imply.
+impl<I: IdTypes> PartialEq for UnansweredCell<I> {
+    fn eq(&self, other: &Self) -> bool {
+        self.subscription_id == other.subscription_id
+            && self.consumer_id == other.consumer_id
+            && self.column == other.column
+    }
+}
+
+impl<I: IdTypes> Eq for UnansweredCell<I> {}
+
+/// One subscription's predicate that the target engine refuses to evaluate
+/// for one row.
+///
+/// Per subscription: a row that overflows one predicate's arithmetic leaves
+/// every other subscription reading the same event answered.
+#[derive(Clone, Copy, Debug)]
+pub struct EvaluationFailure<I: IdTypes> {
+    /// The subscription that could not be evaluated. One consumer can hold
+    /// several, so this and not the consumer is what identifies the failure.
+    pub subscription_id: crate::SubscriptionId,
+    /// The consumer that subscription belongs to.
+    pub consumer_id: I::ConsumerId,
+    /// What the engine refuses.
+    pub refusal: crate::compiler::vm::refusal::EvaluationRefusal,
+}
+
+// Hand-implemented for the same reason as `Value<B>`: `#[derive]` would
+// require `I: PartialEq`, which `IdTypes` does not imply, while the two
+// fields it compares are both comparable on their own.
+impl<I: IdTypes> PartialEq for EvaluationFailure<I> {
+    fn eq(&self, other: &Self) -> bool {
+        self.subscription_id == other.subscription_id
+            && self.consumer_id == other.consumer_id
+            && self.refusal == other.refusal
+    }
+}
+
+impl<I: IdTypes> Eq for EvaluationFailure<I> {}
 
 impl<I: IdTypes, C: Checkpoint, B: Backend> ConsumerNotifications<I, C, B> {
     /// No consumer notified, no checkpoint, no narrowing.
@@ -250,6 +396,8 @@ impl<I: IdTypes, C: Checkpoint, B: Backend> ConsumerNotifications<I, C, B> {
             updated,
             checkpoint: None,
             narrowings: Vec::new(),
+            evaluation_failures: Vec::new(),
+            unanswered: Vec::new(),
         }
     }
 
@@ -294,6 +442,35 @@ impl<I: IdTypes, C: Checkpoint, B: Backend> ConsumerNotifications<I, C, B> {
         &self.narrowings
     }
 
+    /// The subscriptions whose predicate could not be evaluated for this
+    /// row, and why. Empty for every event whose predicates all answered.
+    #[must_use]
+    pub fn evaluation_failures(&self) -> &[EvaluationFailure<I>] {
+        &self.evaluation_failures
+    }
+
+    /// The subscriptions whose predicate read a cell this event does not
+    /// carry. Empty for every event that carries every cell its
+    /// subscriptions read.
+    #[must_use]
+    pub fn unanswered(&self) -> &[UnansweredCell<I>] {
+        &self.unanswered
+    }
+
+    /// Attach the unanswerable subscriptions one event produced.
+    #[must_use]
+    pub(crate) fn with_unanswered(mut self, unanswered: Vec<UnansweredCell<I>>) -> Self {
+        self.unanswered = unanswered;
+        self
+    }
+
+    /// Attach the evaluation failures one event produced.
+    #[must_use]
+    pub(crate) fn with_evaluation_failures(mut self, failures: Vec<EvaluationFailure<I>>) -> Self {
+        self.evaluation_failures = failures;
+        self
+    }
+
     /// Attach the narrowings a membership change produced.
     #[must_use]
     pub(crate) fn with_narrowings(mut self, narrowings: Vec<TermNarrowing<B>>) -> Self {
@@ -318,6 +495,24 @@ impl<I: IdTypes, C: Checkpoint, B: Backend> core::fmt::Debug for ConsumerNotific
             .field("updated", &self.updated)
             .field("checkpoint", &self.checkpoint)
             .field("narrowings", &self.narrowings)
+            // `I::ConsumerId` carries no `Debug`, so the causes are what
+            // this can show; the ids are read through the accessor.
+            .field(
+                "evaluation_failures",
+                &self
+                    .evaluation_failures
+                    .iter()
+                    .map(|failure| failure.refusal)
+                    .collect::<Vec<_>>(),
+            )
+            .field(
+                "unanswered",
+                &self
+                    .unanswered
+                    .iter()
+                    .map(|entry| (entry.subscription_id, entry.column))
+                    .collect::<Vec<_>>(),
+            )
             .finish()
     }
 }
@@ -397,9 +592,9 @@ impl<I: IdTypes, B: Backend> AggregateValueUpdate<I, B> {
 
     /// Additive value carried by `Set`, or `None` for another result kind.
     #[must_use]
-    pub const fn folded_value(&self) -> Option<AggValue> {
+    pub fn folded_value(&self) -> Option<AggValue> {
         match &self.change {
-            AggregateValueChange::Set(AggregateResultValue::Folded(value)) => Some(*value),
+            AggregateValueChange::Set(AggregateResultValue::Folded(value)) => Some(value.clone()),
             AggregateValueChange::Set(AggregateResultValue::Scalar(_))
             | AggregateValueChange::Remove => None,
         }
@@ -424,6 +619,33 @@ pub enum MaintenanceStopReason {
     GroupKeyUnencodable {
         /// Source table carrying the value.
         table_id: TableId,
+    },
+    /// A total left what its engine can represent, which is where the
+    /// engine itself raises.
+    ///
+    /// Measured: SQLite answers `integer overflow` past 64 bits and
+    /// PostgreSQL answers `value overflows numeric format` past 131072
+    /// integer digits, each reachable from two rows. A re-read cannot
+    /// answer either, so the tier changes and the caller learns why.
+    SumOutOfRange {
+        /// Source table whose column is summed.
+        table_id: TableId,
+    },
+    /// The event omitted a cell the aggregate's filter reads, so whether
+    /// the row belongs cannot be decided from the event.
+    ///
+    /// Distinct from [`Self::MissingOldRow`], which is about the old
+    /// image being incomplete. This one is about the filter: an UPDATE
+    /// can carry a complete old row and omit an unchanged TOASTed column
+    /// the filter names, and then the old row's removal is decidable
+    /// while the new row's membership is not. Folding one side alone
+    /// would leave the total permanently wrong, so maintenance stops and
+    /// a read answers instead.
+    FilterCellMissing {
+        /// Source table whose event omitted the cell.
+        table_id: TableId,
+        /// The column the filter could not read.
+        column: ColumnId,
     },
     /// A keyed row read received a CDC change with no readable primary key.
     KeyedChangeWithoutKey {
@@ -458,6 +680,17 @@ pub struct AggregateMaintenanceOutput<
     pub triggers: Vec<crate::reexec::ReExecutionTrigger<I, C, B>>,
     /// Tier changes caused by this operation.
     pub transitions: Vec<MaintenanceTransition<B>>,
+    /// Subscriptions whose filter the engine refuses to evaluate for this
+    /// event, with the cause.
+    ///
+    /// No trigger and no tier change accompanies one: a database read would
+    /// raise the same error, so there is nothing for it to answer. The
+    /// subscription's fold is left exactly as it was, since the row was
+    /// never judged, and the next event is evaluated normally.
+    pub evaluation_failures: Vec<(
+        crate::SubscriptionId,
+        crate::compiler::vm::refusal::EvaluationRefusal,
+    )>,
 }
 
 impl<I: IdTypes, B: Backend, C: Checkpoint> AggregateMaintenanceOutput<I, B, C> {
@@ -466,6 +699,7 @@ impl<I: IdTypes, B: Backend, C: Checkpoint> AggregateMaintenanceOutput<I, B, C> 
             updates: Vec::new(),
             triggers: Vec::new(),
             transitions: Vec::new(),
+            evaluation_failures: Vec::new(),
         }
     }
 }

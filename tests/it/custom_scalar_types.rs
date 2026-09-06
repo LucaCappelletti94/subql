@@ -14,7 +14,12 @@ use sqlparser::dialect::PostgreSqlDialect;
 use subql::backend::Pg18;
 use subql::backend::Postgres;
 use subql::backend::{
-    Backend, BuiltinKind, Carried, CustomScalars, ScalarKind, ScalarKindOf, Value,
+    Backend, Carried, CustomScalars, ScalarFamily, ScalarKind, ScalarKindOf, Value,
+};
+use subql::backend::{NumericWidening, TextOperation, TextRule, ValueKind, ValueKindOf};
+use subql::compiler::vm::arithmetic::checked_integer_binary;
+use subql::compiler::vm::refusal::{
+    ArithmeticOp, DanglingEscape, DivisionByZero, EvaluationRefusal, IntegerOverflow, LikeEscape,
 };
 use subql::compiler::SqlLiteralParse;
 use subql::testing::TestEvent;
@@ -61,10 +66,10 @@ impl CustomScalars for MyScalars {
         }
     }
 
-    fn carrier(kind: Self::Kind) -> BuiltinKind {
+    fn carrier(kind: Self::Kind) -> ScalarFamily {
         match kind {
-            MyKind::Mood => BuiltinKind::String,
-            MyKind::Build => BuiltinKind::Int,
+            MyKind::Mood => ScalarFamily::String,
+            MyKind::Build => ScalarFamily::Int,
         }
     }
 
@@ -101,6 +106,128 @@ impl CustomScalars for MyScalars {
 struct Custom;
 
 impl Backend for Custom {
+    /// This backend speaks the PostgreSQL dialect, so it takes
+    /// PostgreSQL's `LIKE` escape rule with it.
+    const LIKE_ESCAPE: Option<LikeEscape> = Some(LikeEscape {
+        character: '\\',
+        dangling: DanglingEscape::Fails,
+    });
+
+    /// PostgreSQL's dialect, so PostgreSQL's rule.
+    const DIVISION_BY_ZERO: DivisionByZero = DivisionByZero::Fails;
+
+    /// This backend carries its integers in `i64`, so it takes the checked
+    /// arithmetic, and it speaks the PostgreSQL dialect, which raises on
+    /// overflow.
+    fn integer_binary(
+        operation: ArithmeticOp,
+        left: i64,
+        right: i64,
+    ) -> Result<Value<Self>, EvaluationRefusal> {
+        checked_integer_binary(IntegerOverflow::Fails, operation, left, right)
+    }
+
+    fn integer_negate(value: i64) -> Result<Value<Self>, EvaluationRefusal> {
+        checked_integer_binary(IntegerOverflow::Fails, ArithmeticOp::Negate, value, 0)
+    }
+
+    /// No cross-kind numeric comparison: this backend's fixtures compare
+    /// same-kind values only.
+    fn numeric_widening(_left: ScalarFamily, _right: ScalarFamily) -> Option<NumericWidening> {
+        None
+    }
+
+    /// And raises when a floating total leaves range, as PostgreSQL does.
+    const FLOAT_SUM_OVERFLOW: subql::backend::FloatSumOverflow =
+        subql::backend::FloatSumOverflow::Raises;
+
+    /// This fixture stands in for PostgreSQL, so it orders floats the way
+    /// PostgreSQL does.
+    const FLOAT_ORDER: subql::backend::FloatOrder = subql::backend::FloatOrder::NanIsGreatest;
+
+    /// And read a variance back the way it does, from its own answer.
+    const VARIANCE_SEED: subql::backend::VarianceSeed = subql::backend::VarianceSeed::EnginesOwn;
+
+    /// And average like it: an exact total's mean is an exact decimal.
+    const MEAN: subql::backend::MeanRule = subql::backend::MeanRule::Exact;
+
+    /// The fixtures sum like PostgreSQL: a narrow integer column totals
+    /// into a 64-bit integer and everything exact totals into a decimal.
+    fn sum_rule(column: subql::backend::DeclaredType) -> subql::backend::SumRule {
+        match column {
+            subql::backend::DeclaredType::Int(subql::backend::IntWidth::UpToThirtyTwo) => {
+                subql::backend::SumRule::Integer
+            }
+            subql::backend::DeclaredType::Int(subql::backend::IntWidth::SixtyFour)
+            | subql::backend::DeclaredType::Decimal => subql::backend::SumRule::Decimal {
+                integer_digits: Some(131_072),
+            },
+            _ => subql::backend::SumRule::Double,
+        }
+    }
+
+    /// The fixtures divide like PostgreSQL: two integers truncate, and a
+    /// decimal quotient takes the significant-digit scale.
+    const DIVISION: subql::backend::DivisionRule = subql::backend::DivisionRule::IntegersTruncate;
+
+    fn decimal_quotient(
+        dividend: bigdecimal::BigDecimal,
+        divisor: bigdecimal::BigDecimal,
+        _quotient: subql::compiler::bytecode::Quotient,
+    ) -> bigdecimal::BigDecimal {
+        subql::compiler::vm::arithmetic::quotient_at_significant_digits(&dividend, &divisor)
+    }
+
+    /// Never called: this backend's `/` truncates two integers.
+    fn integer_quotient(
+        dividend: i64,
+        divisor: i64,
+        increment: subql::backend::DivisionPrecisionIncrement,
+    ) -> bigdecimal::BigDecimal {
+        subql::compiler::vm::arithmetic::quotient_in_words(
+            &bigdecimal::BigDecimal::from(dividend),
+            &bigdecimal::BigDecimal::from(divisor),
+            increment,
+        )
+    }
+
+    /// On the standard carrier, so the shared narrowing serves even though
+    /// this backend never resolves a single-width result.
+    fn hold_float_at_single(value: f64) -> f64 {
+        subql::backend::at_float4(value)
+    }
+
+    /// The fixtures declare no single-width column, so no result is held at
+    /// float4 and this backend narrows nothing.
+    fn float_arithmetic_width(
+        left: Option<subql::backend::FloatWidth>,
+        right: Option<subql::backend::FloatWidth>,
+    ) -> Option<subql::backend::FloatWidth> {
+        left.or(right).map(|_| subql::backend::FloatWidth::Double)
+    }
+
+    /// The fixtures declare no fixed-width or single-width column, so the
+    /// common refinements serve.
+    fn refine_declared_type(
+        family: subql::backend::ScalarFamily,
+        declared_type: &str,
+    ) -> subql::backend::DeclaredType {
+        subql::backend::declared_type_of(
+            family,
+            subql::backend::declares_sixty_four_bit_int(declared_type),
+            subql::backend::FloatWidth::Double,
+            subql::backend::TextWidth::Varying,
+        )
+    }
+
+    /// Byte comparison, which is all this backend's fixtures need.
+    fn text_rule(
+        _comparison: &subql::backend::ComparisonContext<'_, Self>,
+        _operation: TextOperation,
+    ) -> subql::backend::TextResolution {
+        subql::backend::TextResolution::Rule(TextRule::EXACT)
+    }
+
     type Dialect = PostgreSqlDialect;
     type Custom = MyScalars;
     type Bool = bool;
@@ -122,18 +249,18 @@ impl Backend for Custom {
 impl SqlLiteralParse for Custom {
     fn parse_literal(
         sql: &SqlValue,
-        target: ScalarKindOf<Self>,
+        target: ValueKindOf<Self>,
     ) -> Result<Value<Self>, RegisterError> {
         // A backend with custom types implements the builtin arms itself and
         // routes the custom one through the engine, which is what keeps a
         // literal and a row cell on one conversion.
-        if let ScalarKind::Custom(custom) = target {
+        if let ValueKind::Custom(custom) = target {
             return subql::compiler::parse_custom_literal::<Self>(sql, custom);
         }
-        let builtin = target.as_builtin().expect("not custom, so builtin");
+        let builtin = target.family().expect("not custom, so builtin");
         Ok(widen(Postgres::<Pg18>::parse_literal(
             sql,
-            ScalarKind::from(builtin),
+            ValueKind::from(builtin),
         )?))
     }
 }
@@ -191,13 +318,15 @@ fn a_declared_custom_type_classifies_as_itself() {
     );
     assert_eq!(
         kind_of_column("note"),
-        Some(BuiltinKind::String.into()),
+        Some(ScalarFamily::String.into()),
         "a builtin declaration wins over the backend's classifier"
     );
     assert_eq!(
         kind_of_column("id"),
-        Some(BuiltinKind::Int.into()),
-        "and so does an integer"
+        Some(ScalarKind::Builtin(subql::backend::DeclaredType::Int(
+            subql::backend::IntWidth::UpToThirtyTwo
+        ))),
+        "and so does an integer, at the width its declaration fixes"
     );
 }
 
@@ -207,14 +336,22 @@ fn a_declared_custom_type_classifies_as_itself() {
 fn a_wire_cell_decodes_through_the_carrier_and_the_conversion() {
     let decoded =
         subql::backend::decode_cell::<Custom, _>(0, ScalarKind::Custom(MyKind::Mood), |carrier| {
-            assert_eq!(carrier, BuiltinKind::String, "a mood travels as text");
+            assert_eq!(
+                carrier.family(),
+                ScalarFamily::String,
+                "a mood travels as text"
+            );
             Value::String("happy".to_owned())
         });
     assert_eq!(decoded, Ok(Value::Custom(MyValue::Mood(Mood::Happy))));
 
     let decoded =
         subql::backend::decode_cell::<Custom, _>(1, ScalarKind::Custom(MyKind::Build), |carrier| {
-            assert_eq!(carrier, BuiltinKind::Int, "a build travels as an integer");
+            assert_eq!(
+                carrier.family(),
+                ScalarFamily::Int,
+                "a build travels as an integer"
+            );
             Value::Int(1234)
         });
     assert_eq!(decoded, Ok(Value::Custom(MyValue::Build(1234))));
@@ -246,7 +383,7 @@ fn a_refused_conversion_is_reported_as_itself_not_as_a_bad_carrier() {
         malformed,
         Err(ValueError::Builtin {
             column: 9,
-            kind: BuiltinKind::Int
+            kind: ScalarFamily::Int
         }),
         "the carrier itself could not be read"
     );
@@ -260,14 +397,14 @@ fn a_refused_conversion_is_reported_as_itself_not_as_a_bad_carrier() {
 fn a_custom_literal_parses_through_the_same_conversion() {
     let happy = Custom::parse_literal(
         &SqlValue::SingleQuotedString("happy".to_owned()),
-        ScalarKind::Custom(MyKind::Mood),
+        ValueKind::Custom(MyKind::Mood),
     )
     .expect("happy is a mood");
     assert_eq!(happy, Value::Custom(MyValue::Mood(Mood::Happy)));
 
     let glad = Custom::parse_literal(
         &SqlValue::SingleQuotedString("glad".to_owned()),
-        ScalarKind::Custom(MyKind::Mood),
+        ValueKind::Custom(MyKind::Mood),
     )
     .expect("glad is a mood");
     assert_eq!(
@@ -277,7 +414,7 @@ fn a_custom_literal_parses_through_the_same_conversion() {
 
     let refused = Custom::parse_literal(
         &SqlValue::SingleQuotedString("furious".to_owned()),
-        ScalarKind::Custom(MyKind::Mood),
+        ValueKind::Custom(MyKind::Mood),
     );
     assert!(
         matches!(refused, Err(RegisterError::TypeError(_))),
@@ -286,7 +423,7 @@ fn a_custom_literal_parses_through_the_same_conversion() {
 
     let build = Custom::parse_literal(
         &SqlValue::Number("42".to_owned(), false),
-        ScalarKind::Custom(MyKind::Build),
+        ValueKind::Custom(MyKind::Build),
     )
     .expect("42 is a build");
     assert_eq!(build, Value::Custom(MyValue::Build(42)));
@@ -304,11 +441,11 @@ fn keying_is_answered_per_custom_type() {
         "a mood refuses keying, and the engine must respect that"
     );
     assert!(
-        subql::term::kind_can_key::<Custom>(BuiltinKind::Int.into()),
+        subql::term::kind_can_key::<Custom>(ScalarFamily::Int.into()),
         "builtins keep their own rule"
     );
     assert!(!subql::term::kind_can_key::<Custom>(
-        BuiltinKind::Json.into()
+        ScalarFamily::Json.into()
     ));
 }
 
@@ -317,9 +454,15 @@ fn keying_is_answered_per_custom_type() {
 #[test]
 fn a_custom_value_names_its_own_kind() {
     let value: Value<Custom> = Value::Custom(MyValue::Mood(Mood::Sad));
-    assert_eq!(value.scalar_kind(), Some(ScalarKind::Custom(MyKind::Mood)));
+    assert_eq!(
+        value.scalar_kind(),
+        Some(subql::backend::ValueKind::Custom(MyKind::Mood))
+    );
     let value: Value<Custom> = Value::Custom(MyValue::Build(3));
-    assert_eq!(value.scalar_kind(), Some(ScalarKind::Custom(MyKind::Build)));
+    assert_eq!(
+        value.scalar_kind(),
+        Some(subql::backend::ValueKind::Custom(MyKind::Build))
+    );
 }
 
 /// The whole path, end to end: a subscription filtering on a column of the

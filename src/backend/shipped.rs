@@ -3,13 +3,58 @@
 
 use super::scalar_value::{
     decode_exact_group_value, encode_mysql_component, encode_postgres_component,
-    encode_sqlite_component, mysql_text_key, postgres_text_key, sqlite_text_key, widen_i64_to_f64,
+    encode_sqlite_component, mysql_binary_text_rule, postgres_reproduces, single_column_rule,
+    sqlite_text_rule, widen_i64_to_f64,
 };
 use super::{
-    Backend, BuiltinKind, GroupKeyColumnOf, GroupKeyEncoder, NoCustomScalars, ScalarKindOf,
-    SqliteJson, Value,
+    Backend, ColumnComparisonOf, GroupKeyEncoder, NoCustomScalars, NumericWidening, ScalarFamily,
+    SqliteJson, TextRule, Value,
 };
 use alloc::string::ToString;
+
+/// How PostgreSQL reads trailing spaces for one text comparison.
+///
+/// Measured on 16.11, with a `char(5)` column holding `ab` (so stored as
+/// `ab   `) and a `varchar`/`text` column holding `ab   `:
+///
+/// | left   | right             | answer for `=`               |
+/// |--------|-------------------|------------------------------|
+/// | `char` | `char`            | trailing spaces ignored      |
+/// | `char` | literal           | trailing spaces ignored      |
+/// | `char` | `varchar`         | trailing spaces ignored      |
+/// | `char` | `text`            | `char` side stripped, then exact |
+/// | other  | other             | exact                        |
+///
+/// The `text` row is not an inconsistency: converting `char` to `text`
+/// strips the padding, and `text` comparison is then exact. So a `char`
+/// against `text` answers `false` for `ab` versus `ab   `, while the same
+/// pair as `char` against `varchar` answers `true`.
+fn postgres_trailing_spaces<V: postgres_jsonb_canonical::PgVersion + 'static>(
+    comparison: &super::scalar_value::ComparisonContext<'_, Postgres<V>>,
+) -> super::TrailingSpaces {
+    use super::TrailingSpaces;
+
+    let declares_char = |side: Option<&ColumnComparisonOf<Postgres<V>>>| {
+        side.is_some_and(ColumnComparisonOf::<Postgres<V>>::declares_char_type)
+    };
+    // `text` is the one partner that keeps its own trailing spaces while
+    // stripping the `char` side. A literal carries no facts and resolves
+    // to the `char` side's type, so it is not this case.
+    let declares_text = |side: Option<&ColumnComparisonOf<Postgres<V>>>| {
+        side.is_some_and(|facts| facts.declared_type.trim().eq_ignore_ascii_case("text"))
+    };
+
+    match (
+        declares_char(comparison.left),
+        declares_char(comparison.right),
+    ) {
+        (true, true) => TrailingSpaces::BothIgnored,
+        (true, false) if declares_text(comparison.right) => TrailingSpaces::LeftStripped,
+        (false, true) if declares_text(comparison.left) => TrailingSpaces::RightStripped,
+        (true, false) | (false, true) => TrailingSpaces::BothIgnored,
+        (false, false) => TrailingSpaces::BothSignificant,
+    }
+}
 
 /// Postgres backend marker, parameterised by the server major it targets.
 ///
@@ -19,37 +64,307 @@ use alloc::string::ToString;
 pub struct Postgres<V = postgres_jsonb_canonical::Pg18>(core::marker::PhantomData<V>);
 
 impl<V: postgres_jsonb_canonical::PgVersion + 'static> Backend for Postgres<V> {
+    fn hold_float_at_single(value: f64) -> f64 {
+        super::scalar_value::at_float4(value)
+    }
+
+    /// Measured on 16.11: two float4 operands keep a float4 result, while
+    /// any other pair promotes. `real * 3` has no operator, so an integer
+    /// operand lands in the promoting arm.
+    fn float_arithmetic_width(
+        left: Option<super::scalar_value::FloatWidth>,
+        right: Option<super::scalar_value::FloatWidth>,
+    ) -> Option<super::scalar_value::FloatWidth> {
+        use super::scalar_value::FloatWidth;
+
+        match (left, right) {
+            (Some(FloatWidth::Single), Some(FloatWidth::Single)) => Some(FloatWidth::Single),
+            (Some(_), _) | (_, Some(_)) => Some(FloatWidth::Double),
+            (None, None) => None,
+        }
+    }
+
+    /// Measured: `real` and `float4` are float4, `double precision` and
+    /// `float8` are float8.
+    fn refine_declared_type(
+        family: super::scalar_value::ScalarFamily,
+        declared_type: &str,
+    ) -> super::scalar_value::DeclaredType {
+        let declared = declared_type.trim();
+        let float = if ["real", "float4"]
+            .iter()
+            .any(|name| declared.eq_ignore_ascii_case(name))
+        {
+            super::scalar_value::FloatWidth::Single
+        } else {
+            super::scalar_value::FloatWidth::Double
+        };
+        super::scalar_value::declared_type_of(
+            family,
+            super::scalar_value::declares_sixty_four_bit_int(declared),
+            float,
+            super::scalar_value::declares_fixed_width_text(declared),
+        )
+    }
+
+    /// Measured: PostgreSQL raises `division by zero`.
+    const DIVISION_BY_ZERO: crate::compiler::vm::refusal::DivisionByZero =
+        crate::compiler::vm::refusal::DivisionByZero::Fails;
+
+    /// Measured: `var_pop(x) * count(x)` is `2` exactly over the three
+    /// rows whose sum of squares loses the answer.
+    /// Measured: two rows of `1e308` in a `double precision` column
+    /// answer `ERROR value out of range: overflow`, and two rows of
+    /// `3e38` in a `real` column answer the same.
+    const FLOAT_SUM_OVERFLOW: super::scalar_value::FloatSumOverflow =
+        super::scalar_value::FloatSumOverflow::Raises;
+
+    /// Measured on 16.15: `'NaN'::float8 = 'NaN'::float8` is true,
+    /// `'NaN'::float8 > 1` is true, and so are `f > i`, `f > x` and
+    /// `i < f` for `f = 'NaN'::float8`, `i = 1::int` and `x = 1::numeric`,
+    /// since the engine widens the other operand and then applies this
+    /// order.
+    const FLOAT_ORDER: super::scalar_value::FloatOrder =
+        super::scalar_value::FloatOrder::NanIsGreatest;
+
+    const VARIANCE_SEED: super::scalar_value::VarianceSeed =
+        super::scalar_value::VarianceSeed::EnginesOwn;
+
+    /// Measured: `avg(int)` of 1 and 2 is `1.5000000000000000`, which is
+    /// this engine's own `numeric` division of the total by the count.
+    const MEAN: super::scalar_value::MeanRule = super::scalar_value::MeanRule::Exact;
+
+    /// Measured: `sum(smallint)` and `sum(int)` are `bigint`, `sum(bigint)`
+    /// and `sum(numeric)` are `numeric`, and `sum(double precision)` is a
+    /// double. `numeric` stops at 131072 integer digits.
+    fn sum_rule(column: super::scalar_value::DeclaredType) -> super::scalar_value::SumRule {
+        use super::scalar_value::{DeclaredType, IntWidth, SumRule};
+
+        match column {
+            DeclaredType::Int(IntWidth::UpToThirtyTwo) => SumRule::Integer,
+            DeclaredType::Int(IntWidth::SixtyFour) | DeclaredType::Decimal => SumRule::Decimal {
+                integer_digits: Some(131_072),
+            },
+            // `sum(real)` is a `real` aggregate here, unlike on the other
+            // two engines, so the width the column declares is the width
+            // the total accumulates in.
+            DeclaredType::Float(super::scalar_value::FloatWidth::Single) => SumRule::Single,
+            _ => SumRule::Double,
+        }
+    }
+
+    /// Measured: `7 / 2` is `3`, and `1::numeric / 3` is
+    /// `0.33333333333333333333`, twenty digits and rounded up.
+    const DIVISION: super::scalar_value::DivisionRule =
+        super::scalar_value::DivisionRule::IntegersTruncate;
+
+    /// The quotient's scale is the engine's, resolved at registration.
+    fn decimal_quotient(
+        dividend: bigdecimal::BigDecimal,
+        divisor: bigdecimal::BigDecimal,
+        quotient: crate::compiler::bytecode::Quotient,
+    ) -> bigdecimal::BigDecimal {
+        match quotient {
+            crate::compiler::bytecode::Quotient::FromTheOperands => {
+                crate::compiler::vm::arithmetic::quotient_at_significant_digits(&dividend, &divisor)
+            }
+            crate::compiler::bytecode::Quotient::InWordsAt(increment) => {
+                crate::compiler::vm::arithmetic::quotient_in_words(&dividend, &divisor, increment)
+            }
+        }
+    }
+
+    /// Never called: this engine's `/` truncates two integers rather than
+    /// answering a decimal, so the integer arm stays on
+    /// [`Backend::integer_binary`].
+    fn integer_quotient(
+        dividend: i64,
+        divisor: i64,
+        increment: super::scalar_value::DivisionPrecisionIncrement,
+    ) -> bigdecimal::BigDecimal {
+        crate::compiler::vm::arithmetic::quotient_in_words(
+            &bigdecimal::BigDecimal::from(dividend),
+            &bigdecimal::BigDecimal::from(divisor),
+            increment,
+        )
+    }
+
     type Custom = NoCustomScalars<Self>;
 
+    /// Measured: a backslash escapes, and a pattern ending with one is
+    /// refused once the matcher reaches it with input still to read.
+    const LIKE_ESCAPE: Option<crate::compiler::vm::refusal::LikeEscape> =
+        Some(crate::compiler::vm::refusal::LikeEscape {
+            character: '\\',
+            dangling: crate::compiler::vm::refusal::DanglingEscape::Fails,
+        });
+
+    /// Measured on 16.11. Equality under a deterministic collation is byte
+    /// equality, including for the database default, since `CREATE
+    /// DATABASE` cannot select a nondeterministic collation. Ordering is
+    /// the locale's and byte order does not reproduce it, so only `C` and
+    /// `POSIX` are served. A `char(n)` column's padding is then handled on
+    /// top, per operation: `=` and `<` ignore it, `LIKE` does not.
+    fn text_rule(
+        comparison: &super::scalar_value::ComparisonContext<'_, Self>,
+        operation: crate::backend::TextOperation,
+    ) -> crate::backend::TextResolution {
+        use crate::backend::{TextOperation, TextResolution, TextRule};
+
+        // Two columns naming different collations is a statement the
+        // server will not run: measured, `c ("C") = p ("POSIX")` answers
+        // `ERROR: could not determine which collation to use for string
+        // comparison`, while `c = d` against the database default and
+        // `c = 'ab'` both answer normally, because those sides yield.
+        if super::scalar_value::named_collations_conflict(comparison) {
+            return TextResolution::Refused {
+                reason: "the operands name different collations, and PostgreSQL answers \
+                         `could not determine which collation to use for string comparison`",
+            };
+        }
+        for side in [comparison.left, comparison.right] {
+            let Some(facts) = side else { continue };
+            if !postgres_reproduces(facts, operation) {
+                return TextResolution::NeedsRead;
+            }
+        }
+        let rule = TextRule::EXACT;
+        TextResolution::Rule(match operation {
+            // `LIKE` reads the stored value, padding included: measured,
+            // a `char(5)` holding `ab` does not match the pattern `ab`.
+            TextOperation::Pattern => rule,
+            // `ILIKE` folds, and `postgres_reproduces` has already
+            // refused every collation whose folding is not ASCII-only.
+            TextOperation::CaseInsensitivePattern => TextRule {
+                case: crate::backend::TextCase::AsciiNoCase,
+                ..rule
+            },
+            TextOperation::Equality | TextOperation::Ordering => {
+                rule.with_spaces(postgres_trailing_spaces(comparison))
+            }
+        })
+    }
+
+    /// Measured: PostgreSQL raises `bigint out of range`.
+    fn integer_binary(
+        operation: crate::compiler::vm::refusal::ArithmeticOp,
+        left: i64,
+        right: i64,
+    ) -> Result<Value<Self>, crate::compiler::vm::refusal::EvaluationRefusal> {
+        crate::compiler::vm::arithmetic::checked_integer_binary(
+            crate::compiler::vm::refusal::IntegerOverflow::Fails,
+            operation,
+            left,
+            right,
+        )
+    }
+
+    fn integer_negate(
+        value: i64,
+    ) -> Result<Value<Self>, crate::compiler::vm::refusal::EvaluationRefusal> {
+        crate::compiler::vm::arithmetic::checked_integer_binary(
+            crate::compiler::vm::refusal::IntegerOverflow::Fails,
+            crate::compiler::vm::refusal::ArithmeticOp::Negate,
+            value,
+            0,
+        )
+    }
+
+    /// Measured: a float operand puts the comparison at `double precision`
+    /// width, and an integer against a decimal is exact.
+    fn numeric_widening(left: ScalarFamily, right: ScalarFamily) -> Option<NumericWidening> {
+        match (left, right) {
+            (ScalarFamily::Float, ScalarFamily::Int | ScalarFamily::Decimal)
+            | (ScalarFamily::Int | ScalarFamily::Decimal, ScalarFamily::Float) => {
+                Some(NumericWidening::AtFloatWidth)
+            }
+            (ScalarFamily::Int, ScalarFamily::Decimal)
+            | (ScalarFamily::Decimal, ScalarFamily::Int) => Some(NumericWidening::Exact),
+            _ => None,
+        }
+    }
+
+    fn compare_cross_kind_numeric(
+        left: &Value<Self>,
+        right: &Value<Self>,
+    ) -> Result<Option<core::cmp::Ordering>, crate::EvaluationRefusal> {
+        crate::backend::cross_kind_numeric_ordering(left, right)
+    }
+
+    /// PostgreSQL's own float rule: NaN equals NaN. IEEE, which is what
+    /// `PartialOrd` on `f64` implements, says a NaN equals nothing, so
+    /// `WHERE value = value` skipped the row the server returns.
+    ///
+    /// Only the float variants differ. `numeric` also has a NaN in the
+    /// server, but [`Backend::Decimal`] is a `BigDecimal`, which cannot
+    /// represent one, so no such value reaches here.
+    fn scalars_equal(
+        comparison: super::scalar_value::ComparisonContext<'_, Self>,
+        left: &Value<Self>,
+        right: &Value<Self>,
+    ) -> Result<bool, crate::EvaluationRefusal> {
+        Ok(match (left, right) {
+            (Value::Float(x), Value::Float(y)) if x.is_nan() || y.is_nan() => {
+                x.is_nan() && y.is_nan()
+            }
+            // The rule was resolved at registration, so no collation is
+            // consulted here. Its absence means the comparison came from a
+            // path that carries no facts, such as extreme maintenance,
+            // where byte comparison is the standing behaviour.
+            (Value::String(x), Value::String(y)) => {
+                comparison.text.unwrap_or(TextRule::EXACT).equal(x, y)
+            }
+            _ => crate::compiler::value_cmp::structural_equality(comparison, left, right)?,
+        })
+    }
+
+    /// NaN is PostgreSQL's largest float: above every non-NaN value, and
+    /// equal to another NaN. IEEE leaves every such pair unordered, which
+    /// answered `Tri::Unknown` and dropped the row. Text ordering reads
+    /// trailing spaces the same way equality does.
+    fn compare_scalars(
+        comparison: super::scalar_value::ComparisonContext<'_, Self>,
+        left: &Value<Self>,
+        right: &Value<Self>,
+    ) -> Result<Option<core::cmp::Ordering>, crate::EvaluationRefusal> {
+        Ok(match (left, right) {
+            (Value::Float(x), Value::Float(y)) => Self::FLOAT_ORDER.compare(*x, *y),
+            _ => crate::compiler::value_cmp::structural_ordering(comparison, left, right)?,
+        })
+    }
+
     fn group_key_encoder(
-        columns: alloc::vec::Vec<GroupKeyColumnOf<Self>>,
+        columns: alloc::vec::Vec<ColumnComparisonOf<Self>>,
     ) -> Option<GroupKeyEncoder<Self>> {
-        let supported = columns.iter().all(|column| match column.kind.as_builtin() {
+        let supported = columns.iter().all(|column| match column.kind.family() {
             Some(
-                BuiltinKind::Int
-                | BuiltinKind::Bool
-                | BuiltinKind::Bytes
-                | BuiltinKind::Uuid
-                | BuiltinKind::Timestamp
-                | BuiltinKind::TimestampTz
-                | BuiltinKind::Date
-                | BuiltinKind::Time
-                | BuiltinKind::Float
-                | BuiltinKind::Jsonb,
+                ScalarFamily::Int
+                | ScalarFamily::Bool
+                | ScalarFamily::Bytes
+                | ScalarFamily::Uuid
+                | ScalarFamily::Timestamp
+                | ScalarFamily::TimestampTz
+                | ScalarFamily::Date
+                | ScalarFamily::Time
+                | ScalarFamily::Float
+                | ScalarFamily::Jsonb,
             ) => true,
-            Some(BuiltinKind::String) => postgres_text_key(column).is_some(),
+            Some(ScalarFamily::String) => single_column_rule::<Self>(column).is_some(),
             // PostgreSQL numeric waits on Diesel #5168 for infinity support.
-            Some(BuiltinKind::Decimal | BuiltinKind::Json) | None => false,
+            Some(ScalarFamily::Decimal | ScalarFamily::Json) | None => false,
         });
         supported.then(|| GroupKeyEncoder::new(columns, encode_postgres_component))
     }
 
-    fn decode_group_value(kind: ScalarKindOf<Self>, value: Value<Self>) -> Option<Value<Self>> {
-        match (kind.as_builtin(), value) {
-            (Some(BuiltinKind::Float), Value::Int(value)) => {
+    fn decode_group_value(
+        kind: super::scalar_value::ValueKindOf<Self>,
+        value: Value<Self>,
+    ) -> Option<Value<Self>> {
+        match (kind.family(), value) {
+            (Some(ScalarFamily::Float), Value::Int(value)) => {
                 Some(Value::Float(widen_i64_to_f64(value)))
             }
-            (Some(BuiltinKind::Float), Value::Decimal(value)) => {
+            (Some(ScalarFamily::Float), Value::Decimal(value)) => {
                 value.to_string().parse().ok().map(Value::Float)
             }
             (_, value) => (!value.is_missing()).then_some(value),
@@ -77,35 +392,266 @@ impl<V: postgres_jsonb_canonical::PgVersion + 'static> Backend for Postgres<V> {
 pub struct MySql;
 
 impl Backend for MySql {
+    fn hold_float_at_single(value: f64) -> f64 {
+        super::scalar_value::at_float4(value)
+    }
+
+    /// Measured on 8.4.11: `FLOAT + FLOAT + FLOAT` answers the double sum,
+    /// so a float4 operand promotes and nothing is held at float4.
+    fn float_arithmetic_width(
+        left: Option<super::scalar_value::FloatWidth>,
+        right: Option<super::scalar_value::FloatWidth>,
+    ) -> Option<super::scalar_value::FloatWidth> {
+        left.or(right)
+            .map(|_| super::scalar_value::FloatWidth::Double)
+    }
+
+    /// Measured: MySQL's `FLOAT` is float4 and its `DOUBLE` is float8.
+    fn refine_declared_type(
+        family: super::scalar_value::ScalarFamily,
+        declared_type: &str,
+    ) -> super::scalar_value::DeclaredType {
+        let declared = declared_type.trim();
+        let float = if declared.eq_ignore_ascii_case("float") {
+            super::scalar_value::FloatWidth::Single
+        } else {
+            super::scalar_value::FloatWidth::Double
+        };
+        super::scalar_value::declared_type_of(
+            family,
+            super::scalar_value::declares_sixty_four_bit_int(declared),
+            float,
+            super::scalar_value::declares_fixed_width_text(declared),
+        )
+    }
+
     type Custom = NoCustomScalars<Self>;
 
+    /// Measured: a backslash escapes, and a pattern ending with one
+    /// answers 0 whether or not input remains, so it never raises.
+    const LIKE_ESCAPE: Option<crate::compiler::vm::refusal::LikeEscape> =
+        Some(crate::compiler::vm::refusal::LikeEscape {
+            character: '\\',
+            dangling: crate::compiler::vm::refusal::DanglingEscape::NoMatch,
+        });
+
+    /// Measured: MySQL answers `NULL` with warning 1365, even with
+    /// `ERROR_FOR_DIVISION_BY_ZERO` in `sql_mode`, which raises on writes.
+    const DIVISION_BY_ZERO: crate::compiler::vm::refusal::DivisionByZero =
+        crate::compiler::vm::refusal::DivisionByZero::IsNull;
+
+    /// Measured: it answers `var_pop` and `stddev_pop` digit for digit
+    /// with PostgreSQL, so it can hand back its own spread too.
+    /// Measured on 8.0.46 and 8.4.11: two rows of `1e308` in a `DOUBLE`
+    /// column answer `0`, and adding `-1e308` to them still answers `0`,
+    /// so the total stays there once it leaves range. Its `+` operator
+    /// raises `ERROR 1690` for the same pair.
+    const FLOAT_SUM_OVERFLOW: super::scalar_value::FloatSumOverflow =
+        super::scalar_value::FloatSumOverflow::Unmaintainable;
+
+    /// IEEE, and reachable only in principle: measured, MySQL refuses a
+    /// non-finite double on the way into a column with
+    /// `ERROR 1367 Illegal double '1e400' value found during parsing`, so
+    /// no `NaN` cell reaches a comparison.
+    const FLOAT_ORDER: super::scalar_value::FloatOrder = super::scalar_value::FloatOrder::Ieee;
+
+    const VARIANCE_SEED: super::scalar_value::VarianceSeed =
+        super::scalar_value::VarianceSeed::EnginesOwn;
+
+    /// Measured: `avg` over 1, 2 and 2 compares as `1.666666666`, which is
+    /// this engine's own `/` applied to the total and the count, and it
+    /// follows the declared increment exactly as `/` does.
+    const MEAN: super::scalar_value::MeanRule = super::scalar_value::MeanRule::Exact;
+
+    /// Measured: every integer width and every decimal sums into a decimal,
+    /// `decimal(32,0)` for an `int` column and `decimal(41,0)` for a
+    /// `bigint` one, and a floating column sums into a double. No bound is
+    /// reachable in a `SELECT`.
+    fn sum_rule(column: super::scalar_value::DeclaredType) -> super::scalar_value::SumRule {
+        use super::scalar_value::{DeclaredType, SumRule};
+
+        match column {
+            DeclaredType::Int(_) | DeclaredType::Decimal => SumRule::Decimal {
+                integer_digits: None,
+            },
+            _ => SumRule::Double,
+        }
+    }
+
+    /// Measured: `7 / 2` is `3.5000` and `2 / 3` compares as
+    /// `0.666666666`, truncated at a nine-digit word. MySQL spells integer
+    /// division `DIV`, which is a different operator.
+    const DIVISION: super::scalar_value::DivisionRule =
+        super::scalar_value::DivisionRule::QuotientsAreDecimalInWords;
+
+    /// The quotient's scale is the engine's, resolved at registration.
+    fn decimal_quotient(
+        dividend: bigdecimal::BigDecimal,
+        divisor: bigdecimal::BigDecimal,
+        quotient: crate::compiler::bytecode::Quotient,
+    ) -> bigdecimal::BigDecimal {
+        match quotient {
+            crate::compiler::bytecode::Quotient::FromTheOperands => {
+                crate::compiler::vm::arithmetic::quotient_at_significant_digits(&dividend, &divisor)
+            }
+            crate::compiler::bytecode::Quotient::InWordsAt(increment) => {
+                crate::compiler::vm::arithmetic::quotient_in_words(&dividend, &divisor, increment)
+            }
+        }
+    }
+
+    /// Two integers divide to a decimal here, so both widen and take the
+    /// same word quantisation any other pair takes.
+    fn integer_quotient(
+        dividend: i64,
+        divisor: i64,
+        increment: super::scalar_value::DivisionPrecisionIncrement,
+    ) -> bigdecimal::BigDecimal {
+        crate::compiler::vm::arithmetic::quotient_in_words(
+            &bigdecimal::BigDecimal::from(dividend),
+            &bigdecimal::BigDecimal::from(divisor),
+            increment,
+        )
+    }
+
+    /// Measured: MySQL raises `BIGINT value is out of range`. Its unary
+    /// minus on the smallest integer promotes past `i64` instead, which is
+    /// reported as a failure here rather than answered from a number this
+    /// carrier cannot hold.
+    fn integer_binary(
+        operation: crate::compiler::vm::refusal::ArithmeticOp,
+        left: i64,
+        right: i64,
+    ) -> Result<Value<Self>, crate::compiler::vm::refusal::EvaluationRefusal> {
+        crate::compiler::vm::arithmetic::checked_integer_binary(
+            crate::compiler::vm::refusal::IntegerOverflow::Fails,
+            operation,
+            left,
+            right,
+        )
+    }
+
+    fn integer_negate(
+        value: i64,
+    ) -> Result<Value<Self>, crate::compiler::vm::refusal::EvaluationRefusal> {
+        crate::compiler::vm::arithmetic::checked_integer_binary(
+            crate::compiler::vm::refusal::IntegerOverflow::Fails,
+            crate::compiler::vm::refusal::ArithmeticOp::Negate,
+            value,
+            0,
+        )
+    }
+
+    /// Measured: a float operand puts the comparison at `double precision`
+    /// width, and an integer against a decimal is exact.
+    fn numeric_widening(left: ScalarFamily, right: ScalarFamily) -> Option<NumericWidening> {
+        match (left, right) {
+            (ScalarFamily::Float, ScalarFamily::Int | ScalarFamily::Decimal)
+            | (ScalarFamily::Int | ScalarFamily::Decimal, ScalarFamily::Float) => {
+                Some(NumericWidening::AtFloatWidth)
+            }
+            (ScalarFamily::Int, ScalarFamily::Decimal)
+            | (ScalarFamily::Decimal, ScalarFamily::Int) => Some(NumericWidening::Exact),
+            _ => None,
+        }
+    }
+
+    fn compare_cross_kind_numeric(
+        left: &Value<Self>,
+        right: &Value<Self>,
+    ) -> Result<Option<core::cmp::Ordering>, crate::EvaluationRefusal> {
+        crate::backend::cross_kind_numeric_ordering(left, right)
+    }
+
+    /// Measured on 8.4.11: only the binary collations are reproducible.
+    /// The server default folds case and accents, and a case-sensitive UCA
+    /// collation is not byte-exact either, since `utf8mb4_0900_as_cs`
+    /// reports the NFC and NFD spellings of one letter equal where
+    /// `utf8mb4_bin` reports them different. Every other collation, and an
+    /// unnamed database default, is a database read.
+    fn text_rule(
+        comparison: &super::scalar_value::ComparisonContext<'_, Self>,
+        operation: crate::backend::TextOperation,
+    ) -> crate::backend::TextResolution {
+        use crate::backend::{TextResolution, TextRule};
+
+        // Measured: `a ILIKE 'x'` is a syntax error on 8.4.11, so there is
+        // no answer to reproduce and none is offered.
+        if matches!(
+            operation,
+            crate::backend::TextOperation::CaseInsensitivePattern
+        ) {
+            return TextResolution::NeedsRead;
+        }
+        // Two columns naming different collations: measured,
+        // `b (utf8mb4_bin) = n (utf8mb4_0900_bin)` answers `ERROR 1267
+        // Illegal mix of collations`, and so does any other differing
+        // pair of the same charset. A column against the database default
+        // resolves instead, in favour of the binary side.
+        if super::scalar_value::named_collations_conflict(comparison) {
+            return TextResolution::Refused {
+                reason: "the operands name different collations, and MySQL answers \
+                         `ERROR 1267 Illegal mix of collations`",
+            };
+        }
+        for side in [comparison.left, comparison.right] {
+            let Some(facts) = side else { continue };
+            if mysql_binary_text_rule(facts).is_none() {
+                return TextResolution::NeedsRead;
+            }
+        }
+        // Both sides name the same collation or one side is a literal, so
+        // either resolves the pair.
+        let rule = comparison
+            .left
+            .or(comparison.right)
+            .and_then(mysql_binary_text_rule)
+            .unwrap_or(TextRule::EXACT);
+        // A collation's padding is a fact about equality and ordering, not
+        // about a pattern. Measured on 8.0 with a `VARCHAR` holding
+        // `ab   ` under `utf8mb4_bin`, which is `PAD SPACE`: `b = 'ab'`
+        // is 1 and `b LIKE 'ab'` is 0, so the pattern reads the stored
+        // value with its spaces where equality does not.
+        TextResolution::Rule(match operation {
+            crate::backend::TextOperation::Pattern => {
+                rule.with_spaces(crate::backend::TrailingSpaces::BothSignificant)
+            }
+            _ => rule,
+        })
+    }
+
     fn group_key_encoder(
-        columns: alloc::vec::Vec<GroupKeyColumnOf<Self>>,
+        columns: alloc::vec::Vec<ColumnComparisonOf<Self>>,
     ) -> Option<GroupKeyEncoder<Self>> {
-        let supported = columns.iter().all(|column| match column.kind.as_builtin() {
+        let supported = columns.iter().all(|column| match column.kind.family() {
             Some(
-                BuiltinKind::Int
-                | BuiltinKind::Bool
-                | BuiltinKind::Bytes
-                | BuiltinKind::Timestamp
-                | BuiltinKind::TimestampTz
-                | BuiltinKind::Date
-                | BuiltinKind::Time
-                | BuiltinKind::Decimal,
+                ScalarFamily::Int
+                | ScalarFamily::Bool
+                | ScalarFamily::Bytes
+                | ScalarFamily::Timestamp
+                | ScalarFamily::TimestampTz
+                | ScalarFamily::Date
+                | ScalarFamily::Time
+                | ScalarFamily::Decimal,
             ) => true,
-            Some(BuiltinKind::String | BuiltinKind::Uuid) => mysql_text_key(column).is_some(),
+            Some(ScalarFamily::String | ScalarFamily::Uuid) => {
+                single_column_rule::<Self>(column).is_some()
+            }
             // MySQL 8.0 groups persisted signed zero into two groups.
-            Some(BuiltinKind::Float | BuiltinKind::Json | BuiltinKind::Jsonb) | None => false,
+            Some(ScalarFamily::Float | ScalarFamily::Json | ScalarFamily::Jsonb) | None => false,
         });
         supported.then(|| GroupKeyEncoder::new(columns, encode_mysql_component))
     }
 
-    fn decode_group_value(kind: ScalarKindOf<Self>, value: Value<Self>) -> Option<Value<Self>> {
-        match (kind.as_builtin(), value) {
-            (Some(BuiltinKind::Float), Value::Int(value)) => {
+    fn decode_group_value(
+        kind: super::scalar_value::ValueKindOf<Self>,
+        value: Value<Self>,
+    ) -> Option<Value<Self>> {
+        match (kind.family(), value) {
+            (Some(ScalarFamily::Float), Value::Int(value)) => {
                 Some(Value::Float(widen_i64_to_f64(value)))
             }
-            (Some(BuiltinKind::Float), Value::Decimal(value)) => {
+            (Some(ScalarFamily::Float), Value::Decimal(value)) => {
                 value.to_string().parse().ok().map(Value::Float)
             }
             (_, value) => (!value.is_missing()).then_some(value),
@@ -139,26 +685,228 @@ impl Backend for MySql {
 pub struct SQLite;
 
 impl Backend for SQLite {
+    fn hold_float_at_single(value: f64) -> f64 {
+        super::scalar_value::at_float4(value)
+    }
+
+    /// SQLite has one floating type and it is float8, so no result is held
+    /// at float4.
+    fn float_arithmetic_width(
+        left: Option<super::scalar_value::FloatWidth>,
+        right: Option<super::scalar_value::FloatWidth>,
+    ) -> Option<super::scalar_value::FloatWidth> {
+        left.or(right)
+            .map(|_| super::scalar_value::FloatWidth::Double)
+    }
+
+    /// SQLite has one floating type, `REAL`, and it is float8. Its
+    /// `CHAR(n)` is advisory, stored as given, so no text type is fixed
+    /// width here.
+    fn refine_declared_type(
+        family: super::scalar_value::ScalarFamily,
+        _declared_type: &str,
+    ) -> super::scalar_value::DeclaredType {
+        // SQLite's one integer is 64 bits wide, whatever a column
+        // declares, so every integer column resolves the same way.
+        super::scalar_value::declared_type_of(
+            family,
+            super::scalar_value::IntWidth::SixtyFour,
+            super::scalar_value::FloatWidth::Double,
+            super::scalar_value::TextWidth::Varying,
+        )
+    }
+
     type Custom = NoCustomScalars<Self>;
 
+    /// Measured: SQLite answers `NULL`.
+    const DIVISION_BY_ZERO: crate::compiler::vm::refusal::DivisionByZero =
+        crate::compiler::vm::refusal::DivisionByZero::IsNull;
+
+    /// Measured: `no such function: VAR_POP`. SQLite has no variance
+    /// function, so a seed there can only ask for a sum of squares.
+    /// Measured: two rows of `9e307` answer `inf`, and subtracting
+    /// `9e307` from them still answers `inf`, which is plain IEEE.
+    const FLOAT_SUM_OVERFLOW: super::scalar_value::FloatSumOverflow =
+        super::scalar_value::FloatSumOverflow::Saturates;
+
+    /// IEEE, and likewise unreachable in practice: SQLite binds a
+    /// non-finite double as `NULL`, so a comparison never sees one.
+    const FLOAT_ORDER: super::scalar_value::FloatOrder = super::scalar_value::FloatOrder::Ieee;
+
+    const VARIANCE_SEED: super::scalar_value::VarianceSeed =
+        super::scalar_value::VarianceSeed::SumOfSquares;
+
+    /// Measured: `typeof(avg(x))` is `real` for every column, and
+    /// `avg` of one row of `9007199254740993` is `9.00719925474099e+15`,
+    /// so the mean is inexact there and reproducing it means staying in
+    /// `f64`.
+    const MEAN: super::scalar_value::MeanRule = super::scalar_value::MeanRule::Double;
+
+    /// Measured: integers sum as one 64-bit integer, answering `integer
+    /// overflow` past it, and the total turns real as soon as a
+    /// non-integer joins. SQLite has no decimal type, so a column
+    /// declaring one carries integers or reals and follows the same rule.
+    fn sum_rule(column: super::scalar_value::DeclaredType) -> super::scalar_value::SumRule {
+        use super::scalar_value::{DeclaredType, SumRule};
+
+        match column {
+            DeclaredType::Int(_) => SumRule::IntegerPromotingToDouble,
+            _ => SumRule::Double,
+        }
+    }
+
+    /// Measured: `7 / 2` is `3`. Only the integer half of this rule can
+    /// run, since SQLite has no decimal type.
+    const DIVISION: super::scalar_value::DivisionRule =
+        super::scalar_value::DivisionRule::IntegersTruncate;
+
+    /// SQLite decodes no decimal cell, so this states the rule it declares rather than a second one.
+    fn decimal_quotient(
+        dividend: bigdecimal::BigDecimal,
+        divisor: bigdecimal::BigDecimal,
+        quotient: crate::compiler::bytecode::Quotient,
+    ) -> bigdecimal::BigDecimal {
+        match quotient {
+            crate::compiler::bytecode::Quotient::FromTheOperands => {
+                crate::compiler::vm::arithmetic::quotient_at_significant_digits(&dividend, &divisor)
+            }
+            crate::compiler::bytecode::Quotient::InWordsAt(increment) => {
+                crate::compiler::vm::arithmetic::quotient_in_words(&dividend, &divisor, increment)
+            }
+        }
+    }
+
+    /// Never called: this engine's `/` truncates two integers.
+    fn integer_quotient(
+        dividend: i64,
+        divisor: i64,
+        increment: super::scalar_value::DivisionPrecisionIncrement,
+    ) -> bigdecimal::BigDecimal {
+        crate::compiler::vm::arithmetic::quotient_in_words(
+            &bigdecimal::BigDecimal::from(dividend),
+            &bigdecimal::BigDecimal::from(divisor),
+            increment,
+        )
+    }
+
+    /// Measured: SQLite carries an overflowed integer result as a real.
+    fn integer_binary(
+        operation: crate::compiler::vm::refusal::ArithmeticOp,
+        left: i64,
+        right: i64,
+    ) -> Result<Value<Self>, crate::compiler::vm::refusal::EvaluationRefusal> {
+        crate::compiler::vm::arithmetic::checked_integer_binary(
+            crate::compiler::vm::refusal::IntegerOverflow::PromotesToFloat,
+            operation,
+            left,
+            right,
+        )
+    }
+
+    fn integer_negate(
+        value: i64,
+    ) -> Result<Value<Self>, crate::compiler::vm::refusal::EvaluationRefusal> {
+        crate::compiler::vm::arithmetic::checked_integer_binary(
+            crate::compiler::vm::refusal::IntegerOverflow::PromotesToFloat,
+            crate::compiler::vm::refusal::ArithmeticOp::Negate,
+            value,
+            0,
+        )
+    }
+
+    /// SQLite compares an integer against a real without rounding either,
+    /// measured: `9007199254740993 = 9007199254740992.0` is 0 where the
+    /// other two engines answer 1. It has no decimal type, so a decimal
+    /// operand has no measured rule and is not served.
+    fn numeric_widening(left: ScalarFamily, right: ScalarFamily) -> Option<NumericWidening> {
+        match (left, right) {
+            (ScalarFamily::Int, ScalarFamily::Float) | (ScalarFamily::Float, ScalarFamily::Int) => {
+                Some(NumericWidening::Exact)
+            }
+            _ => None,
+        }
+    }
+
+    /// SQLite gives `LIKE` no default escape: a backslash in a pattern
+    /// matches a backslash, so no pattern can end with one dangling.
+    const LIKE_ESCAPE: Option<crate::compiler::vm::refusal::LikeEscape> = None;
+
+    fn compare_cross_kind_numeric(
+        left: &Value<Self>,
+        right: &Value<Self>,
+    ) -> Result<Option<core::cmp::Ordering>, crate::EvaluationRefusal> {
+        crate::backend::cross_kind_numeric_ordering(left, right)
+    }
+
+    /// SQLite's three built-in collations are all exactly reproducible:
+    /// `BINARY` compares bytes, `NOCASE` folds ASCII case only, measured
+    /// as leaving a ligature alone, and `RTRIM` ignores trailing spaces.
+    ///
+    /// `LIKE` is the one operation that does not take the column's
+    /// collation: measured, `'ABC' LIKE 'abc'` is `1` and `'Ä' LIKE 'ä'`
+    /// is `0`, so it folds ASCII case whatever the column says. And there
+    /// is no `ILIKE` keyword, so no case-insensitive pattern is offered.
+    fn text_rule(
+        comparison: &super::scalar_value::ComparisonContext<'_, Self>,
+        operation: crate::backend::TextOperation,
+    ) -> crate::backend::TextResolution {
+        use crate::backend::TextResolution;
+
+        if matches!(
+            operation,
+            crate::backend::TextOperation::CaseInsensitivePattern
+        ) {
+            return TextResolution::NeedsRead;
+        }
+        // The leftmost operand carrying a collation decides, which is
+        // SQLite's own rule and not an arbitrary choice: measured on
+        // 3.51.1, `nocase_col = binary_col` is 1 and `binary_col =
+        // nocase_col` is 0, and a literal carries no collation, so a
+        // column against one answers under the column's either way.
+        //
+        // The loop used to overwrite the rule per side, so the *last*
+        // operand decided and the two directions answered alike.
+        let mut rule = None;
+        for side in [comparison.left, comparison.right] {
+            let Some(facts) = side else { continue };
+            let Some(resolved) = sqlite_text_rule(facts) else {
+                return TextResolution::NeedsRead;
+            };
+            if rule.is_none() {
+                rule = Some(resolved);
+            }
+        }
+        let mut rule = rule.unwrap_or(crate::backend::TextRule::EXACT);
+        if matches!(operation, crate::backend::TextOperation::Pattern) {
+            rule.case = crate::backend::TextCase::AsciiNoCase;
+            // `LIKE` is a function here and consults no collation at all.
+            // Measured on 3.51.1 with a `TEXT COLLATE RTRIM` column
+            // holding `ab   `: `r = 'ab'` is 1 and `r LIKE 'ab'` is 0.
+            rule.spaces = crate::backend::TrailingSpaces::BothSignificant;
+        }
+        TextResolution::Rule(rule)
+    }
+
     fn group_key_encoder(
-        columns: alloc::vec::Vec<GroupKeyColumnOf<Self>>,
+        columns: alloc::vec::Vec<ColumnComparisonOf<Self>>,
     ) -> Option<GroupKeyEncoder<Self>> {
-        let supported = columns.iter().all(|column| match column.kind.as_builtin() {
+        let supported = columns.iter().all(|column| match column.kind.family() {
             Some(
-                BuiltinKind::Int
-                | BuiltinKind::Bool
-                | BuiltinKind::Bytes
-                | BuiltinKind::Timestamp
-                | BuiltinKind::TimestampTz
-                | BuiltinKind::Date
-                | BuiltinKind::Time
-                | BuiltinKind::Float
-                | BuiltinKind::Json
-                | BuiltinKind::Jsonb,
+                ScalarFamily::Int
+                | ScalarFamily::Bool
+                | ScalarFamily::Bytes
+                | ScalarFamily::Timestamp
+                | ScalarFamily::TimestampTz
+                | ScalarFamily::Date
+                | ScalarFamily::Time
+                | ScalarFamily::Float
+                | ScalarFamily::Json
+                | ScalarFamily::Jsonb,
             ) => true,
-            Some(BuiltinKind::String | BuiltinKind::Uuid) => sqlite_text_key(column).is_some(),
-            Some(BuiltinKind::Decimal) | None => false,
+            Some(ScalarFamily::String | ScalarFamily::Uuid) => {
+                single_column_rule::<Self>(column).is_some()
+            }
+            Some(ScalarFamily::Decimal) | None => false,
         });
         supported.then(|| GroupKeyEncoder::new(columns, encode_sqlite_component))
     }
@@ -183,56 +931,59 @@ impl Backend for SQLite {
     type Decimal = bigdecimal::BigDecimal;
     type Json = SqliteJson;
 
-    fn decode_group_value(kind: ScalarKindOf<Self>, value: Value<Self>) -> Option<Value<Self>> {
-        match (kind.as_builtin(), value) {
-            (Some(BuiltinKind::Bool), Value::Int(value)) => Some(Value::Bool(value)),
-            (Some(BuiltinKind::Uuid), Value::String(value)) => Some(Value::Uuid(value)),
-            (Some(BuiltinKind::Timestamp), Value::String(value)) => {
+    fn decode_group_value(
+        kind: super::scalar_value::ValueKindOf<Self>,
+        value: Value<Self>,
+    ) -> Option<Value<Self>> {
+        match (kind.family(), value) {
+            (Some(ScalarFamily::Bool), Value::Int(value)) => Some(Value::Bool(value)),
+            (Some(ScalarFamily::Uuid), Value::String(value)) => Some(Value::Uuid(value)),
+            (Some(ScalarFamily::Timestamp), Value::String(value)) => {
                 sql_scalar_text::parse_timestamp(&value).map(Value::Timestamp)
             }
-            (Some(BuiltinKind::TimestampTz), Value::String(value)) => {
+            (Some(ScalarFamily::TimestampTz), Value::String(value)) => {
                 sql_scalar_text::parse_timestamp_tz(&value).map(Value::TimestampTz)
             }
-            (Some(BuiltinKind::Date), Value::String(value)) => {
+            (Some(ScalarFamily::Date), Value::String(value)) => {
                 sql_scalar_text::parse_date(&value).map(Value::Date)
             }
-            (Some(BuiltinKind::Time), Value::String(value)) => {
+            (Some(ScalarFamily::Time), Value::String(value)) => {
                 sql_scalar_text::parse_time(&value).map(Value::Time)
             }
-            (Some(BuiltinKind::Decimal), Value::String(value)) => {
+            (Some(ScalarFamily::Decimal), Value::String(value)) => {
                 sql_scalar_text::parse_decimal(&value).map(Value::Decimal)
             }
-            (Some(BuiltinKind::Float), Value::Int(value)) => {
+            (Some(ScalarFamily::Float), Value::Int(value)) => {
                 Some(Value::Float(widen_i64_to_f64(value)))
             }
-            (Some(BuiltinKind::Decimal), Value::Int(value)) => {
+            (Some(ScalarFamily::Decimal), Value::Int(value)) => {
                 Some(Value::Decimal(bigdecimal::BigDecimal::from(value)))
             }
-            (Some(BuiltinKind::Decimal), Value::Float(value)) => {
+            (Some(ScalarFamily::Decimal), Value::Float(value)) => {
                 value.to_string().parse().ok().map(Value::Decimal)
             }
-            (Some(BuiltinKind::Json), Value::String(value)) => {
+            (Some(ScalarFamily::Json), Value::String(value)) => {
                 Some(Value::Json(SqliteJson::text(value)))
             }
-            (Some(BuiltinKind::Json), Value::Int(value)) => {
+            (Some(ScalarFamily::Json), Value::Int(value)) => {
                 Some(Value::Json(SqliteJson::integer(value)))
             }
-            (Some(BuiltinKind::Json), Value::Float(value)) => {
+            (Some(ScalarFamily::Json), Value::Float(value)) => {
                 Some(Value::Json(SqliteJson::real(value)))
             }
-            (Some(BuiltinKind::Json), Value::Bytes(value)) => {
+            (Some(ScalarFamily::Json), Value::Bytes(value)) => {
                 Some(Value::Json(SqliteJson::blob(value)))
             }
-            (Some(BuiltinKind::Jsonb), Value::String(value)) => {
+            (Some(ScalarFamily::Jsonb), Value::String(value)) => {
                 Some(Value::Jsonb(SqliteJson::text(value)))
             }
-            (Some(BuiltinKind::Jsonb), Value::Int(value)) => {
+            (Some(ScalarFamily::Jsonb), Value::Int(value)) => {
                 Some(Value::Jsonb(SqliteJson::integer(value)))
             }
-            (Some(BuiltinKind::Jsonb), Value::Float(value)) => {
+            (Some(ScalarFamily::Jsonb), Value::Float(value)) => {
                 Some(Value::Jsonb(SqliteJson::real(value)))
             }
-            (Some(BuiltinKind::Jsonb), Value::Bytes(value)) => {
+            (Some(ScalarFamily::Jsonb), Value::Bytes(value)) => {
                 Some(Value::Jsonb(SqliteJson::blob(value)))
             }
             (_, value) => decode_exact_group_value(kind, value),

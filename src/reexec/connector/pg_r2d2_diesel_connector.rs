@@ -8,7 +8,7 @@ use super::{
     drain_cursor_buffer, run_setup_statements, Connector, CursorError, CursorId, ReadQuery,
     RowPage, ScalarRowError, SessionSetup, Snapshot,
 };
-use crate::backend::{BuiltinKind, Value};
+use crate::backend::{ScalarFamily, Value};
 use alloc::string::String;
 use diesel::{sql_query, Connection, QueryResult, RunQueryDsl};
 use thiserror::Error;
@@ -178,7 +178,7 @@ impl<S: SessionSetup> Connector for PgR2D2DieselConnector<S> {
     fn execute_scalar(
         &self,
         query: &ReadQuery<'_, Self::Backend>,
-        kind: BuiltinKind,
+        kind: ScalarFamily,
         auth: &S,
     ) -> Result<(Value<Self::Backend>, Option<Self::Checkpoint>), Self::Error> {
         let mut conn = self.pool.get()?;
@@ -236,7 +236,7 @@ impl<S: SessionSetup> Connector for PgR2D2DieselConnector<S> {
     fn execute_scalar_row(
         &self,
         query: &ReadQuery<'_, Self::Backend>,
-        kinds: &[BuiltinKind],
+        kinds: &[ScalarFamily],
         auth: &S,
     ) -> Result<
         (

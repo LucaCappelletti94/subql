@@ -59,6 +59,81 @@ pub enum CatalogError {
     },
 }
 
+/// A cause the in-process evaluator cannot answer, at the compiler's error
+/// boundary.
+///
+/// Carries only backend-independent data, because this type is not generic
+/// and a custom backend scalar kind cannot cross it. A cause whose operands
+/// are builtin travels whole; a cause naming a custom kind has to be built in
+/// generic code instead, which is where the collation and cross-kind reasons
+/// will be produced.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum Refusal {
+    /// A shared answer over a row-security table would be unsafe.
+    #[error("aggregate on RLS table requires database re-execution")]
+    RowSecurityNeedsPerConsumerRead {
+        /// The table whose row security forces the read.
+        table: crate::TableId,
+    },
+    /// The aggregate reads a column the fold cannot carry.
+    #[error("{function} requires a numeric column (Int, Float, or Decimal), but column {column} has type {kind:?}")]
+    UnfoldableAggregate {
+        /// The aggregated column.
+        column: crate::ColumnId,
+        /// The column's builtin kind, which is what the fold checked.
+        kind: crate::backend::ScalarFamily,
+        /// The aggregate function, as the statement spelled it.
+        function: String,
+    },
+    /// The comparison orders a kind whose order this build cannot
+    /// reproduce, `jsonb` being the one such kind today.
+    #[error(
+        "ordered comparison on column {column} of type {kind:?} is not reproducible in process"
+    )]
+    OrderNotReproducible {
+        /// The compared column.
+        column: crate::ColumnId,
+        /// The column's builtin kind, which is what carries no order here.
+        kind: crate::backend::ScalarFamily,
+    },
+    /// The operands' collations describe a text comparison this build does
+    /// not reproduce.
+    #[error(
+        "column {column} declares a collation whose comparison is not reproducible in process"
+    )]
+    CollationNotReproducible {
+        /// The compared column.
+        column: crate::ColumnId,
+        /// The collation as the catalog names it, or `None` for the
+        /// database default and for rules the catalog cannot name.
+        collation: Option<String>,
+    },
+    /// `/` on this engine answers a decimal whose scale depends on a
+    /// session setting the engine was not told.
+    #[error(
+        "division on this engine needs its declared div_precision_increment, which this engine \
+         was not given: pass it through with_division_precision_increment"
+    )]
+    DivisionPrecisionNotDeclared,
+    /// The comparison names two columns of different kinds and this
+    /// backend has no widening for the pair.
+    #[error("columns {left} and {right} have kinds {left_kind:?} and {right_kind:?}, which are not compared in process")]
+    CrossKindComparison {
+        /// Left operand column.
+        left: crate::ColumnId,
+        /// Left operand's builtin kind.
+        left_kind: crate::backend::ScalarFamily,
+        /// Right operand column.
+        right: crate::ColumnId,
+        /// Right operand's builtin kind.
+        right_kind: crate::backend::ScalarFamily,
+    },
+    /// A form with no structured cause, carrying the compiler's own words.
+    #[error("{0}")]
+    Unsupported(String),
+}
+
 /// Errors during subscription registration
 #[derive(Error, Clone, Debug)]
 #[non_exhaustive]
@@ -74,6 +149,37 @@ pub enum RegisterError {
     /// SQL uses unsupported features
     #[error("Unsupported SQL: {0}")]
     UnsupportedSql(String),
+
+    /// The in-process evaluator cannot answer this form, naming the cause so
+    /// the engine routes on it and a caller branches on it.
+    ///
+    /// The engine catches this, plans a read, and lifts the cause into
+    /// [`NotServed<B>`](crate::NotServed), widening a builtin kind into that
+    /// backend's scalar kind.
+    #[error("{0}")]
+    NotServedInProcess(Refusal),
+
+    /// The engine itself will not execute this statement, so neither an
+    /// in-process answer nor a database read can produce one.
+    ///
+    /// Distinct from [`Self::NotServedInProcess`], which promises that a
+    /// read answers. Measured on PostgreSQL 16.15, a comparison between
+    /// two columns whose collations differ answers
+    /// `ERROR: could not determine which collation to use for string
+    /// comparison`, and `EXPLAIN` of the same statement plans without
+    /// complaint, so registration cannot discover it by asking the
+    /// planner and a re-read raises the identical error. Reporting it as
+    /// not-served-in-process would tell a caller to do the one thing
+    /// that cannot work.
+    #[error("{engine} will not execute this statement: {reason}")]
+    RefusedByEngine {
+        /// Which engine refuses it, since the three disagree about
+        /// which statements they will run.
+        engine: &'static str,
+        /// The engine's own account of why, in its words where it gives
+        /// one.
+        reason: String,
+    },
 
     /// Table name not found in catalog
     #[error("Unknown table: {0}")]
@@ -185,7 +291,7 @@ pub enum ValueError {
         /// Column ordinal whose carried cell failed to decode.
         column: crate::ColumnId,
         /// The catalog scalar kind subql tried to decode the cell into.
-        kind: crate::backend::BuiltinKind,
+        kind: crate::backend::ScalarFamily,
     },
     /// A custom type's conversion refused the value its carrier delivered.
     ///

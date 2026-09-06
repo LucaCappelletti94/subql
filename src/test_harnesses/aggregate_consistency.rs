@@ -272,17 +272,12 @@ struct AggComponents {
 }
 
 impl AggComponents {
-    // Amounts originate from `i16`, so the running sums stay well inside
-    // f64's exact-integer range; the precision-loss lint is theoretical.
-    #[allow(clippy::cast_precision_loss)]
-    const fn sum_f64(&self) -> f64 {
-        self.sum as f64
-    }
     #[allow(clippy::cast_precision_loss)]
     const fn sum_sq_f64(&self) -> f64 {
         self.sum_sq as f64
     }
-    /// SUM / SUM(sq) components read back as NULL when no non-NULL row matched.
+    /// SUM and the spread's component read back as NULL when no non-NULL
+    /// row matched.
     const fn sum_cell(&self) -> Value<Postgres> {
         if self.numeric == 0 {
             Value::Null
@@ -290,11 +285,24 @@ impl AggComponents {
             Value::Int(self.sum)
         }
     }
-    const fn sum_sq_cell(&self) -> Value<Postgres> {
+    /// The sum of squared deviations, which is what a Postgres seed
+    /// carries: the server hands back `var_pop(x) * count(x)` rather than
+    /// a sum of squares.
+    #[allow(clippy::cast_precision_loss)]
+    fn deviations(&self) -> f64 {
+        if self.numeric == 0 {
+            return 0.0;
+        }
+        let n = self.numeric as f64;
+        let sum = self.sum as f64;
+        self.sum_sq as f64 - sum * sum / n
+    }
+
+    fn deviations_cell(&self) -> Value<Postgres> {
         if self.numeric == 0 {
             Value::Null
         } else {
-            Value::Int(self.sum_sq)
+            Value::Float(self.deviations())
         }
     }
 }
@@ -316,24 +324,50 @@ fn agg_components(virt: &BTreeMap<i64, VirtRow>) -> AggComponents {
     c
 }
 
+/// How Postgres folds the fixtures' `i16` amount column: its sum is a
+/// `bigint`, its mean an exact `numeric`, and its division needs no
+/// declared setting.
+const FOLD_RULE: crate::runtime::aggregate::FoldRule = crate::runtime::aggregate::FoldRule {
+    total: crate::backend::SumRule::Integer,
+    mean: crate::backend::MeanRule::Exact,
+    quotient: crate::compiler::bytecode::Quotient::FromTheOperands,
+    variance_seed: crate::backend::VarianceSeed::EnginesOwn,
+    // The harness stands in for PostgreSQL, which raises.
+    float_overflow: crate::backend::FloatSumOverflow::Raises,
+};
+
+/// The oracle's exact total, in the type that rule answers.
+const fn exact_total(sum: i64) -> crate::NumericValue {
+    crate::NumericValue::Integer(sum)
+}
+
 /// Textbook aggregate value over the components, using the same formulas
 /// as [`AggAccumulator::value`], so seeding matches it exactly.
 #[allow(clippy::cast_precision_loss, clippy::suboptimal_flops)]
 fn oracle_agg_value(spec: &AggSpec, c: &AggComponents) -> AggValue {
     let n = c.numeric as f64;
-    let sum = c.sum as f64;
-    let sum_sq = c.sum_sq as f64;
-    let var_pop = (c.numeric > 0).then(|| sum_sq / n - (sum / n).powi(2));
-    let var_samp = (c.numeric >= 2).then(|| (sum_sq - sum.powi(2) / n) / (n - 1.0));
+    let deviations = c.deviations();
+    let var_pop = (c.numeric > 0).then(|| deviations / n);
+    let var_samp = (c.numeric >= 2).then(|| deviations / (n - 1.0));
     match spec {
-        AggSpec::CountStar => AggValue::Count(c.count_star),
-        AggSpec::CountColumn { .. } => AggValue::Count(c.count_col),
-        AggSpec::Sum { .. } => AggValue::Sum(sum),
-        AggSpec::Avg { .. } => AggValue::Real((c.numeric > 0).then(|| sum / n)),
-        AggSpec::VarPop { .. } => AggValue::Real(var_pop),
-        AggSpec::VarSamp { .. } => AggValue::Real(var_samp),
-        AggSpec::StddevPop { .. } => AggValue::Real(var_pop.map(f64::sqrt)),
-        AggSpec::StddevSamp { .. } => AggValue::Real(var_samp.map(f64::sqrt)),
+        AggSpec::CountStar => AggValue::CountStar(c.count_star),
+        AggSpec::CountColumn { .. } => AggValue::CountColumn(c.count_col),
+        // The fixtures sum an `i16` column under Postgres, whose sum is a
+        // `bigint`, so the oracle's exact total is an integer.
+        AggSpec::Sum { .. } => AggValue::Sum((c.numeric > 0).then(|| exact_total(c.sum))),
+        // Postgres divides the exact total by the count as `numeric`.
+        AggSpec::Avg { .. } => AggValue::Avg((c.numeric > 0).then(|| {
+            crate::NumericValue::Decimal(
+                crate::compiler::vm::arithmetic::quotient_at_significant_digits(
+                    &bigdecimal::BigDecimal::from(c.sum),
+                    &bigdecimal::BigDecimal::from(c.numeric),
+                ),
+            )
+        })),
+        AggSpec::VarPop { .. } => AggValue::VarPop(var_pop),
+        AggSpec::VarSamp { .. } => AggValue::VarSamp(var_samp),
+        AggSpec::StddevPop { .. } => AggValue::StddevPop(var_pop.map(f64::sqrt)),
+        AggSpec::StddevSamp { .. } => AggValue::StddevSamp(var_samp.map(f64::sqrt)),
     }
 }
 
@@ -347,14 +381,30 @@ fn oracle_agg_value(spec: &AggSpec, c: &AggComponents) -> AggValue {
 /// misrouted delta, which moves these values by whole units, because the
 /// amounts driving them are `i16`.
 #[allow(clippy::cast_precision_loss)]
-fn agg_values_agree(engine: AggValue, oracle: AggValue, c: &AggComponents) -> bool {
+fn agg_values_agree(engine: &AggValue, oracle: &AggValue, c: &AggComponents) -> bool {
+    // Pairing per aggregate rather than per carrier is what makes the
+    // `_ => false` arm mean something: while all four of the variance
+    // family reported as one `Real`, a variance compared against a
+    // standard deviation matched the same arm and agreed whenever their
+    // values happened to coincide, which for a spread of 1 they do.
     match (engine, oracle) {
-        (AggValue::Count(a), AggValue::Count(b)) => a == b,
-        (AggValue::Sum(a), AggValue::Sum(b)) => {
-            (a - b).abs() <= 1e-9_f64.max(c.sum_f64().abs() * 1e-12)
-        }
-        (AggValue::Real(None), AggValue::Real(None)) => true,
-        (AggValue::Real(Some(a)), AggValue::Real(Some(b))) => {
+        (AggValue::CountStar(a), AggValue::CountStar(b))
+        | (AggValue::CountColumn(a), AggValue::CountColumn(b)) => a == b,
+        (AggValue::Sum(None), AggValue::Sum(None)) => true,
+        // An exact total agrees exactly, which is the whole point of it.
+        (AggValue::Sum(Some(a)), AggValue::Sum(Some(b))) => a == b,
+        (AggValue::Avg(None), AggValue::Avg(None)) => true,
+        // A mean is exact here too, being the engine's own division of the
+        // exact total by the count.
+        (AggValue::Avg(Some(a)), AggValue::Avg(Some(b))) => a == b,
+        (AggValue::VarPop(None), AggValue::VarPop(None))
+        | (AggValue::VarSamp(None), AggValue::VarSamp(None))
+        | (AggValue::StddevPop(None), AggValue::StddevPop(None))
+        | (AggValue::StddevSamp(None), AggValue::StddevSamp(None)) => true,
+        (AggValue::VarPop(Some(a)), AggValue::VarPop(Some(b)))
+        | (AggValue::VarSamp(Some(a)), AggValue::VarSamp(Some(b)))
+        | (AggValue::StddevPop(Some(a)), AggValue::StddevPop(Some(b)))
+        | (AggValue::StddevSamp(Some(a)), AggValue::StddevSamp(Some(b))) => {
             (a - b).abs() <= 1e-3_f64.max(c.sum_sq_f64().abs().sqrt() * 1e-5)
         }
         _ => false,
@@ -367,13 +417,15 @@ fn seed_row(spec: &AggSpec, c: &AggComponents) -> Vec<Value<Postgres>> {
     match spec {
         AggSpec::CountStar => alloc::vec![Value::Int(c.count_star)],
         AggSpec::CountColumn { .. } => alloc::vec![Value::Int(c.count_col)],
-        AggSpec::Sum { .. } => alloc::vec![c.sum_cell()],
-        AggSpec::Avg { .. } => alloc::vec![c.sum_cell(), Value::Int(c.numeric)],
+        // SUM and AVG read the same pair: the total and its contributors.
+        AggSpec::Sum { .. } | AggSpec::Avg { .. } => {
+            alloc::vec![c.sum_cell(), Value::Int(c.numeric)]
+        }
         AggSpec::VarPop { .. }
         | AggSpec::VarSamp { .. }
         | AggSpec::StddevPop { .. }
         | AggSpec::StddevSamp { .. } => {
-            alloc::vec![c.sum_cell(), c.sum_sq_cell(), Value::Int(c.numeric)]
+            alloc::vec![c.sum_cell(), c.deviations_cell(), Value::Int(c.numeric)]
         }
     }
 }
@@ -393,7 +445,7 @@ fn assert_seed_matches_oracle(c: &AggComponents) {
     ];
     for spec in specs {
         assert_eq!(
-            AggAccumulator::seed_from_row(&spec, &seed_row(&spec, c)).value(),
+            AggAccumulator::seed_from_row(&spec, FOLD_RULE, &seed_row(&spec, c)).value(),
             oracle_agg_value(&spec, c),
             "seed decode drift for {spec:?}",
         );
@@ -561,7 +613,7 @@ pub fn harness_aggregate_consistency(data: &[u8]) {
                     else {
                         panic!("ungrouped aggregate cannot remove a group")
                     };
-                    (u.subscription, *value)
+                    (u.subscription, value.clone())
                 })
                 .collect();
 
@@ -572,12 +624,12 @@ pub fn harness_aggregate_consistency(data: &[u8]) {
                     .current_aggregate_value(*subscription)
                     .expect("a seeded aggregate holds a value");
                 assert!(
-                    agg_values_agree(held, oracle, &now),
+                    agg_values_agree(&held, &oracle, &now),
                     "consumer {cid} value drift: engine={held:?} oracle={oracle:?}",
                 );
                 match reported.get(subscription) {
-                    Some(&value) => assert_eq!(
-                        value, held,
+                    Some(value) => assert_eq!(
+                        value, &held,
                         "consumer {cid} reported a value it does not hold",
                     ),
                     None => assert!(

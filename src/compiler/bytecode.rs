@@ -21,6 +21,116 @@ use crate::types::ColumnId;
 use alloc::vec::Vec;
 use serde::{Deserialize, Serialize};
 
+/// The width an arithmetic instruction's float result is held at, or
+/// `None` when the operation is not on floats.
+///
+/// Resolved at compile time from the operands' declared widths, because it
+/// is a property of the expression rather than of the values that reach it:
+/// PostgreSQL computes `real + real` in float4 and promotes `real * 3` to
+/// double precision, so two programs over the same cells hold their results
+/// differently.
+pub type FloatResult = Option<crate::backend::FloatWidth>;
+
+/// What one `/` needs to answer, resolved once at registration.
+///
+/// The engine's [`DivisionRule`](crate::backend::DivisionRule) says how a
+/// quotient is computed, and one of those ways needs a session setting the
+/// deployment declares. Resolving both into a single value here is what
+/// keeps the VM from holding a rule and a setting that could disagree: a
+/// program either carries an increment because its engine's rule wants
+/// one, or carries no place to put it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
+pub enum Quotient {
+    /// The operands decide it: two integers truncate toward zero, and a
+    /// decimal quotient takes the scale that gives sixteen significant
+    /// digits, rounded half away from zero.
+    FromTheOperands,
+    /// Every quotient is a decimal whose digits are quantised to
+    /// nine-digit words and truncated, at this declared increment.
+    InWordsAt(crate::backend::DivisionPrecisionIncrement),
+}
+
+impl Quotient {
+    /// How this backend divides, given what the deployment declared.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::errors::Refusal::DivisionPrecisionNotDeclared`] when the
+    /// engine's rule wants a session setting this engine was not given.
+    /// Both callers refuse rather than assume: the `/` operator at
+    /// compile time and a mean at registration.
+    pub fn resolve<B: crate::backend::Backend>(
+        increment: Option<crate::backend::DivisionPrecisionIncrement>,
+    ) -> Result<Self, crate::errors::Refusal> {
+        match B::DIVISION {
+            crate::backend::DivisionRule::IntegersTruncate => Ok(Self::FromTheOperands),
+            crate::backend::DivisionRule::QuotientsAreDecimalInWords => increment
+                .map(Self::InWordsAt)
+                .ok_or(crate::errors::Refusal::DivisionPrecisionNotDeclared),
+        }
+    }
+}
+
+/// Which column's comparison facts an instruction's operands carry, as
+/// indices into [`BytecodeProgram::column_comparisons`].
+///
+/// Two-sided because a comparison's answer can depend on both columns: a
+/// cross-width numeric pair compares at one width, and two differently
+/// collated text columns have no single collation.
+///
+/// Only a direct column reference carries facts. A literal side, and a side
+/// that is a compound expression such as `amount + quantity`, both carry
+/// `None`: an expression's result type is derived rather than declared, and
+/// deriving it is separate compiler work this type does not attempt.
+///
+/// Resolved at compile time so evaluation indexes rather than searches.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ComparisonRef {
+    /// Index of the left operand's facts.
+    pub left: Option<u16>,
+    /// Index of the right operand's facts.
+    pub right: Option<u16>,
+    /// How a text comparison is answered, resolved from both operands'
+    /// declared types and collations for this instruction's operation.
+    ///
+    /// `None` on every non-text comparison. A text comparison the backend
+    /// cannot reproduce never reaches a program at all: it is classified
+    /// at registration and answered by a database read.
+    pub text: Option<crate::backend::TextRule>,
+}
+
+impl ComparisonRef {
+    /// Neither operand carries resolved facts.
+    pub const NONE: Self = Self {
+        left: None,
+        right: None,
+        text: None,
+    };
+
+    /// Facts for both operands, with no text rule.
+    #[must_use]
+    pub const fn new(left: Option<u16>, right: Option<u16>) -> Self {
+        Self {
+            left,
+            right,
+            text: None,
+        }
+    }
+
+    /// This reference carrying `text` as its resolved text rule.
+    #[must_use]
+    pub const fn with_text(self, text: Option<crate::backend::TextRule>) -> Self {
+        Self { text, ..self }
+    }
+}
+
+/// A [`ComparisonRef`] slot the program does not carry.
+///
+/// Only reachable from a corrupt or truncated program, which is what
+/// persistence and the fuzzers can produce.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DanglingComparisonRef(pub u16);
+
 /// VM instruction for tri-state predicate evaluation.
 ///
 /// Parameterised on the observed [`Backend`] so that `PushLiteral` and
@@ -52,33 +162,33 @@ pub enum Instruction<B: Backend> {
     /// `Tri::False`.
     ///
     /// Stack: `[..., a, b] -> [..., Tri]`.
-    Equal,
+    Equal(ComparisonRef),
 
     /// Not equal: `a != b`. Complement of [`Equal`](Self::Equal) on defined
     /// operands; still `Tri::Unknown` on `Missing` / `Null`.
     ///
     /// Stack: `[..., a, b] -> [..., Tri]`.
-    NotEqual,
+    NotEqual(ComparisonRef),
 
     /// Less than: `a < b`.
     ///
     /// Stack: `[..., a, b] -> [..., Tri]`.
-    LessThan,
+    LessThan(ComparisonRef),
 
     /// Less than or equal: `a <= b`.
     ///
     /// Stack: `[..., a, b] -> [..., Tri]`.
-    LessThanOrEqual,
+    LessThanOrEqual(ComparisonRef),
 
     /// Greater than: `a > b`.
     ///
     /// Stack: `[..., a, b] -> [..., Tri]`.
-    GreaterThan,
+    GreaterThan(ComparisonRef),
 
     /// Greater than or equal: `a >= b`.
     ///
     /// Stack: `[..., a, b] -> [..., Tri]`.
-    GreaterThanOrEqual,
+    GreaterThanOrEqual(ComparisonRef),
 
     // NULL Checks (pop 1 value, push Tri)
     /// IS NULL check. `Missing` and `Null` both satisfy `IS NULL`.
@@ -116,31 +226,35 @@ pub enum Instruction<B: Backend> {
     /// cross-scalar and `Missing` / `Null` operands) yields `Value::Null`.
     ///
     /// Stack: `[..., a, b] -> [..., Value]`.
-    Add,
+    Add(FloatResult),
 
     /// Subtract: `a - b`. Same-scalar rules as [`Add`](Self::Add).
     ///
     /// Stack: `[..., a, b] -> [..., Value]`.
-    Subtract,
+    Subtract(FloatResult),
 
     /// Multiply: `a * b`. Same-scalar rules as [`Add`](Self::Add).
     ///
     /// Stack: `[..., a, b] -> [..., Value]`.
-    Multiply,
+    Multiply(FloatResult),
 
-    /// Divide: `a / b`. Same-scalar rules as [`Add`](Self::Add). Division by
-    /// zero yields `Value::Null`. Integer division is truncated (result is
-    /// `Int` when both operands are `Int`); the compiler emits an explicit
-    /// cast to `Float` upstream when the query wants float division.
+    /// Divide: `a / b`, answered by the engine's own rule, which
+    /// registration resolved into the [`Quotient`] this carries.
+    ///
+    /// Where two integers divide to an integer the quotient is truncated
+    /// toward zero; where they divide to a decimal it carries the declared
+    /// increment. A zero divisor is [`Backend::DIVISION_BY_ZERO`]'s
+    /// answer. Cross-scalar pairs and `Missing` / `Null` operands yield
+    /// `Value::Null`.
     ///
     /// Stack: `[..., a, b] -> [..., Value]`.
-    Divide,
+    Divide(FloatResult, Quotient),
 
     /// Modulo: `a % b`. `Int % Int -> Int` only (SQL modulo is undefined on
     /// floats). Any other pair, or a zero divisor, yields `Value::Null`.
     ///
     /// Stack: `[..., a, b] -> [..., Value]`.
-    Modulo,
+    Modulo(FloatResult),
 
     /// Negate: `-a` (unary minus).
     ///
@@ -149,7 +263,7 @@ pub enum Instruction<B: Backend> {
     /// `Value::Null`.
     ///
     /// Stack: `[..., a] -> [..., Value]`.
-    Negate,
+    Negate(FloatResult),
 
     // Special Operations
     /// `IN (...)`: membership test against a literal set.
@@ -159,7 +273,13 @@ pub enum Instruction<B: Backend> {
     /// (SQL standard: `x IN (1, NULL)` is `Unknown` when `x != 1`).
     ///
     /// Stack: `[..., value] -> [..., Tri]`.
-    In(Vec<Value<B>>),
+    In {
+        /// The literal set the value is tested against.
+        literals: Vec<Value<B>>,
+        /// The tested operand's facts. The right side is always `None`: the
+        /// set holds literals, which carry no column.
+        comparison: ComparisonRef,
+    },
 
     /// `BETWEEN a AND b`: closed-range membership. Equivalent to
     /// `value >= lower AND value <= upper`.
@@ -167,7 +287,12 @@ pub enum Instruction<B: Backend> {
     /// Any `Missing` / `Null` operand yields `Tri::Unknown`.
     ///
     /// Stack: `[..., value, lower, upper] -> [..., Tri]`.
-    Between,
+    Between {
+        /// Facts for the `value >= lower` comparison.
+        lower: ComparisonRef,
+        /// Facts for the `value <= upper` comparison.
+        upper: ComparisonRef,
+    },
 
     /// `LIKE` pattern matching against a text scalar. `%` matches zero or
     /// more characters, `_` matches exactly one character. No ESCAPE clause
@@ -178,8 +303,16 @@ pub enum Instruction<B: Backend> {
     ///
     /// Stack: `[..., string, pattern] -> [..., Tri]`.
     Like {
-        /// When `false`, both operands are lowercased before matching.
-        case_sensitive: bool,
+        /// The string and pattern operands' facts, including how this
+        /// engine folds case for the operator that was written. A pattern
+        /// can be a column, so this side is not always `None`.
+        ///
+        /// `LIKE` and `ILIKE` compile to the same instruction because the
+        /// only difference between them is that rule: measured,
+        /// PostgreSQL's `LIKE` is case-sensitive under every collation and
+        /// its `ILIKE` folds ASCII under `C`, while SQLite's `LIKE` folds
+        /// ASCII and has no `ILIKE` at all.
+        comparison: ComparisonRef,
     },
 
     // Control Flow (short-circuit evaluation)
@@ -248,6 +381,14 @@ pub struct BytecodeProgram<B: Backend> {
     /// reloaded term with no columns would narrow nothing and deliver the row to
     /// every subscriber sharing the predicate.
     pub term_columns: Vec<Vec<ColumnId>>,
+
+    /// The catalog facts the program's comparisons depend on, addressed by
+    /// [`ComparisonRef`] index.
+    ///
+    /// Interned once at compile time, so evaluation indexes this table
+    /// rather than searching it, and carried in the program because the
+    /// program is what persistence stores and reloads.
+    pub column_comparisons: Vec<crate::backend::ColumnComparisonOf<B>>,
 }
 
 impl<B: Backend> BytecodeProgram<B> {
@@ -266,12 +407,46 @@ impl<B: Backend> BytecodeProgram<B> {
     /// program pruned on the load set alone would miss it.
     #[must_use]
     pub fn with_terms(instructions: Vec<Instruction<B>>, term_columns: Vec<Vec<ColumnId>>) -> Self {
+        Self::with_comparisons(instructions, term_columns, Vec::new())
+    }
+
+    /// Build a program carrying the comparison facts its operands reference.
+    #[must_use]
+    pub fn with_comparisons(
+        instructions: Vec<Instruction<B>>,
+        term_columns: Vec<Vec<ColumnId>>,
+        column_comparisons: Vec<crate::backend::ColumnComparisonOf<B>>,
+    ) -> Self {
         let dependency_columns = Self::extract_dependencies(&instructions, &term_columns);
         Self {
             instructions,
             dependency_columns,
             term_columns,
+            column_comparisons,
         }
+    }
+
+    /// The facts at one [`ComparisonRef`] slot.
+    ///
+    /// `Ok(None)` is a side that names no column. A slot outside the table is
+    /// a corrupt program, not a side without facts: answering `None` there
+    /// would silently compare structurally and change the predicate's answer,
+    /// so it is refused.
+    ///
+    /// # Errors
+    ///
+    /// [`DanglingComparisonRef`] when `index` is outside
+    /// [`Self::column_comparisons`].
+    pub fn comparison_at(
+        &self,
+        index: Option<u16>,
+    ) -> Result<Option<&crate::backend::ColumnComparisonOf<B>>, DanglingComparisonRef> {
+        index.map_or(Ok(None), |slot| {
+            self.column_comparisons
+                .get(usize::from(slot))
+                .map(Some)
+                .ok_or(DanglingComparisonRef(slot))
+        })
     }
 
     /// Column ids referenced by any [`Instruction::LoadColumn`] in
@@ -316,27 +491,36 @@ impl<B: Backend> Clone for Instruction<B> {
         match self {
             Self::PushLiteral(v) => Self::PushLiteral(v.clone()),
             Self::LoadColumn(col) => Self::LoadColumn(*col),
-            Self::Equal => Self::Equal,
-            Self::NotEqual => Self::NotEqual,
-            Self::LessThan => Self::LessThan,
-            Self::LessThanOrEqual => Self::LessThanOrEqual,
-            Self::GreaterThan => Self::GreaterThan,
-            Self::GreaterThanOrEqual => Self::GreaterThanOrEqual,
+            Self::Equal(r) => Self::Equal(*r),
+            Self::NotEqual(r) => Self::NotEqual(*r),
+            Self::LessThan(r) => Self::LessThan(*r),
+            Self::LessThanOrEqual(r) => Self::LessThanOrEqual(*r),
+            Self::GreaterThan(r) => Self::GreaterThan(*r),
+            Self::GreaterThanOrEqual(r) => Self::GreaterThanOrEqual(*r),
             Self::IsNull => Self::IsNull,
             Self::IsNotNull => Self::IsNotNull,
             Self::And => Self::And,
             Self::Or => Self::Or,
             Self::Not => Self::Not,
-            Self::Add => Self::Add,
-            Self::Subtract => Self::Subtract,
-            Self::Multiply => Self::Multiply,
-            Self::Divide => Self::Divide,
-            Self::Modulo => Self::Modulo,
-            Self::Negate => Self::Negate,
-            Self::In(lits) => Self::In(lits.clone()),
-            Self::Between => Self::Between,
-            Self::Like { case_sensitive } => Self::Like {
-                case_sensitive: *case_sensitive,
+            Self::Add(width) => Self::Add(*width),
+            Self::Subtract(width) => Self::Subtract(*width),
+            Self::Multiply(width) => Self::Multiply(*width),
+            Self::Divide(width, quotient) => Self::Divide(*width, *quotient),
+            Self::Modulo(width) => Self::Modulo(*width),
+            Self::Negate(width) => Self::Negate(*width),
+            Self::In {
+                literals,
+                comparison,
+            } => Self::In {
+                literals: literals.clone(),
+                comparison: *comparison,
+            },
+            Self::Between { lower, upper } => Self::Between {
+                lower: *lower,
+                upper: *upper,
+            },
+            Self::Like { comparison } => Self::Like {
+                comparison: *comparison,
             },
             Self::JumpIfFalse(offset) => Self::JumpIfFalse(*offset),
             Self::JumpIfTrue(offset) => Self::JumpIfTrue(*offset),
@@ -350,28 +534,43 @@ impl<B: Backend> core::fmt::Debug for Instruction<B> {
         match self {
             Self::PushLiteral(v) => f.debug_tuple("PushLiteral").field(v).finish(),
             Self::LoadColumn(col) => f.debug_tuple("LoadColumn").field(col).finish(),
-            Self::Equal => f.write_str("Equal"),
-            Self::NotEqual => f.write_str("NotEqual"),
-            Self::LessThan => f.write_str("LessThan"),
-            Self::LessThanOrEqual => f.write_str("LessThanOrEqual"),
-            Self::GreaterThan => f.write_str("GreaterThan"),
-            Self::GreaterThanOrEqual => f.write_str("GreaterThanOrEqual"),
+            Self::Equal(r) => f.debug_tuple("Equal").field(r).finish(),
+            Self::NotEqual(r) => f.debug_tuple("NotEqual").field(r).finish(),
+            Self::LessThan(r) => f.debug_tuple("LessThan").field(r).finish(),
+            Self::LessThanOrEqual(r) => f.debug_tuple("LessThanOrEqual").field(r).finish(),
+            Self::GreaterThan(r) => f.debug_tuple("GreaterThan").field(r).finish(),
+            Self::GreaterThanOrEqual(r) => f.debug_tuple("GreaterThanOrEqual").field(r).finish(),
             Self::IsNull => f.write_str("IsNull"),
             Self::IsNotNull => f.write_str("IsNotNull"),
             Self::And => f.write_str("And"),
             Self::Or => f.write_str("Or"),
             Self::Not => f.write_str("Not"),
-            Self::Add => f.write_str("Add"),
-            Self::Subtract => f.write_str("Subtract"),
-            Self::Multiply => f.write_str("Multiply"),
-            Self::Divide => f.write_str("Divide"),
-            Self::Modulo => f.write_str("Modulo"),
-            Self::Negate => f.write_str("Negate"),
-            Self::In(lits) => f.debug_tuple("In").field(lits).finish(),
-            Self::Between => f.write_str("Between"),
-            Self::Like { case_sensitive } => f
+            Self::Add(width) => f.debug_tuple("Add").field(width).finish(),
+            Self::Subtract(width) => f.debug_tuple("Subtract").field(width).finish(),
+            Self::Multiply(width) => f.debug_tuple("Multiply").field(width).finish(),
+            Self::Divide(width, quotient) => f
+                .debug_tuple("Divide")
+                .field(width)
+                .field(quotient)
+                .finish(),
+            Self::Modulo(width) => f.debug_tuple("Modulo").field(width).finish(),
+            Self::Negate(width) => f.debug_tuple("Negate").field(width).finish(),
+            Self::In {
+                literals,
+                comparison,
+            } => f
+                .debug_struct("In")
+                .field("literals", literals)
+                .field("comparison", comparison)
+                .finish(),
+            Self::Between { lower, upper } => f
+                .debug_struct("Between")
+                .field("lower", lower)
+                .field("upper", upper)
+                .finish(),
+            Self::Like { comparison } => f
                 .debug_struct("Like")
-                .field("case_sensitive", case_sensitive)
+                .field("comparison", comparison)
                 .finish(),
             Self::JumpIfFalse(offset) => f.debug_tuple("JumpIfFalse").field(offset).finish(),
             Self::JumpIfTrue(offset) => f.debug_tuple("JumpIfTrue").field(offset).finish(),
@@ -385,26 +584,46 @@ impl<B: Backend> PartialEq for Instruction<B> {
         match (self, other) {
             (Self::PushLiteral(a), Self::PushLiteral(b)) => a == b,
             (Self::LoadColumn(ac), Self::LoadColumn(bc)) => ac == bc,
-            (Self::Equal, Self::Equal)
-            | (Self::NotEqual, Self::NotEqual)
-            | (Self::LessThan, Self::LessThan)
-            | (Self::LessThanOrEqual, Self::LessThanOrEqual)
-            | (Self::GreaterThan, Self::GreaterThan)
-            | (Self::GreaterThanOrEqual, Self::GreaterThanOrEqual)
-            | (Self::IsNull, Self::IsNull)
+            (Self::Equal(a), Self::Equal(b))
+            | (Self::NotEqual(a), Self::NotEqual(b))
+            | (Self::LessThan(a), Self::LessThan(b))
+            | (Self::LessThanOrEqual(a), Self::LessThanOrEqual(b))
+            | (Self::GreaterThan(a), Self::GreaterThan(b))
+            | (Self::GreaterThanOrEqual(a), Self::GreaterThanOrEqual(b))
+            | (Self::Like { comparison: a }, Self::Like { comparison: b }) => a == b,
+            (Self::IsNull, Self::IsNull)
             | (Self::IsNotNull, Self::IsNotNull)
             | (Self::And, Self::And)
             | (Self::Or, Self::Or)
-            | (Self::Not, Self::Not)
-            | (Self::Add, Self::Add)
-            | (Self::Subtract, Self::Subtract)
-            | (Self::Multiply, Self::Multiply)
-            | (Self::Divide, Self::Divide)
-            | (Self::Modulo, Self::Modulo)
-            | (Self::Negate, Self::Negate)
-            | (Self::Between, Self::Between) => true,
-            (Self::In(a), Self::In(b)) => a == b,
-            (Self::Like { case_sensitive: a }, Self::Like { case_sensitive: b }) => a == b,
+            | (Self::Not, Self::Not) => true,
+            (Self::Add(a), Self::Add(b))
+            | (Self::Subtract(a), Self::Subtract(b))
+            | (Self::Multiply(a), Self::Multiply(b))
+            | (Self::Modulo(a), Self::Modulo(b))
+            | (Self::Negate(a), Self::Negate(b)) => a == b,
+            (Self::Divide(width_a, quotient_a), Self::Divide(width_b, quotient_b)) => {
+                width_a == width_b && quotient_a == quotient_b
+            }
+            (
+                Self::Between {
+                    lower: al,
+                    upper: au,
+                },
+                Self::Between {
+                    lower: bl,
+                    upper: bu,
+                },
+            ) => al == bl && au == bu,
+            (
+                Self::In {
+                    literals: a,
+                    comparison: ar,
+                },
+                Self::In {
+                    literals: b,
+                    comparison: br,
+                },
+            ) => a == b && ar == br,
             (Self::JumpIfFalse(a), Self::JumpIfFalse(b))
             | (Self::JumpIfTrue(a), Self::JumpIfTrue(b)) => a == b,
             (Self::TermTruth(a), Self::TermTruth(b)) => a == b,
@@ -419,6 +638,7 @@ impl<B: Backend> Clone for BytecodeProgram<B> {
             instructions: self.instructions.clone(),
             dependency_columns: self.dependency_columns.clone(),
             term_columns: self.term_columns.clone(),
+            column_comparisons: self.column_comparisons.clone(),
         }
     }
 }
@@ -429,6 +649,7 @@ impl<B: Backend> core::fmt::Debug for BytecodeProgram<B> {
             .field("instructions", &self.instructions)
             .field("dependency_columns", &self.dependency_columns)
             .field("term_columns", &self.term_columns)
+            .field("column_comparisons", &self.column_comparisons)
             .finish()
     }
 }
@@ -438,6 +659,7 @@ impl<B: Backend> PartialEq for BytecodeProgram<B> {
         self.instructions == other.instructions
             && self.dependency_columns == other.dependency_columns
             && self.term_columns == other.term_columns
+            && self.column_comparisons == other.column_comparisons
     }
 }
 #[cfg(test)]
@@ -451,10 +673,10 @@ mod tests {
         let instructions: Vec<Instruction<Postgres>> = vec![
             Instruction::LoadColumn(5), // age
             Instruction::PushLiteral(Value::Int(18)),
-            Instruction::GreaterThan,
+            Instruction::GreaterThan(ComparisonRef::NONE),
             Instruction::LoadColumn(7), // status
             Instruction::PushLiteral(Value::String("active".into())),
-            Instruction::Equal,
+            Instruction::Equal(ComparisonRef::NONE),
             Instruction::And,
         ];
 
@@ -480,10 +702,10 @@ mod tests {
         let instructions: Vec<Instruction<Postgres>> = vec![
             Instruction::LoadColumn(5),
             Instruction::PushLiteral(Value::Int(18)),
-            Instruction::GreaterThan,
+            Instruction::GreaterThan(ComparisonRef::NONE),
             Instruction::LoadColumn(5), // Same column again
             Instruction::PushLiteral(Value::Int(65)),
-            Instruction::LessThan,
+            Instruction::LessThan(ComparisonRef::NONE),
             Instruction::And,
         ];
 
@@ -500,7 +722,7 @@ mod tests {
         let instructions: Vec<Instruction<Postgres>> = vec![
             Instruction::LoadColumn(5),
             Instruction::PushLiteral(Value::Int(18)),
-            Instruction::GreaterThan,
+            Instruction::GreaterThan(ComparisonRef::NONE),
             Instruction::JumpIfFalse(3),
             Instruction::TermTruth(0),
             Instruction::And,

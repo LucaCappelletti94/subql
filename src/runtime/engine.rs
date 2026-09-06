@@ -13,6 +13,7 @@ use super::{
 };
 use crate::backend::{Backend, CdcEvent, RowKind, Value};
 use crate::compiler::literals::SqlLiteralParse;
+use crate::errors::Refusal;
 use crate::{
     catalog_helpers,
     compiler::{
@@ -46,9 +47,6 @@ use sql_traits::prelude::DatabaseLike;
 use std::io::Write;
 #[cfg(test)]
 use std::sync::{Mutex, OnceLock};
-const RLS_AGGREGATE_NEEDS_DATABASE_READ: &str =
-    "aggregate on RLS table requires database re-execution";
-
 type BatchEntries<I, B> = Vec<(Predicate<B>, Vec<SubscriptionBinding<I>>)>;
 
 /// Per-subscription activity counters used by activity-aware eviction
@@ -289,6 +287,10 @@ where
     /// deployment-specific, and defaulting it fails silently when wrong.
     #[cfg(feature = "membership-term")]
     translator: Option<rls2fga::translator::Translator>,
+    /// MySQL's `div_precision_increment` as this deployment declared it.
+    /// Only an engine whose `/` answers a decimal needs it, and that
+    /// engine refuses the operator until it is given.
+    division_increment: Option<crate::backend::DivisionPrecisionIncrement>,
     /// Which term slots a change to each table moves, keyed by the table whose
     /// rows carry the membership.
     ///
@@ -426,6 +428,30 @@ fn table_context<'a, I: IdTypes, B: Backend>(
     Ok((partition, consumer_dict))
 }
 
+/// Whether this projection's fold divides, which is what a mean is.
+///
+/// `AVG` obviously, and a grouped `HAVING` over `AVG`, which reads a mean
+/// from the same components whatever the projected function is.
+fn projection_computes_a_mean(projection: &crate::compiler::sql_shape::QueryProjection) -> bool {
+    use crate::compiler::sql_shape::QueryProjection;
+
+    let mean_spec =
+        |spec: &crate::compiler::AggSpec| matches!(spec, crate::compiler::AggSpec::Avg { .. });
+    match projection {
+        QueryProjection::Rows => false,
+        QueryProjection::Aggregate(spec) => mean_spec(spec),
+        QueryProjection::GroupedAggregate { agg, having, .. } => {
+            mean_spec(agg)
+                || having.as_ref().is_some_and(|having| {
+                    matches!(
+                        having.subject,
+                        crate::HavingSubject::Aggregate(crate::HavingFunction::Avg)
+                    )
+                })
+        }
+    }
+}
+
 impl<E: CdcEvent, I: IdTypes, DB: DatabaseLike + 'static> SubscriptionEngine<E, I, DB>
 where
     E::Backend: SqlLiteralParse,
@@ -473,6 +499,7 @@ where
             &self.dialect,
             &self.database,
             binds,
+            self.division_increment,
         )?;
 
         // Registration policy: under RLS, viewers observe different rows,
@@ -490,8 +517,10 @@ where
         ) && catalog_helpers::table_has_rls(&self.database, compiled.table_id)?
         {
             if database_reads_per_consumer {
-                return Err(RegisterError::UnsupportedSql(
-                    RLS_AGGREGATE_NEEDS_DATABASE_READ.to_string(),
+                return Err(RegisterError::NotServedInProcess(
+                    Refusal::RowSecurityNeedsPerConsumerRead {
+                        table: compiled.table_id,
+                    },
                 ));
             }
             return Err(RegisterError::AggregatorOnRlsTable {
@@ -561,6 +590,15 @@ where
             projection,
             terms,
         } = compiled;
+
+        // A mean is a quotient, so an aggregate that computes one needs the
+        // same declared setting the `/` operator needs. Refused here
+        // rather than answered from a guess, which drops the registration
+        // to a re-read tier carrying the reason.
+        if projection_computes_a_mean(&projection) {
+            crate::compiler::bytecode::Quotient::resolve::<E::Backend>(self.division_increment)
+                .map_err(RegisterError::NotServedInProcess)?;
+        }
 
         let (term_subscriber, term_seeds) = self.settle_term_seeds(&terms, table_id, &spec)?;
 
@@ -737,11 +775,15 @@ where
         let mut seeds: Vec<Vec<crate::term::TermRow<E::Backend>>> =
             alloc::vec![Vec::new(); terms.len()];
         for term in terms.iter().filter(|term| term.compares_the_caller()) {
+            // Compared as values, not as declared types: a subscriber value
+            // carries no declaration, so the shared fact is the family. A
+            // `char(5)` column and a text subscriber name the same rows.
             let compared = catalog_helpers::column_scalar_kind::<E::Backend, _>(
                 &self.database,
                 table_id,
                 term.columns[0],
-            );
+            )
+            .map(|kind| kind.value_kind());
             let stated = subscriber.scalar_kind();
             if compared != Some(stated) {
                 return Err(RegisterError::MembershipTermRefused(format!(
@@ -968,7 +1010,7 @@ where
             QueryProjection::GroupedAggregate { groups, .. } => groups
                 .iter()
                 .map(|column| {
-                    catalog_helpers::group_key_column::<E::Backend, _>(
+                    catalog_helpers::column_comparison::<E::Backend, _>(
                         database,
                         compiled.table_id,
                         *column,
@@ -1134,6 +1176,7 @@ where
             aggregate_registrations: HashMap::new(),
             #[cfg(feature = "membership-term")]
             translator: None,
+            division_increment: None,
             term_watch: HashMap::new(),
             aggregates: HashMap::new(),
             grouped_aggregates: HashMap::new(),
@@ -1186,6 +1229,27 @@ where
     #[must_use]
     pub fn with_translator(mut self, translator: rls2fga::translator::Translator) -> Self {
         self.translator = Some(translator);
+        self
+    }
+
+    /// Supply MySQL's `div_precision_increment`, which its `/` needs.
+    ///
+    /// Without this, a MySQL predicate using `/` is refused with
+    /// [`crate::errors::Refusal::DivisionPrecisionNotDeclared`]
+    /// and answered by re-executing the query, because the setting decides
+    /// the answer and no default may be assumed: measured on MySQL 8.4.11,
+    /// `1 / 3` compares equal to `0` at increment 0 and to
+    /// `0.333333333333333333` at increment 10. Read the deployment's own
+    /// with `SELECT @@div_precision_increment`.
+    ///
+    /// PostgreSQL and SQLite need nothing here: their `/` truncates two
+    /// integers and their decimal scale follows no session setting.
+    #[must_use]
+    pub const fn with_division_precision_increment(
+        mut self,
+        increment: crate::backend::DivisionPrecisionIncrement,
+    ) -> Self {
+        self.division_increment = Some(increment);
         self
     }
 
@@ -1399,7 +1463,16 @@ where
         };
         let compiled = match self.compile_spec(spec, database_reads_per_consumer) {
             Ok(compiled) => compiled,
-            Err(RegisterError::UnsupportedSql(refusal)) => {
+            Err(RegisterError::UnsupportedSql(prose)) => {
+                return self.plan_reread(
+                    &source_query,
+                    Refusal::Unsupported(prose),
+                    consumer_id,
+                    session,
+                    database_reads_per_consumer,
+                )
+            }
+            Err(RegisterError::NotServedInProcess(refusal)) => {
                 return self.plan_reread(
                     &source_query,
                     refusal,
@@ -1536,18 +1609,22 @@ where
     fn plan_reread(
         &mut self,
         source_query: &crate::reexec::BoundQuery<E::Backend>,
-        refusal: String,
+        refusal: Refusal,
         consumer_id: I::ConsumerId,
         session: Option<I::SessionId>,
         database_reads_per_consumer: bool,
     ) -> Result<Registered<E::Backend>, RegisterError> {
-        if database_reads_per_consumer && refusal == RLS_AGGREGATE_NEEDS_DATABASE_READ {
+        // Routed on the cause, not on the sentence describing it.
+        if database_reads_per_consumer
+            && matches!(refusal, Refusal::RowSecurityNeedsPerConsumerRead { .. })
+        {
             return self.plan_whole_reread(source_query, refusal, consumer_id, session);
         }
         let planned = crate::reexec::plan::build_plan::<E::Backend, DB>(
             source_query,
             self.dialect(),
             &self.database,
+            self.division_increment,
         );
         let registration = RereadRegistration {
             consumer: consumer_id,
@@ -1573,12 +1650,59 @@ where
                         self.capture_whole(subscription_id, plan, &registration)
                     }
                 };
-                registered.not_served_because = Some(refusal);
+                registered.not_served_because = Some(Self::lift_refusal(refusal));
                 self.persist_reads_after_change(subscription_id)?;
                 Ok(registered)
             }
-            // No tier can serve it either, so the compiler's refusal stands.
-            Err(_) => Err(RegisterError::UnsupportedSql(refusal)),
+            // No tier can serve it either, so the registration is refused
+            // outright. `NotServedInProcess` never reaches a caller as an
+            // error: it says a read will answer this, which is the opposite
+            // of what happened here, so the cause is rendered as the
+            // unsupported-SQL refusal it now is.
+            Err(_) => Err(RegisterError::UnsupportedSql(
+                Self::lift_refusal(refusal).to_string(),
+            )),
+        }
+    }
+
+    /// Lift a compiler refusal into the reason a caller reads, widening each
+    /// builtin kind it carries into this backend's scalar kind.
+    fn lift_refusal(refusal: Refusal) -> crate::NotServed<E::Backend> {
+        match refusal {
+            Refusal::RowSecurityNeedsPerConsumerRead { table } => {
+                crate::NotServed::RowSecurityNeedsPerConsumerRead { table }
+            }
+            Refusal::UnfoldableAggregate {
+                column,
+                kind,
+                function,
+            } => crate::NotServed::UnfoldableAggregate {
+                column,
+                kind: kind.into(),
+                function,
+            },
+            Refusal::OrderNotReproducible { column, kind } => {
+                crate::NotServed::OrderNotReproducible {
+                    column,
+                    kind: kind.into(),
+                }
+            }
+            Refusal::CollationNotReproducible { column, collation } => {
+                crate::NotServed::CollationNotReproducible { column, collation }
+            }
+            Refusal::DivisionPrecisionNotDeclared => crate::NotServed::DivisionPrecisionNotDeclared,
+            Refusal::CrossKindComparison {
+                left,
+                left_kind,
+                right,
+                right_kind,
+            } => crate::NotServed::CrossKindComparison {
+                left,
+                left_kind: left_kind.into(),
+                right,
+                right_kind: right_kind.into(),
+            },
+            Refusal::Unsupported(prose) => crate::NotServed::UnsupportedSql(prose),
         }
     }
 
@@ -1631,7 +1755,7 @@ where
     fn plan_whole_reread(
         &mut self,
         source_query: &crate::reexec::BoundQuery<E::Backend>,
-        refusal: String,
+        refusal: Refusal,
         consumer_id: I::ConsumerId,
         session: Option<I::SessionId>,
     ) -> Result<Registered<E::Backend>, RegisterError> {
@@ -1648,7 +1772,7 @@ where
             database_reads_per_consumer: true,
         };
         let mut registered = self.capture_whole(subscription_id, plan, &registration);
-        registered.not_served_because = Some(refusal);
+        registered.not_served_because = Some(Self::lift_refusal(refusal));
         self.persist_reads_after_change(subscription_id)?;
         Ok(registered)
     }
@@ -1981,6 +2105,7 @@ where
             updates: Vec::new(),
             triggers: alloc::vec![trigger],
             transitions: alloc::vec![transition],
+            evaluation_failures: Vec::new(),
         })
     }
 
@@ -2425,6 +2550,7 @@ where
             &entry.source_query,
             &self.dialect,
             &self.database,
+            self.division_increment,
         )
         .map_err(|e| DropReason::Unplannable {
             message: format!("{e:?}"),
@@ -3885,7 +4011,7 @@ where
     /// assert_eq!(
     ///     out.aggregate_updates()[0].change,
     ///     subql::AggregateValueChange::Set(subql::AggregateResultValue::Folded(
-    ///         AggValue::Count(1),
+    ///         AggValue::CountStar(1),
     ///     ))
     /// );
     /// assert_eq!(out.notified(), vec![7, 9]); // deduped union of both paths
@@ -4429,7 +4555,7 @@ where
                 QueryProjection::GroupedAggregate { groups, .. } => groups
                     .iter()
                     .map(|column| {
-                        catalog_helpers::group_key_column::<E::Backend, _>(
+                        catalog_helpers::column_comparison::<E::Backend, _>(
                             &self.database,
                             table_id,
                             *column,
@@ -5125,6 +5251,7 @@ mod tests {
             }) => panic!("{where_clause} should not be served in process, got {served:?}"),
             Ok(registered) => registered
                 .not_served_because
+                .map(|reason| reason.to_string())
                 .expect("a tier that needs a read says why"),
             Err(e) => panic!("{where_clause} should register on a read tier, got {e:?}"),
         }

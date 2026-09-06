@@ -8,7 +8,7 @@ use rls2fga::translator::{Translator, TranslatorBuilder};
 use rls2fga::types::ConfidenceLevel;
 use sql_traits::structs::ParserDB;
 use sqlparser::dialect::PostgreSqlDialect;
-use subql::backend::{BuiltinKind, Postgres, Value};
+use subql::backend::{Postgres, ScalarFamily, Value};
 use subql::testing::TestEvent;
 use subql::{
     catalog_helpers, DefaultIds, RegisterError, SubscriptionEngine, SubscriptionRequest, TableId,
@@ -310,7 +310,7 @@ fn describe_terms_names_both_pairs_and_the_seed_read() {
     };
     assert_eq!(term.member_table, "shares");
     assert_eq!(term.member_subject, "viewer");
-    assert_eq!(term.subject_kind, BuiltinKind::String);
+    assert_eq!(term.subject_kind, ScalarFamily::String);
     let pairs: Vec<(&str, &str)> = term
         .pairs
         .iter()
@@ -322,7 +322,7 @@ fn describe_terms_names_both_pairs_and_the_seed_read() {
         "compared and membership columns pair up in written order"
     );
     assert!(
-        term.pairs.iter().all(|pair| pair.kind == BuiltinKind::Int),
+        term.pairs.iter().all(|pair| pair.kind == ScalarFamily::Int),
         "both pairs decode as integers"
     );
     assert_eq!(
@@ -348,6 +348,7 @@ mod refusals {
         );
         registered
             .not_served_because
+            .map(|reason| reason.to_string())
             .expect("the fallback names why the fold refused")
     }
 
@@ -400,6 +401,7 @@ mod refusals {
         );
         let reason = registered
             .not_served_because
+            .map(|reason| reason.to_string())
             .expect("the fallback names why the fold refused");
         assert!(
             reason.contains("subtraction"),

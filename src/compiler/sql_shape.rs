@@ -75,12 +75,12 @@ pub enum AggSpec {
     /// resolved at registration.
     Avg { column: crate::ColumnId },
     /// `SELECT VAR_POP(column_name)`. Population variance. Emits `Stats`
-    /// deltas (`sum`, `sum_sq`, `count`). Consumer computes
-    /// `sum_sq / N - (sum / N).powi(2)`.
+    /// deltas (`sum`, `squared_deviations`, `count`). The value is
+    /// `squared_deviations / N`.
     VarPop { column: crate::ColumnId },
     /// `SELECT VAR_SAMP(column_name)` (alias `VARIANCE`). Sample variance.
-    /// Emits `Stats` deltas. Consumer computes
-    /// `(sum_sq - sum.powi(2) / N) / (N - 1)`, requires `N >= 2`.
+    /// Emits `Stats` deltas. The value is
+    /// `squared_deviations / (N - 1)`, and requires `N >= 2`.
     VarSamp { column: crate::ColumnId },
     /// `SELECT STDDEV_POP(column_name)`. Population standard deviation.
     /// Same `Stats` deltas as `VarPop`. Consumer takes `sqrt(var_pop)`.
@@ -201,6 +201,27 @@ pub enum HavingFunction {
 }
 
 impl HavingFunction {
+    /// This function as the aggregate kind it reads through.
+    ///
+    /// A `HAVING` function is a view onto the seven of
+    /// [`AggKind`](crate::AggKind) that aggregate a
+    /// column. `COUNT(*)` is the eighth and is not one of these, because
+    /// it counts rows rather than a column's values, so the view is total
+    /// in this direction and partial in the other.
+    #[must_use]
+    pub const fn kind(self) -> crate::AggKind {
+        use crate::AggKind as K;
+        match self {
+            Self::CountColumn => K::CountColumn,
+            Self::Sum => K::Sum,
+            Self::Avg => K::Avg,
+            Self::VarPop => K::VarPop,
+            Self::VarSamp => K::VarSamp,
+            Self::StddevPop => K::StddevPop,
+            Self::StddevSamp => K::StddevSamp,
+        }
+    }
+
     /// The function a projected spec maintains, `None` for `COUNT(*)`,
     /// which aggregates no column.
     #[must_use]
@@ -394,20 +415,23 @@ fn resolve_numeric_agg_column<DB: DatabaseLike>(
     let display = func.to_uppercase();
     let column = resolve_single_column_arg(&display, f, table_id, database)?;
 
-    if let Some(kind) = catalog_helpers::column_builtin_kind(database, table_id, column) {
+    if let Some(kind) = catalog_helpers::column_scalar_family(database, table_id, column) {
         match kind {
             // Numeric scalars: SUM/AVG/variance/stddev accept these.
-            crate::backend::BuiltinKind::Int
-            | crate::backend::BuiltinKind::Float
-            | crate::backend::BuiltinKind::Decimal => {}
+            crate::backend::ScalarFamily::Int
+            | crate::backend::ScalarFamily::Float
+            | crate::backend::ScalarFamily::Decimal => {}
             // Everything else is rejected. Give the caller the concrete
             // kind in the error so the message matches the aggregate's
             // requirement.
             other => {
-                return Err(RegisterError::UnsupportedSql(format!(
-                    "{display} requires a numeric column (Int, Float, or Decimal), \
-                     but column {column} has type {other:?}"
-                )));
+                return Err(RegisterError::NotServedInProcess(
+                    crate::errors::Refusal::UnfoldableAggregate {
+                        column,
+                        kind: other,
+                        function: display,
+                    },
+                ));
             }
         }
     }
@@ -700,7 +724,7 @@ fn grouped_projection<B: crate::backend::Backend, DB: DatabaseLike>(
 ) -> Result<QueryProjection, RegisterError> {
     let columns: Vec<_> = groups
         .iter()
-        .map(|column| catalog_helpers::group_key_column::<B, _>(database, table_id, *column))
+        .map(|column| catalog_helpers::column_comparison::<B, _>(database, table_id, *column))
         .collect::<Option<_>>()
         .ok_or_else(|| {
             RegisterError::UnsupportedSql(
@@ -1020,7 +1044,7 @@ pub(crate) fn extract_grouped_extreme<B: crate::backend::Backend, DB: DatabaseLi
     };
     let Some(columns) = groups
         .iter()
-        .map(|column| catalog_helpers::group_key_column::<B, _>(database, table_id, *column))
+        .map(|column| catalog_helpers::column_comparison::<B, _>(database, table_id, *column))
         .collect::<Option<Vec<_>>>()
     else {
         return Ok(None);
@@ -1260,20 +1284,24 @@ pub(crate) fn render_aggregate_bootstrap<B: crate::backend::Backend, DB: Databas
             Expr::Identifier(super::quoted_ident(dialect, &name)),
             slot,
         ));
-        group_kinds.push(catalog_helpers::column_builtin_kind(
+        group_kinds.push(catalog_helpers::column_scalar_family(
             database, table_id, *column,
         )?);
     }
     let components: Vec<Expr> = match spec {
-        _ if widened => alloc::vec![sum(), sum_of_squares(&arg)?, count()],
+        _ if widened => alloc::vec![sum(), sum_of_squared_deviations::<B>(&arg)?, count()],
         AggSpec::CountStar => alloc::vec![agg_call("COUNT", FunctionArgExpr::Wildcard)],
         AggSpec::CountColumn { .. } => alloc::vec![count()],
-        AggSpec::Sum { .. } => alloc::vec![sum()],
-        AggSpec::Avg { .. } => alloc::vec![sum(), count()],
+        // `SUM` and `AVG` read the same pair: the total and how many rows
+        // contributed to it. `AVG` divides by that count and `SUM` reports
+        // NULL when it is zero.
+        AggSpec::Sum { .. } | AggSpec::Avg { .. } => alloc::vec![sum(), count()],
         AggSpec::VarPop { .. }
         | AggSpec::VarSamp { .. }
         | AggSpec::StddevPop { .. }
-        | AggSpec::StddevSamp { .. } => alloc::vec![sum(), sum_of_squares(&arg)?, count()],
+        | AggSpec::StddevSamp { .. } => {
+            alloc::vec![sum(), sum_of_squared_deviations::<B>(&arg)?, count()]
+        }
     };
     let component_count = components.len();
     items.extend(
@@ -1293,16 +1321,27 @@ pub(crate) fn render_aggregate_bootstrap<B: crate::backend::Backend, DB: Databas
     *select_projection_mut(&mut stmt)? = items;
     let mut kinds = group_kinds;
     if widened {
+        // A widened seed reads `SUM(arg)` first whatever the projected
+        // function is, so the kind is the total's own and not the spec's.
+        // Reading it off the spec's list gave a `COUNT` the count's `Int`
+        // and the variance family a `Float`, either of which a total that
+        // accumulates otherwise silently ignores. Only the middle
+        // component is a double, being nobody's exact answer.
         kinds.extend([
-            crate::backend::BuiltinKind::Float,
-            crate::backend::BuiltinKind::Float,
-            crate::backend::BuiltinKind::Int,
+            bootstrap_total_kind(crate::catalog_helpers::total_rule::<B, DB>(
+                spec, database, table_id,
+            )),
+            crate::backend::ScalarFamily::Float,
+            crate::backend::ScalarFamily::Int,
         ]);
     } else {
-        kinds.extend(aggregate_bootstrap_kinds(spec));
+        kinds.extend(aggregate_bootstrap_kinds(
+            spec,
+            crate::catalog_helpers::total_rule::<B, DB>(spec, database, table_id),
+        ));
     }
     if !groups.is_empty() {
-        kinds.push(crate::backend::BuiltinKind::Int);
+        kinds.push(crate::backend::ScalarFamily::Int);
     }
     Some(crate::AggregateBootstrap {
         query: crate::reexec::BoundQuery::new(stmt.to_string(), binds.to_vec()),
@@ -1312,28 +1351,65 @@ pub(crate) fn render_aggregate_bootstrap<B: crate::backend::Backend, DB: Databas
 }
 
 /// Per-column decode kinds for an aggregate's seed components, in component
-/// order. `COUNT` components are exact integers
-/// ([`crate::backend::BuiltinKind::Int`]); `SUM` and `SUM(x*x)` components are
-/// decoded as double ([`crate::backend::BuiltinKind::Float`]) regardless of the
-/// source column type, matching the `f64` accumulator, since `SUM` promotes to
-/// `bigint`/`numeric`/`DECIMAL` depending on the backend.
-pub(crate) fn aggregate_bootstrap_kinds(spec: &AggSpec) -> Vec<crate::backend::BuiltinKind> {
+/// order.
+///
+/// `COUNT` components are exact integers
+/// ([`crate::backend::ScalarFamily::Int`]). A `SUM` component decodes in the
+/// type its engine sums into, so that the seed and the fold hold the same
+/// number: PostgreSQL answers `bigint` for an `int` column and `numeric`
+/// for a `bigint` one, MySQL answers a decimal for both, and SQLite an
+/// integer. `SUM(x*x)` and `AVG`'s total keep their double, which is what
+/// their `f64` components still are until Phase D2.
+pub(crate) fn aggregate_bootstrap_kinds(
+    spec: &AggSpec,
+    rule: crate::backend::SumRule,
+) -> Vec<crate::backend::ScalarFamily> {
+    aggregate_bootstrap_kinds_with_total(spec, bootstrap_total_kind(rule))
+}
+
+/// The kind a `SUM` over a column accumulating under `rule` decodes in.
+///
+/// One function because every seed that reads a total reads the same
+/// column type: `SUM`'s, `AVG`'s, the variance family's leading
+/// component, and a widened seed's whatever it projects. Asking the
+/// aggregate instead of the rule is what gave a widened `COUNT` an `Int`
+/// where PostgreSQL answers `numeric`.
+const fn bootstrap_total_kind(rule: crate::backend::SumRule) -> crate::backend::ScalarFamily {
+    match rule {
+        crate::backend::SumRule::Integer | crate::backend::SumRule::IntegerPromotingToDouble => {
+            crate::backend::ScalarFamily::Int
+        }
+        crate::backend::SumRule::Decimal { .. } => crate::backend::ScalarFamily::Decimal,
+        // A `real` total still decodes as a float cell: the width is the
+        // accumulator's, and `SUM(real)` comes back as a floating value
+        // either way.
+        crate::backend::SumRule::Single | crate::backend::SumRule::Double => {
+            crate::backend::ScalarFamily::Float
+        }
+    }
+}
+
+fn aggregate_bootstrap_kinds_with_total(
+    spec: &AggSpec,
+    total: crate::backend::ScalarFamily,
+) -> Vec<crate::backend::ScalarFamily> {
     match spec {
         AggSpec::CountStar | AggSpec::CountColumn { .. } => {
-            alloc::vec![crate::backend::BuiltinKind::Int]
+            alloc::vec![crate::backend::ScalarFamily::Int]
         }
-        AggSpec::Sum { .. } => alloc::vec![crate::backend::BuiltinKind::Float],
-        AggSpec::Avg { .. } => alloc::vec![
-            crate::backend::BuiltinKind::Float,
-            crate::backend::BuiltinKind::Int,
-        ],
+        AggSpec::Sum { .. } | AggSpec::Avg { .. } => {
+            alloc::vec![total, crate::backend::ScalarFamily::Int]
+        }
+        // The leading component is `SUM(arg)` here too, so it decodes in
+        // the type the engine sums into. The middle one is the sum of
+        // squared deviations, which no engine answers exactly.
         AggSpec::VarPop { .. }
         | AggSpec::VarSamp { .. }
         | AggSpec::StddevPop { .. }
         | AggSpec::StddevSamp { .. } => alloc::vec![
-            crate::backend::BuiltinKind::Float,
-            crate::backend::BuiltinKind::Float,
-            crate::backend::BuiltinKind::Int,
+            total,
+            crate::backend::ScalarFamily::Float,
+            crate::backend::ScalarFamily::Int,
         ],
     }
 }
@@ -1401,34 +1477,53 @@ fn component(expr: Expr, slot: usize) -> SelectItem {
     }
 }
 
-/// `SUM(arg * 1.0 * arg)`, the squared term a variance or standard deviation
-/// seed carries.
+/// The seed component for the variance family's spread: the engine's own
+/// sum of squared deviations, spelled `VAR_POP(x) * COUNT(x)`.
 ///
-/// The `* 1.0 *` forces the product into floating or decimal arithmetic on
-/// every backend, so `col * col` cannot overflow the source integer type before
-/// it is summed. Portable across PostgreSQL (numeric), MySQL (decimal) and
-/// SQLite (real), and it needs no dialect-specific cast keyword.
-fn sum_of_squares(arg: &FunctionArgExpr) -> Option<Expr> {
+/// Read back from the server rather than derived from a sum of squares,
+/// because `sum_sq - sum^2/n` is the cancellation this fold exists to
+/// avoid, and a seed carrying it would reintroduce the wrong answer the
+/// moment a subscription starts from a database read. Measured over
+/// `100000000.0`, `100000001.0` and `100000002.0`, PostgreSQL answers `2`
+/// for `var_pop(x) * count(x)` exactly, while `sum(x*x)` is
+/// `3.0000000600000004e+16` and loses the answer.
+///
+/// `VAR_POP` is NULL over no rows, so the product is NULL there, which
+/// seeds the empty state exactly as the other components do.
+fn sum_of_squared_deviations<B: crate::backend::Backend>(arg: &FunctionArgExpr) -> Option<Expr> {
     let FunctionArgExpr::Expr(col) = arg else {
-        // `COUNT(*)` has no column to square, and no spec that needs this term
-        // accepts a wildcard argument.
+        // `COUNT(*)` has no column to spread, and no spec that needs this
+        // term accepts a wildcard argument.
         return None;
     };
-    let one =
-        Expr::Value(sqlparser::ast::Value::Number("1.0".to_string(), false).with_empty_span());
-    let scaled = Expr::BinaryOp {
-        left: alloc::boxed::Box::new(col.clone()),
-        op: BinaryOperator::Multiply,
-        right: alloc::boxed::Box::new(one),
-    };
-    Some(agg_call(
-        "SUM",
-        FunctionArgExpr::Expr(Expr::BinaryOp {
-            left: alloc::boxed::Box::new(scaled),
+    match B::VARIANCE_SEED {
+        crate::backend::VarianceSeed::EnginesOwn => Some(Expr::BinaryOp {
+            left: alloc::boxed::Box::new(agg_call("VAR_POP", arg.clone())),
             op: BinaryOperator::Multiply,
-            right: alloc::boxed::Box::new(col.clone()),
+            right: alloc::boxed::Box::new(agg_call("COUNT", arg.clone())),
         }),
-    ))
+        // No variance function to ask, so the seed asks for a sum of
+        // squares and the deviations are derived from it. The `* 1.0 *`
+        // keeps the product out of the source integer type.
+        crate::backend::VarianceSeed::SumOfSquares => {
+            let one = Expr::Value(
+                sqlparser::ast::Value::Number("1.0".to_string(), false).with_empty_span(),
+            );
+            let scaled = Expr::BinaryOp {
+                left: alloc::boxed::Box::new(col.clone()),
+                op: BinaryOperator::Multiply,
+                right: alloc::boxed::Box::new(one),
+            };
+            Some(agg_call(
+                "SUM",
+                FunctionArgExpr::Expr(Expr::BinaryOp {
+                    left: alloc::boxed::Box::new(scaled),
+                    op: BinaryOperator::Multiply,
+                    right: alloc::boxed::Box::new(col.clone()),
+                }),
+            ))
+        }
+    }
 }
 
 fn select_projection(stmt: &Statement) -> Option<&[SelectItem]> {

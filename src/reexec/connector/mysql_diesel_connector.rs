@@ -11,7 +11,7 @@ use super::{
     run_setup_statements, Connector, ReadQuery, RowPage, ScalarRowError, SessionSetup, Snapshot,
 };
 #[cfg(feature = "executor-diesel-mysql")]
-use crate::backend::{BuiltinKind, Value};
+use crate::backend::{ScalarFamily, Value};
 use alloc::string::String;
 #[cfg(feature = "executor-diesel-mysql")]
 use core::cell::RefCell;
@@ -147,7 +147,7 @@ impl<S: SessionSetup> Connector for MysqlDieselConnector<S> {
     fn execute_scalar(
         &self,
         query: &ReadQuery<'_, Self::Backend>,
-        kind: BuiltinKind,
+        kind: ScalarFamily,
         auth: &S,
     ) -> Result<(Value<Self::Backend>, Option<Self::Checkpoint>), Self::Error> {
         let mut conn = self.conn.borrow_mut();
@@ -184,7 +184,7 @@ impl<S: SessionSetup> Connector for MysqlDieselConnector<S> {
     fn execute_scalar_row(
         &self,
         query: &ReadQuery<'_, Self::Backend>,
-        kinds: &[BuiltinKind],
+        kinds: &[ScalarFamily],
         auth: &S,
     ) -> Result<
         (

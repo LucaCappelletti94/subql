@@ -3,7 +3,7 @@
 
 use sql_traits::structs::ParserDB;
 use sqlparser::dialect::{MySqlDialect, PostgreSqlDialect, SQLiteDialect};
-use subql::backend::{BuiltinKind, MySql, Postgres, SQLite, Value};
+use subql::backend::{MySql, Postgres, SQLite, ScalarFamily, Value};
 use subql::reexec::ReExecutionRead;
 use subql::testing::TestEvent;
 use subql::{
@@ -75,7 +75,7 @@ fn registration_exposes_a_grouped_seed_with_extreme_and_row_count() {
     assert_eq!(bootstrap.group_columns, 1);
     assert_eq!(
         bootstrap.kinds,
-        vec![BuiltinKind::String, BuiltinKind::Int, BuiltinKind::Int]
+        vec![ScalarFamily::String, ScalarFamily::Int, ScalarFamily::Int]
     );
     assert!(bootstrap.query.sql().contains("MIN(\"amount\") AS c0"));
     assert!(bootstrap.query.sql().contains("COUNT(*) AS c1"));
@@ -130,7 +130,7 @@ fn insert_folds_delete_requeries_only_the_displaced_group() {
         panic!("expected grouped scalar read")
     };
     assert_eq!(group, &north.key);
-    assert_eq!(*column_kinds, [BuiltinKind::Int, BuiltinKind::Int]);
+    assert_eq!(*column_kinds, [ScalarFamily::Int, ScalarFamily::Int]);
     assert!(
         query.sql().contains("\"region\" = $1"),
         "scoped SQL was {query:?}"
@@ -196,7 +196,8 @@ fn registration_binds_precede_group_scope_binds() {
 #[test]
 fn positional_registration_binds_follow_rewritten_sql_order_mysql() {
     let catalog = ParserDB::parse::<MySqlDialect>(
-        "CREATE TABLE orders (id INT PRIMARY KEY, region VARCHAR(32) COLLATE utf8mb4_bin, amount INT, status VARCHAR(32));",
+        "CREATE TABLE orders (id INT PRIMARY KEY, region VARCHAR(32) COLLATE utf8mb4_bin, \
+         amount INT, status VARCHAR(32) COLLATE utf8mb4_bin);",
     )
     .expect("parse DDL");
     let orders = catalog_helpers::table_id(&catalog, "orders").expect("orders resolves");

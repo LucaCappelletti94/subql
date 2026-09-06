@@ -28,7 +28,7 @@ use sqlite_diff_rs::{
 
 use super::event::SqliteChangesetEvent;
 use crate::backend::{
-    Backend, BuiltinKind, CustomScalars, SQLite, ScalarKind, ScalarKindOf, SqliteJson, Value,
+    Backend, CustomScalars, SQLite, ScalarFamily, ScalarKind, ScalarKindOf, SqliteJson, Value,
 };
 use crate::wal::{resolve_table, WalParseError, WalParser};
 use crate::{catalog_helpers, ColumnId, EventKind, TableId};
@@ -277,7 +277,7 @@ fn decode_wire_cell(
                 })
                 .map_or(Value::Missing, Value::Custom)
         }
-        Some(builtin) => decode_wire_value(wire, builtin.as_builtin()),
+        Some(builtin) => decode_wire_value(wire, builtin.family()),
         None => decode_wire_value(wire, None),
     }
 }
@@ -289,49 +289,49 @@ fn decode_wire_cell(
 /// contract from the [`crate::backend::CdcEvent`] trait.
 fn decode_wire_value(
     wire: WireValue<alloc::string::String, Vec<u8>>,
-    kind: Option<BuiltinKind>,
+    kind: Option<ScalarFamily>,
 ) -> Value<SQLite> {
     match wire {
         WireValue::Null => Value::Null,
         WireValue::Integer(i) => match kind {
-            Some(BuiltinKind::Bool) => Value::Bool(i),
-            Some(BuiltinKind::Int) | None => Value::Int(i),
-            Some(BuiltinKind::Json) => Value::Json(SqliteJson::integer(i)),
-            Some(BuiltinKind::Jsonb) => Value::Jsonb(SqliteJson::integer(i)),
+            Some(ScalarFamily::Bool) => Value::Bool(i),
+            Some(ScalarFamily::Int) | None => Value::Int(i),
+            Some(ScalarFamily::Json) => Value::Json(SqliteJson::integer(i)),
+            Some(ScalarFamily::Jsonb) => Value::Jsonb(SqliteJson::integer(i)),
             _ => Value::Missing,
         },
         WireValue::Real(f) => match kind {
-            Some(BuiltinKind::Float) | None => Value::Float(f),
-            Some(BuiltinKind::Json) => Value::Json(SqliteJson::real(f)),
-            Some(BuiltinKind::Jsonb) => Value::Jsonb(SqliteJson::real(f)),
+            Some(ScalarFamily::Float) | None => Value::Float(f),
+            Some(ScalarFamily::Json) => Value::Json(SqliteJson::real(f)),
+            Some(ScalarFamily::Jsonb) => Value::Jsonb(SqliteJson::real(f)),
             _ => Value::Missing,
         },
         WireValue::Text(s) => match kind {
-            Some(BuiltinKind::String) | None => Value::String(s),
-            Some(BuiltinKind::Uuid) => Value::Uuid(s),
-            Some(BuiltinKind::Timestamp) => {
+            Some(ScalarFamily::String) | None => Value::String(s),
+            Some(ScalarFamily::Uuid) => Value::Uuid(s),
+            Some(ScalarFamily::Timestamp) => {
                 sql_scalar_text::parse_timestamp(&s).map_or(Value::Missing, Value::Timestamp)
             }
-            Some(BuiltinKind::TimestampTz) => {
+            Some(ScalarFamily::TimestampTz) => {
                 sql_scalar_text::parse_timestamp_tz(&s).map_or(Value::Missing, Value::TimestampTz)
             }
-            Some(BuiltinKind::Date) => {
+            Some(ScalarFamily::Date) => {
                 sql_scalar_text::parse_date(&s).map_or(Value::Missing, Value::Date)
             }
-            Some(BuiltinKind::Time) => {
+            Some(ScalarFamily::Time) => {
                 sql_scalar_text::parse_time(&s).map_or(Value::Missing, Value::Time)
             }
-            Some(BuiltinKind::Decimal) => {
+            Some(ScalarFamily::Decimal) => {
                 sql_scalar_text::parse_decimal(&s).map_or(Value::Missing, Value::Decimal)
             }
-            Some(BuiltinKind::Json) => Value::Json(SqliteJson::text(s)),
-            Some(BuiltinKind::Jsonb) => Value::Jsonb(SqliteJson::text(s)),
+            Some(ScalarFamily::Json) => Value::Json(SqliteJson::text(s)),
+            Some(ScalarFamily::Jsonb) => Value::Jsonb(SqliteJson::text(s)),
             _ => Value::Missing,
         },
         WireValue::Blob(b) => match kind {
-            Some(BuiltinKind::Bytes) | None => Value::Bytes(b),
-            Some(BuiltinKind::Json) => Value::Json(SqliteJson::blob(b)),
-            Some(BuiltinKind::Jsonb) => Value::Jsonb(SqliteJson::blob(b)),
+            Some(ScalarFamily::Bytes) | None => Value::Bytes(b),
+            Some(ScalarFamily::Json) => Value::Json(SqliteJson::blob(b)),
+            Some(ScalarFamily::Jsonb) => Value::Jsonb(SqliteJson::blob(b)),
             _ => Value::Missing,
         },
     }
@@ -533,7 +533,7 @@ mod tests {
         assert!(matches!(
             decode_wire_value(
                 WireValue::Text("2026-01-01 00:00:00".into()),
-                Some(BuiltinKind::Timestamp)
+                Some(ScalarFamily::Timestamp)
             ),
             Value::Timestamp(_)
         ));
@@ -541,21 +541,21 @@ mod tests {
         assert_eq!(
             decode_wire_value(
                 WireValue::Text("2025-12-31 22:00:00-02".into()),
-                Some(BuiltinKind::TimestampTz)
+                Some(ScalarFamily::TimestampTz)
             ),
             Value::TimestampTz(expected)
         );
         assert!(matches!(
             decode_wire_value(
                 WireValue::Text("2026-01-01".into()),
-                Some(BuiltinKind::Date)
+                Some(ScalarFamily::Date)
             ),
             Value::Date(_)
         ));
         assert!(matches!(
             decode_wire_value(
                 WireValue::Text("12:34:56.789".into()),
-                Some(BuiltinKind::Time)
+                Some(ScalarFamily::Time)
             ),
             Value::Time(_)
         ));
@@ -566,14 +566,14 @@ mod tests {
         assert_eq!(
             decode_wire_value(
                 WireValue::Text("2026-01-01 00:00:00".into()),
-                Some(BuiltinKind::TimestampTz)
+                Some(ScalarFamily::TimestampTz)
             ),
             Value::Missing
         );
         assert_eq!(
             decode_wire_value(
                 WireValue::Text("2026-01-01 00:00:00+00".into()),
-                Some(BuiltinKind::Timestamp)
+                Some(ScalarFamily::Timestamp)
             ),
             Value::Missing
         );
@@ -587,20 +587,20 @@ mod tests {
             (
                 decode_wire_value(
                     WireValue::Text(String::from("{ \"a\": 1 }")),
-                    Some(BuiltinKind::Json),
+                    Some(ScalarFamily::Json),
                 ),
                 SqliteJsonStorage::Text(String::from("{ \"a\": 1 }")),
             ),
             (
-                decode_wire_value(WireValue::Integer(1), Some(BuiltinKind::Json)),
+                decode_wire_value(WireValue::Integer(1), Some(ScalarFamily::Json)),
                 SqliteJsonStorage::Integer(1),
             ),
             (
-                decode_wire_value(WireValue::Real(1.5), Some(BuiltinKind::Json)),
+                decode_wire_value(WireValue::Real(1.5), Some(ScalarFamily::Json)),
                 SqliteJsonStorage::Real(1.5),
             ),
             (
-                decode_wire_value(WireValue::Blob(vec![1, 2]), Some(BuiltinKind::Json)),
+                decode_wire_value(WireValue::Blob(vec![1, 2]), Some(ScalarFamily::Json)),
                 SqliteJsonStorage::Blob(vec![1, 2]),
             ),
         ];

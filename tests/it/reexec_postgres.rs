@@ -28,7 +28,7 @@ use crate::common;
 use diesel::{sql_query, PgConnection, RunQueryDsl};
 use sql_traits::structs::ParserDB;
 use sqlparser::dialect::PostgreSqlDialect;
-use subql::backend::{BuiltinKind, Postgres, Value};
+use subql::backend::{Postgres, ScalarFamily, Value};
 use subql::reexec::{
     AutoResolvingEngine, Connector, PgDieselConnector, SessionSetup, SnapshotResult, SyncMode,
 };
@@ -164,7 +164,7 @@ fn scaffold_registers_both_subscription_kinds() {
         .connector()
         .execute_scalar(
             &subql::reexec::ReadQuery::without_binds("SELECT MIN(price) AS v FROM orders"),
-            subql::backend::BuiltinKind::Float,
+            subql::backend::ScalarFamily::Float,
             &(),
         )
         .expect("connector executes");
@@ -470,16 +470,21 @@ fn execute_scalar_row_decodes_integer_aggregate_seed() {
         .clone()
         .expect("aggregate carries a bootstrap");
 
-    // sum=12 (bigint), sum_sq=56 (bigint), count=3, decoded through the
-    // double cast into (Float, Float, Int).
+    // sum=12, squared deviations=8, count=3, decoded into
+    // (Float, Float, Int).
+    //
+    // Eight, not fifty-six. The seed's middle component is the sum of
+    // squared deviations, read as `VAR_POP(amount) * COUNT(amount)`,
+    // because PostgreSQL and MySQL both have `VAR_POP` and answering
+    // from their own variance is what keeps the seed agreeing with them
+    // to the last digit. A sum of squares would be 56 and is what
+    // SQLite's seed carries instead, since it has no variance function
+    // at all.
     let connector = PgDieselConnector::new(common::pg_connect(port));
     let (row, checkpoint) = connector
         .execute_scalar_row(&bundle.query.as_read_query(), &bundle.kinds, &())
         .expect("execute_scalar_row");
-    assert_eq!(
-        row,
-        vec![Value::Float(12.0), Value::Float(56.0), Value::Int(3)]
-    );
+    assert_eq!(row, vec![Value::Int(12), Value::Float(8.0), Value::Int(3)]);
     // The read is LSN-anchored like execute_scalar.
     assert!(checkpoint.is_some());
 }
@@ -575,7 +580,7 @@ fn every_read_reports_a_position_taken_before_its_snapshot() {
         PgDieselConnector::new(common::pg_connect(port))
             .execute_scalar(
                 &subql::reexec::ReadQuery::without_binds(&sql),
-                BuiltinKind::Int,
+                ScalarFamily::Int,
                 &(),
             )
             .expect("scalar read")
@@ -611,7 +616,7 @@ fn every_read_reports_a_position_taken_before_its_snapshot() {
         PgDieselConnector::new(common::pg_connect(port))
             .execute_scalar_row(
                 &subql::reexec::ReadQuery::without_binds(&sql),
-                &[BuiltinKind::Int],
+                &[ScalarFamily::Int],
                 &(),
             )
             .expect("seed read")
@@ -655,7 +660,7 @@ fn session_setup_runs_inside_each_read_transaction_sync_pg() {
     let (value, _) = connector
         .execute_scalar(
             &subql::reexec::ReadQuery::without_binds(read_marker),
-            BuiltinKind::String,
+            ScalarFamily::String,
             &setup,
         )
         .expect("scalar read");
@@ -682,7 +687,7 @@ fn session_setup_runs_inside_each_read_transaction_sync_pg() {
     let (value, _) = plain
         .execute_scalar(
             &subql::reexec::ReadQuery::without_binds(read_marker),
-            BuiltinKind::String,
+            ScalarFamily::String,
             &(),
         )
         .expect("scalar read");

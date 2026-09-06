@@ -5,11 +5,11 @@
 
 use sql_traits::structs::ParserDB;
 use sqlparser::dialect::PostgreSqlDialect;
-use subql::backend::{BuiltinKind, Postgres, Value};
+use subql::backend::{Postgres, ScalarFamily, Value};
 use subql::testing::TestEvent;
 use subql::{
     catalog_helpers, AggValue, AggregateSeedInstall, AggregateValueChange, DefaultIds, Install,
-    PgLsn, SubscriptionEngine, SubscriptionRequest, TableId, Tier,
+    NumericValue, PgLsn, SubscriptionEngine, SubscriptionRequest, TableId, Tier,
 };
 
 const DDL: &str = "CREATE TABLE orders (id INT PRIMARY KEY, region TEXT, amount INT, status TEXT);";
@@ -139,14 +139,17 @@ mod registration {
             subscription,
             vec![vec![
                 Value::String("north".into()),
-                Value::Float(20.0),
+                Value::Int(20),
                 Value::Float(400.0),
                 Value::Int(1),
                 Value::Int(1),
             ]],
         );
         assert_eq!(opening.len(), 1, "sum 20 is greater than 10");
-        assert_eq!(opening[0].change, folded(AggValue::Sum(20.0)));
+        assert_eq!(
+            opening[0].change,
+            folded(AggValue::Sum(Some(NumericValue::Integer(20))))
+        );
     }
 
     #[test]
@@ -159,7 +162,14 @@ mod registration {
         assert!(!bootstrap.query.sql().to_uppercase().contains("HAVING"));
         assert_eq!(
             bootstrap.kinds,
-            vec![BuiltinKind::String, BuiltinKind::Float, BuiltinKind::Int],
+            vec![
+                ScalarFamily::String,
+                // `amount` is an `INT`, whose sum is a `bigint`, so the
+                // total component decodes exactly rather than as a double.
+                ScalarFamily::Int,
+                ScalarFamily::Int,
+                ScalarFamily::Int
+            ],
             "COUNT(*) uses the grouped row count without widening the component set"
         );
     }
@@ -216,14 +226,14 @@ mod crossing {
             vec![
                 vec![
                     Value::String("north".into()),
-                    Value::Float(8.0),
+                    Value::Int(8),
                     Value::Float(64.0),
                     Value::Int(1),
                     Value::Int(1),
                 ],
                 vec![
                     Value::String("south".into()),
-                    Value::Float(20.0),
+                    Value::Int(20),
                     Value::Float(400.0),
                     Value::Int(1),
                     Value::Int(1),
@@ -231,7 +241,10 @@ mod crossing {
             ],
         );
         assert_eq!(opening.len(), 1, "only the passing group is announced");
-        assert_eq!(opening[0].change, folded(AggValue::Sum(20.0)));
+        assert_eq!(
+            opening[0].change,
+            folded(AggValue::Sum(Some(NumericValue::Integer(20))))
+        );
         let south = opening[0].group.clone().expect("south key");
 
         let entering = engine
@@ -239,7 +252,10 @@ mod crossing {
             .expect("insert folds");
         assert_eq!(entering.updates.len(), 1, "south stays silent");
         assert_ne!(entering.updates[0].group.as_ref(), Some(&south));
-        assert_eq!(entering.updates[0].change, folded(AggValue::Sum(13.0)));
+        assert_eq!(
+            entering.updates[0].change,
+            folded(AggValue::Sum(Some(NumericValue::Integer(13))))
+        );
 
         let leaving = engine
             .aggregate_updates(&delete(orders, 3, "north", 5, 20))
@@ -260,7 +276,7 @@ mod crossing {
             subscription,
             vec![vec![
                 Value::String("north".into()),
-                Value::Float(2.0),
+                Value::Int(2),
                 Value::Float(4.0),
                 Value::Int(1),
                 Value::Int(1),
@@ -278,7 +294,7 @@ mod crossing {
             .expect("insert folds");
         assert_eq!(
             entering.updates[0].change,
-            folded(AggValue::Sum(11.0)),
+            folded(AggValue::Sum(Some(NumericValue::Integer(11)))),
             "the entering value carries every silently folded row"
         );
     }
@@ -295,7 +311,7 @@ mod crossing {
             subscription,
             vec![vec![
                 Value::String("north".into()),
-                Value::Float(2.0),
+                Value::Int(2),
                 Value::Float(4.0),
                 Value::Int(1),
                 Value::Int(1),
@@ -322,7 +338,9 @@ mod crossing {
             subscription,
             vec![vec![
                 Value::String("north".into()),
-                Value::Float(7.0),
+                Value::Int(7),
+                // SUM's own contributor count, then the group's row count.
+                Value::Int(2),
                 Value::Int(2),
             ]],
         );
@@ -331,7 +349,7 @@ mod crossing {
             .expect("insert folds");
         assert_eq!(
             entering.updates[0].change,
-            folded(AggValue::Sum(7.0)),
+            folded(AggValue::Sum(Some(NumericValue::Integer(7)))),
             "the third row crosses the row-count threshold without moving the sum"
         );
     }
@@ -349,14 +367,17 @@ mod crossing {
             subscription,
             vec![vec![
                 Value::String("north".into()),
-                Value::Float(8.0),
+                Value::Int(8),
                 Value::Float(34.0),
                 Value::Int(2),
                 Value::Int(2),
             ]],
         );
         assert_eq!(opening.len(), 1, "average 4 passes");
-        assert_eq!(opening[0].change, folded(AggValue::Sum(8.0)));
+        assert_eq!(
+            opening[0].change,
+            folded(AggValue::Sum(Some(NumericValue::Integer(8))))
+        );
 
         let leaving = engine
             .aggregate_updates(&delete(orders, 1, "north", 5, 10))
@@ -380,7 +401,7 @@ mod crossing {
             subscription,
             vec![vec![
                 Value::String("north".into()),
-                Value::Float(0.0),
+                Value::Int(0),
                 Value::Int(0),
                 Value::Int(1),
             ]],
@@ -408,7 +429,7 @@ mod crossing {
             subscription,
             vec![vec![
                 Value::String("north".into()),
-                Value::Float(20.0),
+                Value::Int(20),
                 Value::Float(400.0),
                 Value::Int(1),
                 Value::Int(1),
@@ -452,7 +473,7 @@ mod crossing {
             subscription,
             vec![vec![
                 Value::String("north".into()),
-                Value::Float(8.0),
+                Value::Int(8),
                 Value::Float(34.0),
                 Value::Int(2),
                 Value::Int(2),
@@ -465,7 +486,10 @@ mod crossing {
             .aggregate_updates(&delete(orders, 1, "north", 3, 10))
             .expect("delete folds");
         assert_eq!(output.updates.len(), 1);
-        assert_eq!(output.updates[0].change, folded(AggValue::Sum(5.0)));
+        assert_eq!(
+            output.updates[0].change,
+            folded(AggValue::Sum(Some(NumericValue::Integer(5))))
+        );
     }
 
     #[test]
@@ -542,14 +566,14 @@ mod crossing {
             vec![
                 vec![
                     Value::String("north".into()),
-                    Value::Float(2.0),
+                    Value::Int(2),
                     Value::Float(4.0),
                     Value::Int(1),
                     Value::Int(1),
                 ],
                 vec![
                     Value::String("south".into()),
-                    Value::Float(20.0),
+                    Value::Int(20),
                     Value::Float(400.0),
                     Value::Int(1),
                     Value::Int(1),
@@ -591,7 +615,7 @@ mod crossing {
             vec![vec![
                 Value::String("north".into()),
                 Value::String("paid".into()),
-                Value::Float(8.0),
+                Value::Int(8),
                 Value::Float(64.0),
                 Value::Int(1),
                 Value::Int(1),
@@ -611,7 +635,7 @@ mod crossing {
         );
         assert_eq!(
             entering.updates[0].change,
-            folded(AggValue::Sum(13.0)),
+            folded(AggValue::Sum(Some(NumericValue::Integer(13)))),
             "the north-paid group crosses on the fifth added unit"
         );
     }

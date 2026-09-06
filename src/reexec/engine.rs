@@ -122,7 +122,7 @@ pub enum ReExecutionRead<B: Backend = crate::backend::Postgres> {
         /// Bound two-column query constrained to this group.
         query: crate::reexec::BoundQuery<B>,
         /// Decode hints for the extreme and source-row count.
-        column_kinds: [crate::backend::BuiltinKind; 2],
+        column_kinds: [crate::backend::ScalarFamily; 2],
     },
 }
 

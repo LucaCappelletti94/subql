@@ -9,6 +9,20 @@
 
 mod common;
 
+mod differential;
+
+mod agg_avg_exactness;
+
+mod agg_non_finite;
+
+mod agg_variance;
+
+mod agg_sum_decimal;
+
+mod agg_sum_exactness;
+
+mod agg_sum_nullability;
+
 mod aggregate_bootstrap;
 
 mod aggregate_totals;
@@ -241,6 +255,8 @@ mod reexec_postgres_r2d2;
 
 mod reexec_proptest;
 
+mod reexec_snapshot_parity;
+
 mod reexec_rls_guard;
 
 mod reexec_throttle;
@@ -316,6 +332,34 @@ mod round_trip_pg_pk_change_changeset_e2e;
 mod round_trip_pg_wal2json_e2e;
 
 mod served_statement_shape;
+
+mod semantics_nan;
+
+mod semantics_bool_order;
+
+mod semantics_jsonb_order;
+
+mod semantics_like_escape;
+
+mod semantics_bpchar;
+
+mod semantics_collation;
+
+mod semantics_collation_pairs;
+
+mod semantics_cross_kind;
+
+mod semantics_arith_overflow;
+
+mod semantics_div_zero;
+
+mod semantics_division;
+
+mod semantics_ilike;
+
+mod semantics_missing_cell;
+
+mod semantics_float_width;
 
 // Docker-free coverage for the connector session-setup seam (U8) over in-memory
 // SQLite, plus Docker-gated cursor and async-MySQL coverage in the connector

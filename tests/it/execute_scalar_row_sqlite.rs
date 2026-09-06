@@ -6,6 +6,13 @@
 //! Ties the registration, the connector decode, and the accumulator to a
 //! direct recompute for the whole aggregate family. Real-Postgres coverage
 //! rides the existing `#[ignore]` Docker convention elsewhere.
+//!
+//! The engine is a SQLite one, matching the connector, because a seed
+//! query is rendered for the engine that will run it: PostgreSQL's
+//! variance seed reads `VAR_POP(x) * COUNT(x)` and SQLite answers `no such
+//! function: VAR_POP`, so a Postgres bootstrap is not a thing a SQLite
+//! connector can execute. That makes this round trip SQLite's own,
+//! including its rules for what a sum and a mean answer.
 
 #![allow(
     clippy::unwrap_used,
@@ -17,8 +24,8 @@
 use diesel::{sql_query, Connection, RunQueryDsl, SqliteConnection};
 use proptest::prelude::*;
 use sql_traits::structs::ParserDB;
-use sqlparser::dialect::PostgreSqlDialect;
-use subql::backend::{Postgres, Value};
+use sqlparser::dialect::SQLiteDialect;
+use subql::backend::{SQLite, Value};
 use subql::reexec::{Connector, DieselConnector};
 use subql::testing::TestEvent;
 use subql::{
@@ -35,15 +42,15 @@ diesel::table! {
 
 const CATALOG: &str = "CREATE TABLE t (id INT PRIMARY KEY, amount INT);";
 
-type Engine = SubscriptionEngine<TestEvent<Postgres>, DefaultIds, ParserDB>;
+type Engine = SubscriptionEngine<TestEvent<SQLite>, DefaultIds, ParserDB>;
 
 /// Register `sql` and return the engine, the subscription holding its running
 /// total, and its bootstrap bundle (`sql` + `kinds`).
-fn registered(sql: &str) -> (Engine, SubscriptionId, AggregateBootstrap) {
-    let db = ParserDB::parse::<PostgreSqlDialect>(CATALOG).unwrap();
-    let mut engine: Engine = SubscriptionEngine::new(db, PostgreSqlDialect {});
+fn registered(sql: &str) -> (Engine, SubscriptionId, AggregateBootstrap<SQLite>) {
+    let db = ParserDB::parse::<SQLiteDialect>(CATALOG).unwrap();
+    let mut engine: Engine = SubscriptionEngine::new(db, SQLiteDialect {});
     let result = engine
-        .register(SubscriptionRequest::<DefaultIds, Postgres>::new(1u64, sql))
+        .register(SubscriptionRequest::<DefaultIds, SQLite>::new(1u64, sql))
         .unwrap();
     let bootstrap = result
         .served()
@@ -55,14 +62,14 @@ fn registered(sql: &str) -> (Engine, SubscriptionId, AggregateBootstrap) {
 }
 
 /// Just the bootstrap bundle, for the tests that only read the SQL.
-fn bootstrap(sql: &str) -> AggregateBootstrap {
+fn bootstrap(sql: &str) -> AggregateBootstrap<SQLite> {
     registered(sql).2
 }
 
 fn install_seed(
     engine: &mut Engine,
     subscription: SubscriptionId,
-    row: Vec<Value<Postgres>>,
+    row: Vec<Value<SQLite>>,
 ) -> Result<AggValue, subql::AggregateInstallError> {
     let updates = subql::Install::install(
         engine,
@@ -78,7 +85,7 @@ fn install_seed(
         .expect("ungrouped install sets a value"))
 }
 /// In-memory SQLite `t` seeded with `amounts` (None = NULL amount).
-fn sqlite_with(amounts: &[Option<i64>]) -> DieselConnector<SqliteConnection, Postgres> {
+fn sqlite_with(amounts: &[Option<i64>]) -> DieselConnector<SqliteConnection, SQLite> {
     let mut conn = SqliteConnection::establish(":memory:").unwrap();
     sql_query("CREATE TABLE t (id INTEGER PRIMARY KEY, amount INTEGER)")
         .execute(&mut conn)
@@ -103,17 +110,28 @@ fn oracle(spec: &AggSpec, amounts: &[Option<i64>]) -> AggValue {
     let n = nums.len() as f64;
     let sum: f64 = nums.iter().sum();
     let sum_sq: f64 = nums.iter().map(|v| v * v).sum();
-    let var_pop = (numeric > 0).then(|| sum_sq / n - (sum / n).powi(2));
-    let var_samp = (numeric >= 2).then(|| (sum_sq - sum.powi(2) / n) / (n - 1.0));
+    // SQLite has no variance function, so its seed carries a sum of
+    // squares and the deviations are derived from it once, as
+    // `sum_sq - sum^2/n`, rather than by subtracting two divided
+    // quantities. The oracle derives them the same way.
+    let deviations = sum_sq - sum * sum / n;
+    let var_pop = (numeric > 0).then(|| deviations / n);
+    let var_samp = (numeric >= 2).then(|| deviations / (n - 1.0));
     match spec {
-        AggSpec::CountStar => AggValue::Count(count_star),
-        AggSpec::CountColumn { .. } => AggValue::Count(numeric),
-        AggSpec::Sum { .. } => AggValue::Sum(sum),
-        AggSpec::Avg { .. } => AggValue::Real((numeric > 0).then(|| sum / n)),
-        AggSpec::VarPop { .. } => AggValue::Real(var_pop),
-        AggSpec::VarSamp { .. } => AggValue::Real(var_samp),
-        AggSpec::StddevPop { .. } => AggValue::Real(var_pop.map(f64::sqrt)),
-        AggSpec::StddevSamp { .. } => AggValue::Real(var_samp.map(f64::sqrt)),
+        AggSpec::CountStar => AggValue::CountStar(count_star),
+        AggSpec::CountColumn { .. } => AggValue::CountColumn(numeric),
+        // SQLite sums integers as one 64-bit integer, measured.
+        AggSpec::Sum { .. } => AggValue::Sum(
+            (numeric > 0).then(|| subql::NumericValue::Integer(amounts.iter().flatten().sum())),
+        ),
+        // SQLite answers a real for every mean, measured.
+        AggSpec::Avg { .. } => {
+            AggValue::Avg((numeric > 0).then(|| subql::NumericValue::Double(sum / n)))
+        }
+        AggSpec::VarPop { .. } => AggValue::VarPop(var_pop),
+        AggSpec::VarSamp { .. } => AggValue::VarSamp(var_samp),
+        AggSpec::StddevPop { .. } => AggValue::StddevPop(var_pop.map(f64::sqrt)),
+        AggSpec::StddevSamp { .. } => AggValue::StddevSamp(var_samp.map(f64::sqrt)),
         _ => unreachable!("every AggSpec variant handled"),
     }
 }
@@ -155,27 +173,32 @@ fn execute_scalar_row_decodes_components() {
         .execute_scalar_row(&b.query.as_read_query(), &b.kinds, &())
         .unwrap();
     assert_eq!(row, vec![Value::Int(3)]);
-    // SUM: single Float component (cast to double).
+    // SUM: (the exact total, contributor count). SQLite sums integers as
+    // one integer, measured, and a sum over no contributing row is NULL
+    // rather than zero.
     let b = bootstrap("SELECT SUM(amount) FROM t");
     let (row, _) = connector
         .execute_scalar_row(&b.query.as_read_query(), &b.kinds, &())
         .unwrap();
-    assert_eq!(row, vec![Value::Float(12.0)]);
-    // AVG: (sum, count).
+    assert_eq!(row, vec![Value::Int(12), Value::Int(3)]);
+    // AVG: (the exact total, count), since a mean is that total divided
+    // by the count.
     let b = bootstrap("SELECT AVG(amount) FROM t");
     let (row, _) = connector
         .execute_scalar_row(&b.query.as_read_query(), &b.kinds, &())
         .unwrap();
-    assert_eq!(row, vec![Value::Float(12.0), Value::Int(3)]);
-    // VAR_POP: (sum, sum_sq, count) = (12, 56, 3).
+    assert_eq!(row, vec![Value::Int(12), Value::Int(3)]);
+    // VAR_POP: (sum, sum_sq, count) = (12, 56, 3), and the sum decodes as
+    // an integer because that is what SQLite answers: measured,
+    // `typeof(SUM(v))` over an INTEGER column is `integer`. The leading
+    // component of a variance seed is `SUM(amount)`, so it decodes in the
+    // type the engine sums into, exactly as `SUM`'s and `AVG`'s do just
+    // above. Only the sum of squares is a double.
     let b = bootstrap("SELECT VAR_POP(amount) FROM t");
     let (row, _) = connector
         .execute_scalar_row(&b.query.as_read_query(), &b.kinds, &())
         .unwrap();
-    assert_eq!(
-        row,
-        vec![Value::Float(12.0), Value::Float(56.0), Value::Int(3)]
-    );
+    assert_eq!(row, vec![Value::Int(12), Value::Float(56.0), Value::Int(3)]);
 }
 
 #[test]
@@ -196,7 +219,7 @@ fn execute_scalar_row_empty_table_is_empty_state() {
     // The empty row seeds the empty aggregate.
     assert_eq!(
         install_seed(&mut engine, subscription, row),
-        Ok(AggValue::Real(None)),
+        Ok(AggValue::Avg(None)),
     );
 }
 

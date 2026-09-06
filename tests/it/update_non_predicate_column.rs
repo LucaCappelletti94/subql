@@ -179,7 +179,7 @@ fn aggregate_subscription_sees_an_update_of_the_column_it_sums() {
         &mut engine,
         subscription,
         subql::AggregateSeedInstall {
-            rows: vec![vec![Value::Float(9.5)]],
+            rows: vec![vec![Value::Float(9.5), Value::Int(1)]],
             read_at: None,
         },
     )
@@ -192,7 +192,10 @@ fn aggregate_subscription_sees_an_update_of_the_column_it_sums() {
     assert_eq!(updates[0].consumer, CONSUMER);
     assert_eq!(
         updates[0].change,
-        subql::AggregateValueChange::Set(subql::AggregateResultValue::Folded(AggValue::Sum(11.5),))
+        // A `DOUBLE PRECISION` column sums into a double on every engine.
+        subql::AggregateValueChange::Set(subql::AggregateResultValue::Folded(AggValue::Sum(Some(
+            subql::NumericValue::Double(11.5)
+        )),))
     );
 }
 

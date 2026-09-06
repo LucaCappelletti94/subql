@@ -2,10 +2,30 @@
 //! rather than a banner comment.
 
 use crate::backend::{
-    Backend, BuiltinKind, Checkpoint, ColumnId, CustomScalars, DatabaseLike, EventKind, RowKind,
-    ScalarKindOf, TableId, Value,
+    Backend, Checkpoint, ColumnId, CustomScalars, DatabaseLike, EventKind, RowKind, ScalarKindOf,
+    TableId, Value,
 };
 use alloc::vec::Vec;
+
+/// What a row image says about one cell.
+///
+/// `Missing` is the variant that carries weight: a cell the source did not
+/// carry cannot be answered from the event, which is a different fact from
+/// the cell carrying SQL `NULL`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum CellPresence {
+    /// The source's row image did not carry this cell.
+    Missing,
+    /// The cell carries SQL `NULL`.
+    Null,
+    /// The cell carries a value.
+    Present,
+    /// The source carried the cell but subql could not decode it to its
+    /// declared type. The prefilter cannot index it, so every predicate
+    /// depending on the column is selected as a candidate and the VM
+    /// surfaces the decode error.
+    Undecodable,
+}
 
 /// One CDC row event as seen by the engine.
 ///
@@ -134,6 +154,23 @@ pub trait CdcEvent {
         row: RowKind,
         col: ColumnId,
     ) -> Result<Value<Self::Backend>, crate::ValueError>;
+
+    /// What the row image says about one cell.
+    ///
+    /// The distinction [`CellPresence::Missing`] draws is the load-bearing
+    /// one: a cell the source did not carry, an unchanged TOAST value or a
+    /// column outside the replica identity, is not a SQL `NULL`, and a
+    /// predicate reading it cannot be answered from the event at all.
+    ///
+    /// No caller acts on this yet; the prefilter still classifies inline.
+    fn presence_at<DB: DatabaseLike>(&self, db: &DB, row: RowKind, col: ColumnId) -> CellPresence {
+        match self.value_at(db, row, col) {
+            Ok(Value::Missing) => CellPresence::Missing,
+            Ok(Value::Null) => CellPresence::Null,
+            Ok(_) => CellPresence::Present,
+            Err(_) => CellPresence::Undecodable,
+        }
+    }
 
     #[doc(hidden)]
     fn value_at_resolved<DB: DatabaseLike>(
@@ -292,16 +329,20 @@ pub fn decode_cell<B, F>(
 ) -> Result<Value<B>, crate::ValueError>
 where
     B: Backend,
-    F: FnOnce(BuiltinKind) -> Value<B>,
+    F: FnOnce(crate::backend::DeclaredType) -> Value<B>,
 {
     let Some(custom) = kind.custom().copied() else {
-        // Total: `custom()` answered `None`, so `as_builtin` answers `Some`.
-        let builtin = kind.as_builtin().unwrap_or(BuiltinKind::String);
+        // Total: `custom()` answered `None`, so `builtin` answers `Some`.
+        let builtin = kind
+            .declared_type()
+            .unwrap_or(crate::backend::DeclaredType::Text(
+                crate::backend::TextWidth::Varying,
+            ));
         let decoded = decode(builtin);
         return if decoded.is_missing() {
             Err(crate::ValueError::Builtin {
                 column,
-                kind: builtin,
+                kind: builtin.family(),
             })
         } else {
             Ok(decoded)
@@ -309,7 +350,14 @@ where
     };
 
     let carrier = <B::Custom as CustomScalars>::carrier(custom);
-    let raw = decode(carrier);
+    // A carrier is a family: a custom type declares no width, so the decode
+    // reads the common case rather than inventing a refinement.
+    let raw = decode(crate::backend::declared_type_of(
+        carrier,
+        crate::backend::IntWidth::SixtyFour,
+        crate::backend::FloatWidth::Double,
+        crate::backend::TextWidth::Varying,
+    ));
     let Some(view) = raw.as_carried() else {
         return Err(crate::ValueError::Builtin {
             column,
@@ -337,6 +385,97 @@ where
 /// Returns `None` when postcard cannot encode the tuple.
 pub fn encode_value_key<B: Backend>(values: &[Value<B>]) -> Option<alloc::vec::Vec<u8>> {
     postcard::to_allocvec(values).ok()
+}
+
+/// The presence a row image reports per cell, which is what tells "the source
+/// did not say" apart from "the value is NULL".
+#[cfg(all(test, feature = "std"))]
+#[allow(clippy::unwrap_used)]
+mod cell_presence_tests {
+    use crate::backend::{CdcEvent, CellPresence, Postgres, RowKind, Value};
+    use crate::testing::TestEvent;
+    use alloc::vec;
+    use sql_traits::structs::ParserDB;
+    use sqlparser::dialect::PostgreSqlDialect;
+
+    #[test]
+    fn presence_distinguishes_missing_from_null() {
+        let db = ParserDB::parse::<PostgreSqlDialect>(
+            "CREATE TABLE t (id INT PRIMARY KEY, absent TEXT, nulled TEXT);",
+        )
+        .expect("the DDL parses");
+        let table = crate::catalog_helpers::table_id(&db, "t").expect("t is cataloged");
+        let event =
+            TestEvent::<Postgres>::insert(table, vec![Value::Int(1), Value::Missing, Value::Null])
+                .with_pk_columns([0u16]);
+
+        assert_eq!(
+            event.presence_at(&db, RowKind::New, 0),
+            CellPresence::Present
+        );
+        assert_eq!(
+            event.presence_at(&db, RowKind::New, 1),
+            CellPresence::Missing,
+            "a cell the source did not carry is not a NULL"
+        );
+        assert_eq!(event.presence_at(&db, RowKind::New, 2), CellPresence::Null);
+    }
+
+    #[test]
+    fn presence_reports_a_cell_the_source_could_not_decode() {
+        struct Corrupt(crate::TableId);
+
+        impl CdcEvent for Corrupt {
+            type Backend = Postgres;
+            type Checkpoint = crate::NoCheckpoint;
+
+            fn kind(&self) -> crate::EventKind {
+                crate::EventKind::Insert
+            }
+
+            fn table_id<DB: sql_traits::prelude::DatabaseLike>(&self, _db: &DB) -> crate::TableId {
+                self.0
+            }
+
+            fn checkpoint(&self) -> Option<Self::Checkpoint> {
+                None
+            }
+
+            fn pk_columns<DB: sql_traits::prelude::DatabaseLike>(
+                &self,
+                _db: &DB,
+            ) -> alloc::vec::Vec<crate::ColumnId> {
+                vec![0]
+            }
+
+            fn changed_columns<DB: sql_traits::prelude::DatabaseLike>(
+                &self,
+                _db: &DB,
+            ) -> alloc::vec::Vec<crate::ColumnId> {
+                alloc::vec::Vec::new()
+            }
+
+            fn value_at<DB: sql_traits::prelude::DatabaseLike>(
+                &self,
+                _db: &DB,
+                _row: RowKind,
+                col: crate::ColumnId,
+            ) -> Result<Value<Self::Backend>, crate::ValueError> {
+                Err(crate::ValueError::Builtin {
+                    column: col,
+                    kind: crate::backend::ScalarFamily::Int,
+                })
+            }
+        }
+
+        let db = ParserDB::parse::<PostgreSqlDialect>("CREATE TABLE t (id INT PRIMARY KEY);")
+            .expect("the DDL parses");
+        let table = crate::catalog_helpers::table_id(&db, "t").expect("t is cataloged");
+        assert_eq!(
+            Corrupt(table).presence_at(&db, RowKind::New, 0),
+            CellPresence::Undecodable
+        );
+    }
 }
 
 #[cfg(test)]
@@ -429,21 +568,21 @@ mod value_key_tests {
 #[allow(clippy::unwrap_used)]
 mod canonical_group_key_tests {
     use crate::backend::{
-        Backend, BuiltinKind, GroupKeyCollation, GroupKeyCollationName, GroupKeyColumn, MySql,
-        NoCustom, Pg18, Postgres, SQLite, SqliteJson, Value,
+        Backend, CollationFacts, CollationName, ColumnComparison, MySql, NoCustom, Pg18, Postgres,
+        SQLite, ScalarFamily, SqliteJson, Value,
     };
     use alloc::{string::String, vec};
     use sql_traits::traits::MySqlCollationPadding;
 
-    fn column(kind: BuiltinKind) -> GroupKeyColumn<NoCustom> {
-        column_with_collation(kind, GroupKeyCollation::DatabaseDefault)
+    fn column(kind: ScalarFamily) -> ColumnComparison<NoCustom> {
+        column_with_collation(kind, CollationFacts::DatabaseDefault)
     }
 
     fn column_with_collation(
-        kind: BuiltinKind,
-        collation: GroupKeyCollation,
-    ) -> GroupKeyColumn<NoCustom> {
-        GroupKeyColumn {
+        kind: ScalarFamily,
+        collation: CollationFacts,
+    ) -> ColumnComparison<NoCustom> {
+        ColumnComparison {
             kind: kind.into(),
             declared_type: String::from("test"),
             collation,
@@ -453,23 +592,23 @@ mod canonical_group_key_tests {
     fn named_collation(
         name: &str,
         postgres_deterministic: Option<bool>,
-        mysql_padding: Option<MySqlCollationPadding>,
-    ) -> GroupKeyCollation {
-        GroupKeyCollation::Named {
-            name: GroupKeyCollationName {
+        padding: Option<MySqlCollationPadding>,
+    ) -> CollationFacts {
+        CollationFacts::Named {
+            name: CollationName {
                 name: String::from(name),
                 name_is_quoted: false,
                 schema: None,
                 schema_is_quoted: false,
             },
             postgres_deterministic,
-            mysql_padding,
+            padding: padding.map(Into::into),
         }
     }
 
     #[test]
     fn canonical_key_has_one_versioned_tuple_format() {
-        let encoder = Postgres::<Pg18>::group_key_encoder(vec![column(BuiltinKind::Int)])
+        let encoder = Postgres::<Pg18>::group_key_encoder(vec![column(ScalarFamily::Int)])
             .expect("integer groups have a canonical encoder");
         let key = encoder
             .encode(&[Value::Int(42)])
@@ -483,7 +622,7 @@ mod canonical_group_key_tests {
 
     #[test]
     fn canonical_key_rejects_values_outside_the_selected_domain() {
-        let encoder = Postgres::<Pg18>::group_key_encoder(vec![column(BuiltinKind::Int)])
+        let encoder = Postgres::<Pg18>::group_key_encoder(vec![column(ScalarFamily::Int)])
             .expect("integer groups have a canonical encoder");
 
         assert!(encoder.encode(&[]).is_none());
@@ -500,7 +639,7 @@ mod canonical_group_key_tests {
 
     #[test]
     fn postgres_float_keys_follow_grouping_equality() {
-        let encoder = Postgres::<Pg18>::group_key_encoder(vec![column(BuiltinKind::Float)])
+        let encoder = Postgres::<Pg18>::group_key_encoder(vec![column(ScalarFamily::Float)])
             .expect("Postgres float grouping is canonical");
 
         let zero = encoder.encode(&[Value::Float(0.0)]).unwrap();
@@ -518,27 +657,27 @@ mod canonical_group_key_tests {
     #[test]
     fn postgres_text_requires_deterministic_comparison() {
         assert!(
-            Postgres::<Pg18>::group_key_encoder(vec![column(BuiltinKind::String)]).is_some(),
+            Postgres::<Pg18>::group_key_encoder(vec![column(ScalarFamily::String)]).is_some(),
             "the database default is deterministic"
         );
         assert!(
             Postgres::<Pg18>::group_key_encoder(vec![column_with_collation(
-                BuiltinKind::String,
+                ScalarFamily::String,
                 named_collation("unicode", Some(true), None),
             )])
             .is_some()
         );
         assert!(
             Postgres::<Pg18>::group_key_encoder(vec![column_with_collation(
-                BuiltinKind::String,
+                ScalarFamily::String,
                 named_collation("ci", Some(false), None),
             )])
             .is_none()
         );
         assert!(
             Postgres::<Pg18>::group_key_encoder(vec![column_with_collation(
-                BuiltinKind::String,
-                GroupKeyCollation::Unknown,
+                ScalarFamily::String,
+                CollationFacts::Unknown,
             )])
             .is_none()
         );
@@ -547,7 +686,7 @@ mod canonical_group_key_tests {
     #[test]
     fn sqlite_builtin_collations_have_exact_canonical_forms() {
         let nocase = SQLite::group_key_encoder(vec![column_with_collation(
-            BuiltinKind::String,
+            ScalarFamily::String,
             named_collation("NOCASE", None, None),
         )])
         .unwrap();
@@ -565,7 +704,7 @@ mod canonical_group_key_tests {
         );
 
         let rtrim = SQLite::group_key_encoder(vec![column_with_collation(
-            BuiltinKind::String,
+            ScalarFamily::String,
             named_collation("RTRIM", None, None),
         )])
         .unwrap();
@@ -577,10 +716,10 @@ mod canonical_group_key_tests {
 
     #[test]
     fn mysql_binary_collations_apply_their_padding_rule() {
-        assert!(MySql::group_key_encoder(vec![column(BuiltinKind::String)]).is_none());
+        assert!(MySql::group_key_encoder(vec![column(ScalarFamily::String)]).is_none());
 
         let pad = MySql::group_key_encoder(vec![column_with_collation(
-            BuiltinKind::String,
+            ScalarFamily::String,
             named_collation("utf8mb4_bin", None, Some(MySqlCollationPadding::PadSpace)),
         )])
         .unwrap();
@@ -590,7 +729,7 @@ mod canonical_group_key_tests {
         );
 
         let no_pad = MySql::group_key_encoder(vec![column_with_collation(
-            BuiltinKind::String,
+            ScalarFamily::String,
             named_collation("utf8mb4_0900_bin", None, Some(MySqlCollationPadding::NoPad)),
         )])
         .unwrap();
@@ -602,7 +741,7 @@ mod canonical_group_key_tests {
 
     #[test]
     fn mysql_decimal_keys_ignore_scale_spelling() {
-        let encoder = MySql::group_key_encoder(vec![column(BuiltinKind::Decimal)]).unwrap();
+        let encoder = MySql::group_key_encoder(vec![column(ScalarFamily::Decimal)]).unwrap();
         assert_eq!(
             encoder.encode(&[Value::Decimal("1.0".parse().unwrap())]),
             encoder.encode(&[Value::Decimal("1.00".parse().unwrap())])
@@ -612,7 +751,7 @@ mod canonical_group_key_tests {
     #[test]
     fn postgres_jsonb_keys_follow_structural_equality() {
         let encoder =
-            Postgres::<Pg18>::group_key_encoder(vec![column(BuiltinKind::Jsonb)]).unwrap();
+            Postgres::<Pg18>::group_key_encoder(vec![column(ScalarFamily::Jsonb)]).unwrap();
         let left: serde_json::Value =
             serde_json::from_str(r#"{"a": 1.0, "b": [true, null]}"#).unwrap();
         let right: serde_json::Value =
@@ -626,7 +765,7 @@ mod canonical_group_key_tests {
 
     #[test]
     fn sqlite_json_keys_preserve_storage_equality() {
-        let encoder = SQLite::group_key_encoder(vec![column(BuiltinKind::Json)]).unwrap();
+        let encoder = SQLite::group_key_encoder(vec![column(ScalarFamily::Json)]).unwrap();
         assert_eq!(
             encoder.encode(&[Value::Json(SqliteJson::integer(1))]),
             encoder.encode(&[Value::Json(SqliteJson::real(1.0))])
@@ -645,7 +784,7 @@ mod canonical_group_key_tests {
         #[test]
         fn sqlite_nocase_folds_every_ascii_case_pair(value in "[A-Za-z0-9]{0,64}") {
             let encoder = SQLite::group_key_encoder(vec![column_with_collation(
-                BuiltinKind::String,
+                ScalarFamily::String,
                 named_collation("NOCASE", None, None),
             )])
             .unwrap();
@@ -659,7 +798,7 @@ mod canonical_group_key_tests {
         fn postgres_float_collapses_every_nan_payload(bits in proptest::prelude::any::<u64>()) {
             let value = f64::from_bits(bits);
             if value.is_nan() {
-                let encoder = Postgres::<Pg18>::group_key_encoder(vec![column(BuiltinKind::Float)]).unwrap();
+                let encoder = Postgres::<Pg18>::group_key_encoder(vec![column(ScalarFamily::Float)]).unwrap();
                 proptest::prop_assert_eq!(
                     encoder.encode(&[Value::Float(value)]),
                     encoder.encode(&[Value::Float(f64::NAN)])

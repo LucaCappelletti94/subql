@@ -13,26 +13,7 @@ use alloc::vec::Vec;
 use arc_swap::ArcSwap;
 use roaring::RoaringBitmap;
 
-/// Three-valued presence flag reported by
-/// [`TablePartition::select_candidates`]'s column-probe closure.
-///
-/// Names whether a probed cell was missing, null, or present, without a
-/// payload: the caller conveys the payload via the paired
-/// [`ColumnProbe::value`] field.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum CellPresence {
-    /// The source's row image did not carry this cell.
-    Missing,
-    /// The cell carries SQL `NULL`.
-    Null,
-    /// The cell carries a value (see [`ColumnProbe::value`]).
-    Present,
-    /// The source carried the cell but subql could not decode it to its
-    /// declared type. The prefilter cannot index it, so every predicate
-    /// depending on the column is selected as a candidate and the VM
-    /// surfaces the decode error.
-    Undecodable,
-}
+pub use crate::backend::CellPresence;
 
 /// Column probe result yielded by
 /// [`TablePartition::select_candidates`]'s caller-supplied closure.
@@ -253,8 +234,12 @@ impl<I: IdTypes, B: Backend> TablePartition<I, B> {
                         candidates |= bitmap;
                     }
                 }
-                CellPresence::Missing => {}
-                CellPresence::Undecodable => {
+                // A cell the event does not carry cannot be indexed, so
+                // pruning on it would drop a predicate the comparator
+                // would have judged, exactly as for a cell that failed to
+                // decode. Every predicate reading the column stays a
+                // candidate and the evaluation decides.
+                CellPresence::Missing | CellPresence::Undecodable => {
                     if let Some(deps) = snapshot.indexes.dependency.get(&col_id) {
                         candidates |= deps;
                     }

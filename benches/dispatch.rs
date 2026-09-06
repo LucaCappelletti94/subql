@@ -234,7 +234,7 @@ fn bench_catalog() -> ParserDB {
          CREATE TABLE orders (\
              id INT PRIMARY KEY, user_id INT, amount INT, status TEXT, \
              priority INT, quantity INT, discount INT, tax INT, shipping INT, \
-             created_at INT\
+             created_at INT, folded TEXT COLLATE \"C\"\
          );",
     )
     .expect("bench DDL parses")
@@ -269,6 +269,7 @@ fn make_test_event(seed: u64) -> TestEvent<Postgres> {
             Value::Int(tax),
             Value::Int(shipping),
             Value::Int(created_at),
+            Value::String(status.into()),
         ],
     )
     .with_pk_columns([0u16])
@@ -774,8 +775,56 @@ fn deduplication_benchmark(c: &mut Criterion) {
     group.finish();
 }
 
+/// `LIKE` and `ILIKE` dispatch, which is where a per-row allocation would
+/// show.
+///
+/// The matcher folds each character as the walk reaches it rather than
+/// lowercasing either operand, so a case-insensitive pattern costs no
+/// allocation that a case-sensitive one does not. Restoring a per-row
+/// `to_lowercase` shows up here as two allocations per row per
+/// subscription, which is what this case exists to catch.
+fn pattern_dispatch_benchmark(c: &mut Criterion) {
+    let mut group = c.benchmark_group("pattern_dispatch");
+    group.sample_size(20);
+    group.sampling_mode(SamplingMode::Flat);
+    group.warm_up_time(Duration::from_millis(500));
+    group.measurement_time(Duration::from_secs(3));
+
+    for (label, operator) in [("like", "LIKE"), ("ilike", "ILIKE")] {
+        let catalog = bench_catalog();
+        let mut engine: SubscriptionEngine<TestEvent<Postgres>, DefaultIds, ParserDB> =
+            SubscriptionEngine::new(catalog, PostgreSqlDialect {});
+        for i in 0..1_000_u64 {
+            engine
+                .register(SubscriptionRequest::new(
+                    i % 100,
+                    format!("SELECT * FROM orders WHERE folded {operator} 'ship%{i}'"),
+                ))
+                .unwrap();
+        }
+        let events = event_corpus(EVENT_CORPUS_SIZE, EVENT_CORPUS_SALT, make_test_event);
+        let mut next_event_idx = 0_usize;
+
+        group.bench_function(label, |b| {
+            b.iter(|| {
+                let event = &events[next_event_idx];
+                next_event_idx = (next_event_idx + 1) % events.len();
+                let matched = engine
+                    .consumers(black_box(event))
+                    .unwrap()
+                    .into_iter()
+                    .count();
+                black_box(matched);
+            });
+        });
+    }
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
+    pattern_dispatch_benchmark,
     dispatch_scaling_benchmark,
     dispatch_kind_scaling_benchmark,
     index_efficiency_benchmark,

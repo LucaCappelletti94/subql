@@ -3830,7 +3830,7 @@ dependencies = [
 [[package]]
 name = "pg2sqlite"
 version = "0.1.0"
-source = "git+https://github.com/LucaCappelletti94/pg2sqlite?branch=main#8ca2446f83d4e8e62c053285b359832886704342"
+source = "git+https://github.com/LucaCappelletti94/pg2sqlite?branch=main#c6e9b9984799501842ab0d2b6a7b743f556adf78"
 dependencies = [
  "sql-traits",
  "sqlparser",
@@ -4591,7 +4591,7 @@ dependencies = [
 [[package]]
 name = "rls2fga"
 version = "0.1.0"
-source = "git+https://github.com/LucaCappelletti94/rls2fga?branch=main#c16390bfb0468aa874a4507b07823c7ec9c8b9d9"
+source = "git+https://github.com/LucaCappelletti94/rls2fga?branch=main#b0fa4e56724da2ec5e69e6da669e1dccab126fe9"
 dependencies = [
  "openfga-client",
  "rls2fga-types",
@@ -4605,7 +4605,7 @@ dependencies = [
 [[package]]
 name = "rls2fga-types"
 version = "0.1.0"
-source = "git+https://github.com/LucaCappelletti94/rls2fga?branch=main#c16390bfb0468aa874a4507b07823c7ec9c8b9d9"
+source = "git+https://github.com/LucaCappelletti94/rls2fga?branch=main#b0fa4e56724da2ec5e69e6da669e1dccab126fe9"
 dependencies = [
  "serde",
  "thiserror 2.0.20",
@@ -5227,7 +5227,7 @@ dependencies = [
 [[package]]
 name = "sqlparser"
 version = "0.62.0"
-source = "git+https://github.com/apache/datafusion-sqlparser-rs?branch=main#75a1040597fd6233f24a6b41641b360e30fb01b9"
+source = "git+https://github.com/apache/datafusion-sqlparser-rs?branch=main#5c974dd1399d9d16cc2924bef1846dbfba91cd49"
 dependencies = [
  "log",
  "recursive",
@@ -5374,6 +5374,7 @@ dependencies = [
  "sqlite-diff-rs",
  "sqlparser",
  "sqlparser-canonicalize",
+ "subql",
  "tempfile",
  "testcontainers",
  "thiserror 2.0.20",

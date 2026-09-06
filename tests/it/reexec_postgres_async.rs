@@ -30,7 +30,7 @@ use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::AsyncPgConnection;
 use sql_traits::structs::ParserDB;
 use sqlparser::dialect::PostgreSqlDialect;
-use subql::backend::{BuiltinKind, Postgres, Value};
+use subql::backend::{Postgres, ScalarFamily, Value};
 use subql::reexec::{
     AsyncConnector, AsyncMode, AutoResolvingEngine, PgAsyncDieselConnector, SessionSetup,
     SnapshotResult,
@@ -355,10 +355,10 @@ fn execute_scalar_row_decodes_integer_aggregate_seed_async() {
             .execute_scalar_row(&bundle.query.as_read_query(), &bundle.kinds, &())
             .await
             .expect("execute_scalar_row");
-        assert_eq!(
-            row,
-            vec![Value::Float(12.0), Value::Float(56.0), Value::Int(3)]
-        );
+        // (sum, squared deviations, count) = (12, 8, 3). Eight because
+        // the seed reads the engine's own `VAR_POP(amount) * COUNT(amount)`
+        // rather than a sum of squares, which would be 56.
+        assert_eq!(row, vec![Value::Int(12), Value::Float(8.0), Value::Int(3)]);
         assert!(checkpoint.is_some());
     });
 }
@@ -1129,7 +1129,7 @@ fn every_read_reports_a_position_taken_before_its_snapshot() {
         on.block_on(async move {
             held.execute_scalar(
                 &subql::reexec::ReadQuery::without_binds(&sql),
-                BuiltinKind::Int,
+                ScalarFamily::Int,
                 &(),
             )
             .await
@@ -1173,7 +1173,7 @@ fn every_read_reports_a_position_taken_before_its_snapshot() {
         on.block_on(async move {
             held.execute_scalar_row(
                 &subql::reexec::ReadQuery::without_binds(&sql),
-                &[BuiltinKind::Int],
+                &[ScalarFamily::Int],
                 &(),
             )
             .await
@@ -1296,7 +1296,7 @@ fn a_scalar_over_a_narrow_integer_column_decodes_async() {
     let (value, _) = rt
         .block_on(connector.execute_scalar(
             &subql::reexec::ReadQuery::without_binds("SELECT MIN(quantity) FROM orders"),
-            BuiltinKind::Int,
+            ScalarFamily::Int,
             &(),
         ))
         .expect("INT column decodes");
@@ -1304,7 +1304,7 @@ fn a_scalar_over_a_narrow_integer_column_decodes_async() {
     let (value, _) = rt
         .block_on(connector.execute_scalar(
             &subql::reexec::ReadQuery::without_binds("SELECT MIN(small) FROM probe"),
-            BuiltinKind::Int,
+            ScalarFamily::Int,
             &(),
         ))
         .expect("INT column decodes");
@@ -1312,7 +1312,7 @@ fn a_scalar_over_a_narrow_integer_column_decodes_async() {
     let (value, _) = rt
         .block_on(connector.execute_scalar(
             &subql::reexec::ReadQuery::without_binds("SELECT MAX(tiny) FROM probe"),
-            BuiltinKind::Int,
+            ScalarFamily::Int,
             &(),
         ))
         .expect("SMALLINT column decodes");
@@ -1349,7 +1349,7 @@ fn session_setup_runs_inside_each_read_transaction_async_pg() {
         let (value, _) = connector
             .execute_scalar(
                 &subql::reexec::ReadQuery::without_binds(read_marker),
-                BuiltinKind::String,
+                ScalarFamily::String,
                 &setup,
             )
             .await
@@ -1395,7 +1395,7 @@ fn session_setup_runs_inside_each_read_transaction_async_pg() {
         let (value, _) = plain
             .execute_scalar(
                 &subql::reexec::ReadQuery::without_binds(read_marker),
-                BuiltinKind::String,
+                ScalarFamily::String,
                 &(),
             )
             .await

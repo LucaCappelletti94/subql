@@ -11,8 +11,10 @@ use arbitrary::{Arbitrary, Unstructured};
 use sql_traits::structs::ParserDB;
 use sqlparser::dialect::PostgreSqlDialect;
 
-use crate::backend::{Postgres, RowKind, Value};
-use crate::compiler::bytecode::{BytecodeProgram, Instruction};
+use crate::backend::{DivisionPrecisionIncrement, FloatWidth, Postgres, RowKind, Value};
+use crate::compiler::bytecode::{
+    BytecodeProgram, ComparisonRef, FloatResult, Instruction, Quotient,
+};
 use crate::compiler::canonicalize::{hash_sql, normalize_sql};
 use crate::compiler::parser::parse_and_compile;
 use crate::compiler::vm::Vm;
@@ -63,38 +65,83 @@ pub fn arb_value(u: &mut Unstructured<'_>) -> arbitrary::Result<Value<Postgres>>
     }
 }
 
+/// Generate a [`ComparisonRef`] from fuzzer-controlled bytes.
+///
+/// Indices deliberately reach past any table a generated program carries, so
+/// the resolution path is fuzzed for out-of-range slots as well as valid ones.
+fn arb_comparison_ref(u: &mut Unstructured<'_>) -> arbitrary::Result<ComparisonRef> {
+    let side = |u: &mut Unstructured<'_>| -> arbitrary::Result<Option<u16>> {
+        Ok(match u.int_in_range(0u8..=3)? {
+            0 => None,
+            other => Some(u16::from(other) - 1),
+        })
+    };
+    let left = side(u)?;
+    let right = side(u)?;
+    Ok(ComparisonRef::new(left, right))
+}
+
+/// Generate a float result width from fuzzer-controlled bytes, so a
+/// generated program exercises both the narrowed and the plain arithmetic
+/// paths.
+fn arb_float_result(u: &mut Unstructured<'_>) -> arbitrary::Result<FloatResult> {
+    Ok(match u.int_in_range(0u8..=2)? {
+        0 => None,
+        1 => Some(FloatWidth::Single),
+        _ => Some(FloatWidth::Double),
+    })
+}
+
+/// Generate a quotient rule from fuzzer-controlled bytes, so a generated
+/// program exercises both an integer quotient and a decimal one.
+fn arb_quotient(u: &mut Unstructured<'_>) -> arbitrary::Result<Quotient> {
+    Ok(match u.int_in_range(0u8..=1)? {
+        0 => Quotient::FromTheOperands,
+        _ => Quotient::InWordsAt(
+            DivisionPrecisionIncrement::new(u.int_in_range(0u8..=30)?)
+                .unwrap_or_else(|| DivisionPrecisionIncrement::new(4).expect("4 is in range")),
+        ),
+    })
+}
+
 /// Generate an [`Instruction<Postgres>`] from fuzzer-controlled bytes.
 pub fn arb_instruction(u: &mut Unstructured<'_>) -> arbitrary::Result<Instruction<Postgres>> {
     match u.int_in_range(0u8..=23)? {
         0 => Ok(Instruction::PushLiteral(arb_value(u)?)),
         1 => Ok(Instruction::LoadColumn(u.int_in_range(0u16..=63)?)),
-        2 => Ok(Instruction::Equal),
-        3 => Ok(Instruction::NotEqual),
-        4 => Ok(Instruction::LessThan),
-        5 => Ok(Instruction::LessThanOrEqual),
-        6 => Ok(Instruction::GreaterThan),
-        7 => Ok(Instruction::GreaterThanOrEqual),
+        2 => Ok(Instruction::Equal(arb_comparison_ref(u)?)),
+        3 => Ok(Instruction::NotEqual(arb_comparison_ref(u)?)),
+        4 => Ok(Instruction::LessThan(arb_comparison_ref(u)?)),
+        5 => Ok(Instruction::LessThanOrEqual(arb_comparison_ref(u)?)),
+        6 => Ok(Instruction::GreaterThan(arb_comparison_ref(u)?)),
+        7 => Ok(Instruction::GreaterThanOrEqual(arb_comparison_ref(u)?)),
         8 => Ok(Instruction::IsNull),
         9 => Ok(Instruction::IsNotNull),
         10 => Ok(Instruction::And),
         11 => Ok(Instruction::Or),
         12 => Ok(Instruction::Not),
-        13 => Ok(Instruction::Add),
-        14 => Ok(Instruction::Subtract),
-        15 => Ok(Instruction::Multiply),
-        16 => Ok(Instruction::Divide),
-        17 => Ok(Instruction::Modulo),
-        18 => Ok(Instruction::Negate),
+        13 => Ok(Instruction::Add(arb_float_result(u)?)),
+        14 => Ok(Instruction::Subtract(arb_float_result(u)?)),
+        15 => Ok(Instruction::Multiply(arb_float_result(u)?)),
+        16 => Ok(Instruction::Divide(arb_float_result(u)?, arb_quotient(u)?)),
+        17 => Ok(Instruction::Modulo(arb_float_result(u)?)),
+        18 => Ok(Instruction::Negate(arb_float_result(u)?)),
         19 => {
             let len = u.int_in_range(0usize..=8)?;
             let list: Vec<Value<Postgres>> = (0..len)
                 .map(|_| arb_value(u))
                 .collect::<arbitrary::Result<_>>()?;
-            Ok(Instruction::In(list))
+            Ok(Instruction::In {
+                literals: list,
+                comparison: arb_comparison_ref(u)?,
+            })
         }
-        20 => Ok(Instruction::Between),
+        20 => Ok(Instruction::Between {
+            lower: arb_comparison_ref(u)?,
+            upper: arb_comparison_ref(u)?,
+        }),
         21 => Ok(Instruction::Like {
-            case_sensitive: bool::arbitrary(u)?,
+            comparison: arb_comparison_ref(u)?,
         }),
         // Jump instructions with bounded offsets (0..=31 to stay within any reasonable program)
         22 => Ok(Instruction::JumpIfFalse(u.int_in_range(0usize..=31)?)),

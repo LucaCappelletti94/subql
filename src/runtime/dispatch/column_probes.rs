@@ -49,25 +49,25 @@ pub(super) fn probe_column_for_agg<E: CdcEvent, DB: DatabaseLike>(
     Ok(match &value {
         Value::Missing => AggCellRead::Missing,
         Value::Null => AggCellRead::Null,
-        Value::Int(i) => {
-            (i as &dyn Any)
-                .downcast_ref::<i64>()
-                .map_or(AggCellRead::NonNumeric, |i64_ref| {
-                    #[allow(clippy::cast_precision_loss)]
-                    AggCellRead::Numeric(*i64_ref as f64)
-                })
-        }
-        Value::Float(f) => {
-            (f as &dyn Any)
-                .downcast_ref::<f64>()
-                .map_or(AggCellRead::NonNumeric, |f64_ref| {
-                    if f64_ref.is_finite() {
-                        AggCellRead::Numeric(*f64_ref)
-                    } else {
-                        AggCellRead::NonNumeric
-                    }
-                })
-        }
+        Value::Int(i) => (i as &dyn Any)
+            .downcast_ref::<i64>()
+            .map_or(AggCellRead::NonNumeric, |int| AggCellRead::Integer(*int)),
+        // `Infinity` and `NaN` fold like any other float, because the
+        // engines answer with them: measured, PostgreSQL sums `1.0` and
+        // `Infinity` to `Infinity` and answers `NaN` once a `NaN`
+        // participates, and SQLite answers `Inf`. Both are representable
+        // in the carrier the float family already holds, so dropping one
+        // only hid a row that moved the answer.
+        Value::Float(f) => (f as &dyn Any)
+            .downcast_ref::<f64>()
+            .map_or(AggCellRead::NonNumeric, |float| AggCellRead::Real(*float)),
+        // A decimal cell folds exactly, which is what an engine that sums
+        // one into a decimal answers.
+        Value::Decimal(d) => (d as &dyn Any)
+            .downcast_ref::<bigdecimal::BigDecimal>()
+            .map_or(AggCellRead::NonNumeric, |decimal| {
+                AggCellRead::Decimal(decimal.clone())
+            }),
         _ => AggCellRead::NonNumeric,
     })
 }
