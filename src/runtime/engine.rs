@@ -5030,6 +5030,50 @@ mod tests {
 
     type Engine = SubscriptionEngine<TestEvent<Postgres>, DefaultIds, ParserDB>;
 
+    /// The core delivers no read answers, because it holds no connector.
+    ///
+    /// `rows_updates` and `row_deltas` are `Vec::new()` where
+    /// `reread_notifications` builds its result, and the auto-resolving
+    /// wrapper relies on that: its own `Dispatched` omits both fields
+    /// entirely, so anything the core put there would be dropped rather
+    /// than delivered.
+    ///
+    /// Enforced here rather than at the wrapper. A review pointed out that
+    /// the wrapper's `debug_assert` cannot prevent a production drop, and
+    /// that naming the fields in a destructuring pattern does not help
+    /// either: the fields exist, so the pattern keeps compiling whatever
+    /// the core starts putting in them. The invariant is the core's, so
+    /// this fails at the source if it is ever broken.
+    #[test]
+    fn the_core_delivers_no_read_answers() {
+        let database = ParserDB::parse::<PostgreSqlDialect>(DDL).expect("the DDL parses");
+        let table = crate::catalog_helpers::table_id(&database, "orders").expect("orders resolves");
+        let mut engine: Engine = SubscriptionEngine::new(database, PostgreSqlDialect {});
+        engine
+            .register(SubscriptionRequest::new(
+                1u64,
+                "SELECT * FROM orders WHERE status = 'paid'",
+            ))
+            .expect("the filter registers");
+
+        let event = TestEvent::<Postgres>::insert(
+            table,
+            alloc::vec![Value::Int(1), Value::Int(5), Value::String("paid".into()),],
+        )
+        .with_pk_columns([0u16]);
+        let notifications = engine
+            .reread_notifications(&event)
+            .expect("the event dispatches");
+        assert!(
+            notifications.rows_updates.is_empty(),
+            "the core has no connector, so it cannot page a whole result"
+        );
+        assert!(
+            notifications.row_deltas.is_empty(),
+            "nor answer a keyed read"
+        );
+    }
+
     struct CountingEvent {
         inner: TestEvent<Postgres>,
         table_id_calls: core::cell::Cell<usize>,

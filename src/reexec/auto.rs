@@ -586,9 +586,15 @@ where
         } = self.inner.reread_notifications(event)?;
         // Both are `Vec::new()` by construction: the core holds no
         // connector, so it cannot fill either, and this path is why
-        // `Dispatched` does not carry them. Destructured rather than
-        // ignored so that a core which one day does fill them fails to
-        // compile here instead of dropping them.
+        // `Dispatched` does not carry them.
+        //
+        // This assertion is debug-time only and does not prevent a
+        // production drop. Naming the fields does not help either: they
+        // exist, so destructuring them keeps compiling whatever the core
+        // starts putting in them. The invariant belongs to the core, so it
+        // is enforced there, by
+        // `runtime::engine::tests::the_core_delivers_no_read_answers`,
+        // which fails if `reread_notifications` ever fills either channel.
         debug_assert!(
             rows_updates.is_empty() && row_deltas.is_empty(),
             "the core has no connector, so it cannot deliver read answers"

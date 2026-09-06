@@ -284,10 +284,14 @@ pub struct Dispatched<I: IdTypes, B: Backend, C: crate::Checkpoint = crate::NoCh
     /// Separate from [`outstanding`](Self::outstanding) because they are
     /// different facts and a caller cannot recover one from the other. A
     /// debounced read is not deferred, it is discarded: `enqueue_read`
-    /// returns before enqueuing, and a later event queues a fresh read
-    /// once the window has passed. So the queue depth stays zero while
-    /// this event's refresh was thrown away, and the answer a consumer
-    /// holds may be stale by up to that window.
+    /// returns before enqueuing, and nothing schedules a replacement when
+    /// the window expires. Only the next CDC event for that subscription
+    /// queues a fresh read.
+    ///
+    /// So the window is **not** a bound on staleness. If no further event
+    /// arrives, the answer a consumer holds stays as it is indefinitely,
+    /// not for the configured duration. Reading the window as a maximum
+    /// age is the mistake this paragraph exists to prevent.
     ///
     /// Zero here and zero in `outstanding` together mean this engine has
     /// no read outstanding and discarded none. That is the whole of what
