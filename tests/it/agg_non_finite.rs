@@ -521,3 +521,101 @@ fn pg_mean_recovers_when_an_infinity_is_updated_away() {
         "measured: PostgreSQL answers 2.3333333333333335"
     );
 }
+
+/// A widened `COUNT(col)` counts a non-finite float, as the engine does.
+///
+/// The module header records the measurement: `COUNT(approx)` over `1.0`
+/// and one non-finite value is 2 on PostgreSQL. A sibling `HAVING SUM`
+/// widens the fold, which swaps the projected count's own delta for the
+/// full-stats shape, and that shape carries a non-finite contribution in
+/// `Spread::non_finite` while leaving `Spread::rows` at zero. The
+/// contribution counter read only `rows`, so the widened subscription
+/// answered 1 where the unwidened one answers 2 and the server answers 2.
+///
+/// The widening is reachable and not hypothetical:
+/// `HavingSubject::Aggregate(HavingFunction::Sum)` always widens
+/// (`sql_shape.rs`), and a `CountColumn` projection has a column, so
+/// `delta_spec_and_groups` selects `DeltaSpec::FullStats`.
+#[test]
+fn a_widened_count_counts_a_non_finite_float() {
+    const GROUPED_DDL: &str =
+        "CREATE TABLE t (id INT PRIMARY KEY, region TEXT, approx DOUBLE PRECISION)";
+    let database = ParserDB::parse::<PostgreSqlDialect>(GROUPED_DDL).unwrap();
+    let table: TableId = catalog_helpers::table_id(&database, "t").unwrap();
+    let mut engine: SubscriptionEngine<TestEvent<Postgres, PgLsn>, DefaultIds, ParserDB> =
+        SubscriptionEngine::new(database, PostgreSqlDialect {});
+    let registered = engine
+        .register(SubscriptionRequest::new(
+            7u64,
+            "SELECT region, COUNT(approx) FROM t GROUP BY region HAVING SUM(approx) > 0",
+        ))
+        .expect("the grouped fold registers");
+    assert!(
+        registered.not_served_because.is_none(),
+        "this fold is served in process, and it was refused"
+    );
+    subql::Install::install(
+        &mut engine,
+        registered.subscription_id,
+        subql::AggregateSeedInstall {
+            rows: Vec::new(),
+            read_at: Some(PgLsn(5)),
+        },
+    )
+    .expect("the empty grouped seed lands");
+
+    let mut last = None;
+    for (index, value) in [1.0_f64, f64::INFINITY].iter().enumerate() {
+        let lsn = 10 + u64::try_from(index).unwrap() * 10;
+        let event = TestEvent::insert(
+            table,
+            vec![
+                Value::Int(i64::try_from(lsn).unwrap()),
+                Value::String("north".into()),
+                Value::Float(*value),
+            ],
+        )
+        .with_pk_columns([0u16])
+        .with_checkpoint(PgLsn(lsn));
+        let updates = engine.aggregate_updates(&event).expect("the row folds");
+        if let Some(update) = updates.into_iter().next_back() {
+            last = Some(update.change);
+        }
+    }
+    assert_eq!(
+        last,
+        Some(subql::AggregateValueChange::Set(
+            subql::AggregateResultValue::Folded(AggValue::CountColumn(2))
+        )),
+        "both rows count: a non-finite float is not NULL, and PostgreSQL counts it"
+    );
+
+    // And it stops counting when it leaves, which is the other half of the
+    // same rule. Without this the removal side goes untested: a fix that
+    // counted a non-finite row on the way in and not on the way out would
+    // leave the count one too high forever, and the mutation battery found
+    // exactly that gap.
+    let removal = TestEvent::delete(
+        table,
+        vec![
+            Value::Int(20),
+            Value::String("north".into()),
+            Value::Float(f64::INFINITY),
+        ],
+    )
+    .with_pk_columns([0u16])
+    .with_checkpoint(PgLsn(30));
+    let after = engine
+        .aggregate_updates(&removal)
+        .expect("the removal folds")
+        .into_iter()
+        .next_back()
+        .map(|update| update.change);
+    assert_eq!(
+        after,
+        Some(subql::AggregateValueChange::Set(
+            subql::AggregateResultValue::Folded(AggValue::CountColumn(1))
+        )),
+        "the finite row is all that remains, so the count is 1"
+    );
+}

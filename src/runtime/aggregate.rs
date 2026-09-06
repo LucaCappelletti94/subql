@@ -1017,7 +1017,14 @@ impl AggAccumulator {
             } => {
                 self.total.add(value)?;
                 self.sum += value.as_f64();
-                self.contributions += added.rows - removed.rows;
+                // A non-finite value is a contribution. `Spread` holds it
+                // apart from `rows` because a squared deviation from it has
+                // no inverse, not because it is absent: measured on
+                // PostgreSQL 16, `COUNT(v)` over `1.0` and `Infinity` is 2.
+                // Reading only `rows` made a widened `COUNT(col)` answer 1
+                // where the unwidened path and the server both answer 2.
+                self.contributions +=
+                    (added.rows + added.non_finite) - (removed.rows + removed.non_finite);
                 self.spread = self.spread.combine(*added).without(*removed);
             }
         }
