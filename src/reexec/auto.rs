@@ -482,7 +482,7 @@ where
     ///
     /// A trigger inside the window is discarded rather than deferred and
     /// reported through
-    /// [`Dispatched::debounced`](super::Dispatched::debounced); nothing
+    /// [`Dispatched::debounced`](super::Dispatched::debounced). Nothing
     /// reschedules it, so the held value can be stale indefinitely.
     #[must_use]
     pub const fn with_debounce_per_query(mut self, debounce: Duration) -> Self {

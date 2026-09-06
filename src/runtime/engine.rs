@@ -5052,6 +5052,11 @@ mod tests {
         let notifications = engine
             .reread_notifications(&event)
             .expect("the event dispatches");
+        assert_eq!(
+            notifications.engine.inserted(),
+            [1],
+            "the event matched, so the emptiness below is about read answers"
+        );
         assert!(
             notifications.rows_updates.is_empty(),
             "the core has no connector, so it cannot page a whole result"
