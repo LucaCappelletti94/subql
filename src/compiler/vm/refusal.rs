@@ -47,6 +47,13 @@ pub enum EvaluationRefusal {
     /// read. Measured: PostgreSQL raises exactly there, and answers false
     /// when the input ran out first, which is a no-match rather than this.
     LikePatternEndsWithEscape,
+    /// An exact operand has to be cast to `double precision` to be
+    /// compared against a float, and does not fit. Measured on PostgreSQL
+    /// 16: `1e309::numeric > 1.5::float8` raises `out of range for type
+    /// double precision` at either sign, while `1e300` is answered
+    /// normally. PostgreSQL only, since MySQL's `DECIMAL` holds at most 65
+    /// digits and SQLite compares through the exact rule instead.
+    DecimalOutsideFloatRange,
 }
 
 /// What a backend answers when a divisor is zero.

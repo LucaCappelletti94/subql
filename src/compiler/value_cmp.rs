@@ -36,6 +36,7 @@
 //! [`Backend::compare_scalars`](crate::backend::Backend::compare_scalars).
 
 use crate::backend::{Backend, ComparisonContext, Value};
+use crate::compiler::vm::refusal::EvaluationRefusal;
 use crate::compiler::Tri;
 
 /// Structural equality between two same-scalar [`Value`]s: the default a
@@ -51,21 +52,28 @@ use crate::compiler::Tri;
 /// Text is the one scalar whose equality is not its payload's: the rule the
 /// compiler resolved says whether case or trailing spaces count. Every
 /// other variant compares by payload.
+///
+/// # Errors
+///
+/// [`EvaluationRefusal`] when the backend's widening raises rather than
+/// answering. Before this was fallible the refusal reached the wildcard
+/// arm below and answered `false`, so a pair the engine will not evaluate
+/// was reported as a definite no-match.
 pub fn structural_equality<B: Backend>(
     comparison: ComparisonContext<'_, B>,
     a: &Value<B>,
     b: &Value<B>,
-) -> bool {
+) -> Result<bool, EvaluationRefusal> {
     if let (Value::String(x), Value::String(y)) = (a, b) {
-        return comparison
+        return Ok(comparison
             .text
             .unwrap_or(crate::backend::TextRule::EXACT)
-            .equal(x.as_ref(), y.as_ref());
+            .equal(x.as_ref(), y.as_ref()));
     }
-    if let Some(ordering) = B::compare_cross_kind_numeric(a, b) {
-        return ordering == core::cmp::Ordering::Equal;
+    if let Some(ordering) = B::compare_cross_kind_numeric(a, b)? {
+        return Ok(ordering == core::cmp::Ordering::Equal);
     }
-    match (a, b) {
+    Ok(match (a, b) {
         (Value::Bool(x), Value::Bool(y)) => x == y,
         (Value::Int(x), Value::Int(y)) => x == y,
         (Value::Float(x), Value::Float(y)) => x == y,
@@ -86,7 +94,7 @@ pub fn structural_equality<B: Backend>(
         (Value::Custom(x), Value::Custom(y)) => x == y,
         // Missing/Null and cross-scalar pairs are never equal here.
         _ => false,
-    }
+    })
 }
 
 /// Structural ordering between two same-scalar [`Value`]s: the default a
@@ -104,22 +112,22 @@ pub fn structural_ordering<B: Backend>(
     comparison: ComparisonContext<'_, B>,
     lhs: &Value<B>,
     rhs: &Value<B>,
-) -> Option<core::cmp::Ordering> {
+) -> Result<Option<core::cmp::Ordering>, EvaluationRefusal> {
     if lhs.is_absent() || rhs.is_absent() {
-        return None;
+        return Ok(None);
     }
     if let (Value::String(x), Value::String(y)) = (lhs, rhs) {
-        return Some(
+        return Ok(Some(
             comparison
                 .text
                 .unwrap_or(crate::backend::TextRule::EXACT)
                 .compare(x.as_ref(), y.as_ref()),
-        );
+        ));
     }
-    if let Some(ordering) = B::compare_cross_kind_numeric(lhs, rhs) {
-        return Some(ordering);
+    if let Some(ordering) = B::compare_cross_kind_numeric(lhs, rhs)? {
+        return Ok(Some(ordering));
     }
-    match (lhs, rhs) {
+    Ok(match (lhs, rhs) {
         (Value::Bool(x), Value::Bool(y)) => x.partial_cmp(y),
         (Value::Int(x), Value::Int(y)) => x.partial_cmp(y),
         (Value::Float(x), Value::Float(y)) => x.partial_cmp(y),
@@ -134,7 +142,7 @@ pub fn structural_ordering<B: Backend>(
         // Json / Jsonb have no order here; a cross-scalar mismatch also
         // lands on this arm.
         _ => None,
-    }
+    })
 }
 
 /// The builtin kind a runtime numeric scalar carries, or `None` when the
@@ -160,26 +168,41 @@ const fn numeric_kind<B: Backend>(value: &Value<B>) -> Option<crate::backend::Sc
 /// `Backend`, because `B::Int` and `B::Float` are associated types with no
 /// conversion to `i64` and `f64`. A backend carrying its numbers otherwise
 /// implements the comparison itself.
+///
+/// # Errors
+///
+/// [`EvaluationRefusal::DecimalOutsideFloatRange`] when the widening is to
+/// a double and an exact operand does not fit one. The engine raises there
+/// rather than answering, so neither an ordering nor an absence of one is
+/// the truth.
 pub fn cross_kind_numeric_ordering<B>(
     left: &Value<B>,
     right: &Value<B>,
-) -> Option<core::cmp::Ordering>
+) -> Result<Option<core::cmp::Ordering>, EvaluationRefusal>
 where
     B: Backend<Int = i64, Float = f64, Decimal = bigdecimal::BigDecimal>,
 {
     use crate::backend::NumericWidening;
 
-    let (left_kind, right_kind) = (numeric_kind(left)?, numeric_kind(right)?);
+    let (Some(left_kind), Some(right_kind)) = (numeric_kind(left), numeric_kind(right)) else {
+        return Ok(None);
+    };
     if left_kind == right_kind {
         // Same scalar on both sides: not this function's question.
-        return None;
+        return Ok(None);
     }
-    match B::numeric_widening(left_kind, right_kind)? {
+    let Some(widening) = B::numeric_widening(left_kind, right_kind) else {
+        return Ok(None);
+    };
+    Ok(match widening {
         // Widened to a double on both sides, so this is a float pair and
         // the engine's float order governs it. Asking IEEE here is what
         // dropped a NaN row whose other operand was an `int`.
         NumericWidening::AtFloatWidth => {
-            B::FLOAT_ORDER.compare(at_float_width(left)?, at_float_width(right)?)
+            let (Some(left), Some(right)) = (at_float_width(left)?, at_float_width(right)?) else {
+                return Ok(None);
+            };
+            B::FLOAT_ORDER.compare(left, right)
         }
         // An exact comparison still has to order an infinity, which has
         // no decimal to be exact about: `BigDecimal::from_f64` answers
@@ -195,27 +218,55 @@ where
             if matches!(left, Value::Float(value) if !value.is_finite())
                 || matches!(right, Value::Float(value) if !value.is_finite()) =>
         {
-            B::FLOAT_ORDER.compare(at_float_width(left)?, at_float_width(right)?)
+            let (Some(left), Some(right)) = (at_float_width(left)?, at_float_width(right)?) else {
+                return Ok(None);
+            };
+            B::FLOAT_ORDER.compare(left, right)
         }
-        NumericWidening::Exact => exactly(left)?.partial_cmp(&exactly(right)?),
-    }
+        NumericWidening::Exact => {
+            let (Some(left), Some(right)) = (exactly(left), exactly(right)) else {
+                return Ok(None);
+            };
+            left.partial_cmp(&right)
+        }
+    })
 }
 
 /// One numeric operand as `f64`, reproducing a cast to `double precision`.
-fn at_float_width<B>(value: &Value<B>) -> Option<f64>
+///
+/// `Ok(None)` means the value is not numeric, which is a structural
+/// absence of order rather than a failure.
+///
+/// # Errors
+///
+/// [`EvaluationRefusal::DecimalOutsideFloatRange`] when an exact value has
+/// no double to be cast to. Measured on PostgreSQL 16, the server raises
+/// `out of range for type double precision` at either sign rather than
+/// answering, so this is neither an order nor the absence of one.
+///
+/// The conversion saturates rather than failing, so this answered an
+/// ordering against an infinity and reported the row as a match. Both the
+/// review that found it and the first reading of it here described the
+/// opposite mechanism, a dropped row; the row was matching.
+fn at_float_width<B>(value: &Value<B>) -> Result<Option<f64>, EvaluationRefusal>
 where
     B: Backend<Int = i64, Float = f64, Decimal = bigdecimal::BigDecimal>,
 {
     match value {
-        Value::Int(int) => Some(crate::backend::widen_i64_to_f64(*int)),
-        Value::Float(float) => Some(*float),
-        // The parse is the cast the server performs. A decimal outside
-        // `f64`'s range has no `double precision` to be cast to, so the
-        // pair has no order.
+        Value::Int(int) => Ok(Some(crate::backend::widen_i64_to_f64(*int))),
+        Value::Float(float) => Ok(Some(*float)),
+        // `to_f64` saturates rather than failing: a decimal past the
+        // double range converts to an infinity and answers `Some`. So the
+        // check is finiteness, not `None`. A decimal is never itself
+        // infinite, so an infinite conversion can only mean the value did
+        // not fit, which is the cast PostgreSQL refuses to perform.
         Value::Decimal(decimal) => {
-            <bigdecimal::BigDecimal as bigdecimal::ToPrimitive>::to_f64(decimal)
+            match <bigdecimal::BigDecimal as bigdecimal::ToPrimitive>::to_f64(decimal) {
+                Some(widened) if widened.is_finite() => Ok(Some(widened)),
+                _ => Err(EvaluationRefusal::DecimalOutsideFloatRange),
+            }
         }
-        _ => None,
+        _ => Ok(None),
     }
 }
 
@@ -245,7 +296,7 @@ pub fn values_equal<B: Backend>(
     comparison: ComparisonContext<'_, B>,
     a: &Value<B>,
     b: &Value<B>,
-) -> bool {
+) -> Result<bool, EvaluationRefusal> {
     B::scalars_equal(comparison, a, b)
 }
 
@@ -258,16 +309,16 @@ pub fn compare_ordered_values<B, F>(
     lhs: &Value<B>,
     rhs: &Value<B>,
     predicate: F,
-) -> Tri
+) -> Result<Tri, EvaluationRefusal>
 where
     B: Backend,
     F: FnOnce(core::cmp::Ordering) -> bool,
 {
-    match B::compare_scalars(comparison, lhs, rhs) {
+    Ok(match B::compare_scalars(comparison, lhs, rhs)? {
         Some(ordering) if predicate(ordering) => Tri::True,
         Some(_) => Tri::False,
         None => Tri::Unknown,
-    }
+    })
 }
 
 /// The descriptor the compiler resolves per compared column, and the backend
@@ -722,7 +773,8 @@ mod tests {
         fn values_equal_is_reflexive_for_present_values(v in arb_value()) {
             if is_present(&v) {
                 prop_assert!(
-                    values_equal(ComparisonContext::none(), &v, &v),
+                    values_equal(ComparisonContext::none(), &v, &v)
+                        .expect("reflexivity check: present value cannot refuse"),
                     "present value {:?} not equal to itself",
                     v,
                 );
@@ -736,7 +788,8 @@ mod tests {
         fn null_and_missing_are_not_self_equal(v in arb_value()) {
             if !is_present(&v) {
                 prop_assert!(
-                    !values_equal(ComparisonContext::none(), &v, &v),
+                    !values_equal(ComparisonContext::none(), &v, &v)
+                        .expect("absent-value check: missing/null cannot refuse"),
                     "absent value {:?} unexpectedly self-equal",
                     v,
                 );
@@ -751,7 +804,8 @@ mod tests {
                 && !numeric_pair(&a, &b)
             {
                 prop_assert!(
-                    !values_equal(ComparisonContext::none(), &a, &b),
+                    !values_equal(ComparisonContext::none(), &a, &b)
+                        .expect("cross-scalar equality: cannot refuse for non-numeric pair"),
                     "cross-scalar pair ({:?}, {:?}) reported equal",
                     a,
                     b,
@@ -772,7 +826,8 @@ mod tests {
                     Ordering::is_ge,
                 ];
                 for pred in preds {
-                    let got = compare_ordered_values(ComparisonContext::none(), &a, &b, pred);
+                    let got = compare_ordered_values(ComparisonContext::none(), &a, &b, pred)
+                        .expect("null/missing ordered comparison: cannot refuse");
                     prop_assert_eq!(
                         got,
                         Tri::Unknown,
@@ -799,7 +854,8 @@ mod tests {
         #[test]
         fn ordered_cmp_follows_postgres_nan_order(a in arb_value(), b in arb_value()) {
             if (is_nan(&a) || is_nan(&b)) && is_present(&a) && is_present(&b) {
-                let got = compare_ordered_values(ComparisonContext::none(), &a, &b, Ordering::is_lt);
+            let got = compare_ordered_values(ComparisonContext::none(), &a, &b, Ordering::is_lt)
+                .expect("NaN ordering check: cannot refuse for numeric pair");
                 let widened = |value: &Value<Postgres>| {
                     matches!(value, Value::Float(_) | Value::Int(_) | Value::Decimal(_))
                 };
@@ -830,7 +886,8 @@ mod tests {
             if core::mem::discriminant(&a) != core::mem::discriminant(&b)
                 && !numeric_pair(&a, &b)
             {
-                let got = compare_ordered_values(ComparisonContext::none(), &a, &b, Ordering::is_lt);
+                let got = compare_ordered_values(ComparisonContext::none(), &a, &b, Ordering::is_lt)
+                    .expect("incomparable-pair ordered comparison: cannot refuse");
                 prop_assert_eq!(
                     got,
                     Tri::Unknown,
@@ -846,7 +903,8 @@ mod tests {
         #[test]
         fn ordered_cmp_orders_booleans(a in arb_value(), b in arb_value()) {
             if let (Value::Bool(x), Value::Bool(y)) = (&a, &b) {
-                let got = compare_ordered_values(ComparisonContext::none(), &a, &b, Ordering::is_lt);
+                let got = compare_ordered_values(ComparisonContext::none(), &a, &b, Ordering::is_lt)
+                    .expect("bool ordering check: cannot refuse");
                 let expected = if !x && *y { Tri::True } else { Tri::False };
                 prop_assert_eq!(
                     got,
@@ -865,8 +923,10 @@ mod tests {
         /// mutually vacuous).
         #[test]
         fn lt_and_ge_partition_defined_pairs(a in arb_value(), b in arb_value()) {
-            let lt = compare_ordered_values(ComparisonContext::none(), &a, &b, Ordering::is_lt);
-            let ge = compare_ordered_values(ComparisonContext::none(), &a, &b, Ordering::is_ge);
+            let lt = compare_ordered_values(ComparisonContext::none(), &a, &b, Ordering::is_lt)
+                .expect("lt partition check: cannot refuse");
+            let ge = compare_ordered_values(ComparisonContext::none(), &a, &b, Ordering::is_ge)
+                .expect("ge partition check: cannot refuse");
             if lt != Tri::Unknown && ge != Tri::Unknown {
                 prop_assert_ne!(lt, ge, "`<` and `>=` agreed on ({:?}, {:?})", a, b);
             }
@@ -882,21 +942,13 @@ mod tests {
         // A numeric pair is compared under the backend's widening, which
         // is what the engine does: `1 = 1.0` is a row.
         let float_one = Value::<Postgres>::Float(1.0);
-        assert!(values_equal(
-            ComparisonContext::none(),
-            &int_one,
-            &float_one
-        ));
-        assert!(values_equal(
-            ComparisonContext::none(),
-            &float_one,
-            &int_one
-        ));
+        assert!(values_equal(ComparisonContext::none(), &int_one, &float_one).unwrap());
+        assert!(values_equal(ComparisonContext::none(), &float_one, &int_one).unwrap());
 
         // Outside it, nothing coerces: PostgreSQL has no operator for this
         // pair, so there is nothing to reproduce.
         let str_one = Value::<Postgres>::String("1".to_string());
-        assert!(!values_equal(ComparisonContext::none(), &int_one, &str_one));
+        assert!(!values_equal(ComparisonContext::none(), &int_one, &str_one).unwrap());
     }
 
     /// Ordered comparison on `Bool` follows SQL's boolean order rather
@@ -906,15 +958,15 @@ mod tests {
         let f = Value::<Postgres>::Bool(false);
         let t = Value::<Postgres>::Bool(true);
         assert_eq!(
-            compare_ordered_values(ComparisonContext::none(), &f, &t, Ordering::is_lt),
+            compare_ordered_values(ComparisonContext::none(), &f, &t, Ordering::is_lt).unwrap(),
             Tri::True
         );
         assert_eq!(
-            compare_ordered_values(ComparisonContext::none(), &t, &f, Ordering::is_lt),
+            compare_ordered_values(ComparisonContext::none(), &t, &f, Ordering::is_lt).unwrap(),
             Tri::False
         );
         assert_eq!(
-            compare_ordered_values(ComparisonContext::none(), &t, &t, Ordering::is_le),
+            compare_ordered_values(ComparisonContext::none(), &t, &t, Ordering::is_le).unwrap(),
             Tri::True
         );
     }
@@ -926,11 +978,11 @@ mod tests {
         let a = Value::<Postgres>::Bytes(vec![0, 1, 2]);
         let b = Value::<Postgres>::Bytes(vec![0, 1, 3]);
         assert_eq!(
-            compare_ordered_values(ComparisonContext::none(), &a, &b, Ordering::is_lt),
+            compare_ordered_values(ComparisonContext::none(), &a, &b, Ordering::is_lt).unwrap(),
             Tri::True
         );
         assert_eq!(
-            compare_ordered_values(ComparisonContext::none(), &b, &a, Ordering::is_lt),
+            compare_ordered_values(ComparisonContext::none(), &b, &a, Ordering::is_lt).unwrap(),
             Tri::False
         );
     }

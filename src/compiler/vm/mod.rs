@@ -331,8 +331,9 @@ impl<B: Backend> Vm<B> {
             }
 
             Instruction::NotEqual(comparison) => {
-                let result = self
-                    .compare_values(program, *comparison, |ctx, a, b| !values_equal(ctx, a, b))?;
+                let result = self.compare_values(program, *comparison, |ctx, a, b| {
+                    values_equal(ctx, a, b).map(|equal| !equal)
+                })?;
                 self.stack.push(StackValue::Tri(result));
             }
 
@@ -431,7 +432,7 @@ impl<B: Backend> Vm<B> {
                 for lit in literals {
                     if lit.is_absent() {
                         has_null_rhs = true;
-                    } else if values_equal(ctx, &value, lit) {
+                    } else if values_equal(ctx, &value, lit).map_err(VmError::Refused)? {
                         found = true;
                         break;
                     }
@@ -466,13 +467,15 @@ impl<B: Backend> Vm<B> {
                     &value,
                     &lower,
                     |ord| !matches!(ord, core::cmp::Ordering::Less),
-                );
+                )
+                .map_err(VmError::Refused)?;
                 let le_upper = compare_ordered_values(
                     comparison_context(program, *upper_facts)?,
                     &value,
                     &upper,
                     |ord| !matches!(ord, core::cmp::Ordering::Greater),
-                );
+                )
+                .map_err(VmError::Refused)?;
 
                 let result = ge_lower.and(le_upper);
                 self.stack.push(StackValue::Tri(result));
@@ -644,7 +647,11 @@ impl<B: Backend> Vm<B> {
         f: F,
     ) -> Result<Tri, VmError>
     where
-        F: FnOnce(ComparisonContext<'_, B>, &Value<B>, &Value<B>) -> bool,
+        F: FnOnce(
+            ComparisonContext<'_, B>,
+            &Value<B>,
+            &Value<B>,
+        ) -> Result<bool, crate::compiler::vm::refusal::EvaluationRefusal>,
     {
         let b = self.pop_value()?;
         let a = self.pop_value()?;
@@ -654,7 +661,7 @@ impl<B: Backend> Vm<B> {
         }
 
         let ctx = comparison_context(program, comparison)?;
-        Ok(if f(ctx, &a, &b) {
+        Ok(if f(ctx, &a, &b).map_err(VmError::Refused)? {
             Tri::True
         } else {
             Tri::False
@@ -672,12 +679,8 @@ impl<B: Backend> Vm<B> {
     {
         let b = self.pop_value()?;
         let a = self.pop_value()?;
-        Ok(compare_ordered_values(
-            comparison_context(program, comparison)?,
-            &a,
-            &b,
-            f,
-        ))
+        compare_ordered_values(comparison_context(program, comparison)?, &a, &b, f)
+            .map_err(VmError::Refused)
     }
 }
 

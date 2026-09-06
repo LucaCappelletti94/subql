@@ -226,6 +226,7 @@ fn mysql_binary_collation_padding_is_per_collation() {
             "a binary collation is reproducible: {collation}"
         );
         MySql::scalars_equal(context, &padded, &bare)
+            .expect("scalars_equal cannot refuse for in-range string comparison")
     };
 
     assert!(

@@ -375,15 +375,20 @@ pub trait Backend: 'static {
     /// perform. A backend on the standard carriers delegates to
     /// [`crate::backend::cross_kind_numeric_ordering`], which
     /// reads the policy from [`Backend::numeric_widening`].
-    #[must_use]
+    ///
+    /// # Errors
+    ///
+    /// [`crate::EvaluationRefusal`] when the engine raises rather than
+    /// answering. The standard widening raises when an exact operand has
+    /// no `double precision` to be cast to.
     fn compare_cross_kind_numeric(
         _left: &Value<Self>,
         _right: &Value<Self>,
-    ) -> Option<core::cmp::Ordering>
+    ) -> Result<Option<core::cmp::Ordering>, crate::EvaluationRefusal>
     where
         Self: Sized,
     {
-        None
+        Ok(None)
     }
 
     /// What this backend answers when a divisor is zero.
@@ -525,12 +530,16 @@ pub trait Backend: 'static {
     /// comparator can reproduce, `char(n)` padding, a cross-width numeric
     /// pair) overrides this and reads the context, which is why the context
     /// carries both sides rather than one.
-    #[must_use]
+    ///
+    /// # Errors
+    ///
+    /// [`crate::EvaluationRefusal`] when the engine raises for this pair
+    /// rather than answering it.
     fn scalars_equal(
         comparison: super::scalar_value::ComparisonContext<'_, Self>,
         left: &Value<Self>,
         right: &Value<Self>,
-    ) -> bool
+    ) -> Result<bool, crate::EvaluationRefusal>
     where
         Self: Sized,
     {
@@ -541,12 +550,15 @@ pub trait Backend: 'static {
     /// no defined order, which the caller lifts to `Tri::Unknown`.
     ///
     /// Same contract as [`Backend::scalars_equal`].
-    #[must_use]
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Backend::scalars_equal`].
     fn compare_scalars(
         comparison: super::scalar_value::ComparisonContext<'_, Self>,
         left: &Value<Self>,
         right: &Value<Self>,
-    ) -> Option<core::cmp::Ordering>
+    ) -> Result<Option<core::cmp::Ordering>, crate::EvaluationRefusal>
     where
         Self: Sized,
     {

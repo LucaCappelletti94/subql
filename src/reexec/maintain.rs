@@ -141,8 +141,13 @@ impl<B: Backend> MinMaxQuery<B> {
             ScalarAggKind::Min => |o| o == Ordering::Less,
             ScalarAggKind::Max => |o| o == Ordering::Greater,
         };
+        // A refusal is undecidable, which is exactly what `None` already
+        // means here: the caller reads the database instead. Cross-kind
+        // cannot arise on one column's own values, so this is a guard
+        // rather than a live path, and a guard is the point: assuming it
+        // unreachable is how the comparison came to drop rows in silence.
         Some(matches!(
-            compare_ordered_values(ComparisonContext::none(), candidate, current, wins),
+            compare_ordered_values(ComparisonContext::none(), candidate, current, wins).ok()?,
             Tri::True
         ))
     }
@@ -203,7 +208,11 @@ impl<B: Backend> MinMaxQuery<B> {
             return Maintenance::NeedsReexecution;
         };
         let value = self.agg_value(event, row, db);
-        if !value.is_absent() && values_equal(ComparisonContext::none(), &value, current) {
+        // A refusal cannot say whether the extreme left, so the safe answer
+        // is the one that asks the database.
+        if !value.is_absent()
+            && values_equal(ComparisonContext::none(), &value, current).unwrap_or(true)
+        {
             // The current extreme (or a tie of it) was removed, the next
             // extreme is unknown without a scan.
             Maintenance::NeedsReexecution
@@ -473,7 +482,7 @@ impl<B: Backend + SqlLiteralParse, C: Checkpoint> GroupedMinMaxQuery<B, C> {
         };
         matches!(
             compare_ordered_values(ComparisonContext::none(), candidate, current, wins),
-            Tri::True
+            Ok(Tri::True)
         )
     }
 
@@ -496,7 +505,7 @@ impl<B: Backend + SqlLiteralParse, C: Checkpoint> GroupedMinMaxQuery<B, C> {
                         threshold,
                         move |ordering| op.admits(ordering),
                     ),
-                    Tri::True
+                    Ok(Tri::True)
                 )
             }
             Some(crate::reexec::plan::GroupedHavingCheck::RowCount { op, threshold }) => {
@@ -515,10 +524,9 @@ impl<B: Backend + SqlLiteralParse, C: Checkpoint> GroupedMinMaxQuery<B, C> {
         group: &mut GroupedExtreme<B>,
     ) -> Option<crate::AggregateValueChange<B>> {
         if Self::passes(having, &group.current, group.rows) {
-            let repeat = group
-                .announced
-                .as_ref()
-                .is_some_and(|seen| values_equal(ComparisonContext::none(), seen, &group.current));
+            let repeat = group.announced.as_ref().is_some_and(|seen| {
+                values_equal(ComparisonContext::none(), seen, &group.current).unwrap_or(false)
+            });
             group.announced = Some(group.current.clone());
             return (!repeat).then(|| {
                 crate::AggregateValueChange::Set(crate::AggregateResultValue::Scalar(
@@ -584,6 +592,7 @@ impl<B: Backend + SqlLiteralParse, C: Checkpoint> GroupedMinMaxQuery<B, C> {
                         }
                     } else if !row.value.is_absent()
                         && values_equal(ComparisonContext::none(), &row.value, &group.current)
+                            .unwrap_or(true)
                     {
                         refresh.insert(row.key.clone(), row.values.clone());
                     } else {

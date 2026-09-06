@@ -338,3 +338,96 @@ fn sqlite_orders_an_infinity_against_an_integer() {
         "and a negative infinity is below every integer"
     );
 }
+
+/// A decimal too large for `double precision` refuses the comparison
+/// rather than answering it.
+///
+/// The `AtFloatWidth` rule casts the exact side to a double, which is what
+/// PostgreSQL does, and a `NUMERIC` has no bound while a double does.
+/// Measured on PostgreSQL 16, the server does not answer such a pair at
+/// all:
+///
+/// ```text
+/// 1e300::numeric > 1.5::float8      t
+/// 1e309::numeric > 1.5::float8      ERROR: out of range for type double precision
+/// (-1e309)::numeric > 1.5::float8   ERROR: out of range for type double precision
+/// 1e309::numeric::float8            ERROR: out of range for type double precision
+/// ```
+///
+/// So this is a per-row refusal and not a no-match. Answering `Unknown`
+/// dropped the row in silence, which is a subscriber quietly missing an
+/// answer the database would have refused to give; answering an ordering
+/// by treating the value as an infinity would be worse, since it invents a
+/// result the server declines to produce.
+///
+/// PostgreSQL only. MySQL's `DECIMAL` holds at most 65 digits, far inside
+/// the double range, and SQLite compares an integer against a real through
+/// the exact rule instead.
+#[test]
+fn a_decimal_past_the_double_range_refuses_the_comparison() {
+    let db = ParserDB::parse::<PostgreSqlDialect>(PG_DDL).expect("DDL parses");
+    let table = catalog_helpers::table_id(&db, "t").expect("t is in the catalog");
+    let mut engine: SubscriptionEngine<TestEvent<Postgres>, DefaultIds, ParserDB> =
+        SubscriptionEngine::new(db, PostgreSqlDialect {});
+    let subscription = engine
+        .register(SubscriptionRequest::new(
+            1u64,
+            "SELECT * FROM t WHERE amount > price",
+        ))
+        .expect("the comparison registers")
+        .subscription_id;
+
+    let huge = "1".to_string() + &"0".repeat(309);
+    let refused = engine
+        .consumers(&TestEvent::insert(table, row(5, 1.5, &huge, "paid")))
+        .expect("dispatch succeeds");
+    assert_eq!(
+        refused
+            .evaluation_failures()
+            .iter()
+            .map(|failure| (failure.subscription_id, failure.refusal))
+            .collect::<Vec<_>>(),
+        vec![(
+            subscription,
+            subql::EvaluationRefusal::DecimalOutsideFloatRange
+        )],
+        "the report names the subscription and the operand the server will not cast"
+    );
+    assert!(
+        refused.inserted().is_empty(),
+        "a refusal is not a match, and not a no-match either"
+    );
+
+    // Both signs, because the server raises for both and a check that
+    // looked only at one would pass the test above while letting the
+    // other through.
+    let huge_negative = "-".to_string() + &huge;
+    let refused_negative = engine
+        .consumers(&TestEvent::insert(
+            table,
+            row(5, 1.5, &huge_negative, "paid"),
+        ))
+        .expect("dispatch succeeds");
+    assert_eq!(
+        refused_negative
+            .evaluation_failures()
+            .iter()
+            .map(|failure| failure.refusal)
+            .collect::<Vec<_>>(),
+        vec![subql::EvaluationRefusal::DecimalOutsideFloatRange],
+        "measured: PostgreSQL raises for the negative overflow too"
+    );
+
+    // A decimal the double range holds is answered, so the refusal is
+    // about the range and not about the pairing.
+    assert!(
+        notifies!(
+            Postgres,
+            PostgreSqlDialect,
+            PG_DDL,
+            "SELECT * FROM t WHERE amount > price",
+            row(5, 1.5, "1e300", "paid")
+        ),
+        "measured as true: 1e300 is inside the double range"
+    );
+}

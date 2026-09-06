@@ -287,7 +287,7 @@ impl<V: postgres_jsonb_canonical::PgVersion + 'static> Backend for Postgres<V> {
     fn compare_cross_kind_numeric(
         left: &Value<Self>,
         right: &Value<Self>,
-    ) -> Option<core::cmp::Ordering> {
+    ) -> Result<Option<core::cmp::Ordering>, crate::EvaluationRefusal> {
         crate::backend::cross_kind_numeric_ordering(left, right)
     }
 
@@ -302,8 +302,8 @@ impl<V: postgres_jsonb_canonical::PgVersion + 'static> Backend for Postgres<V> {
         comparison: super::scalar_value::ComparisonContext<'_, Self>,
         left: &Value<Self>,
         right: &Value<Self>,
-    ) -> bool {
-        match (left, right) {
+    ) -> Result<bool, crate::EvaluationRefusal> {
+        Ok(match (left, right) {
             (Value::Float(x), Value::Float(y)) if x.is_nan() || y.is_nan() => {
                 x.is_nan() && y.is_nan()
             }
@@ -314,8 +314,8 @@ impl<V: postgres_jsonb_canonical::PgVersion + 'static> Backend for Postgres<V> {
             (Value::String(x), Value::String(y)) => {
                 comparison.text.unwrap_or(TextRule::EXACT).equal(x, y)
             }
-            _ => crate::compiler::value_cmp::structural_equality(comparison, left, right),
-        }
+            _ => crate::compiler::value_cmp::structural_equality(comparison, left, right)?,
+        })
     }
 
     /// NaN is PostgreSQL's largest float: above every non-NaN value, and
@@ -326,11 +326,11 @@ impl<V: postgres_jsonb_canonical::PgVersion + 'static> Backend for Postgres<V> {
         comparison: super::scalar_value::ComparisonContext<'_, Self>,
         left: &Value<Self>,
         right: &Value<Self>,
-    ) -> Option<core::cmp::Ordering> {
-        match (left, right) {
+    ) -> Result<Option<core::cmp::Ordering>, crate::EvaluationRefusal> {
+        Ok(match (left, right) {
             (Value::Float(x), Value::Float(y)) => Self::FLOAT_ORDER.compare(*x, *y),
-            _ => crate::compiler::value_cmp::structural_ordering(comparison, left, right),
-        }
+            _ => crate::compiler::value_cmp::structural_ordering(comparison, left, right)?,
+        })
     }
 
     fn group_key_encoder(
@@ -559,7 +559,7 @@ impl Backend for MySql {
     fn compare_cross_kind_numeric(
         left: &Value<Self>,
         right: &Value<Self>,
-    ) -> Option<core::cmp::Ordering> {
+    ) -> Result<Option<core::cmp::Ordering>, crate::EvaluationRefusal> {
         crate::backend::cross_kind_numeric_ordering(left, right)
     }
 
@@ -834,7 +834,7 @@ impl Backend for SQLite {
     fn compare_cross_kind_numeric(
         left: &Value<Self>,
         right: &Value<Self>,
-    ) -> Option<core::cmp::Ordering> {
+    ) -> Result<Option<core::cmp::Ordering>, crate::EvaluationRefusal> {
         crate::backend::cross_kind_numeric_ordering(left, right)
     }
 
