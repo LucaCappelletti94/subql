@@ -477,27 +477,13 @@ where
         self
     }
 
-    /// Configure a minimum interval between two re-executions of the
-    /// same captured query.
+    /// Rate-limit re-executions of one captured query, requiring
+    /// [`with_clock`](Self::with_clock).
     ///
-    /// A trigger inside the window is dropped: the connector is not
-    /// called and no [`ScalarUpdate`](super::ScalarUpdate) is emitted.
-    /// Requires [`with_clock`](Self::with_clock); without a clock this
-    /// setting is ignored.
-    ///
-    /// It is not dropped silently. `apply` reports it through
-    /// [`Dispatched::debounced`](super::Dispatched::debounced), which is
-    /// what lets a caller tell a fully answered event from one whose
-    /// refresh was deliberately discarded.
-    ///
-    /// Nor does the engine's stored value stay current. This used to say
-    /// it did, on the reasoning that the prior re-execution had just set
-    /// it, and that is wrong twice over: the dropped trigger existed
-    /// because something changed, and nothing schedules a replacement
-    /// read when the window expires. Only the next CDC event for that
-    /// query queues one, so if none arrives the value stays as it is
-    /// indefinitely rather than for this duration. The window is a rate
-    /// limit, not a bound on staleness.
+    /// A trigger inside the window is discarded rather than deferred and
+    /// reported through
+    /// [`Dispatched::debounced`](super::Dispatched::debounced); nothing
+    /// reschedules it, so the held value can be stale indefinitely.
     #[must_use]
     pub const fn with_debounce_per_query(mut self, debounce: Duration) -> Self {
         self.debounce = Some(debounce);
@@ -541,10 +527,7 @@ where
     /// subscription and group so a burst costs one read. A read inside its
     /// debounce window is dropped, exactly as the fused path dropped it.
     ///
-    /// Answers `false` when the debounce window dropped the trigger, so a
-    /// caller counting what it queued can also count what it discarded.
-    /// The two are different facts: a dropped read is not deferred, and
-    /// the queue depth alone cannot express one.
+    /// `false` when the debounce window discarded the trigger.
     pub(super) fn enqueue_read(
         &mut self,
         trigger: super::ReExecutionTrigger<I, E::Checkpoint, E::Backend>,
@@ -597,17 +580,8 @@ where
             triggers,
             transitions,
         } = self.inner.reread_notifications(event)?;
-        // Both are `Vec::new()` by construction: the core holds no
-        // connector, so it cannot fill either, and this path is why
-        // `Dispatched` does not carry them.
-        //
-        // This assertion is debug-time only and does not prevent a
-        // production drop. Naming the fields does not help either: they
-        // exist, so destructuring them keeps compiling whatever the core
-        // starts putting in them. The invariant belongs to the core, so it
-        // is enforced there, by
-        // `runtime::engine::tests::the_core_delivers_no_read_answers`,
-        // which fails if `reread_notifications` ever fills either channel.
+        // Debug-time only. The invariant is the core's and is enforced
+        // there by `the_core_delivers_no_read_answers`.
         debug_assert!(
             rows_updates.is_empty() && row_deltas.is_empty(),
             "the core has no connector, so it cannot deliver read answers"
@@ -638,8 +612,7 @@ where
     /// becomes the read that answers it, deduplicated and debounced like
     /// every other discovered read.
     ///
-    /// Answers how many of them the debounce window dropped, so `apply`
-    /// can report a deliberate drop rather than leaving it invisible.
+    /// Answers how many the debounce window discarded.
     fn enqueue_unanswered(
         &mut self,
         notifications: &crate::ConsumerNotifications<I, E::Checkpoint, E::Backend>,
@@ -2350,14 +2323,8 @@ mod tests {
         assert_eq!(queries[0].binds(), &[Value::String("paid".into())]);
     }
 
-    /// A debounced unanswered-cell read is reported too.
-    ///
-    /// Two paths queue reads in `apply`: the core's own triggers, and the
-    /// subscriptions whose predicate read a cell the event did not carry.
-    /// Both go through `enqueue_read`, so both can be dropped by the
-    /// window, and the mutation battery showed that dropping the second
-    /// contribution to the count reddened nothing: the debounce test
-    /// exercises only the trigger path.
+    /// `debounced` counts the unanswered-cell path, not only the trigger
+    /// path.
     #[expect(
         clippy::clone_on_ref_ptr,
         reason = "the clone below performs the Arc<ManualClock> to Arc<dyn Clock> \
@@ -2419,22 +2386,8 @@ mod tests {
         );
     }
 
-    /// What a dispatched event reports about the work it left behind.
-    ///
-    /// A guard for a type change rather than a failing test, and the
-    /// distinction is worth stating: nothing answered wrongly before this,
-    /// a caller simply could not learn that reads were queued.
-    /// `ReExecNotifications.triggers` is documented as the queries the
-    /// materializer must re-execute, and this wrapper drained it into its
-    /// own queue and returned the field empty, while `rows_updates` and
-    /// `row_deltas` are empty by construction on that path. So the
-    /// obligation read zero and the results read empty, both correctly and
-    /// both misleadingly. `Dispatched` omits all three.
-    ///
-    /// The count itself is a real contract with several ways to be wrong,
-    /// which is what the mutation battery is for: it must be the depth of
-    /// the queue now, not a constant, not one per event, and not the number
-    /// ever queued.
+    /// `outstanding` is the queue's depth now: not a constant, not one per
+    /// event, and not the number ever queued.
     #[test]
     fn a_dispatch_reports_the_reads_it_queued() {
         let (mut engine, table) = engine_with_values(alloc::vec![]);
@@ -2480,9 +2433,7 @@ mod tests {
             "a burst coalesces, so the report does not count events"
         );
 
-        // A second subscription makes the depth two, so the report cannot
-        // be a flag wearing a number's clothes. With one queued read a
-        // count collapsed to `min(1)` would have passed everything above.
+        // Depth two, so a count collapsed to `min(1)` cannot pass.
         engine
             .register(
                 SubscriptionRequest::new(2u64, "SELECT DISTINCT quantity FROM orders"),
@@ -2497,8 +2448,7 @@ mod tests {
             "two subscriptions each queued one read, so the depth is two"
         );
 
-        // One page per queued read: two subscriptions now have one each,
-        // and the mock refuses a cursor it has no page for.
+        // The mock refuses a cursor it has no page for.
         engine
             .connector()
             .cursor_pages
@@ -2929,10 +2879,7 @@ mod tests {
         // The engine's MIN is currently 7.0 from the prior re-exec. To
         // force a second trigger we delete a row matching 7.0.
         let dispatched = e.apply(&delete_event(tid, 2, 7.0)).unwrap();
-        // The drop is reported rather than left invisible. `outstanding`
-        // alone cannot say it: the trigger was discarded, not deferred, so
-        // the queue is empty and a caller reading only the depth would
-        // take a deliberately unrefreshed event for a finished one.
+        // The queue is empty because the trigger was discarded.
         assert_eq!(
             dispatched.debounced, 1,
             "the window dropped this event's read and the report says so"

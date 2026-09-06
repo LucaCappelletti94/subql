@@ -1680,13 +1680,9 @@ mod tests {
         assert_eq!(e.connector().call_count(), 0);
     }
 
-    /// The mirror of `auto::tests::a_dispatch_reports_the_reads_it_queued`.
-    ///
-    /// `apply` is shared, so this covers the same line twice, and that is
-    /// the point rather than an oversight: on this branch a mutation
-    /// proved the async wrapper is held to its behaviour only because its
-    /// suite mirrors the sync one, so a shared line with a single test
-    /// stays correct for one mode by luck.
+    /// Mirrors `auto::tests::a_dispatch_reports_the_reads_it_queued`,
+    /// because a shared line tested on one side only is correct for the
+    /// other by luck.
     #[test]
     fn async_dispatch_reports_the_reads_it_queued() {
         let (mut e, tid) = engine_with_values(vec![]);
@@ -1717,10 +1713,7 @@ mod tests {
             "a burst coalesces, so the report does not count events"
         );
 
-        // Two subscriptions make the depth two, so the report cannot be a
-        // flag wearing a number's clothes. With one queued read a count
-        // collapsed to `min(1)` passed everything above, which is exactly
-        // what the mutation battery caught here and not on the sync side.
+        // Depth two, so a count collapsed to `min(1)` cannot pass.
         e.register(
             SubscriptionRequest::new(2u64, "SELECT DISTINCT quantity FROM orders"),
             (),
@@ -1734,8 +1727,7 @@ mod tests {
             "two subscriptions each queued one read, so the depth is two"
         );
 
-        // One page per queued read: the mock refuses a cursor it has no
-        // page for.
+        // The mock refuses a cursor it has no page for.
         e.connector().cursor_pages.lock().extend([
             crate::reexec::RowPage {
                 columns: vec![String::from("status")],

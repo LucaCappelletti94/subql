@@ -5030,20 +5030,8 @@ mod tests {
 
     type Engine = SubscriptionEngine<TestEvent<Postgres>, DefaultIds, ParserDB>;
 
-    /// The core delivers no read answers, because it holds no connector.
-    ///
-    /// `rows_updates` and `row_deltas` are `Vec::new()` where
-    /// `reread_notifications` builds its result, and the auto-resolving
-    /// wrapper relies on that: its own `Dispatched` omits both fields
-    /// entirely, so anything the core put there would be dropped rather
-    /// than delivered.
-    ///
-    /// Enforced here rather than at the wrapper. A review pointed out that
-    /// the wrapper's `debug_assert` cannot prevent a production drop, and
-    /// that naming the fields in a destructuring pattern does not help
-    /// either: the fields exist, so the pattern keeps compiling whatever
-    /// the core starts putting in them. The invariant is the core's, so
-    /// this fails at the source if it is ever broken.
+    /// The core delivers no read answers, holding no connector, which the
+    /// auto-resolving wrapper relies on by omitting both channels.
     #[test]
     fn the_core_delivers_no_read_answers() {
         let database = ParserDB::parse::<PostgreSqlDialect>(DDL).expect("the DDL parses");
