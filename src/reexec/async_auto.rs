@@ -10,7 +10,6 @@
 use super::async_connector::AsyncConnector;
 use super::auto::{reconcile_checkpoint, AutoResolvingEngine, ResolverMode, SnapshotResult};
 use super::connector::ReExecError;
-use super::engine::ReExecNotifications;
 use crate::backend::{Backend, CdcEvent, Value};
 use crate::compiler::literals::SqlLiteralParse;
 use crate::{IdTypes, SubscriptionId};
@@ -1000,7 +999,7 @@ where
     X: AsyncConnector<Backend = E::Backend>,
     X::AuthContext: Send + Sync,
 {
-    type Notifications = ReExecNotifications<I, E::Backend, E::Checkpoint>;
+    type Notifications = super::Dispatched<I, E::Backend, E::Checkpoint>;
     type Error = crate::DispatchError;
 
     #[allow(clippy::manual_async_fn)]
@@ -1677,8 +1676,79 @@ mod tests {
 
         let n = e.apply(&event).unwrap();
         assert!(n.scalar_updates.is_empty());
-        assert!(n.triggers.is_empty());
+        assert_eq!(n.outstanding, 0, "nothing was queued either");
         assert_eq!(e.connector().call_count(), 0);
+    }
+
+    /// Mirrors `auto::tests::a_dispatch_reports_the_reads_it_queued`,
+    /// because a shared line tested on one side only is correct for the
+    /// other by luck.
+    #[test]
+    fn async_dispatch_reports_the_reads_it_queued() {
+        let (mut e, tid) = engine_with_values(vec![]);
+        e.register(
+            SubscriptionRequest::new(1u64, "SELECT DISTINCT status FROM orders"),
+            (),
+        )
+        .expect("whole read registers");
+
+        let queued = e
+            .apply(&insert_event(tid, 1, 5.0))
+            .expect("the event applies");
+        assert_eq!(
+            queued.outstanding,
+            e.pending_read_count(),
+            "the report is the depth of the queue, not a guess about it"
+        );
+        assert!(
+            queued.outstanding > 0,
+            "a whole-result subscription queues a read for this event"
+        );
+
+        let again = e
+            .apply(&insert_event(tid, 2, 6.0))
+            .expect("the event applies");
+        assert_eq!(
+            again.outstanding, queued.outstanding,
+            "a burst coalesces, so the report does not count events"
+        );
+
+        // Depth two, so a count collapsed to `min(1)` cannot pass.
+        e.register(
+            SubscriptionRequest::new(2u64, "SELECT DISTINCT quantity FROM orders"),
+            (),
+        )
+        .expect("a second whole read registers");
+        let two = e
+            .apply(&insert_event(tid, 4, 8.0))
+            .expect("the event applies");
+        assert_eq!(
+            two.outstanding, 2,
+            "two subscriptions each queued one read, so the depth is two"
+        );
+
+        // The mock refuses a cursor it has no page for.
+        e.connector().cursor_pages.lock().extend([
+            crate::reexec::RowPage {
+                columns: vec![String::from("status")],
+                rows: vec![vec![Value::String("paid".into())]],
+                more: false,
+            },
+            crate::reexec::RowPage {
+                columns: vec![String::from("quantity")],
+                rows: vec![vec![Value::Int(1)]],
+                more: false,
+            },
+        ]);
+        block_on(e.resolve_collect()).expect("the reads run");
+        let settled = e
+            .apply(&update_status_only(tid, 3, 7.0))
+            .expect("the event applies");
+        assert_eq!(
+            e.pending_read_count(),
+            settled.outstanding,
+            "and it still agrees with the queue after a drain"
+        );
     }
 
     /// `snapshot` on an unknown id returns `Ok(None)`.

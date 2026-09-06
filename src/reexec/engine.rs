@@ -223,6 +223,39 @@ pub struct ReExecNotifications<I: IdTypes, B: Backend, C: crate::Checkpoint = cr
     pub transitions: Vec<crate::MaintenanceTransition<B>>,
 }
 
+/// Everything one dispatched event produced when the engine owns the
+/// connector and does the reads itself.
+///
+/// Carries no `rows_updates`, `row_deltas` or `triggers`: this engine
+/// queues its own reads, and their answers arrive only through
+/// [`resolve`](crate::reexec::AutoResolvingEngine::resolve).
+pub struct Dispatched<I: IdTypes, B: Backend, C: crate::Checkpoint = crate::NoCheckpoint> {
+    /// View-relative notifications from the core engine.
+    pub engine: ConsumerNotifications<I, C, B>,
+    /// Grouped aggregate rows written or removed in process.
+    pub aggregate_updates: Vec<crate::AggregateValueUpdate<I, B>>,
+    /// Scalar values that changed in process, with no database round trip.
+    pub scalar_updates: Vec<ScalarUpdate<I, B, C>>,
+    /// Subscriptions that changed maintenance tier.
+    pub transitions: Vec<crate::MaintenanceTransition<B>>,
+    /// Depth of the read queue after this event.
+    ///
+    /// Not a completeness signal, and not a promise about which channels
+    /// `resolve` will deliver: a refused predicate queues no read and is
+    /// reported through
+    /// [`engine.evaluation_failures`](crate::ConsumerNotifications::evaluation_failures)
+    /// instead.
+    pub outstanding: usize,
+    /// Reads discarded because one for the same subscription and group ran
+    /// inside the [debounce
+    /// window](crate::reexec::AutoResolvingEngine::with_debounce_per_query).
+    ///
+    /// Discarded, not deferred: nothing reschedules when the window
+    /// expires, so the window rate-limits reads and does not bound
+    /// staleness.
+    pub debounced: usize,
+}
+
 /// One result delivered by `resolve` as its read completes.
 ///
 /// The sink receives each installed answer the moment its read finishes,

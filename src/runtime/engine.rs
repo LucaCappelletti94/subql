@@ -5030,6 +5030,43 @@ mod tests {
 
     type Engine = SubscriptionEngine<TestEvent<Postgres>, DefaultIds, ParserDB>;
 
+    /// The core delivers no read answers, holding no connector, which the
+    /// auto-resolving wrapper relies on by omitting both channels.
+    #[test]
+    fn the_core_delivers_no_read_answers() {
+        let database = ParserDB::parse::<PostgreSqlDialect>(DDL).expect("the DDL parses");
+        let table = crate::catalog_helpers::table_id(&database, "orders").expect("orders resolves");
+        let mut engine: Engine = SubscriptionEngine::new(database, PostgreSqlDialect {});
+        engine
+            .register(SubscriptionRequest::new(
+                1u64,
+                "SELECT * FROM orders WHERE status = 'paid'",
+            ))
+            .expect("the filter registers");
+
+        let event = TestEvent::<Postgres>::insert(
+            table,
+            alloc::vec![Value::Int(1), Value::Int(5), Value::String("paid".into()),],
+        )
+        .with_pk_columns([0u16]);
+        let notifications = engine
+            .reread_notifications(&event)
+            .expect("the event dispatches");
+        assert_eq!(
+            notifications.engine.inserted(),
+            [1],
+            "the event matched, so the emptiness below is about read answers"
+        );
+        assert!(
+            notifications.rows_updates.is_empty(),
+            "the core has no connector, so it cannot page a whole result"
+        );
+        assert!(
+            notifications.row_deltas.is_empty(),
+            "nor answer a keyed read"
+        );
+    }
+
     struct CountingEvent {
         inner: TestEvent<Postgres>,
         table_id_calls: core::cell::Cell<usize>,

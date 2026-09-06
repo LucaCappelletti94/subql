@@ -477,14 +477,13 @@ where
         self
     }
 
-    /// Configure a minimum interval between two re-executions of the
-    /// same captured query.
+    /// Rate-limit re-executions of one captured query, requiring
+    /// [`with_clock`](Self::with_clock).
     ///
-    /// Triggers within the window are silently dropped: the connector is
-    /// not called and no [`ScalarUpdate`](super::ScalarUpdate) is emitted (the engine's stored
-    /// value, set by the prior re-execution, remains current). Requires
-    /// [`with_clock`](Self::with_clock). Without a clock the debounce
-    /// config is ignored.
+    /// A trigger inside the window is discarded rather than deferred and
+    /// reported through
+    /// [`Dispatched::debounced`](super::Dispatched::debounced). Nothing
+    /// reschedules it, so the held value can be stale indefinitely.
     #[must_use]
     pub const fn with_debounce_per_query(mut self, debounce: Duration) -> Self {
         self.debounce = Some(debounce);
@@ -527,14 +526,17 @@ where
     /// Queue one discovered read, replacing a queued read of the same
     /// subscription and group so a burst costs one read. A read inside its
     /// debounce window is dropped, exactly as the fused path dropped it.
+    ///
+    /// `false` when the debounce window discarded the trigger.
     pub(super) fn enqueue_read(
         &mut self,
         trigger: super::ReExecutionTrigger<I, E::Checkpoint, E::Backend>,
-    ) {
+    ) -> bool {
         if self.debounce_skip(trigger.subscription_id, &trigger.read) {
-            return;
+            return false;
         }
         self.pending_reads.enqueue(trigger);
+        true
     }
 
     /// Drop one queued read after its answer was installed and delivered.
@@ -568,7 +570,7 @@ where
     pub fn apply(
         &mut self,
         event: &E,
-    ) -> Result<ReExecNotifications<I, E::Backend, E::Checkpoint>, crate::DispatchError> {
+    ) -> Result<super::Dispatched<I, E::Backend, E::Checkpoint>, crate::DispatchError> {
         let ReExecNotifications {
             engine,
             aggregate_updates,
@@ -578,19 +580,27 @@ where
             triggers,
             transitions,
         } = self.inner.reread_notifications(event)?;
+        // Debug-time only. The invariant is the core's and is enforced
+        // there by `the_core_delivers_no_read_answers`.
+        debug_assert!(
+            rows_updates.is_empty() && row_deltas.is_empty(),
+            "the core has no connector, so it cannot deliver read answers"
+        );
         self.apply_transitions(&transitions);
+        let mut debounced = 0usize;
         for trigger in triggers {
-            self.enqueue_read(trigger);
+            if !self.enqueue_read(trigger) {
+                debounced += 1;
+            }
         }
-        self.enqueue_unanswered(&engine, event);
-        Ok(ReExecNotifications {
+        debounced += self.enqueue_unanswered(&engine, event);
+        Ok(super::Dispatched {
             engine,
             aggregate_updates,
             scalar_updates,
-            rows_updates,
-            row_deltas,
-            triggers: Vec::new(),
             transitions,
+            outstanding: self.pending_read_count(),
+            debounced,
         })
     }
 
@@ -601,19 +611,25 @@ where
     /// the query is retained and the connector is owned, so the report
     /// becomes the read that answers it, deduplicated and debounced like
     /// every other discovered read.
+    ///
+    /// Answers how many the debounce window discarded.
     fn enqueue_unanswered(
         &mut self,
         notifications: &crate::ConsumerNotifications<I, E::Checkpoint, E::Backend>,
         event: &E,
-    ) {
+    ) -> usize {
+        let mut dropped = 0usize;
         for entry in notifications.unanswered() {
-            self.enqueue_read(super::ReExecutionTrigger {
+            if !self.enqueue_read(super::ReExecutionTrigger {
                 subscription_id: entry.subscription_id,
                 consumer_id: entry.consumer_id,
                 read: super::ReExecutionRead::Subscription,
                 checkpoint: event.checkpoint(),
-            });
+            }) {
+                dropped += 1;
+            }
         }
+        dropped
     }
 
     /// Register a subscription. `auth` is stored alongside the captured
@@ -1845,7 +1861,7 @@ where
     M: ResolverMode<E::Backend> + Send,
     M::AuthContext: Send,
 {
-    type Notifications = ReExecNotifications<I, E::Backend, E::Checkpoint>;
+    type Notifications = super::Dispatched<I, E::Backend, E::Checkpoint>;
     type Error = crate::DispatchError;
 
     fn consumers(&mut self, event: &E) -> Result<Self::Notifications, Self::Error> {
@@ -2307,6 +2323,152 @@ mod tests {
         assert_eq!(queries[0].binds(), &[Value::String("paid".into())]);
     }
 
+    /// `debounced` counts the unanswered-cell path, not only the trigger
+    /// path.
+    #[expect(
+        clippy::clone_on_ref_ptr,
+        reason = "the clone below performs the Arc<ManualClock> to Arc<dyn Clock> \
+                  unsize coercion at the assignment site, which Arc::clone cannot \
+                  do from an uncoerced source"
+    )]
+    #[test]
+    fn a_debounced_unanswered_read_is_reported() {
+        let clock = alloc::sync::Arc::new(crate::ManualClock::new(0));
+        let engine_clock: crate::ClockHandle = clock.clone();
+        let (e0, tid) = engine_with_values(alloc::vec![]);
+        let mut engine = e0
+            .with_clock(engine_clock)
+            .with_debounce_per_query(core::time::Duration::from_millis(100));
+        engine
+            .register(
+                SubscriptionRequest::new(1u64, "SELECT * FROM orders WHERE status = 'paid'"),
+                (),
+            )
+            .expect("the filter is served in process");
+
+        // The row image omits `status`, which the predicate reads, so the
+        // event cannot answer it and the read is queued.
+        let unanswerable = |id: i64| {
+            let mut cells = row(id, 5.0);
+            cells[3] = Value::Missing;
+            TestEvent::<Postgres>::update(tid, row(id, 5.0), cells)
+                .with_pk_columns([0u16])
+                .with_changed_columns([1u16])
+        };
+
+        engine
+            .connector()
+            .cursor_pages
+            .borrow_mut()
+            .push(super::super::RowPage {
+                columns: alloc::vec![String::from("id"), String::from("status")],
+                rows: alloc::vec![alloc::vec![Value::Int(1), Value::String("paid".into())]],
+                more: false,
+            });
+        let first = engine.apply(&unanswerable(1)).expect("the event applies");
+        assert_eq!(
+            first.debounced, 0,
+            "nothing has run yet, so nothing is dropped"
+        );
+        assert!(first.outstanding > 0, "the unanswered cell queued a read");
+        engine.resolve_collect().expect("the read runs and stamps");
+
+        // Inside the window, the same subscription's read is discarded.
+        clock.advance(core::time::Duration::from_millis(50));
+        let second = engine.apply(&unanswerable(2)).expect("the event applies");
+        assert_eq!(
+            second.debounced, 1,
+            "the window dropped the unanswered-cell read and the report says so"
+        );
+        assert_eq!(
+            second.outstanding, 0,
+            "which the queue depth alone cannot say"
+        );
+    }
+
+    /// `outstanding` is the queue's depth now: not a constant, not one per
+    /// event, and not the number ever queued.
+    #[test]
+    fn a_dispatch_reports_the_reads_it_queued() {
+        let (mut engine, table) = engine_with_values(alloc::vec![]);
+        engine
+            .register(
+                SubscriptionRequest::new(1u64, "SELECT DISTINCT status FROM orders"),
+                (),
+            )
+            .expect("whole read registers");
+
+        // An event no subscription cares about queues nothing.
+        let quiet = engine
+            .apply(&insert_event(table, 1, 5.0))
+            .expect("the event applies");
+        let after_first = quiet.outstanding;
+
+        engine
+            .connector()
+            .cursor_pages
+            .borrow_mut()
+            .push(super::super::RowPage {
+                columns: alloc::vec![String::from("status")],
+                rows: alloc::vec![alloc::vec![Value::String("paid".into())]],
+                more: false,
+            });
+        assert_eq!(
+            after_first,
+            engine.pending_read_count(),
+            "the report is the depth of the queue, not a guess about it"
+        );
+        assert!(
+            after_first > 0,
+            "a whole-result subscription queues a read for this event"
+        );
+
+        // A second event for the same subscription coalesces: the queue is
+        // keyed by subscription, so the depth does not grow.
+        let again = engine
+            .apply(&insert_event(table, 2, 6.0))
+            .expect("the event applies");
+        assert_eq!(
+            again.outstanding, after_first,
+            "a burst coalesces, so the report does not count events"
+        );
+
+        // Depth two, so a count collapsed to `min(1)` cannot pass.
+        engine
+            .register(
+                SubscriptionRequest::new(2u64, "SELECT DISTINCT quantity FROM orders"),
+                (),
+            )
+            .expect("a second whole read registers");
+        let two = engine
+            .apply(&insert_event(table, 4, 8.0))
+            .expect("the event applies");
+        assert_eq!(
+            two.outstanding, 2,
+            "two subscriptions each queued one read, so the depth is two"
+        );
+
+        // The mock refuses a cursor it has no page for.
+        engine
+            .connector()
+            .cursor_pages
+            .borrow_mut()
+            .push(super::super::RowPage {
+                columns: alloc::vec![String::from("quantity")],
+                rows: alloc::vec![alloc::vec![Value::Int(1)]],
+                more: false,
+            });
+        engine.resolve_collect().expect("the reads run");
+        let settled = engine
+            .apply(&update_status_only(table, 3, 7.0))
+            .expect("the event applies");
+        assert_eq!(
+            engine.pending_read_count(),
+            settled.outstanding,
+            "and it still agrees with the queue after a drain"
+        );
+    }
+
     /// A keyed read asks about the row the event says is its own.
     ///
     /// The key is built from the columns the event declares as its
@@ -2716,7 +2878,16 @@ mod tests {
         clock.advance(core::time::Duration::from_millis(50));
         // The engine's MIN is currently 7.0 from the prior re-exec. To
         // force a second trigger we delete a row matching 7.0.
-        e.apply(&delete_event(tid, 2, 7.0)).unwrap();
+        let dispatched = e.apply(&delete_event(tid, 2, 7.0)).unwrap();
+        // The queue is empty because the trigger was discarded.
+        assert_eq!(
+            dispatched.debounced, 1,
+            "the window dropped this event's read and the report says so"
+        );
+        assert_eq!(
+            dispatched.outstanding, 0,
+            "and nothing is queued, which on its own would look answered"
+        );
         let n = e.resolve_collect().unwrap();
         assert!(
             n.scalar_updates.is_empty(),
