@@ -392,18 +392,41 @@ mod scalar_kind_serde_tests {
         );
     }
 
-    /// The refined cases the family tags could not express take tags of
-    /// their own, and the unrefined ones keep the tags they always had, so a
-    /// stored `real` reloads as float4 rather than as float8.
+    /// Every declared type encodes as its own stable tag, and reloads as
+    /// itself.
+    ///
+    /// Exhaustive on purpose, rather than a sample of the interesting
+    /// pairs. The refined cases the family tags could not express took
+    /// tags of their own and the unrefined ones kept the tags they always
+    /// had, so a stored `real` reloads as float4 rather than float8, and
+    /// the only way to keep that true is for every tag to be named here:
+    /// a new variant then fails to compile this list rather than
+    /// silently taking whatever number the match arm gives it.
+    ///
+    /// A review found `Int(UpToThirtyTwo)` untested and reported
+    /// `Int(SixtyFour)` as covered. Neither was: the list held four of
+    /// the sixteen.
     #[test]
     fn refined_types_have_their_own_stable_tags() {
-        use super::{DeclaredType, FloatWidth, TextWidth};
+        use super::{DeclaredType, FloatWidth, IntWidth, TextWidth};
 
         for (tag, kind) in [
-            (2_u8, DeclaredType::Float(FloatWidth::Double)),
+            (0_u8, DeclaredType::Bool),
+            (1, DeclaredType::Int(IntWidth::SixtyFour)),
+            (2, DeclaredType::Float(FloatWidth::Double)),
+            (3, DeclaredType::Decimal),
             (4, DeclaredType::Text(TextWidth::Varying)),
+            (5, DeclaredType::Bytes),
+            (6, DeclaredType::Uuid),
+            (7, DeclaredType::Date),
+            (8, DeclaredType::Time),
+            (9, DeclaredType::Timestamp),
+            (10, DeclaredType::TimestampTz),
+            (11, DeclaredType::Json),
+            (12, DeclaredType::Jsonb),
             (13, DeclaredType::Float(FloatWidth::Single)),
             (14, DeclaredType::Text(TextWidth::Fixed)),
+            (15, DeclaredType::Int(IntWidth::UpToThirtyTwo)),
         ] {
             let stored = ScalarKind::<TestCustom>::Builtin(kind);
             let encoded = postcard::to_allocvec(&stored).unwrap();
