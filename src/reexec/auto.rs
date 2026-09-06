@@ -568,7 +568,7 @@ where
     pub fn apply(
         &mut self,
         event: &E,
-    ) -> Result<ReExecNotifications<I, E::Backend, E::Checkpoint>, crate::DispatchError> {
+    ) -> Result<super::Dispatched<I, E::Backend, E::Checkpoint>, crate::DispatchError> {
         let ReExecNotifications {
             engine,
             aggregate_updates,
@@ -578,19 +578,26 @@ where
             triggers,
             transitions,
         } = self.inner.reread_notifications(event)?;
+        // Both are `Vec::new()` by construction: the core holds no
+        // connector, so it cannot fill either, and this path is why
+        // `Dispatched` does not carry them. Destructured rather than
+        // ignored so that a core which one day does fill them fails to
+        // compile here instead of dropping them.
+        debug_assert!(
+            rows_updates.is_empty() && row_deltas.is_empty(),
+            "the core has no connector, so it cannot deliver read answers"
+        );
         self.apply_transitions(&transitions);
         for trigger in triggers {
             self.enqueue_read(trigger);
         }
         self.enqueue_unanswered(&engine, event);
-        Ok(ReExecNotifications {
+        Ok(super::Dispatched {
             engine,
             aggregate_updates,
             scalar_updates,
-            rows_updates,
-            row_deltas,
-            triggers: Vec::new(),
             transitions,
+            outstanding: self.pending_read_count(),
         })
     }
 
@@ -1845,7 +1852,7 @@ where
     M: ResolverMode<E::Backend> + Send,
     M::AuthContext: Send,
 {
-    type Notifications = ReExecNotifications<I, E::Backend, E::Checkpoint>;
+    type Notifications = super::Dispatched<I, E::Backend, E::Checkpoint>;
     type Error = crate::DispatchError;
 
     fn consumers(&mut self, event: &E) -> Result<Self::Notifications, Self::Error> {
@@ -2305,6 +2312,106 @@ mod tests {
             "SELECT * FROM orders WHERE (lower(status) = $1) AND \"id\" IN (1)"
         );
         assert_eq!(queries[0].binds(), &[Value::String("paid".into())]);
+    }
+
+    /// What a dispatched event reports about the work it left behind.
+    ///
+    /// A guard for a type change rather than a failing test, and the
+    /// distinction is worth stating: nothing answered wrongly before this,
+    /// a caller simply could not learn that reads were queued.
+    /// `ReExecNotifications.triggers` is documented as the queries the
+    /// materializer must re-execute, and this wrapper drained it into its
+    /// own queue and returned the field empty, while `rows_updates` and
+    /// `row_deltas` are empty by construction on that path. So the
+    /// obligation read zero and the results read empty, both correctly and
+    /// both misleadingly. `Dispatched` omits all three.
+    ///
+    /// The count itself is a real contract with several ways to be wrong,
+    /// which is what the mutation battery is for: it must be the depth of
+    /// the queue now, not a constant, not one per event, and not the number
+    /// ever queued.
+    #[test]
+    fn a_dispatch_reports_the_reads_it_queued() {
+        let (mut engine, table) = engine_with_values(alloc::vec![]);
+        engine
+            .register(
+                SubscriptionRequest::new(1u64, "SELECT DISTINCT status FROM orders"),
+                (),
+            )
+            .expect("whole read registers");
+
+        // An event no subscription cares about queues nothing.
+        let quiet = engine
+            .apply(&insert_event(table, 1, 5.0))
+            .expect("the event applies");
+        let after_first = quiet.outstanding;
+
+        engine
+            .connector()
+            .cursor_pages
+            .borrow_mut()
+            .push(super::super::RowPage {
+                columns: alloc::vec![String::from("status")],
+                rows: alloc::vec![alloc::vec![Value::String("paid".into())]],
+                more: false,
+            });
+        assert_eq!(
+            after_first,
+            engine.pending_read_count(),
+            "the report is the depth of the queue, not a guess about it"
+        );
+        assert!(
+            after_first > 0,
+            "a whole-result subscription queues a read for this event"
+        );
+
+        // A second event for the same subscription coalesces: the queue is
+        // keyed by subscription, so the depth does not grow.
+        let again = engine
+            .apply(&insert_event(table, 2, 6.0))
+            .expect("the event applies");
+        assert_eq!(
+            again.outstanding, after_first,
+            "a burst coalesces, so the report does not count events"
+        );
+
+        // A second subscription makes the depth two, so the report cannot
+        // be a flag wearing a number's clothes. With one queued read a
+        // count collapsed to `min(1)` would have passed everything above.
+        engine
+            .register(
+                SubscriptionRequest::new(2u64, "SELECT DISTINCT quantity FROM orders"),
+                (),
+            )
+            .expect("a second whole read registers");
+        let two = engine
+            .apply(&insert_event(table, 4, 8.0))
+            .expect("the event applies");
+        assert_eq!(
+            two.outstanding, 2,
+            "two subscriptions each queued one read, so the depth is two"
+        );
+
+        // One page per queued read: two subscriptions now have one each,
+        // and the mock refuses a cursor it has no page for.
+        engine
+            .connector()
+            .cursor_pages
+            .borrow_mut()
+            .push(super::super::RowPage {
+                columns: alloc::vec![String::from("quantity")],
+                rows: alloc::vec![alloc::vec![Value::Int(1)]],
+                more: false,
+            });
+        engine.resolve_collect().expect("the reads run");
+        let settled = engine
+            .apply(&update_status_only(table, 3, 7.0))
+            .expect("the event applies");
+        assert_eq!(
+            engine.pending_read_count(),
+            settled.outstanding,
+            "and it still agrees with the queue after a drain"
+        );
     }
 
     /// A keyed read asks about the row the event says is its own.

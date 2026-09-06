@@ -272,12 +272,12 @@ fn engine_and_captured_paths_coexist_through_pg_connector() {
     let mut total_inserted = Vec::new();
     let mut total_deleted = Vec::new();
     let mut total_scalar_updates = Vec::new();
-    let mut total_triggers = 0usize;
+    let mut peak_outstanding = 0usize;
     for event in &events {
         let notifs = engine.apply(event).expect("apply dispatch");
         total_inserted.extend(notifs.engine.inserted().iter().copied());
         total_deleted.extend(notifs.engine.deleted().iter().copied());
-        total_triggers += notifs.triggers.len();
+        peak_outstanding = peak_outstanding.max(notifs.outstanding);
     }
     let resolved = engine.resolve_collect().expect("resolve dispatch");
     total_scalar_updates.extend(resolved.scalar_updates);
@@ -305,7 +305,10 @@ fn engine_and_captured_paths_coexist_through_pg_connector() {
     );
     assert_eq!(total_scalar_updates[0].subscription_id, captured_qid);
     assert_eq!(total_scalar_updates[0].value, Value::Float(9.0));
-    assert_eq!(total_triggers, 0, "auto-resolving engine drains triggers");
+    // Was a sum of `triggers.len()` asserted zero, which it could not fail
+    // to be. These are the facts that field failed to convey.
+    assert!(peak_outstanding > 0, "the wrapper queued reads and said so");
+    assert_eq!(engine.pending_read_count(), 0, "and resolve drained them");
 }
 
 /// Test 2 - UPDATE displaces the current extreme.

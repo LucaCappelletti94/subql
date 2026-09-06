@@ -90,6 +90,6 @@ pub use connector::{DieselBackend, DieselConnector};
 pub use connector::{PgR2D2DieselConnector, PgR2D2Error};
 pub(crate) use engine::ReExecEntry;
 pub use engine::{
-    ReExecNotifications, ReExecutionRead, ReExecutionTrigger, ReadDelivery, ResolvedReads,
-    RowDelta, RowsUpdate, ScalarUpdate,
+    Dispatched, ReExecNotifications, ReExecutionRead, ReExecutionTrigger, ReadDelivery,
+    ResolvedReads, RowDelta, RowsUpdate, ScalarUpdate,
 };

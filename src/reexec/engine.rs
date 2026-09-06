@@ -223,6 +223,53 @@ pub struct ReExecNotifications<I: IdTypes, B: Backend, C: crate::Checkpoint = cr
     pub transitions: Vec<crate::MaintenanceTransition<B>>,
 }
 
+/// Everything one dispatched event produced when the engine owns the
+/// connector and will do the reads itself.
+///
+/// Distinct from [`ReExecNotifications`] because the two answer different
+/// contracts, and one type serving both is what let a caller be misled.
+/// The bare engine holds no connector, so it hands its unresolved reads to
+/// the caller in `triggers` and the caller must execute them. The
+/// auto-resolving wrapper holds the connector, so it takes those reads into
+/// its own queue and the caller must not execute them.
+///
+/// What that cost, before this type existed: the wrapper returned
+/// `ReExecNotifications` with `triggers` emptied, and `rows_updates` and
+/// `row_deltas` are `Vec::new()` by construction on that path because the
+/// core cannot fill them. So a caller checking the documented obligation
+/// read zero, looked in the field where the answers would be, found it
+/// empty, and correctly concluded there was nothing to do. Both readings
+/// were well typed and both were wrong together.
+///
+/// So this type does not carry those three fields at all. The deliveries
+/// are reachable only through
+/// [`resolve`](crate::reexec::AutoResolvingEngine::resolve) and
+/// [`resolve_collect`](crate::reexec::AutoResolvingEngine::resolve_collect),
+/// and a caller that used to read them fails to compile at the line that
+/// silently returned nothing.
+///
+/// The in-process channels stay. They cost no database round trip, so
+/// burying them behind a read would put I/O in front of an answer that did
+/// not need it, and [`outstanding`](Self::outstanding) is the honest signal
+/// that more of every kind is coming.
+pub struct Dispatched<I: IdTypes, B: Backend, C: crate::Checkpoint = crate::NoCheckpoint> {
+    /// View-relative notifications from the core engine.
+    pub engine: ConsumerNotifications<I, C, B>,
+    /// Grouped aggregate rows written or removed in process.
+    pub aggregate_updates: Vec<crate::AggregateValueUpdate<I, B>>,
+    /// Scalar values that changed in process, with no database round trip.
+    pub scalar_updates: Vec<ScalarUpdate<I, B, C>>,
+    /// Subscriptions that changed maintenance tier.
+    pub transitions: Vec<crate::MaintenanceTransition<B>>,
+    /// Reads this engine has queued and not yet executed.
+    ///
+    /// Non-zero means `resolve` has work, and that more of every channel
+    /// above is still to come. Zero means this event is fully answered.
+    /// This is the whole of what the removed `triggers` field used to be
+    /// trying to say, and unlike that field it says it truthfully.
+    pub outstanding: usize,
+}
+
 /// One result delivered by `resolve` as its read completes.
 ///
 /// The sink receives each installed answer the moment its read finishes,
