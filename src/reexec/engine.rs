@@ -250,8 +250,8 @@ pub struct ReExecNotifications<I: IdTypes, B: Backend, C: crate::Checkpoint = cr
 ///
 /// The in-process channels stay. They cost no database round trip, so
 /// burying them behind a read would put I/O in front of an answer that did
-/// not need it, and [`outstanding`](Self::outstanding) is the honest signal
-/// that more of every kind is coming.
+/// not need it, and [`outstanding`](Self::outstanding) says whether
+/// `resolve` has work.
 pub struct Dispatched<I: IdTypes, B: Backend, C: crate::Checkpoint = crate::NoCheckpoint> {
     /// View-relative notifications from the core engine.
     pub engine: ConsumerNotifications<I, C, B>,
@@ -263,12 +263,19 @@ pub struct Dispatched<I: IdTypes, B: Backend, C: crate::Checkpoint = crate::NoCh
     pub transitions: Vec<crate::MaintenanceTransition<B>>,
     /// Reads this engine has queued and not yet executed.
     ///
-    /// The depth of the queue after this event, and nothing more. Non-zero
-    /// means `resolve` has work and that more of every channel above is
-    /// still to come. Zero means this engine has nothing queued, which is
-    /// not the same as the event being answered: see
-    /// [`debounced`](Self::debounced) for a read deliberately discarded,
-    /// and the engine's own notifications for a predicate it refused.
+    /// The depth of the queue after this event, and nothing more.
+    ///
+    /// Non-zero means `resolve` has work. It says nothing about which
+    /// channels that work will deliver, and deliberately so: a queued
+    /// whole-result read produces only [`ResolvedReads::rows_updates`],
+    /// `ResolvedReads` carries no `engine` channel at all, and a read can
+    /// fail before delivering anything. A caller waiting on a channel this
+    /// number does not name would wait for a delivery that never arrives.
+    ///
+    /// Zero means this engine has nothing queued, which is not the same as
+    /// the event being answered: see [`debounced`](Self::debounced) for a
+    /// read deliberately discarded, and the engine's own notifications for
+    /// a predicate it refused.
     pub outstanding: usize,
     /// Reads this event discovered and this engine deliberately dropped,
     /// because a read for the same subscription and group ran inside the
