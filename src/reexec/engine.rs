@@ -263,11 +263,33 @@ pub struct Dispatched<I: IdTypes, B: Backend, C: crate::Checkpoint = crate::NoCh
     pub transitions: Vec<crate::MaintenanceTransition<B>>,
     /// Reads this engine has queued and not yet executed.
     ///
-    /// Non-zero means `resolve` has work, and that more of every channel
-    /// above is still to come. Zero means this event is fully answered.
-    /// This is the whole of what the removed `triggers` field used to be
-    /// trying to say, and unlike that field it says it truthfully.
+    /// The depth of the queue after this event, and nothing more. Non-zero
+    /// means `resolve` has work and that more of every channel above is
+    /// still to come. Zero on its own does **not** mean the event is fully
+    /// answered: see [`debounced`](Self::debounced).
     pub outstanding: usize,
+    /// Reads this event discovered and this engine deliberately dropped,
+    /// because a read for the same subscription and group ran inside the
+    /// configured debounce window.
+    ///
+    /// Separate from [`outstanding`](Self::outstanding) because they are
+    /// different facts and a caller cannot recover one from the other. A
+    /// debounced read is not deferred, it is discarded: `enqueue_read`
+    /// returns before enqueuing, and a later event queues a fresh read
+    /// once the window has passed. So the queue depth stays zero while
+    /// this event's refresh was thrown away, and the answer a consumer
+    /// holds may be stale by up to that window.
+    ///
+    /// Zero here and zero in `outstanding` together mean the event is
+    /// fully answered. That pairing is the honest form of the claim
+    /// `outstanding` alone was making, and the reason this field exists:
+    /// a count that cannot express a deliberate drop is a count that
+    /// says more than it knows, which is the defect this whole type
+    /// replaced.
+    ///
+    /// Always zero unless both a clock and a debounce window are
+    /// configured, since without them nothing is ever dropped.
+    pub debounced: usize,
 }
 
 /// One result delivered by `resolve` as its read completes.

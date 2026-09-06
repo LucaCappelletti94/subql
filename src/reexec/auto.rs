@@ -527,14 +527,20 @@ where
     /// Queue one discovered read, replacing a queued read of the same
     /// subscription and group so a burst costs one read. A read inside its
     /// debounce window is dropped, exactly as the fused path dropped it.
+    ///
+    /// Answers `false` when the debounce window dropped the trigger, so a
+    /// caller counting what it queued can also count what it discarded.
+    /// The two are different facts: a dropped read is not deferred, and
+    /// the queue depth alone cannot express one.
     pub(super) fn enqueue_read(
         &mut self,
         trigger: super::ReExecutionTrigger<I, E::Checkpoint, E::Backend>,
-    ) {
+    ) -> bool {
         if self.debounce_skip(trigger.subscription_id, &trigger.read) {
-            return;
+            return false;
         }
         self.pending_reads.enqueue(trigger);
+        true
     }
 
     /// Drop one queued read after its answer was installed and delivered.
@@ -588,16 +594,20 @@ where
             "the core has no connector, so it cannot deliver read answers"
         );
         self.apply_transitions(&transitions);
+        let mut debounced = 0usize;
         for trigger in triggers {
-            self.enqueue_read(trigger);
+            if !self.enqueue_read(trigger) {
+                debounced += 1;
+            }
         }
-        self.enqueue_unanswered(&engine, event);
+        debounced += self.enqueue_unanswered(&engine, event);
         Ok(super::Dispatched {
             engine,
             aggregate_updates,
             scalar_updates,
             transitions,
             outstanding: self.pending_read_count(),
+            debounced,
         })
     }
 
@@ -608,19 +618,26 @@ where
     /// the query is retained and the connector is owned, so the report
     /// becomes the read that answers it, deduplicated and debounced like
     /// every other discovered read.
+    ///
+    /// Answers how many of them the debounce window dropped, so `apply`
+    /// can report a deliberate drop rather than leaving it invisible.
     fn enqueue_unanswered(
         &mut self,
         notifications: &crate::ConsumerNotifications<I, E::Checkpoint, E::Backend>,
         event: &E,
-    ) {
+    ) -> usize {
+        let mut dropped = 0usize;
         for entry in notifications.unanswered() {
-            self.enqueue_read(super::ReExecutionTrigger {
+            if !self.enqueue_read(super::ReExecutionTrigger {
                 subscription_id: entry.subscription_id,
                 consumer_id: entry.consumer_id,
                 read: super::ReExecutionRead::Subscription,
                 checkpoint: event.checkpoint(),
-            });
+            }) {
+                dropped += 1;
+            }
         }
+        dropped
     }
 
     /// Register a subscription. `auth` is stored alongside the captured
@@ -2314,6 +2331,70 @@ mod tests {
         assert_eq!(queries[0].binds(), &[Value::String("paid".into())]);
     }
 
+    /// A debounced unanswered-cell read is reported too.
+    ///
+    /// Two paths queue reads in `apply`: the core's own triggers, and the
+    /// subscriptions whose predicate read a cell the event did not carry.
+    /// Both go through `enqueue_read`, so both can be dropped by the
+    /// window, and the mutation battery showed that dropping the second
+    /// contribution to the count reddened nothing: the debounce test
+    /// exercises only the trigger path.
+    #[allow(clippy::clone_on_ref_ptr)]
+    #[test]
+    fn a_debounced_unanswered_read_is_reported() {
+        let clock = alloc::sync::Arc::new(crate::ManualClock::new(0));
+        let engine_clock: crate::ClockHandle = clock.clone();
+        let (e0, tid) = engine_with_values(alloc::vec![]);
+        let mut engine = e0
+            .with_clock(engine_clock)
+            .with_debounce_per_query(core::time::Duration::from_millis(100));
+        engine
+            .register(
+                SubscriptionRequest::new(1u64, "SELECT * FROM orders WHERE status = 'paid'"),
+                (),
+            )
+            .expect("the filter is served in process");
+
+        // The row image omits `status`, which the predicate reads, so the
+        // event cannot answer it and the read is queued.
+        let unanswerable = |id: i64| {
+            let mut cells = row(id, 5.0);
+            cells[3] = Value::Missing;
+            TestEvent::<Postgres>::update(tid, row(id, 5.0), cells)
+                .with_pk_columns([0u16])
+                .with_changed_columns([1u16])
+        };
+
+        engine
+            .connector()
+            .cursor_pages
+            .borrow_mut()
+            .push(super::super::RowPage {
+                columns: alloc::vec![String::from("id"), String::from("status")],
+                rows: alloc::vec![alloc::vec![Value::Int(1), Value::String("paid".into())]],
+                more: false,
+            });
+        let first = engine.apply(&unanswerable(1)).expect("the event applies");
+        assert_eq!(
+            first.debounced, 0,
+            "nothing has run yet, so nothing is dropped"
+        );
+        assert!(first.outstanding > 0, "the unanswered cell queued a read");
+        engine.resolve_collect().expect("the read runs and stamps");
+
+        // Inside the window, the same subscription's read is discarded.
+        clock.advance(core::time::Duration::from_millis(50));
+        let second = engine.apply(&unanswerable(2)).expect("the event applies");
+        assert_eq!(
+            second.debounced, 1,
+            "the window dropped the unanswered-cell read and the report says so"
+        );
+        assert_eq!(
+            second.outstanding, 0,
+            "which the queue depth alone cannot say"
+        );
+    }
+
     /// What a dispatched event reports about the work it left behind.
     ///
     /// A guard for a type change rather than a failing test, and the
@@ -2823,7 +2904,19 @@ mod tests {
         clock.advance(core::time::Duration::from_millis(50));
         // The engine's MIN is currently 7.0 from the prior re-exec. To
         // force a second trigger we delete a row matching 7.0.
-        e.apply(&delete_event(tid, 2, 7.0)).unwrap();
+        let dispatched = e.apply(&delete_event(tid, 2, 7.0)).unwrap();
+        // The drop is reported rather than left invisible. `outstanding`
+        // alone cannot say it: the trigger was discarded, not deferred, so
+        // the queue is empty and a caller reading only the depth would
+        // take a deliberately unrefreshed event for a finished one.
+        assert_eq!(
+            dispatched.debounced, 1,
+            "the window dropped this event's read and the report says so"
+        );
+        assert_eq!(
+            dispatched.outstanding, 0,
+            "and nothing is queued, which on its own would look answered"
+        );
         let n = e.resolve_collect().unwrap();
         assert!(
             n.scalar_updates.is_empty(),
