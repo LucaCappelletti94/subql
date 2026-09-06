@@ -480,11 +480,24 @@ where
     /// Configure a minimum interval between two re-executions of the
     /// same captured query.
     ///
-    /// Triggers within the window are silently dropped: the connector is
-    /// not called and no [`ScalarUpdate`](super::ScalarUpdate) is emitted (the engine's stored
-    /// value, set by the prior re-execution, remains current). Requires
-    /// [`with_clock`](Self::with_clock). Without a clock the debounce
-    /// config is ignored.
+    /// A trigger inside the window is dropped: the connector is not
+    /// called and no [`ScalarUpdate`](super::ScalarUpdate) is emitted.
+    /// Requires [`with_clock`](Self::with_clock); without a clock this
+    /// setting is ignored.
+    ///
+    /// It is not dropped silently. `apply` reports it through
+    /// [`Dispatched::debounced`](super::Dispatched::debounced), which is
+    /// what lets a caller tell a fully answered event from one whose
+    /// refresh was deliberately discarded.
+    ///
+    /// Nor does the engine's stored value stay current. This used to say
+    /// it did, on the reasoning that the prior re-execution had just set
+    /// it, and that is wrong twice over: the dropped trigger existed
+    /// because something changed, and nothing schedules a replacement
+    /// read when the window expires. Only the next CDC event for that
+    /// query queues one, so if none arrives the value stays as it is
+    /// indefinitely rather than for this duration. The window is a rate
+    /// limit, not a bound on staleness.
     #[must_use]
     pub const fn with_debounce_per_query(mut self, debounce: Duration) -> Self {
         self.debounce = Some(debounce);
