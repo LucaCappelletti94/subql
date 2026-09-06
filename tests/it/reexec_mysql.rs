@@ -307,7 +307,10 @@ fn execute_scalar_row_decodes_integer_aggregate_seed() {
         .expect("aggregate carries a bootstrap");
 
     // sum=12, squared deviations=8, count=3, decoded into
-    // (Float, Float, Int).
+    // (Decimal, Float, Int). The leading component is a decimal because
+    // that is what MySQL answers for a sum over an `INT` column, which
+    // is the whole point of the seed agreeing with the engine's own
+    // type rather than with a float everywhere.
     //
     // Eight, not fifty-six. The seed's middle component is the sum of
     // squared deviations, read as `VAR_POP(amount) * COUNT(amount)`,
