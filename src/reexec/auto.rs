@@ -2339,7 +2339,12 @@ mod tests {
     /// window, and the mutation battery showed that dropping the second
     /// contribution to the count reddened nothing: the debounce test
     /// exercises only the trigger path.
-    #[allow(clippy::clone_on_ref_ptr)]
+    #[expect(
+        clippy::clone_on_ref_ptr,
+        reason = "the clone below performs the Arc<ManualClock> to Arc<dyn Clock> \
+                  unsize coercion at the assignment site, which Arc::clone cannot \
+                  do from an uncoerced source"
+    )]
     #[test]
     fn a_debounced_unanswered_read_is_reported() {
         let clock = alloc::sync::Arc::new(crate::ManualClock::new(0));

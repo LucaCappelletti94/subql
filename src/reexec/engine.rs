@@ -265,8 +265,10 @@ pub struct Dispatched<I: IdTypes, B: Backend, C: crate::Checkpoint = crate::NoCh
     ///
     /// The depth of the queue after this event, and nothing more. Non-zero
     /// means `resolve` has work and that more of every channel above is
-    /// still to come. Zero on its own does **not** mean the event is fully
-    /// answered: see [`debounced`](Self::debounced).
+    /// still to come. Zero means this engine has nothing queued, which is
+    /// not the same as the event being answered: see
+    /// [`debounced`](Self::debounced) for a read deliberately discarded,
+    /// and the engine's own notifications for a predicate it refused.
     pub outstanding: usize,
     /// Reads this event discovered and this engine deliberately dropped,
     /// because a read for the same subscription and group ran inside the
@@ -280,12 +282,21 @@ pub struct Dispatched<I: IdTypes, B: Backend, C: crate::Checkpoint = crate::NoCh
     /// this event's refresh was thrown away, and the answer a consumer
     /// holds may be stale by up to that window.
     ///
-    /// Zero here and zero in `outstanding` together mean the event is
-    /// fully answered. That pairing is the honest form of the claim
-    /// `outstanding` alone was making, and the reason this field exists:
-    /// a count that cannot express a deliberate drop is a count that
-    /// says more than it knows, which is the defect this whole type
-    /// replaced.
+    /// Zero here and zero in `outstanding` together mean this engine has
+    /// no read outstanding and discarded none. That is the whole of what
+    /// the two counters know, and it is deliberately not a claim that the
+    /// event is fully answered: a predicate the engine refused to
+    /// evaluate is reported through
+    /// [`engine.evaluation_failures`](crate::ConsumerNotifications::evaluation_failures)
+    /// and queues no read at all, because a read would raise the same
+    /// error. Both counters are then zero while that subscription has no
+    /// answer, so a caller wanting completeness has to read the engine's
+    /// own unresolved notifications as well.
+    ///
+    /// Recorded because the claim was made twice and was wrong twice.
+    /// `outstanding` alone first said zero meant fully answered, which
+    /// the debounce window falsified; the pair then said it, which a
+    /// refused evaluation falsifies. A counter states what it counts.
     ///
     /// Always zero unless both a clock and a debounce window are
     /// configured, since without them nothing is ever dropped.
