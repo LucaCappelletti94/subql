@@ -216,7 +216,7 @@ pub fn block_on<F: core::future::Future>(future: F) -> F::Output {
 /// one poll lets a future that cannot be resumed elsewhere pass unnoticed,
 /// while every real implementation makes a round trip.
 #[cfg(any(test, feature = "testing"))]
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Debug, Default)]
 pub struct YieldOnce(pub bool);
 
 #[cfg(any(test, feature = "testing"))]

@@ -11,6 +11,7 @@ use alloc::vec::Vec;
 
 use diesel::result::Error as DieselError;
 use sql_traits::prelude::{DatabaseLike, TableLike};
+use sqlite_diff_rs::Value as WireValue;
 
 /// The columns of every catalog table, keyed by the table's bare stored
 /// name.
@@ -77,33 +78,26 @@ pub fn bind_error(column: &str, expected: &str, got: &str) -> DieselError {
 }
 
 /// Name the SQLite wire shape of a value for use in a refusal.
-pub const fn shape_of<S, B>(value: &sqlite_diff_rs::Value<S, B>) -> &'static str {
+pub const fn shape_of<S, B>(value: &WireValue<S, B>) -> &'static str {
     match value {
-        sqlite_diff_rs::Value::Null => "NULL",
-        sqlite_diff_rs::Value::Integer(_) => "INTEGER",
-        sqlite_diff_rs::Value::Real(_) => "REAL",
-        sqlite_diff_rs::Value::Text(_) => "TEXT",
-        sqlite_diff_rs::Value::Blob(_) => "BLOB",
+        WireValue::Null => "NULL",
+        WireValue::Integer(_) => "INTEGER",
+        WireValue::Real(_) => "REAL",
+        WireValue::Text(_) => "TEXT",
+        WireValue::Blob(_) => "BLOB",
     }
 }
 
 fn refusal(message: String) -> DieselError {
-    DieselError::QueryBuilderError(Box::new(BindRefusal { message }))
+    DieselError::QueryBuilderError(Box::new(BindRefusal::Refused(message)))
 }
 
 /// A bind the adapter refuses, carrying the message the caller sees.
-#[derive(Debug, Clone)]
-struct BindRefusal {
-    message: String,
+#[derive(Debug, Clone, thiserror::Error)]
+enum BindRefusal {
+    #[error("{0}")]
+    Refused(String),
 }
-
-impl core::fmt::Display for BindRefusal {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.write_str(&self.message)
-    }
-}
-
-impl core::error::Error for BindRefusal {}
 
 #[cfg(test)]
 mod tests {

@@ -732,16 +732,19 @@ fn each_read_runs_read_only_at_repeatable_read() {
         .expect("scalar read");
     assert_eq!(read_only, Value::String("on".into()));
 
-    let refused = connector.execute_scalar(
-        &subql::reexec::ReadQuery::without_binds(
-            "SELECT count(*)::bigint AS v FROM (INSERT INTO orders (id, price, quantity, status) \
-             VALUES (99, 1.0, 1, 'paid') RETURNING id) AS wrote",
-        ),
-        ScalarFamily::Int,
-        &(),
-    );
+    let refused = connector
+        .execute_scalar(
+            &subql::reexec::ReadQuery::without_binds(
+                "WITH wrote AS (INSERT INTO orders (id, price, quantity, status) \
+                 VALUES (99, 1.0, 1, 'paid') RETURNING id) \
+                 SELECT 'wrote' AS v FROM wrote LIMIT 1",
+            ),
+            ScalarFamily::String,
+            &(),
+        )
+        .expect_err("a write inside the read snapshot is refused");
     assert!(
-        refused.is_err(),
-        "a write inside the read snapshot is refused"
+        refused.to_string().contains("read-only transaction"),
+        "refused for being read-only rather than for any other reason, got {refused}"
     );
 }

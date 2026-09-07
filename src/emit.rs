@@ -245,39 +245,26 @@ fn build_wire_table<DB: DatabaseLike>(
     Ok(WireTable { inner, wire_types })
 }
 
-/// A wire conversion error, constructed for a table the catalog does not carry.
-///
-/// `sqlite-diff-rs` 0.12 folds every source's conversion error into one type,
-/// so [`fold_events`] names the case rather than the source.
-trait TableNotFound {
-    fn table_not_found(message: String) -> Self;
-}
-
-impl TableNotFound for ConversionError {
-    fn table_not_found(message: String) -> Self {
-        Self::TableNotFound(message)
-    }
-}
-
 /// Fold `events` into one diff set of format `F` over `database`, resolving
 /// each event's table through a [`WireCatalog`] and decoding its columns
 /// through `adapter`.
 ///
 /// The one procedure behind every vehicle below: the format, the wire source
-/// and the decoder registry are the only things that differ.
+/// and the decoder registry are the only things that differ. Every source in
+/// `sqlite-diff-rs` 0.12 reports the same [`ConversionError`], so the catalog
+/// failure has one spelling here rather than one per vehicle.
 fn fold_events<'a, F, DB, E>(
     database: &DB,
     adapter: &impl WireAdapter<E::Src, String, Vec<u8>>,
     events: impl IntoIterator<Item = &'a E>,
-) -> Result<DiffSetBuilder<F, WireTable, String, Vec<u8>>, E::Error>
+) -> Result<DiffSetBuilder<F, WireTable, String, Vec<u8>>, ConversionError>
 where
     F: DiffFormat<String, Vec<u8>>,
     DB: DatabaseLike,
-    E: Digestable<F, WireTable, String, Vec<u8>> + 'a,
-    E::Error: TableNotFound,
+    E: Digestable<F, WireTable, String, Vec<u8>, Error = ConversionError> + 'a,
 {
     let catalog = WireCatalog::from_database(database)
-        .map_err(|e| E::Error::table_not_found(e.to_string()))?;
+        .map_err(|e| ConversionError::TableNotFound(e.to_string()))?;
     let mut builder = DiffSetBuilder::<F, WireTable, String, Vec<u8>>::new();
     for event in events {
         builder = builder.digest(event, &catalog, adapter)?;

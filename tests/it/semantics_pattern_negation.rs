@@ -1,7 +1,6 @@
 //! `NOT LIKE` and `NOT ILIKE` negate the pattern match rather than the row.
 //!
 //! Both lower through one procedure, so the negation is asserted per keyword.
-#![allow(clippy::unwrap_used)]
 
 use sql_traits::structs::ParserDB;
 use sqlparser::dialect::PostgreSqlDialect;

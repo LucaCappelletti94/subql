@@ -106,10 +106,9 @@ pub(super) fn read_current_lsn(
 ///
 /// The position is read before the snapshot exists, because a caller replays
 /// the change stream from it: behind the snapshot it re-delivers changes keyed
-/// application absorbs, ahead of it it loses a transaction the snapshot never
-/// saw. Measured: `pg_current_wal_lsn()` advances inside an open
-/// repeatable-read transaction when another connection commits, so it is not
-/// snapshot-bound.
+/// application absorbs, ahead of it a commit the snapshot never saw is lost.
+/// Measured: `pg_current_wal_lsn()` advances inside an open repeatable-read
+/// transaction when another connection commits, so it is not snapshot-bound.
 #[cfg(feature = "executor-diesel-postgres")]
 pub(super) fn read_at_lsn<T>(
     conn: &mut diesel::PgConnection,
