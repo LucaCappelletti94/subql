@@ -49,24 +49,21 @@
 use alloc::borrow::Cow;
 use alloc::boxed::Box;
 
+use bigdecimal::BigDecimal;
+use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, Utc};
 use diesel::pg::Pg;
 use diesel::result::Error as DieselError;
+use diesel::sql_types::{
+    Bool, Date, Json, Jsonb, Numeric, Time, Timestamp, Timestamptz, Uuid as UuidSqlType,
+};
 use sql_scalar_text::{parse_date, parse_time, parse_timestamp, parse_timestamp_tz};
 use sql_traits::prelude::{ColumnLike, DatabaseLike, DialectLike, TypeMatchLike};
 use sqlite_diff_rs::{Adapter, Binder, DefaultBinder, Value};
 
 use crate::backend::{ScalarFamily, ScalarKindOf};
-use crate::patchset::columns::{unknown_column_error, ColumnIndex};
+use crate::patchset::columns::{bind_error, shape_of, unknown_column_error, ColumnIndex};
 
-pub(crate) mod binders;
 pub(crate) mod custom_type;
-pub(crate) mod errors;
-
-use binders::{
-    BoolBinder, DateBinder, DecimalBinder, JsonBinder, JsonbBinder, TimeBinder, TimestampBinder,
-    TimestampTzBinder, UuidBinder,
-};
-use errors::{bind_error, shape_of};
 
 pub use custom_type::{bind_as, CustomTypePgAdapter, PgCustomBinder};
 
@@ -156,7 +153,7 @@ where
         // inside PG's error text.
         if dialect.is_bool(self.catalog, col).is_yes() {
             return match value {
-                Value::Integer(i) => Ok(Box::new(BoolBinder(*i != 0))),
+                Value::Integer(i) => Ok(bind_as::<Bool, bool>(*i != 0)),
                 Value::Null => Ok(Box::new(DefaultBinder::from(value))),
                 other => Err(bind_error(col_name, "INTEGER or NULL", shape_of(other))),
             };
@@ -167,7 +164,9 @@ where
         if dialect.is_uuid(self.catalog, col).is_yes() {
             return match value {
                 Value::Blob(b) => uuid::Uuid::from_slice(b.as_ref())
-                    .map(|u| -> Box<dyn Binder<Pg> + Send + 'a> { Box::new(UuidBinder(u)) })
+                    .map(|u| -> Box<dyn Binder<Pg> + Send + 'a> {
+                        bind_as::<UuidSqlType, uuid::Uuid>(u)
+                    })
                     .map_err(|_| {
                         bind_error(
                             col_name,
@@ -176,7 +175,9 @@ where
                         )
                     }),
                 Value::Text(s) => uuid::Uuid::parse_str(s.as_ref())
-                    .map(|u| -> Box<dyn Binder<Pg> + Send + 'a> { Box::new(UuidBinder(u)) })
+                    .map(|u| -> Box<dyn Binder<Pg> + Send + 'a> {
+                        bind_as::<UuidSqlType, uuid::Uuid>(u)
+                    })
                     .map_err(|_| {
                         bind_error(
                             col_name,
@@ -203,42 +204,45 @@ where
         {
             Some(ScalarFamily::Decimal) => {
                 text_scalar_bind(col_name, value, "decimal TEXT or NULL", |s| {
-                    Some(Box::new(DecimalBinder(sql_scalar_text::parse_decimal(s)?))
-                        as Box<dyn Binder<Pg> + Send + 'a>)
+                    Some(bind_as::<Numeric, BigDecimal>(
+                        sql_scalar_text::parse_decimal(s)?,
+                    ))
                 })
             }
             Some(ScalarFamily::Timestamp) => {
                 text_scalar_bind(col_name, value, "timestamp TEXT or NULL", |s| {
-                    Some(Box::new(TimestampBinder(parse_timestamp(s)?))
-                        as Box<dyn Binder<Pg> + Send + 'a>)
+                    Some(bind_as::<Timestamp, NaiveDateTime>(parse_timestamp(s)?))
                 })
             }
             Some(ScalarFamily::TimestampTz) => {
                 text_scalar_bind(col_name, value, "timestamptz TEXT or NULL", |s| {
-                    Some(Box::new(TimestampTzBinder(parse_timestamp_tz(s)?))
-                        as Box<dyn Binder<Pg> + Send + 'a>)
+                    Some(bind_as::<Timestamptz, DateTime<Utc>>(parse_timestamp_tz(
+                        s,
+                    )?))
                 })
             }
             Some(ScalarFamily::Date) => {
                 text_scalar_bind(col_name, value, "date TEXT or NULL", |s| {
-                    Some(Box::new(DateBinder(parse_date(s)?)) as Box<dyn Binder<Pg> + Send + 'a>)
+                    Some(bind_as::<Date, NaiveDate>(parse_date(s)?))
                 })
             }
             Some(ScalarFamily::Time) => {
                 text_scalar_bind(col_name, value, "time TEXT or NULL", |s| {
-                    Some(Box::new(TimeBinder(parse_time(s)?)) as Box<dyn Binder<Pg> + Send + 'a>)
+                    Some(bind_as::<Time, NaiveTime>(parse_time(s)?))
                 })
             }
             Some(ScalarFamily::Json) => {
                 text_scalar_bind(col_name, value, "json TEXT or NULL", |s| {
-                    Some(Box::new(JsonBinder(serde_json::from_str(s).ok()?))
-                        as Box<dyn Binder<Pg> + Send + 'a>)
+                    Some(bind_as::<Json, serde_json::Value>(
+                        serde_json::from_str(s).ok()?,
+                    ))
                 })
             }
             Some(ScalarFamily::Jsonb) => {
                 text_scalar_bind(col_name, value, "jsonb TEXT or NULL", |s| {
-                    Some(Box::new(JsonbBinder(serde_json::from_str(s).ok()?))
-                        as Box<dyn Binder<Pg> + Send + 'a>)
+                    Some(bind_as::<Jsonb, serde_json::Value>(
+                        serde_json::from_str(s).ok()?,
+                    ))
                 })
             }
             _ => Ok(Box::new(DefaultBinder::from(value))),

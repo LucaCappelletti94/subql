@@ -61,22 +61,82 @@ impl<'db, DB: DatabaseLike> ColumnIndex<'db, DB> {
 /// carries a `Result` and refuses explicitly instead of binding a default
 /// into a statement that is already wrong.
 pub fn unknown_column_error(table_name: &str, column_index: usize) -> DieselError {
-    DieselError::QueryBuilderError(Box::new(UnknownColumn {
-        message: alloc::format!(
-            "column {column_index} of table {table_name} is not in the catalog"
-        ),
-    }))
+    refusal(alloc::format!(
+        "column {column_index} of table {table_name} is not in the catalog"
+    ))
 }
 
+/// The refusal for a wire value whose shape the target column cannot take.
+///
+/// Shared by every adapter, so one column carries one message wherever it is
+/// refused.
+pub fn bind_error(column: &str, expected: &str, got: &str) -> DieselError {
+    refusal(alloc::format!(
+        "column `{column}` expects {expected}, got {got}"
+    ))
+}
+
+/// Name the SQLite wire shape of a value for use in a refusal.
+pub const fn shape_of<S, B>(value: &sqlite_diff_rs::Value<S, B>) -> &'static str {
+    match value {
+        sqlite_diff_rs::Value::Null => "NULL",
+        sqlite_diff_rs::Value::Integer(_) => "INTEGER",
+        sqlite_diff_rs::Value::Real(_) => "REAL",
+        sqlite_diff_rs::Value::Text(_) => "TEXT",
+        sqlite_diff_rs::Value::Blob(_) => "BLOB",
+    }
+}
+
+fn refusal(message: String) -> DieselError {
+    DieselError::QueryBuilderError(Box::new(BindRefusal { message }))
+}
+
+/// A bind the adapter refuses, carrying the message the caller sees.
 #[derive(Debug, Clone)]
-struct UnknownColumn {
+struct BindRefusal {
     message: String,
 }
 
-impl core::fmt::Display for UnknownColumn {
+impl core::fmt::Display for BindRefusal {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.write_str(&self.message)
     }
 }
 
-impl core::error::Error for UnknownColumn {}
+impl core::error::Error for BindRefusal {}
+
+#[cfg(test)]
+mod tests {
+    use super::{bind_error, shape_of, unknown_column_error};
+    use alloc::string::{String, ToString as _};
+    use alloc::vec::Vec;
+    use sqlite_diff_rs::Value;
+
+    /// Every adapter refuses a mismatched cell with the same sentence, naming
+    /// the column, the shape it takes and the shape it got.
+    #[test]
+    fn a_refused_bind_names_the_column_the_expectation_and_the_shape() {
+        assert_eq!(
+            bind_error("active", "INTEGER or NULL", "TEXT").to_string(),
+            "column `active` expects INTEGER or NULL, got TEXT"
+        );
+        assert_eq!(
+            unknown_column_error("things", 3).to_string(),
+            "column 3 of table things is not in the catalog"
+        );
+    }
+
+    /// The wire shape a refusal reports, one name per SQLite storage class.
+    #[test]
+    fn every_wire_shape_has_a_name() {
+        let shapes: [Value<String, Vec<u8>>; 5] = [
+            Value::Null,
+            Value::Integer(1),
+            Value::Real(1.0),
+            Value::Text("a".to_string()),
+            Value::Blob(Vec::new()),
+        ];
+        let named: Vec<&str> = shapes.iter().map(shape_of).collect();
+        assert_eq!(named, ["NULL", "INTEGER", "REAL", "TEXT", "BLOB"]);
+    }
+}

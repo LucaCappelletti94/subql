@@ -111,6 +111,10 @@ impl<V: postgres_jsonb_canonical::PgVersion + 'static> Backend for Postgres<V> {
     const DIVISION_BY_ZERO: crate::compiler::vm::refusal::DivisionByZero =
         crate::compiler::vm::refusal::DivisionByZero::Fails;
 
+    /// Measured: PostgreSQL raises `bigint out of range`.
+    const INTEGER_OVERFLOW: crate::compiler::vm::refusal::IntegerOverflow =
+        crate::compiler::vm::refusal::IntegerOverflow::Fails;
+
     /// Measured: `var_pop(x) * count(x)` is `2` exactly over the three
     /// rows whose sum of squares loses the answer.
     /// Measured: two rows of `1e308` in a `double precision` column
@@ -164,14 +168,7 @@ impl<V: postgres_jsonb_canonical::PgVersion + 'static> Backend for Postgres<V> {
         divisor: bigdecimal::BigDecimal,
         quotient: crate::compiler::bytecode::Quotient,
     ) -> bigdecimal::BigDecimal {
-        match quotient {
-            crate::compiler::bytecode::Quotient::FromTheOperands => {
-                crate::compiler::vm::arithmetic::quotient_at_significant_digits(&dividend, &divisor)
-            }
-            crate::compiler::bytecode::Quotient::InWordsAt(increment) => {
-                crate::compiler::vm::arithmetic::quotient_in_words(&dividend, &divisor, increment)
-            }
-        }
+        crate::compiler::vm::arithmetic::quotient_by_rule(&dividend, &divisor, quotient)
     }
 
     /// Never called: this engine's `/` truncates two integers rather than
@@ -182,11 +179,7 @@ impl<V: postgres_jsonb_canonical::PgVersion + 'static> Backend for Postgres<V> {
         divisor: i64,
         increment: super::scalar_value::DivisionPrecisionIncrement,
     ) -> bigdecimal::BigDecimal {
-        crate::compiler::vm::arithmetic::quotient_in_words(
-            &bigdecimal::BigDecimal::from(dividend),
-            &bigdecimal::BigDecimal::from(divisor),
-            increment,
-        )
+        crate::compiler::vm::arithmetic::integer_quotient_in_words(dividend, divisor, increment)
     }
 
     type Custom = NoCustomScalars<Self>;
@@ -245,14 +238,13 @@ impl<V: postgres_jsonb_canonical::PgVersion + 'static> Backend for Postgres<V> {
         })
     }
 
-    /// Measured: PostgreSQL raises `bigint out of range`.
     fn integer_binary(
         operation: crate::compiler::vm::refusal::ArithmeticOp,
         left: i64,
         right: i64,
     ) -> Result<Value<Self>, crate::compiler::vm::refusal::EvaluationRefusal> {
         crate::compiler::vm::arithmetic::checked_integer_binary(
-            crate::compiler::vm::refusal::IntegerOverflow::Fails,
+            Self::INTEGER_OVERFLOW,
             operation,
             left,
             right,
@@ -262,26 +254,13 @@ impl<V: postgres_jsonb_canonical::PgVersion + 'static> Backend for Postgres<V> {
     fn integer_negate(
         value: i64,
     ) -> Result<Value<Self>, crate::compiler::vm::refusal::EvaluationRefusal> {
-        crate::compiler::vm::arithmetic::checked_integer_binary(
-            crate::compiler::vm::refusal::IntegerOverflow::Fails,
-            crate::compiler::vm::refusal::ArithmeticOp::Negate,
-            value,
-            0,
-        )
+        crate::compiler::vm::arithmetic::checked_integer_negate(Self::INTEGER_OVERFLOW, value)
     }
 
     /// Measured: a float operand puts the comparison at `double precision`
     /// width, and an integer against a decimal is exact.
     fn numeric_widening(left: ScalarFamily, right: ScalarFamily) -> Option<NumericWidening> {
-        match (left, right) {
-            (ScalarFamily::Float, ScalarFamily::Int | ScalarFamily::Decimal)
-            | (ScalarFamily::Int | ScalarFamily::Decimal, ScalarFamily::Float) => {
-                Some(NumericWidening::AtFloatWidth)
-            }
-            (ScalarFamily::Int, ScalarFamily::Decimal)
-            | (ScalarFamily::Decimal, ScalarFamily::Int) => Some(NumericWidening::Exact),
-            _ => None,
-        }
+        super::scalar_value::standard_numeric_widening(left, right)
     }
 
     fn compare_cross_kind_numeric(
@@ -360,15 +339,7 @@ impl<V: postgres_jsonb_canonical::PgVersion + 'static> Backend for Postgres<V> {
         kind: super::scalar_value::ValueKindOf<Self>,
         value: Value<Self>,
     ) -> Option<Value<Self>> {
-        match (kind.family(), value) {
-            (Some(ScalarFamily::Float), Value::Int(value)) => {
-                Some(Value::Float(widen_i64_to_f64(value)))
-            }
-            (Some(ScalarFamily::Float), Value::Decimal(value)) => {
-                value.to_string().parse().ok().map(Value::Float)
-            }
-            (_, value) => (!value.is_missing()).then_some(value),
-        }
+        super::scalar_value::decode_widening_group_value(kind, value)
     }
     type Dialect = sqlparser::dialect::PostgreSqlDialect;
     type Bool = bool;
@@ -440,6 +411,13 @@ impl Backend for MySql {
     const DIVISION_BY_ZERO: crate::compiler::vm::refusal::DivisionByZero =
         crate::compiler::vm::refusal::DivisionByZero::IsNull;
 
+    /// Measured: MySQL raises `BIGINT value is out of range`. Its unary
+    /// minus on the smallest integer promotes past `i64` instead, which is
+    /// reported as a failure here rather than answered from a number this
+    /// carrier cannot hold.
+    const INTEGER_OVERFLOW: crate::compiler::vm::refusal::IntegerOverflow =
+        crate::compiler::vm::refusal::IntegerOverflow::Fails;
+
     /// Measured: it answers `var_pop` and `stddev_pop` digit for digit
     /// with PostgreSQL, so it can hand back its own spread too.
     /// Measured on 8.0.46 and 8.4.11: two rows of `1e308` in a `DOUBLE`
@@ -490,14 +468,7 @@ impl Backend for MySql {
         divisor: bigdecimal::BigDecimal,
         quotient: crate::compiler::bytecode::Quotient,
     ) -> bigdecimal::BigDecimal {
-        match quotient {
-            crate::compiler::bytecode::Quotient::FromTheOperands => {
-                crate::compiler::vm::arithmetic::quotient_at_significant_digits(&dividend, &divisor)
-            }
-            crate::compiler::bytecode::Quotient::InWordsAt(increment) => {
-                crate::compiler::vm::arithmetic::quotient_in_words(&dividend, &divisor, increment)
-            }
-        }
+        crate::compiler::vm::arithmetic::quotient_by_rule(&dividend, &divisor, quotient)
     }
 
     /// Two integers divide to a decimal here, so both widen and take the
@@ -507,24 +478,16 @@ impl Backend for MySql {
         divisor: i64,
         increment: super::scalar_value::DivisionPrecisionIncrement,
     ) -> bigdecimal::BigDecimal {
-        crate::compiler::vm::arithmetic::quotient_in_words(
-            &bigdecimal::BigDecimal::from(dividend),
-            &bigdecimal::BigDecimal::from(divisor),
-            increment,
-        )
+        crate::compiler::vm::arithmetic::integer_quotient_in_words(dividend, divisor, increment)
     }
 
-    /// Measured: MySQL raises `BIGINT value is out of range`. Its unary
-    /// minus on the smallest integer promotes past `i64` instead, which is
-    /// reported as a failure here rather than answered from a number this
-    /// carrier cannot hold.
     fn integer_binary(
         operation: crate::compiler::vm::refusal::ArithmeticOp,
         left: i64,
         right: i64,
     ) -> Result<Value<Self>, crate::compiler::vm::refusal::EvaluationRefusal> {
         crate::compiler::vm::arithmetic::checked_integer_binary(
-            crate::compiler::vm::refusal::IntegerOverflow::Fails,
+            Self::INTEGER_OVERFLOW,
             operation,
             left,
             right,
@@ -534,26 +497,13 @@ impl Backend for MySql {
     fn integer_negate(
         value: i64,
     ) -> Result<Value<Self>, crate::compiler::vm::refusal::EvaluationRefusal> {
-        crate::compiler::vm::arithmetic::checked_integer_binary(
-            crate::compiler::vm::refusal::IntegerOverflow::Fails,
-            crate::compiler::vm::refusal::ArithmeticOp::Negate,
-            value,
-            0,
-        )
+        crate::compiler::vm::arithmetic::checked_integer_negate(Self::INTEGER_OVERFLOW, value)
     }
 
     /// Measured: a float operand puts the comparison at `double precision`
     /// width, and an integer against a decimal is exact.
     fn numeric_widening(left: ScalarFamily, right: ScalarFamily) -> Option<NumericWidening> {
-        match (left, right) {
-            (ScalarFamily::Float, ScalarFamily::Int | ScalarFamily::Decimal)
-            | (ScalarFamily::Int | ScalarFamily::Decimal, ScalarFamily::Float) => {
-                Some(NumericWidening::AtFloatWidth)
-            }
-            (ScalarFamily::Int, ScalarFamily::Decimal)
-            | (ScalarFamily::Decimal, ScalarFamily::Int) => Some(NumericWidening::Exact),
-            _ => None,
-        }
+        super::scalar_value::standard_numeric_widening(left, right)
     }
 
     fn compare_cross_kind_numeric(
@@ -647,15 +597,7 @@ impl Backend for MySql {
         kind: super::scalar_value::ValueKindOf<Self>,
         value: Value<Self>,
     ) -> Option<Value<Self>> {
-        match (kind.family(), value) {
-            (Some(ScalarFamily::Float), Value::Int(value)) => {
-                Some(Value::Float(widen_i64_to_f64(value)))
-            }
-            (Some(ScalarFamily::Float), Value::Decimal(value)) => {
-                value.to_string().parse().ok().map(Value::Float)
-            }
-            (_, value) => (!value.is_missing()).then_some(value),
-        }
+        super::scalar_value::decode_widening_group_value(kind, value)
     }
     type Dialect = sqlparser::dialect::MySqlDialect;
     type Bool = bool;
@@ -722,6 +664,10 @@ impl Backend for SQLite {
     const DIVISION_BY_ZERO: crate::compiler::vm::refusal::DivisionByZero =
         crate::compiler::vm::refusal::DivisionByZero::IsNull;
 
+    /// Measured: SQLite carries an overflowed integer result as a real.
+    const INTEGER_OVERFLOW: crate::compiler::vm::refusal::IntegerOverflow =
+        crate::compiler::vm::refusal::IntegerOverflow::PromotesToFloat;
+
     /// Measured: `no such function: VAR_POP`. SQLite has no variance
     /// function, so a seed there can only ask for a sum of squares.
     /// Measured: two rows of `9e307` answer `inf`, and subtracting
@@ -766,14 +712,7 @@ impl Backend for SQLite {
         divisor: bigdecimal::BigDecimal,
         quotient: crate::compiler::bytecode::Quotient,
     ) -> bigdecimal::BigDecimal {
-        match quotient {
-            crate::compiler::bytecode::Quotient::FromTheOperands => {
-                crate::compiler::vm::arithmetic::quotient_at_significant_digits(&dividend, &divisor)
-            }
-            crate::compiler::bytecode::Quotient::InWordsAt(increment) => {
-                crate::compiler::vm::arithmetic::quotient_in_words(&dividend, &divisor, increment)
-            }
-        }
+        crate::compiler::vm::arithmetic::quotient_by_rule(&dividend, &divisor, quotient)
     }
 
     /// Never called: this engine's `/` truncates two integers.
@@ -782,21 +721,16 @@ impl Backend for SQLite {
         divisor: i64,
         increment: super::scalar_value::DivisionPrecisionIncrement,
     ) -> bigdecimal::BigDecimal {
-        crate::compiler::vm::arithmetic::quotient_in_words(
-            &bigdecimal::BigDecimal::from(dividend),
-            &bigdecimal::BigDecimal::from(divisor),
-            increment,
-        )
+        crate::compiler::vm::arithmetic::integer_quotient_in_words(dividend, divisor, increment)
     }
 
-    /// Measured: SQLite carries an overflowed integer result as a real.
     fn integer_binary(
         operation: crate::compiler::vm::refusal::ArithmeticOp,
         left: i64,
         right: i64,
     ) -> Result<Value<Self>, crate::compiler::vm::refusal::EvaluationRefusal> {
         crate::compiler::vm::arithmetic::checked_integer_binary(
-            crate::compiler::vm::refusal::IntegerOverflow::PromotesToFloat,
+            Self::INTEGER_OVERFLOW,
             operation,
             left,
             right,
@@ -806,12 +740,7 @@ impl Backend for SQLite {
     fn integer_negate(
         value: i64,
     ) -> Result<Value<Self>, crate::compiler::vm::refusal::EvaluationRefusal> {
-        crate::compiler::vm::arithmetic::checked_integer_binary(
-            crate::compiler::vm::refusal::IntegerOverflow::PromotesToFloat,
-            crate::compiler::vm::refusal::ArithmeticOp::Negate,
-            value,
-            0,
-        )
+        crate::compiler::vm::arithmetic::checked_integer_negate(Self::INTEGER_OVERFLOW, value)
     }
 
     /// SQLite compares an integer against a real without rounding either,

@@ -536,6 +536,17 @@ impl SessionSetup for () {
     }
 }
 
+/// The statement that puts an open transaction on the snapshot every
+/// LSN-anchored Postgres read takes.
+///
+/// `SET TRANSACTION` is DDL-like, so there is no typed DSL spelling of it.
+#[cfg(any(
+    feature = "executor-diesel-postgres",
+    feature = "executor-diesel-async-postgres"
+))]
+pub(super) const PG_READ_SNAPSHOT: &str =
+    "SET TRANSACTION READ ONLY, ISOLATION LEVEL REPEATABLE READ";
+
 /// Run each setup statement in order on `conn`. Shared by every sync
 /// diesel-backed connector, called inside the transaction that serves the read
 /// and before the caller's SQL.

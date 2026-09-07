@@ -13,7 +13,7 @@ use diesel::sql_types::Bool;
 use sql_traits::prelude::{ColumnLike, DatabaseLike, DialectLike, TypeMatchLike};
 use sqlite_diff_rs::{Adapter, Binder, DefaultBinder, Value};
 
-use super::columns::{unknown_column_error, ColumnIndex};
+use super::columns::{bind_error, shape_of, unknown_column_error, ColumnIndex};
 
 /// Adapter that resolves column names and native diesel binders for a
 /// MySQL target from a subql catalog.
@@ -83,35 +83,6 @@ where
         Ok(Box::new(DefaultBinder::from(value)))
     }
 }
-
-const fn shape_of<S, B>(value: &Value<S, B>) -> &'static str {
-    match value {
-        Value::Null => "NULL",
-        Value::Integer(_) => "INTEGER",
-        Value::Real(_) => "REAL",
-        Value::Text(_) => "TEXT",
-        Value::Blob(_) => "BLOB",
-    }
-}
-
-fn bind_error(column: &str, expected: &str, got: &str) -> diesel::result::Error {
-    diesel::result::Error::QueryBuilderError(Box::new(BindTypeMismatch {
-        message: alloc::format!("column `{column}` expects {expected}, got {got}"),
-    }))
-}
-
-#[derive(Debug, Clone)]
-struct BindTypeMismatch {
-    message: alloc::string::String,
-}
-
-impl core::fmt::Display for BindTypeMismatch {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.write_str(&self.message)
-    }
-}
-
-impl core::error::Error for BindTypeMismatch {}
 
 /// Binder that pushes a boolean value onto the AST as a native
 /// [`Bool`] bind. Constructed by [`MysqlAdapter`] when a column resolved

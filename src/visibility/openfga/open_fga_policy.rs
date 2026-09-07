@@ -1338,7 +1338,7 @@ mod tests {
         RequiredParameter, RowWrite, Subject, TupleKeyWithoutCondition, MAX_TUPLES_PER_WRITE,
     };
     use crate::backend::{Postgres, Value};
-    use crate::testing::TestEvent;
+    use crate::testing::{block_on, TestEvent};
     use crate::visibility::shapes::Shapes;
     use crate::visibility::store::Enumeration;
     use crate::visibility::{test_names, EventRow, Verdict, VisibilityPolicy};
@@ -1809,19 +1809,6 @@ CREATE POLICY notes_p ON notes USING (
 CREATE TABLE ledger(id INTEGER PRIMARY KEY, amount INTEGER);
 ALTER TABLE ledger ENABLE ROW LEVEL SECURITY;
 ";
-
-    /// Spin rather than schedule: every future below answers on its first poll,
-    /// because a refused statement asks nothing, and a regression that asks
-    /// panics in [`NeverAsked`] rather than hanging here.
-    fn block_on<F: core::future::Future>(future: F) -> F::Output {
-        let mut context = CoreContext::from_waker(core::task::Waker::noop());
-        let mut pinned = core::pin::pin!(future);
-        loop {
-            if let Poll::Ready(value) = pinned.as_mut().poll(&mut context) {
-                return value;
-            }
-        }
-    }
 
     /// A refusal the model states is an answer, so it comes back as a denial
     /// rather than as [`OpenFgaError::StatementNotAnswered`]. The difference

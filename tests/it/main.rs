@@ -58,6 +58,9 @@ mod apply_patchset_pg_async_e2e;
 mod apply_patchset_pg_e2e;
 
 #[cfg(feature = "apply-patchset-postgres")]
+mod apply_patchset_pg_rich_scalars_e2e;
+
+#[cfg(feature = "apply-patchset-postgres")]
 mod apply_patchset_pg_uuid_e2e;
 
 #[cfg(feature = "apply-patchset-sqlite")]
@@ -340,6 +343,8 @@ mod semantics_bool_order;
 mod semantics_jsonb_order;
 
 mod semantics_like_escape;
+
+mod semantics_pattern_negation;
 
 mod semantics_bpchar;
 

@@ -1304,6 +1304,45 @@ pub(super) fn decode_exact_group_value<B: Backend>(
     }
 }
 
+/// The widening PostgreSQL and MySQL share: a float against an exact operand
+/// puts the pair at float width, and an integer against a decimal is exact.
+#[must_use]
+pub(super) const fn standard_numeric_widening(
+    left: ScalarFamily,
+    right: ScalarFamily,
+) -> Option<NumericWidening> {
+    match (left, right) {
+        (ScalarFamily::Float, ScalarFamily::Int | ScalarFamily::Decimal)
+        | (ScalarFamily::Int | ScalarFamily::Decimal, ScalarFamily::Float) => {
+            Some(NumericWidening::AtFloatWidth)
+        }
+        (ScalarFamily::Int, ScalarFamily::Decimal) | (ScalarFamily::Decimal, ScalarFamily::Int) => {
+            Some(NumericWidening::Exact)
+        }
+        _ => None,
+    }
+}
+
+/// The group-key decode PostgreSQL and MySQL share: a float column reads an
+/// exact key back as a float, since neither engine keys a float group.
+pub(super) fn decode_widening_group_value<B>(
+    kind: ValueKindOf<B>,
+    value: Value<B>,
+) -> Option<Value<B>>
+where
+    B: Backend<Int = i64, Float = f64, Decimal = bigdecimal::BigDecimal>,
+{
+    match (kind.family(), value) {
+        (Some(ScalarFamily::Float), Value::Int(value)) => {
+            Some(Value::Float(widen_i64_to_f64(value)))
+        }
+        (Some(ScalarFamily::Float), Value::Decimal(value)) => {
+            value.to_string().parse().ok().map(Value::Float)
+        }
+        (_, value) => (!value.is_missing()).then_some(value),
+    }
+}
+
 fn canonical_f64(value: f64) -> f64 {
     if value == 0.0 {
         0.0

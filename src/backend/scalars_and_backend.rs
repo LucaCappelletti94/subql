@@ -398,6 +398,14 @@ pub trait Backend: 'static {
     /// every numeric type, while MySQL and SQLite answer `NULL`.
     const DIVISION_BY_ZERO: crate::compiler::vm::refusal::DivisionByZero;
 
+    /// What this backend answers when an integer result does not fit.
+    ///
+    /// Required, and per backend, because the engines disagree: measured,
+    /// PostgreSQL and MySQL raise `out of range` while SQLite promotes the
+    /// result to a real. Read by both [`Backend::integer_binary`] and
+    /// [`Backend::integer_negate`], so the two cannot state different rules.
+    const INTEGER_OVERFLOW: crate::compiler::vm::refusal::IntegerOverflow;
+
     /// What `/` answers on this backend: whether two integers divide to an
     /// integer, and what scale a decimal quotient carries.
     ///
@@ -462,9 +470,7 @@ pub trait Backend: 'static {
     /// [`Backend::hold_float_at_single`] is: a default would let the rule
     /// and the arithmetic disagree in silence. A backend on the standard
     /// `bigdecimal` carrier delegates to
-    /// [`crate::compiler::vm::arithmetic::quotient_in_words`] or
-    /// [`crate::compiler::vm::arithmetic::quotient_at_significant_digits`]
-    /// according to the rule it states.
+    /// [`crate::compiler::vm::arithmetic::quotient_by_rule`].
     #[must_use]
     fn decimal_quotient(
         dividend: Self::Decimal,
@@ -479,9 +485,9 @@ pub trait Backend: 'static {
     ///
     /// Called only under
     /// [`DivisionRule::QuotientsAreDecimalInWords`](super::scalar_value::DivisionRule::QuotientsAreDecimalInWords),
-    /// where `7 / 2` is `3.5000` rather than `3`. A backend on the
-    /// standard carriers widens both sides and delegates to
-    /// [`crate::compiler::vm::arithmetic::quotient_in_words`].
+    /// where `7 / 2` is `3.5000` rather than `3`. A backend on the standard
+    /// carriers delegates to
+    /// [`crate::compiler::vm::arithmetic::integer_quotient_in_words`].
     #[must_use]
     fn integer_quotient(
         dividend: Self::Int,
@@ -491,13 +497,12 @@ pub trait Backend: 'static {
     where
         Self: Sized;
 
-    /// Integer `+`, `-` or `*` as this backend answers it, including what
-    /// it answers when the result does not fit.
+    /// Integer `+`, `-` or `*` as this backend answers it, under
+    /// [`Backend::INTEGER_OVERFLOW`] when the result does not fit.
     ///
-    /// Required, and per backend, because the engines disagree: measured,
-    /// PostgreSQL and MySQL raise `out of range` while SQLite promotes the
-    /// result to a real. A backend on the standard `i64` carrier delegates
-    /// to [`crate::compiler::vm::arithmetic::checked_integer_binary`].
+    /// Required, and per backend, because `Self::Int` is an associated type
+    /// with no `checked_add`. A backend on the standard `i64` carrier
+    /// delegates to [`crate::compiler::vm::arithmetic::checked_integer_binary`].
     ///
     /// # Errors
     ///

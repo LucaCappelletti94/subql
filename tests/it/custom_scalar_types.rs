@@ -17,7 +17,7 @@ use subql::backend::{
     Backend, Carried, CustomScalars, ScalarFamily, ScalarKind, ScalarKindOf, Value,
 };
 use subql::backend::{NumericWidening, TextOperation, TextRule, ValueKind, ValueKindOf};
-use subql::compiler::vm::arithmetic::checked_integer_binary;
+use subql::compiler::vm::arithmetic::{checked_integer_binary, checked_integer_negate};
 use subql::compiler::vm::refusal::{
     ArithmeticOp, DanglingEscape, DivisionByZero, EvaluationRefusal, IntegerOverflow, LikeEscape,
 };
@@ -116,19 +116,21 @@ impl Backend for Custom {
     /// PostgreSQL's dialect, so PostgreSQL's rule.
     const DIVISION_BY_ZERO: DivisionByZero = DivisionByZero::Fails;
 
+    /// PostgreSQL's dialect again: it raises rather than promoting.
+    const INTEGER_OVERFLOW: IntegerOverflow = IntegerOverflow::Fails;
+
     /// This backend carries its integers in `i64`, so it takes the checked
-    /// arithmetic, and it speaks the PostgreSQL dialect, which raises on
-    /// overflow.
+    /// arithmetic.
     fn integer_binary(
         operation: ArithmeticOp,
         left: i64,
         right: i64,
     ) -> Result<Value<Self>, EvaluationRefusal> {
-        checked_integer_binary(IntegerOverflow::Fails, operation, left, right)
+        checked_integer_binary(Self::INTEGER_OVERFLOW, operation, left, right)
     }
 
     fn integer_negate(value: i64) -> Result<Value<Self>, EvaluationRefusal> {
-        checked_integer_binary(IntegerOverflow::Fails, ArithmeticOp::Negate, value, 0)
+        checked_integer_negate(Self::INTEGER_OVERFLOW, value)
     }
 
     /// No cross-kind numeric comparison: this backend's fixtures compare
@@ -173,9 +175,9 @@ impl Backend for Custom {
     fn decimal_quotient(
         dividend: bigdecimal::BigDecimal,
         divisor: bigdecimal::BigDecimal,
-        _quotient: subql::compiler::bytecode::Quotient,
+        quotient: subql::compiler::bytecode::Quotient,
     ) -> bigdecimal::BigDecimal {
-        subql::compiler::vm::arithmetic::quotient_at_significant_digits(&dividend, &divisor)
+        subql::compiler::vm::arithmetic::quotient_by_rule(&dividend, &divisor, quotient)
     }
 
     /// Never called: this backend's `/` truncates two integers.
@@ -184,11 +186,7 @@ impl Backend for Custom {
         divisor: i64,
         increment: subql::backend::DivisionPrecisionIncrement,
     ) -> bigdecimal::BigDecimal {
-        subql::compiler::vm::arithmetic::quotient_in_words(
-            &bigdecimal::BigDecimal::from(dividend),
-            &bigdecimal::BigDecimal::from(divisor),
-            increment,
-        )
+        subql::compiler::vm::arithmetic::integer_quotient_in_words(dividend, divisor, increment)
     }
 
     /// On the standard carrier, so the shared narrowing serves even though

@@ -181,10 +181,10 @@ r2d2 = { version = "0.8", optional = true }
 # resolve to the same diesel node as subql's `future` fork patch, which it
 # does because diesel-async's `diesel ~2.3` requirement is satisfied by
 # the fork.
-diesel-async = { version = "0.7", optional = true, default-features = false }
+diesel-async = { version = "0.9", optional = true, default-features = false }
 
 # SQLite patchsets and digest conversion for both CDC wire formats.
-sqlite-diff-rs = { version = "0.11", default-features = false, features = ["wal2json", "maxwell"] }
+sqlite-diff-rs = { version = "0.12", default-features = false, features = ["wal2json", "maxwell"] }
 # PostgreSQL wal2json parser and model.
 wal2json-events = { version = "0.1.0", default-features = false }
 # MySQL Maxwell parser and model. Direct, like `wal2json-events` and for the
@@ -313,7 +313,7 @@ uuid = { version = "1", features = ["v4"] }
 # reached through diesel-async's re-export. Both backends are enabled so a
 # test can target whichever backend regardless of the single library
 # feature it turns on.
-diesel-async = { version = "0.7", default-features = false, features = ["postgres", "mysql", "bb8"] }
+diesel-async = { version = "0.9", default-features = false, features = ["postgres", "mysql", "bb8"] }
 
 # Property-based testing
 proptest = "1"

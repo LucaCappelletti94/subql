@@ -148,7 +148,7 @@ where
                 None
             }
         }
-        AggSpec::Sum { column } => {
+        AggSpec::Sum { column } | AggSpec::Avg { column } => {
             // No early-out on a zero delta: a row worth zero moves the
             // answer from NULL to 0, or back, without moving the total.
             Some(AggDelta::Totalled {
@@ -156,10 +156,6 @@ where
                 count_delta: weight,
             })
         }
-        AggSpec::Avg { column } => Some(AggDelta::Totalled {
-            value: read(*column).contribution(weight)?,
-            count_delta: weight,
-        }),
         AggSpec::VarPop { column }
         | AggSpec::VarSamp { column }
         | AggSpec::StddevPop { column }
