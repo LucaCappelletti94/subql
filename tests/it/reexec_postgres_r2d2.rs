@@ -77,6 +77,15 @@ fn backend_pid(conn: &mut PgConnection) -> i64 {
 const IDLE_IN_TXN: &str = "SELECT count(*) AS n FROM pg_stat_activity \
      WHERE state = 'idle in transaction' AND xact_start IS NOT NULL";
 
+/// The connector's own cursors open in the asking session. A cursor declared
+/// without `WITH HOLD` lives inside its transaction, so this is zero once the
+/// transaction ends. Named cursors only: diesel runs every query through an
+/// unnamed portal, which `pg_cursors` reports while the query itself runs.
+/// `starts_with` rather than `LIKE`, because the prefix contains underscores
+/// and `LIKE` would read them as wildcards.
+const SUBQL_CURSORS_OPEN: &str =
+    "SELECT count(*) AS n FROM pg_cursors WHERE starts_with(name, 'subql_cursor_')";
+
 const SLOT: &str = "subql_test";
 const DDL: &str =
     "CREATE TABLE orders (id INT PRIMARY KEY, price FLOAT, quantity INT, status TEXT);";
@@ -764,6 +773,12 @@ fn an_abandoned_cursor_ends_its_transaction_and_keeps_its_connection() {
         scalar(&mut observer, IDLE_IN_TXN),
         0,
         "the reused connection must not carry the abandoned transaction"
+    );
+    assert_eq!(
+        scalar(&mut reused, SUBQL_CURSORS_OPEN),
+        0,
+        "and must not carry the abandoned cursor either: ending the transaction \
+         is what closes a cursor declared inside it"
     );
 }
 
