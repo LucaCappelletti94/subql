@@ -712,3 +712,101 @@ mod bound_query_tests {
         assert!(Arc::ptr_eq(&query.inner, &cloned.inner));
     }
 }
+
+#[cfg(all(test, feature = "executor-diesel"))]
+mod cursor_page_tests {
+    use super::{drain_cursor_buffer, run_setup_statements, RowPage};
+    use crate::backend::{Postgres, Value};
+    use alloc::collections::VecDeque;
+    use alloc::string::{String, ToString as _};
+    use alloc::vec;
+    use alloc::vec::Vec;
+    use diesel::{sql_query, Connection as _, QueryableByName, RunQueryDsl as _, SqliteConnection};
+
+    fn row_of(value: Value<Postgres>) -> Vec<Value<Postgres>> {
+        vec![value]
+    }
+
+    /// A row wider than the entire budget is delivered anyway. Holding it back
+    /// would return an empty page while rows are still buffered, and the
+    /// caller pages until a page says it is the last, so the read would never
+    /// end.
+    #[test]
+    fn a_row_wider_than_the_budget_is_still_delivered() {
+        let row = row_of(Value::String("x".repeat(64)));
+        let cost = RowPage::<Postgres>::row_bytes_of(&row);
+        let mut leftover = VecDeque::from([row.clone()]);
+        let mut rows: Vec<Vec<Value<Postgres>>> = Vec::new();
+        let mut spent = 0;
+
+        let budget_stopped =
+            drain_cursor_buffer(&mut leftover, &mut rows, &mut spent, cost.saturating_sub(1));
+
+        assert!(
+            !budget_stopped,
+            "the buffer emptied, so this page ends on the cursor and not on the budget"
+        );
+        assert_eq!(
+            rows,
+            vec![row],
+            "the oversized row is delivered, not starved"
+        );
+        assert!(
+            leftover.is_empty(),
+            "and nothing is left behind for a next page"
+        );
+    }
+
+    /// The budget ends the page at the first row that would exceed it, and the
+    /// rows behind it stay buffered. A `FETCH` cannot be undone, so a row that
+    /// does not fit this page must wait rather than be returned or dropped.
+    #[test]
+    fn the_budget_ends_the_page_and_keeps_the_rest_buffered() {
+        let row = row_of(Value::Int(7));
+        let cost = RowPage::<Postgres>::row_bytes_of(&row);
+        let mut leftover = VecDeque::from([row.clone(), row.clone(), row]);
+        let mut rows: Vec<Vec<Value<Postgres>>> = Vec::new();
+        let mut spent = 0;
+
+        let budget_stopped = drain_cursor_buffer(&mut leftover, &mut rows, &mut spent, cost * 2);
+
+        assert!(budget_stopped, "the budget is what ended this page");
+        assert_eq!(rows.len(), 2, "two rows fit the budget");
+        assert_eq!(
+            leftover.len(),
+            1,
+            "the row that did not fit is kept for the next page"
+        );
+        assert_eq!(spent, cost * 2, "the page spent exactly what it delivered");
+    }
+
+    #[derive(QueryableByName)]
+    struct Marker {
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        note: String,
+    }
+
+    /// Setup statements run in the order the caller gave them. A caller builds
+    /// a session out of steps that depend on each other, a role before the
+    /// setting that role may write, so any other order is a different session.
+    #[test]
+    fn setup_statements_run_in_the_order_given() {
+        let mut conn = SqliteConnection::establish(":memory:").expect("open in-memory sqlite");
+        let statements = [
+            "CREATE TABLE session (note TEXT)".to_string(),
+            "INSERT INTO session (note) VALUES ('first')".to_string(),
+            "UPDATE session SET note = 'second'".to_string(),
+        ];
+
+        run_setup_statements(&mut conn, &statements).expect("each statement runs in turn");
+
+        let markers: Vec<Marker> = sql_query("SELECT note FROM session")
+            .load(&mut conn)
+            .expect("read the marker back");
+        assert_eq!(markers.len(), 1);
+        assert_eq!(
+            markers[0].note, "second",
+            "the last statement given is the last one applied"
+        );
+    }
+}

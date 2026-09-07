@@ -1432,3 +1432,259 @@ fn async_page_reads_apply_typed_binds() {
         assert_eq!(page.value.rows[0][0], Value::Int(7));
     });
 }
+
+/// Backends parked inside a transaction, aborted or not. A failed cursor open
+/// aborts its transaction before rolling it back, and an aborted one is its
+/// own `pg_stat_activity` state, which [`IDLE_IN_TXN`] does not match.
+const IDLE_IN_ANY_TXN: &str = "SELECT count(*) AS n FROM pg_stat_activity \
+     WHERE state LIKE 'idle in transaction%' AND xact_start IS NOT NULL";
+
+/// Every async read runs in the mode `PG_READ_SNAPSHOT` names, the same one
+/// the sync connector uses: a repeatable-read snapshot that refuses writes.
+/// The read's own SQL observes it, on the scalar path and inside a cursor.
+#[test]
+#[ignore = "requires Docker"]
+fn each_async_read_runs_read_only_at_repeatable_read() {
+    common::assert_docker_available();
+    let container = common::pg_with_wal2json();
+    let port = common::pg_port(&container);
+    let mut conn = common::pg_connect(port);
+    setup_pg(&mut conn, &[(1, 5.0)]);
+    sql_query("CREATE SEQUENCE probe_seq")
+        .execute(&mut conn)
+        .expect("create the sequence");
+
+    common::multi_thread_rt().block_on(async {
+        let connector = PgAsyncDieselConnector::new(pg_async_pool(port).await);
+        let (isolation, _) = connector
+            .execute_scalar(
+                &subql::reexec::ReadQuery::without_binds(
+                    "SELECT current_setting('transaction_isolation') AS v",
+                ),
+                ScalarFamily::String,
+                &(),
+            )
+            .await
+            .expect("scalar read");
+        assert_eq!(isolation, Value::String("repeatable read".into()));
+
+        let (read_only, _) = connector
+            .execute_scalar(
+                &subql::reexec::ReadQuery::without_binds(
+                    "SELECT current_setting('transaction_read_only') AS v",
+                ),
+                ScalarFamily::String,
+                &(),
+            )
+            .await
+            .expect("scalar read");
+        assert_eq!(read_only, Value::String("on".into()));
+
+        // The cursor's held transaction is the same snapshot. A write it can
+        // carry, `nextval`, is refused for being read only: `DECLARE` rejects
+        // a data-modifying `WITH` outright, so that cannot be the probe.
+        let cursor = connector
+            .open_cursor(
+                &subql::reexec::ReadQuery::without_binds("SELECT nextval('probe_seq') AS n"),
+                &(),
+            )
+            .await
+            .expect("the declaration itself is accepted");
+        let refused = connector
+            .fetch_cursor(cursor, 4096)
+            .await
+            .expect_err("advancing a sequence inside the read snapshot is refused");
+        assert!(
+            refused.to_string().contains("read-only transaction"),
+            "refused for being read-only rather than for any other reason, got {refused}"
+        );
+    });
+}
+
+/// Two async cursors open at once are two cursors: distinct ids and pages
+/// that do not bleed into each other.
+#[test]
+#[ignore = "requires Docker"]
+fn two_async_cursors_open_at_once_page_independently() {
+    common::assert_docker_available();
+    let container = common::pg_with_wal2json();
+    let port = common::pg_port(&container);
+    let mut conn = common::pg_connect(port);
+    let seed: Vec<(i64, f64)> = (1..=6_u32)
+        .map(|id| (i64::from(id), f64::from(id)))
+        .collect();
+    setup_pg(&mut conn, &seed);
+
+    common::multi_thread_rt().block_on(async {
+        let connector = PgAsyncDieselConnector::new(pg_async_pool(port).await);
+        let ascending = connector
+            .open_cursor(
+                &subql::reexec::ReadQuery::without_binds("SELECT id FROM orders ORDER BY id"),
+                &(),
+            )
+            .await
+            .expect("open the ascending cursor");
+        let descending = connector
+            .open_cursor(
+                &subql::reexec::ReadQuery::without_binds("SELECT id FROM orders ORDER BY id DESC"),
+                &(),
+            )
+            .await
+            .expect("open the descending cursor");
+        assert_ne!(
+            ascending, descending,
+            "each open must hand back its own cursor id"
+        );
+
+        let mut up = Vec::new();
+        let mut down = Vec::new();
+        loop {
+            let mut going = false;
+            for (cursor, ids) in [(ascending, &mut up), (descending, &mut down)] {
+                let page = connector
+                    .fetch_cursor(cursor, 32)
+                    .await
+                    .expect("fetch a page");
+                for row in &page.value.rows {
+                    match row[0] {
+                        Value::Int(id) => ids.push(id),
+                        ref other => panic!("id should decode as an integer, got {other:?}"),
+                    }
+                }
+                going |= page.value.more;
+            }
+            if !going {
+                break;
+            }
+            assert!(
+                up.len() <= 6 && down.len() <= 6,
+                "both cursors should finish"
+            );
+        }
+
+        assert_eq!(
+            up,
+            (1..=6).collect::<Vec<_>>(),
+            "the ascending cursor's rows"
+        );
+        assert_eq!(
+            down,
+            (1..=6).rev().collect::<Vec<_>>(),
+            "the descending cursor's rows, unmixed with the other's"
+        );
+        connector
+            .close_cursor(ascending)
+            .await
+            .expect("close ascending");
+        connector
+            .close_cursor(descending)
+            .await
+            .expect("close descending");
+    });
+}
+
+/// An async cursor that fails to open rolls its transaction back rather than
+/// leaving the pooled connection inside one. Rolling back keeps the
+/// connection: released still in a transaction, the pool can only discard it,
+/// which the backend pid before and after reports exactly.
+#[test]
+#[ignore = "requires Docker"]
+fn an_async_cursor_that_fails_to_open_keeps_its_connection() {
+    common::assert_docker_available();
+    let container = common::pg_with_wal2json();
+    let port = common::pg_port(&container);
+    let mut conn = common::pg_connect(port);
+    setup_pg(&mut conn, &[(1, 1.0)]);
+    let mut observer = common::pg_connect(port);
+
+    common::multi_thread_rt().block_on(async {
+        // One connection, so the pid names the same pool slot each time.
+        let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(common::pg_url(port));
+        let pool: Pool<AsyncPgConnection> = Pool::builder()
+            .max_size(1)
+            .build(manager)
+            .await
+            .expect("build a single-connection pool");
+        let connector = PgAsyncDieselConnector::new(pool);
+        let pid = subql::reexec::ReadQuery::without_binds("SELECT pg_backend_pid()::bigint AS n");
+        let (before, _) = connector
+            .execute_scalar(&pid, ScalarFamily::Int, &())
+            .await
+            .expect("read the backend pid");
+
+        let failed = connector
+            .open_cursor(
+                &subql::reexec::ReadQuery::without_binds("SELECT id FROM no_such_table"),
+                &(),
+            )
+            .await
+            .expect_err("a cursor over a missing table cannot open");
+        assert!(
+            failed.to_string().contains("no_such_table"),
+            "the failure names what the database refused, got {failed}"
+        );
+
+        assert_eq!(
+            count(&mut observer, IDLE_IN_ANY_TXN),
+            0,
+            "a failed open leaves no backend parked in a transaction"
+        );
+        let (after, _) = connector
+            .execute_scalar(&pid, ScalarFamily::Int, &())
+            .await
+            .expect("the pool still serves reads");
+        assert_eq!(
+            after, before,
+            "the connection is rolled back and reused rather than discarded"
+        );
+    });
+}
+
+/// Every page of an async cursor names its columns, the last one included.
+/// The terminal `FETCH` returns no rows, and a page taking its names from
+/// that arrives unlabelled.
+#[test]
+#[ignore = "requires Docker"]
+fn every_page_of_an_async_cursor_names_its_columns() {
+    common::assert_docker_available();
+    let container = common::pg_with_wal2json();
+    let port = common::pg_port(&container);
+    let mut conn = common::pg_connect(port);
+    let seed: Vec<(i64, f64)> = (1..=8_u32)
+        .map(|id| (i64::from(id), f64::from(id)))
+        .collect();
+    setup_pg(&mut conn, &seed);
+
+    common::multi_thread_rt().block_on(async {
+        let connector = PgAsyncDieselConnector::new(pg_async_pool(port).await);
+        let cursor = connector
+            .open_cursor(
+                &subql::reexec::ReadQuery::without_binds(
+                    "SELECT id, status FROM orders ORDER BY id",
+                ),
+                &(),
+            )
+            .await
+            .expect("open cursor");
+
+        let mut pages = 0;
+        loop {
+            let page = connector
+                .fetch_cursor(cursor, 24)
+                .await
+                .expect("fetch a page");
+            pages += 1;
+            assert_eq!(
+                page.value.columns,
+                vec!["id".to_string(), "status".to_string()],
+                "page {pages} must name its columns, last page included"
+            );
+            if !page.value.more {
+                break;
+            }
+            assert!(pages < 50, "the cursor should finish");
+        }
+        assert!(pages > 1, "the budget should have split this result");
+        connector.close_cursor(cursor).await.expect("close");
+    });
+}
