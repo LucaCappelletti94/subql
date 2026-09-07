@@ -80,44 +80,93 @@ fn decode_hex_bytes(hex: &str) -> Option<alloc::vec::Vec<u8>> {
         .collect()
 }
 
-/// Parse a JSON float at the width the column declares, for the same reason
-/// [`parse_float_at_width`] does: wal2json prints the float4 value's own
-/// shortest text.
-fn json_float_at_width(value: &serde_json::Value, width: FloatWidth) -> Value<Postgres> {
-    match width {
-        FloatWidth::Single => {
-            json_f64(value).map_or(Value::Missing, |double| Value::Float(at_float4(double)))
-        }
-        FloatWidth::Double => json_f64(value).map_or(Value::Missing, Value::Float),
+/// The two JSON wire families the two engines read differently.
+///
+/// Every other family decodes identically from a JSON cell, so
+/// [`json_value_by_kind`] takes only these from the backend and the carrier
+/// list is stated once here.
+trait JsonWireScalars:
+    Sized
+    + crate::backend::Backend<
+        Bool = bool,
+        Int = i64,
+        Float = f64,
+        Decimal = BigDecimal,
+        String = alloc::string::String,
+        Bytes = alloc::vec::Vec<u8>,
+        Timestamp = NaiveDateTime,
+        TimestampTz = DateTime<Utc>,
+        Date = NaiveDate,
+        Time = NaiveTime,
+        Json = serde_json::Value,
+        Jsonb = serde_json::Value,
+    >
+{
+    /// PostgreSQL carries a native `uuid`, MySQL stores one as text.
+    fn uuid_cell(value: &serde_json::Value) -> Value<Self>;
+
+    /// PostgreSQL's `bytea` prints bare hex as well as `\x` hex, Maxwell
+    /// prints only the `\x` form.
+    fn bytes_cell(value: &serde_json::Value) -> Value<Self>;
+}
+
+impl JsonWireScalars for Postgres {
+    fn uuid_cell(value: &serde_json::Value) -> Value<Self> {
+        value
+            .as_str()
+            .and_then(|text| Uuid::parse_str(text).ok())
+            .map_or(Value::Missing, Value::Uuid)
+    }
+
+    fn bytes_cell(value: &serde_json::Value) -> Value<Self> {
+        json_pg_bytea(value).map_or(Value::Missing, Value::Bytes)
     }
 }
 
-/// Decode a JSON wire value into a typed [`Value<Postgres>`] routed by the
-/// column's catalog [`ScalarFamily`] (the schema-driven path for wal2json).
+impl JsonWireScalars for MySql {
+    fn uuid_cell(value: &serde_json::Value) -> Value<Self> {
+        value
+            .as_str()
+            .map_or(Value::Missing, |text| Value::Uuid(text.to_string()))
+    }
+
+    fn bytes_cell(value: &serde_json::Value) -> Value<Self> {
+        json_bytea(value).map_or(Value::Missing, Value::Bytes)
+    }
+}
+
+/// Decode a JSON wire value into a typed [`Value<B>`] routed by the column's
+/// catalog [`ScalarFamily`], the schema-driven path for wal2json and Maxwell.
 ///
-/// A wire-carried JSON null becomes [`Value::Null`]. Any shape the kind
-/// cannot accept collapses to [`Value::Missing`], matching the `value_at`
-/// contract (a corrupt cell escalates to re-execution).
-pub(super) fn json_value_to_pg_value_by_kind(
+/// A wire-carried JSON null becomes [`Value::Null`]. Any shape the kind cannot
+/// accept collapses to [`Value::Missing`], matching the `value_at` contract: a
+/// corrupt cell escalates to re-execution.
+///
+/// The width decides what a float cell means, for the same reason
+/// [`parse_float_at_width`] gives: both wires print the float4 value's own
+/// shortest text, and MySQL's `FLOAT` is float4 as PostgreSQL's `real` is.
+fn json_value_by_kind<B: JsonWireScalars>(
     value: &serde_json::Value,
     kind: DeclaredType,
-) -> Value<Postgres> {
+) -> Value<B> {
     if value.is_null() {
         return Value::Null;
     }
     if let DeclaredType::Float(width) = kind {
-        return json_float_at_width(value, width);
+        return json_f64(value).map_or(Value::Missing, |double| {
+            Value::Float(match width {
+                FloatWidth::Single => at_float4(double),
+                FloatWidth::Double => double,
+            })
+        });
     }
     match kind.family() {
         ScalarFamily::Bool => json_bool(value).map_or(Value::Missing, Value::Bool),
         ScalarFamily::Int => json_i64(value).map_or(Value::Missing, Value::Int),
         ScalarFamily::Decimal => json_bigdecimal(value).map_or(Value::Missing, Value::Decimal),
         ScalarFamily::String => Value::String(json_string(value)),
-        ScalarFamily::Bytes => json_pg_bytea(value).map_or(Value::Missing, Value::Bytes),
-        ScalarFamily::Uuid => value
-            .as_str()
-            .and_then(|s| Uuid::parse_str(s).ok())
-            .map_or(Value::Missing, Value::Uuid),
+        ScalarFamily::Bytes => B::bytes_cell(value),
+        ScalarFamily::Uuid => B::uuid_cell(value),
         ScalarFamily::Timestamp => json_timestamp(value).map_or(Value::Missing, Value::Timestamp),
         ScalarFamily::TimestampTz => {
             json_timestamptz(value).map_or(Value::Missing, Value::TimestampTz)
@@ -131,45 +180,20 @@ pub(super) fn json_value_to_pg_value_by_kind(
     }
 }
 
-/// Decode a JSON wire value into a typed [`Value<MySql>`] routed by the
-/// column's catalog [`ScalarFamily`] (the schema-driven path for Maxwell).
-///
-/// Mirrors [`json_value_to_pg_value_by_kind`] except on two kinds:
-/// [`ScalarFamily::Uuid`], which MySQL stores as text so the wire string is
-/// taken verbatim rather than parsed into a [`uuid::Uuid`], and
-/// [`ScalarFamily::Bytes`], which accepts only the `\x`-prefixed hex form while
-/// the Postgres path also accepts bare hex.
+/// [`json_value_by_kind`] for the wal2json path.
+pub(super) fn json_value_to_pg_value_by_kind(
+    value: &serde_json::Value,
+    kind: DeclaredType,
+) -> Value<Postgres> {
+    json_value_by_kind(value, kind)
+}
+
+/// [`json_value_by_kind`] for the Maxwell path.
 pub(super) fn json_value_to_mysql_value_by_kind(
     value: &serde_json::Value,
     kind: DeclaredType,
 ) -> Value<MySql> {
-    if value.is_null() {
-        return Value::Null;
-    }
-    if kind == DeclaredType::Float(FloatWidth::Single) {
-        // MySQL's `FLOAT` is float4, and Maxwell prints the float4 value's
-        // own shortest text, exactly as PostgreSQL's wire does.
-        return json_f64(value).map_or(Value::Missing, |double| Value::Float(at_float4(double)));
-    }
-    match kind.family() {
-        ScalarFamily::Bool => json_bool(value).map_or(Value::Missing, Value::Bool),
-        ScalarFamily::Int => json_i64(value).map_or(Value::Missing, Value::Int),
-        ScalarFamily::Float => json_f64(value).map_or(Value::Missing, Value::Float),
-        ScalarFamily::Decimal => json_bigdecimal(value).map_or(Value::Missing, Value::Decimal),
-        ScalarFamily::String => Value::String(json_string(value)),
-        ScalarFamily::Bytes => json_bytea(value).map_or(Value::Missing, Value::Bytes),
-        ScalarFamily::Uuid => value
-            .as_str()
-            .map_or(Value::Missing, |s| Value::Uuid(s.to_string())),
-        ScalarFamily::Timestamp => json_timestamp(value).map_or(Value::Missing, Value::Timestamp),
-        ScalarFamily::TimestampTz => {
-            json_timestamptz(value).map_or(Value::Missing, Value::TimestampTz)
-        }
-        ScalarFamily::Date => json_date(value).map_or(Value::Missing, Value::Date),
-        ScalarFamily::Time => json_time(value).map_or(Value::Missing, Value::Time),
-        ScalarFamily::Json => json_document(value).map_or(Value::Missing, Value::Json),
-        ScalarFamily::Jsonb => json_document(value).map_or(Value::Missing, Value::Jsonb),
-    }
+    json_value_by_kind(value, kind)
 }
 
 // Backend-agnostic pure JSON scalar parsers shared by the two by-kind
