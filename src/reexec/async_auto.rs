@@ -94,7 +94,7 @@ where
         self.mode
             .permits
             .as_ref()
-            .map_or(0, |state| state.inflight.load(Ordering::Acquire))
+            .map_or(0, |state| state.inflight.load(Ordering::Relaxed))
     }
 
     /// Configured concurrency cap, if any. `None` means unbounded.
