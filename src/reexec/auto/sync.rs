@@ -520,13 +520,14 @@ where
                     error,
                 })?;
             let remaining = match absorb_keyed_page(
+                subscription_id,
                 page.value,
                 batch,
                 key_positions,
                 columns,
                 &mut seen,
                 present,
-            ) {
+            )? {
                 KeyedPage::Answered => return Ok(()),
                 KeyedPage::Resume(remaining) => remaining,
             };

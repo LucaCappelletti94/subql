@@ -686,13 +686,14 @@ where
                         // what keeps this tier cancellation-safe with no
                         // server-side state to strand.
                         let remaining = match super::auto::absorb_keyed_page(
+                            subscription,
                             page.value,
                             batch,
                             &plan.key_positions,
                             &mut columns,
                             &mut seen_in_batch,
                             &mut present,
-                        ) {
+                        )? {
                             super::auto::KeyedPage::Answered => break,
                             super::auto::KeyedPage::Resume(remaining) => remaining,
                         };
