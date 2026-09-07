@@ -22,11 +22,6 @@ diesel = { git = "https://github.com/LucaCappelletti94/diesel", branch = "future
 # visitor no_std fix (#2343) and compound-chain exponential fix (#2344).
 sqlparser = { git = "https://github.com/apache/datafusion-sqlparser-rs", branch = "main" }
 sqlparser_derive = { git = "https://github.com/apache/datafusion-sqlparser-rs", branch = "main" }
-# Unify pg_walstream across subql and sqlite-diff-rs on subql's fork
-# branch (0.8.0 plus the `PgOutputDecoder`), so the `EventType` the
-# crate's pg `Digestable` consumes is the same type subql's sources
-# produce. This also lets `pg-sqlite-emu` encode through pg_walstream 0.8.
-pg_walstream = { git = "https://github.com/LucaCappelletti94/pg-walstream", branch = "feat/pgoutput-decoder" }
 
 # diesel-sqlite-session depends on diesel via git (not crates.io), so
 # `[patch.crates-io]` above does not reach that graph. Route the git
@@ -148,17 +143,16 @@ tracing = { version = "0.1", default-features = false, optional = true }
 dhat = { version = "0.3", optional = true }
 arbitrary = { version = "1", features = ["derive"], optional = true }
 
-# PostgreSQL logical-replication decoder plus low-level parser.
-# Temporarily pinned to the `feat/pgoutput-decoder` branch of the
-# LucaCappelletti94 fork, which adds a connection-independent
-# `PgOutputDecoder` (pgoutput bytes to `ChangeEvent`) so subql can drop
-# its bespoke pgoutput parser. Repoint at a crates.io release once the
-# decoder lands upstream. Default features (`std`, `rustls-tls`) are off
-# so the base `--no-default-features` build stays `no_std + alloc` with
-# no `tokio`. The `std` feature below propagates `pg_walstream/std`, and
-# `pg-streaming` opts into `pg_walstream/rustls-tls` for the pure-Rust
-# replication client.
-pg_walstream = { git = "https://github.com/LucaCappelletti94/pg-walstream", branch = "feat/pgoutput-decoder", default-features = false }
+# PostgreSQL logical-replication decoder plus low-level parser. Carries the
+# connection-independent `PgOutputDecoder` (pgoutput bytes to `ChangeEvent`)
+# that subql reads instead of a bespoke parser, and the `pgoutput_encode`
+# side `pg-sqlite-emu` writes through.
+#
+# Default features (`std`, `rustls-tls`) are off so the base
+# `--no-default-features` build stays `no_std + alloc` with no `tokio`. The
+# `std` feature below propagates `pg_walstream/std`, and `pg-streaming` opts
+# into `pg_walstream/rustls-tls` for the pure-Rust replication client.
+pg_walstream = { version = "0.8", default-features = false }
 
 # Optional diesel-backed Connector for the auto-resolving re-execution
 # engine. Off by default - the lib's no_std + alloc / wasm32 surface stays
