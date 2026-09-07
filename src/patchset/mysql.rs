@@ -143,4 +143,43 @@ mod tests {
             "the refusal names the unknown table, got {err:?}"
         );
     }
+
+    /// A boolean column takes NULL. SQLite has no boolean storage class, so a
+    /// nullable `TINYINT(1)` cell arrives as `Value::Null`, which is a
+    /// legitimate NULL and must bind rather than be refused as a shape the
+    /// column cannot take.
+    #[test]
+    fn null_binds_on_a_boolean_column() {
+        let db = catalog();
+        let adapter = MysqlAdapter::new(&db).expect("the catalog indexes");
+
+        Adapter::<Mysql, String, Vec<u8>>::bind(&adapter, "things", 1, &Value::Null)
+            .map(drop)
+            .expect("NULL is a legitimate value for a boolean column");
+    }
+
+    /// Every other wire shape on a boolean column is refused, naming the
+    /// column, the shapes it takes and the shape it got, so the statement is
+    /// never built around a coerced value.
+    #[test]
+    fn a_non_integer_wire_shape_on_a_boolean_column_is_refused() {
+        let db = catalog();
+        let adapter = MysqlAdapter::new(&db).expect("the catalog indexes");
+
+        for (value, shape) in [
+            (Value::Text("yes".to_string()), "TEXT"),
+            (Value::Real(1.0), "REAL"),
+            (Value::Blob(Vec::from([1_u8])), "BLOB"),
+        ] {
+            let err = Adapter::<Mysql, String, Vec<u8>>::bind(&adapter, "things", 1, &value)
+                .map(drop)
+                .unwrap_err()
+                .to_string();
+            assert_eq!(
+                err,
+                alloc::format!("column `active` expects INTEGER or NULL, got {shape}"),
+                "the refusal names the column, the expectation and the wire shape"
+            );
+        }
+    }
 }

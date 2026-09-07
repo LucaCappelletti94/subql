@@ -165,3 +165,108 @@ fn apply_patchset_sqlite_roundtrip_insert_update_delete() {
         }]
     );
 }
+
+const READINGS_DDL: &str = "CREATE TABLE readings (id INTEGER PRIMARY KEY, score REAL, note TEXT);";
+
+#[derive(QueryableByName, Debug, PartialEq)]
+struct ReadingRow {
+    #[diesel(sql_type = diesel::sql_types::BigInt)]
+    id: i64,
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Double>)]
+    score: Option<f64>,
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+    note: Option<String>,
+}
+
+/// The two storage classes the round trip above never carries: a `REAL` cell
+/// and a NULL cell, on insert and on update, through the same fallthrough
+/// bind. A patchset may set any column to NULL, so the target must store NULL
+/// rather than refuse the cell or coerce it to a zero.
+#[test]
+fn apply_patchset_sqlite_binds_real_and_null_cells() {
+    let mut conn = SqliteConnection::establish(":memory:").expect("open in-memory sqlite");
+    sql_query(READINGS_DDL)
+        .execute(&mut conn)
+        .expect("create table");
+
+    let catalog = ParserDB::parse::<SQLiteDialect>(READINGS_DDL).expect("parse subql DDL");
+    let engine: SubscriptionEngine<TestEvent<subql::backend::SQLite>, DefaultIds, ParserDB> =
+        SubscriptionEngine::new(catalog, SQLiteDialect {});
+    let adapter = SqliteAdapter::new(engine.database()).expect("the catalog indexes");
+
+    let readings = SimpleTable::new("readings", &["id", "score", "note"], &[0]);
+
+    let inserts = PatchSet::<SimpleTable, String, Vec<u8>>::new()
+        .insert(
+            Insert::from(readings.clone())
+                .set(0, 1_i64)
+                .unwrap()
+                .set(1, Value::Real(-0.5))
+                .unwrap()
+                .set(2, "measured".to_owned())
+                .unwrap(),
+        )
+        .insert(
+            Insert::from(readings.clone())
+                .set(0, 2_i64)
+                .unwrap()
+                .set(1, Value::Null)
+                .unwrap()
+                .set(2, Value::Null)
+                .unwrap(),
+        );
+
+    let n = engine
+        .apply_patchset(&inserts, &mut conn, &adapter)
+        .expect("apply inserts");
+    assert_eq!(n, 2, "two rows inserted");
+
+    let rows: Vec<ReadingRow> = sql_query("SELECT id, score, note FROM readings ORDER BY id")
+        .load(&mut conn)
+        .expect("load");
+    assert_eq!(
+        rows,
+        vec![
+            ReadingRow {
+                id: 1,
+                score: Some(-0.5),
+                note: Some("measured".to_owned()),
+            },
+            ReadingRow {
+                id: 2,
+                score: None,
+                note: None,
+            },
+        ],
+        "the REAL cell keeps its value and the NULL cells stay NULL"
+    );
+
+    // An update carries the same two shapes: a fresh REAL, and a column set
+    // back to NULL.
+    let updates = PatchSet::<SimpleTable, String, Vec<u8>>::new().update(
+        Update::<_, PatchsetFormat, String, Vec<u8>>::from(readings)
+            .set(0, 1_i64)
+            .unwrap()
+            .set(1, Value::Real(1.5e300))
+            .unwrap()
+            .set(2, Value::Null)
+            .unwrap(),
+    );
+    let n = engine
+        .apply_patchset(&updates, &mut conn, &adapter)
+        .expect("apply updates");
+    assert_eq!(n, 1, "one row updated");
+
+    let row: ReadingRow = sql_query("SELECT id, score, note FROM readings WHERE id = 1")
+        .get_result(&mut conn)
+        .expect("load id=1");
+    assert_eq!(
+        row,
+        ReadingRow {
+            id: 1,
+            score: Some(1.5e300),
+            note: None,
+        },
+        "a wide REAL survives the bind and a column returns to NULL"
+    );
+}
