@@ -405,11 +405,15 @@ impl<S: SessionSetup + Send + Sync> AsyncConnector for MysqlAsyncDieselConnector
 }
 
 /// Read one page off an async diesel connection, decoding each row without a
-/// compile-time schema and stopping at `max_bytes`.
+/// compile-time schema and bounding the page at `max_bytes`.
 ///
-/// The async peer of the sync `load_page`. `diesel_async`'s `load` yields a
-/// stream, so the budget stops the decode rather than trimming a materialized
-/// vector, and the row after the budget answers `more` without guessing.
+/// The async peer of the sync `load_page`, with one difference worth knowing:
+/// `diesel_async`'s `load` resolves the whole result before this can look at
+/// it, so the budget trims a materialized vector here where the sync path
+/// stops the decode mid-iterator. The page contract is the same either way,
+/// and the rows past the budget are not a loss: a caller resumes a row page
+/// in its own SQL, past the last key it saw, which is why this path needs no
+/// cursor. A result with no key to resume from is what the cursor API is for.
 #[cfg(feature = "executor-diesel-async-postgres")]
 pub(super) async fn load_page_postgres_async(
     conn: &mut diesel_async::AsyncPgConnection,

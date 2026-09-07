@@ -105,15 +105,18 @@ pub struct LogStatusRow {
 /// A binlog file is named like `mysql-bin.000003`, and only the numeric suffix
 /// is kept, so the suffix is taken from the LAST dot: a server whose
 /// `log_bin_basename` itself contains one, `/var/log/my.db/bin.000003`, would
-/// otherwise parse to nothing. The offset is kept as `u32`, so an offset past
-/// four gibibytes reports no coordinate rather than a wrapped one: the
-/// checkpoint is informational and a wrong position is worse than none.
+/// otherwise parse to nothing. A name with no dot at all is not a binlog name
+/// and reports nothing, rather than being read whole as a file number. The
+/// offset is kept as `u32`, so an offset past four gibibytes reports no
+/// coordinate rather than a wrapped one: the checkpoint is informational, and
+/// a wrong position is worse than none.
 #[cfg(any(
     feature = "executor-diesel-mysql",
     feature = "executor-diesel-async-mysql"
 ))]
 pub fn binlog_pos_from(file: &str, position: u64) -> Option<crate::MysqlBinlogPos> {
-    let file = file.rsplit('.').next()?.parse::<u32>().ok()?;
+    let (_, suffix) = file.rsplit_once('.')?;
+    let file = suffix.parse::<u32>().ok()?;
     let pos = u32::try_from(position).ok()?;
     Some(crate::MysqlBinlogPos { file, pos })
 }
@@ -246,12 +249,16 @@ mod binlog_pos_tests {
     }
 
     /// A name whose tail is not a number reports no coordinate, rather than a
-    /// made-up file number.
+    /// made-up file number. Nor does a name with no dot at all: reading `3`
+    /// whole would invent a coordinate out of something that is not a binlog
+    /// name.
     #[test]
-    fn a_non_numeric_tail_reports_no_coordinate() {
+    fn a_name_that_is_not_a_binlog_name_reports_no_coordinate() {
         assert!(binlog_pos_from("mysql-bin.index", 155).is_none());
         assert!(binlog_pos_from("", 155).is_none());
         assert!(binlog_pos_from("mysql-bin.", 155).is_none());
+        assert!(binlog_pos_from("3", 155).is_none());
+        assert!(binlog_pos_from("mysql-bin", 155).is_none());
     }
 
     /// An offset past four gibibytes does not fit the compact position, so it
