@@ -713,15 +713,20 @@ mod bound_query_tests {
     }
 }
 
-#[cfg(all(test, feature = "executor-diesel"))]
+#[cfg(all(
+    test,
+    any(
+        feature = "executor-diesel-postgres-r2d2",
+        feature = "executor-diesel-async-postgres"
+    )
+))]
 mod cursor_page_tests {
-    use super::{drain_cursor_buffer, run_setup_statements, RowPage};
+    use super::{drain_cursor_buffer, RowPage};
     use crate::backend::{Postgres, Value};
     use alloc::collections::VecDeque;
-    use alloc::string::{String, ToString as _};
+    use alloc::string::String;
     use alloc::vec;
     use alloc::vec::Vec;
-    use diesel::{sql_query, Connection as _, QueryableByName, RunQueryDsl as _, SqliteConnection};
 
     fn row_of(value: Value<Postgres>) -> Vec<Value<Postgres>> {
         vec![value]
@@ -779,6 +784,14 @@ mod cursor_page_tests {
         );
         assert_eq!(spent, cost * 2, "the page spent exactly what it delivered");
     }
+}
+
+#[cfg(all(test, feature = "executor-diesel"))]
+mod session_setup_tests {
+    use super::run_setup_statements;
+    use alloc::string::{String, ToString as _};
+    use alloc::vec::Vec;
+    use diesel::{sql_query, Connection as _, QueryableByName, RunQueryDsl as _, SqliteConnection};
 
     #[derive(QueryableByName)]
     struct Marker {
