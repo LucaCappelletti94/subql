@@ -60,12 +60,9 @@ pub struct PgR2D2DieselConnector<S = ()> {
 #[cfg(feature = "executor-diesel-postgres-r2d2")]
 struct PgCursor {
     conn: r2d2::PooledConnection<diesel::r2d2::ConnectionManager<diesel::PgConnection>>,
+    /// The cursor's `DECLARE`d name, which the per-page `FETCH` and the
+    /// closing `CLOSE` are built from.
     name: String,
-    /// `CLOSE <name>`, rendered once at open time.
-    ///
-    /// Held ready so [`Drop`] runs no allocation: `batch_execute` takes a
-    /// `&str`, where `sql_query` would want an owned `String`.
-    close_sql: String,
     checkpoint: Option<crate::PgLsn>,
     columns: alloc::vec::Vec<String>,
     leftover: alloc::collections::VecDeque<alloc::vec::Vec<Value<crate::backend::Postgres>>>,
@@ -96,12 +93,14 @@ impl Drop for PgCursor {
     /// `AutoResolvingEngine::read_whole` is for. Blocking here is fine, this is
     /// sync code, and it is exactly what an async cursor cannot do.
     fn drop(&mut self) {
-        use diesel::connection::SimpleConnection;
-        // Best-effort and deliberately silent. The transaction is read only,
-        // so failing to end it politely costs nothing that dropping the
-        // connection would not already cost, and there is no caller left to
-        // report to. Nothing here can panic, which `Drop` requires.
-        let _ = self.conn.batch_execute(&self.close_sql);
+        // Rolling back is all it takes: a cursor `DECLARE`d without
+        // `WITH HOLD` lives inside its transaction, so ending the transaction
+        // closes it, which `an_abandoned_cursor_ends_its_transaction_and_keeps_its_connection`
+        // asserts against `pg_cursors`. Best-effort and deliberately silent:
+        // the transaction is read only, so failing to end it politely costs
+        // nothing that dropping the connection would not already cost, and
+        // there is no caller left to report to. Nothing here can panic, which
+        // `Drop` requires.
         let _ = PgTxn::rollback_transaction(&mut *self.conn);
     }
 }
@@ -284,7 +283,6 @@ impl<S: SessionSetup> Connector for PgR2D2DieselConnector<S> {
             id,
             alloc::sync::Arc::new(parking_lot::Mutex::new(PgCursor {
                 conn,
-                close_sql: alloc::format!("CLOSE {name}"),
                 name,
                 checkpoint,
                 columns: alloc::vec::Vec::new(),
@@ -339,7 +337,7 @@ impl<S: SessionSetup> Connector for PgR2D2DieselConnector<S> {
             return Ok(());
         };
         let held = &mut *entry.lock();
-        let closed = diesel::sql_query(held.close_sql.clone())
+        let closed = diesel::sql_query(alloc::format!("CLOSE {}", held.name))
             .execute(&mut *held.conn)
             .and_then(|_| PgTxn::commit_transaction(&mut *held.conn));
         match closed {
