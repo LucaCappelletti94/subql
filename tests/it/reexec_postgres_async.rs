@@ -1501,6 +1501,29 @@ fn each_async_read_runs_read_only_at_repeatable_read() {
     });
 }
 
+/// One page of an async cursor as its integer first column, with the flag
+/// saying whether more rows are waiting. A tight budget, so a result of any
+/// size arrives over several pages.
+async fn page_of_ids(
+    connector: &PgAsyncDieselConnector,
+    cursor: subql::reexec::CursorId,
+) -> (Vec<i64>, bool) {
+    let page = connector
+        .fetch_cursor(cursor, 32)
+        .await
+        .expect("fetch a page");
+    let ids = page
+        .value
+        .rows
+        .iter()
+        .map(|row| match &row[0] {
+            Value::Int(id) => *id,
+            other => panic!("id should decode as an integer, got {other:?}"),
+        })
+        .collect();
+    (ids, page.value.more)
+}
+
 /// Two async cursors open at once are two cursors: distinct ids and pages
 /// that do not bleed into each other.
 #[test]
@@ -1539,27 +1562,17 @@ fn two_async_cursors_open_at_once_page_independently() {
         let mut up = Vec::new();
         let mut down = Vec::new();
         loop {
-            let mut going = false;
-            for (cursor, ids) in [(ascending, &mut up), (descending, &mut down)] {
-                let page = connector
-                    .fetch_cursor(cursor, 32)
-                    .await
-                    .expect("fetch a page");
-                for row in &page.value.rows {
-                    match &row[0] {
-                        Value::Int(id) => ids.push(*id),
-                        other => panic!("id should decode as an integer, got {other:?}"),
-                    }
-                }
-                going |= page.value.more;
-            }
-            if !going {
-                break;
-            }
+            let (ascending_page, ascending_more) = page_of_ids(&connector, ascending).await;
+            let (descending_page, descending_more) = page_of_ids(&connector, descending).await;
+            up.extend(ascending_page);
+            down.extend(descending_page);
             assert!(
                 up.len() <= 6 && down.len() <= 6,
                 "both cursors should finish"
             );
+            if !ascending_more && !descending_more {
+                break;
+            }
         }
 
         assert_eq!(
