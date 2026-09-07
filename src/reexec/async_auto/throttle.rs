@@ -4,9 +4,11 @@ use super::{Arc, AtomicUsize, Ordering, Semaphore, SemaphoreGuardArc, Subscripti
 
 /// Internal state for the persistent re-execution concurrency cap.
 ///
-/// The cap is enforced by an [`async_lock::Semaphore`]. The
-/// [`AtomicUsize`] tracks how many permits are held so callers can read
-/// [`AutoResolvingEngine::inflight`] without deriving it from the semaphore.
+/// The cap is enforced by an [`async_lock::Semaphore`], which is what orders
+/// the reads. The [`AtomicUsize`] beside it publishes no data and guards
+/// nothing: it counts held permits so a caller can read
+/// [`AutoResolvingEngine::inflight`] without deriving it from the semaphore,
+/// which is why every access to it is `Relaxed`.
 pub struct ThrottleState {
     pub sem: Arc<Semaphore>,
     pub inflight: Arc<AtomicUsize>,
@@ -23,7 +25,7 @@ pub struct InflightGuard {
 
 impl Drop for InflightGuard {
     fn drop(&mut self) {
-        self.inflight.fetch_sub(1, Ordering::Release);
+        self.inflight.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -43,7 +45,7 @@ pub async fn acquire_permit(
         return None;
     };
     let permit = Arc::clone(sem).acquire_arc().await;
-    let now = inflight.fetch_add(1, Ordering::AcqRel) + 1;
+    let now = inflight.fetch_add(1, Ordering::Relaxed) + 1;
     #[cfg(feature = "observability")]
     tracing::trace!(
         subscription_id,

@@ -60,13 +60,12 @@ impl MockConnector {
     }
 }
 
-#[derive(Debug, PartialEq)]
-struct MockError(&'static str);
-
-impl core::fmt::Display for MockError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        write!(f, "{}", self.0)
-    }
+/// What the mock connector fails with, as one variant, because every failure
+/// it can stage is "the test did not queue an answer for this read".
+#[derive(Debug, PartialEq, thiserror::Error)]
+enum MockError {
+    #[error("{0}")]
+    Unstaged(&'static str),
 }
 
 impl Connector for MockConnector {
@@ -91,7 +90,7 @@ impl Connector for MockConnector {
             .values
             .borrow_mut()
             .pop()
-            .ok_or(MockError("queue empty"))?;
+            .ok_or(MockError::Unstaged("queue empty"))?;
         Ok((value, None))
     }
 
@@ -112,7 +111,9 @@ impl Connector for MockConnector {
             .push(query.clone().into_owned());
         let popped = self.pages.borrow_mut().pop();
         let Some(page) = popped else {
-            return Err(MockError("read_page is not exercised by the scalar tests"));
+            return Err(MockError::Unstaged(
+                "read_page is not exercised by the scalar tests",
+            ));
         };
         Ok(super::super::connector::Snapshot {
             value: page,
@@ -312,7 +313,7 @@ fn connector_error_aborts_batch() {
     match e.resolve_collect() {
         Ok(_) => panic!("expected Connector error, got Ok"),
         Err(ReExecError::Connector {
-            error: MockError(msg),
+            error: MockError::Unstaged(msg),
             ..
         }) => assert_eq!(msg, "queue empty"),
         Err(other) => panic!("expected Connector error, got {other:?}"),
@@ -871,7 +872,7 @@ fn applied_burst_error_surfaces_from_resolve() {
     match e.resolve_collect() {
         Ok(_) => panic!("expected Connector error, got Ok"),
         Err(ReExecError::Connector {
-            error: MockError(msg),
+            error: MockError::Unstaged(msg),
             ..
         }) => assert_eq!(msg, "queue empty"),
         Err(other) => panic!("expected Connector error, got {other:?}"),
@@ -1621,7 +1622,7 @@ fn connector_error_names_its_subscription() {
             error,
         }) => {
             assert_eq!(subscription, qid, "the failing subscription is named");
-            assert_eq!(error, MockError("queue empty"));
+            assert_eq!(error, MockError::Unstaged("queue empty"));
         }
         Err(other) => panic!("expected Connector naming its subscription, got {other:?}"),
     }
