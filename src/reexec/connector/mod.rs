@@ -605,18 +605,32 @@ pub enum ReExecError<E> {
         /// The cursor error.
         error: CursorError<E>,
     },
+    /// A keyed read's row does not carry every key column the read named, so
+    /// no key can be formed for it. Deterministic: the same statement answers
+    /// the same row, which is why it is not retryable.
+    #[error("subscription {subscription}: a keyed row carries no key column {position}")]
+    KeyedRowShape {
+        /// The subscription whose keyed read was answered this way.
+        subscription: crate::SubscriptionId,
+        /// The key column position the row does not carry.
+        position: usize,
+    },
 }
 
 impl<E> ReExecError<E> {
     /// Whether retrying the same read can change the outcome.
     ///
     /// An install failure means the database answer does not match the
-    /// subscription, so the same read returns the same mismatch and a
-    /// retry can only repeat it. Everything else reports a condition that
-    /// can clear, a failed connection or statement above all.
+    /// subscription, and [`Self::KeyedRowShape`] means it does not match the
+    /// read's own shape, so in both cases the same read returns the same
+    /// mismatch and a retry can only repeat it. Everything else reports a
+    /// condition that can clear, a failed connection or statement above all.
     #[must_use]
     pub const fn is_retryable(&self) -> bool {
-        !matches!(self, Self::Install(_) | Self::AggregateInstall(_))
+        !matches!(
+            self,
+            Self::Install(_) | Self::AggregateInstall(_) | Self::KeyedRowShape { .. }
+        )
     }
 }
 

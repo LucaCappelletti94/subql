@@ -267,7 +267,9 @@ where
     ///
     /// [`ReExecError::Connector`] and [`ReExecError::Cursor`] name the
     /// subscription whose read failed. Install errors mean the database
-    /// answer does not match the subscription and are not retryable.
+    /// answer does not match the subscription, and
+    /// [`ReExecError::KeyedRowShape`] that a keyed row does not carry every
+    /// key column the read named. Neither is retryable.
     pub fn resolve<S>(&mut self, mut sink: S) -> Result<(), ReExecError<X::Error>>
     where
         S: FnMut(crate::reexec::ReadDelivery<I, E::Backend, E::Checkpoint>),
@@ -520,13 +522,14 @@ where
                     error,
                 })?;
             let remaining = match absorb_keyed_page(
+                subscription_id,
                 page.value,
                 batch,
                 key_positions,
                 columns,
                 &mut seen,
                 present,
-            ) {
+            )? {
                 KeyedPage::Answered => return Ok(()),
                 KeyedPage::Resume(remaining) => remaining,
             };

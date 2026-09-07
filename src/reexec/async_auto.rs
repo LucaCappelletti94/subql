@@ -299,7 +299,9 @@ where
     ///
     /// [`ReExecError::Connector`] and [`ReExecError::Cursor`] name the
     /// subscription whose read failed. Install errors mean the database
-    /// answer does not match the subscription and are not retryable.
+    /// answer does not match the subscription, and
+    /// [`ReExecError::KeyedRowShape`] that a keyed row does not carry every
+    /// key column the read named. Neither is retryable.
     pub async fn resolve<S>(&mut self, mut sink: S) -> Result<(), ReExecError<X::Error>>
     where
         S: FnMut(super::ReadDelivery<I, E::Backend, E::Checkpoint>) + Send,
@@ -686,13 +688,14 @@ where
                         // what keeps this tier cancellation-safe with no
                         // server-side state to strand.
                         let remaining = match super::auto::absorb_keyed_page(
+                            subscription,
                             page.value,
                             batch,
                             &plan.key_positions,
                             &mut columns,
                             &mut seen_in_batch,
                             &mut present,
-                        ) {
+                        )? {
                             super::auto::KeyedPage::Answered => break,
                             super::auto::KeyedPage::Resume(remaining) => remaining,
                         };

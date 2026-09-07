@@ -73,6 +73,7 @@ impl<'a, B: Backend> Iterator for KeyBatches<'a, B> {
 /// Named rather than returned as a bare `Option`, because both outcomes
 /// are ordinary and the empty one is not a failure: a batch whose keys
 /// all came back is answered.
+#[derive(Debug)]
 pub enum KeyedPage<B: Backend> {
     /// This batch is answered. Stop reading it.
     Answered,
@@ -95,34 +96,51 @@ pub enum KeyedPage<B: Backend> {
 ///   terminates: the remaining sets oscillate between the halves of the
 ///   batch.
 /// - A page with no new keys ends the read whatever it claims about
-///   there being more. This crate's own readers cannot report that
-///   combination, but the connector trait has outside implementors, and
-///   without this a connector that did would loop forever.
+///   there being more, and "new" counts distinct keys rather than rows: a
+///   repeated key is a row that moves nothing. This crate's own readers
+///   cannot report that combination, but the connector trait has outside
+///   implementors, and without this a connector that did would loop forever.
 /// - Resumption is inside the batch, so the statement stays bounded by
 ///   it. Because `seen` accumulates, the remaining set strictly shrinks
 ///   and the loop ends.
-pub fn absorb_keyed_page<B: Backend>(
+///
+/// # Errors
+///
+/// [`ReExecError::KeyedRowShape`] when a row does not carry every key column
+/// the read named. The key such a row yields is shorter than the key that was
+/// asked about, so absorbing it would upsert a row under a key nobody named
+/// and, the requested key never having come back, delete the row that was.
+/// The check is arity only: a row carrying a different column at that
+/// position is indistinguishable from the right one and is absorbed.
+pub fn absorb_keyed_page<B: Backend, Err>(
+    subscription: SubscriptionId,
     page: crate::reexec::RowPage<B>,
     batch: &[Vec<Value<B>>],
     key_positions: &[usize],
     columns: &mut Vec<String>,
     seen: &mut SeenKeys<B>,
     present: &mut Vec<(Vec<Value<B>>, Vec<Value<B>>)>,
-) -> KeyedPage<B> {
+) -> Result<KeyedPage<B>, ReExecError<Err>> {
     if columns.is_empty() {
         columns.clone_from(&page.columns);
     }
-    let before = seen.recorded();
+    let before = seen.distinct();
     for row in page.rows {
-        let key: Vec<Value<B>> = key_positions
-            .iter()
-            .filter_map(|position| row.get(*position).cloned())
-            .collect();
+        let mut key: Vec<Value<B>> = Vec::with_capacity(key_positions.len());
+        for position in key_positions {
+            let Some(value) = row.get(*position) else {
+                return Err(ReExecError::KeyedRowShape {
+                    subscription,
+                    position: *position,
+                });
+            };
+            key.push(value.clone());
+        }
         seen.record(&key);
         present.push((key, row));
     }
-    if !page.more || seen.recorded() == before {
-        return KeyedPage::Answered;
+    if !page.more || seen.distinct() == before {
+        return Ok(KeyedPage::Answered);
     }
     let remaining: Vec<Vec<Value<B>>> = batch
         .iter()
@@ -130,9 +148,9 @@ pub fn absorb_keyed_page<B: Backend>(
         .cloned()
         .collect();
     if remaining.is_empty() {
-        return KeyedPage::Answered;
+        return Ok(KeyedPage::Answered);
     }
-    KeyedPage::Resume(remaining)
+    Ok(KeyedPage::Resume(remaining))
 }
 
 /// The one row a grouped scalar read has to answer with.
@@ -183,7 +201,6 @@ pub fn decode_grouped_seed_rows<B: Backend>(rows: &mut [Vec<Value<B>>], kinds: &
 pub struct SeenKeys<B: Backend> {
     encoded: hashbrown::HashSet<Vec<u8>>,
     unencodable: Vec<Vec<Value<B>>>,
-    recorded: usize,
 }
 
 impl<B: Backend> SeenKeys<B> {
@@ -191,22 +208,28 @@ impl<B: Backend> SeenKeys<B> {
         Self {
             encoded: hashbrown::HashSet::new(),
             unencodable: Vec::new(),
-            recorded: 0,
         }
     }
 
-    /// Rows recorded so far, duplicates included, for the progress check.
-    pub const fn recorded(&self) -> usize {
-        self.recorded
+    /// Distinct keys recorded so far, which is what the progress check needs:
+    /// a page of repeated keys leaves this unchanged and so ends the read.
+    pub fn distinct(&self) -> usize {
+        self.encoded.len() + self.unencodable.len()
     }
 
     pub fn record(&mut self, key: &[Value<B>]) {
-        self.recorded += 1;
         match crate::backend::encode_value_key(key) {
             Some(encoded) => {
                 self.encoded.insert(encoded);
             }
-            None => self.unencodable.push(key.to_vec()),
+            // Reached only by a carrier whose `Serialize` fails, since the
+            // encoder is `postcard`, so the scan is deduplicated on the same
+            // rule the set gives for free rather than tested.
+            None => {
+                if !self.unencodable.iter().any(|held| held == key) {
+                    self.unencodable.push(key.to_vec());
+                }
+            }
         }
     }
 
@@ -318,7 +341,8 @@ mod tests {
         let mut columns = Vec::new();
         let mut seen = SeenKeys::new();
         let mut present = Vec::new();
-        let outcome = absorb_keyed_page(
+        let outcome = absorb_keyed_page::<Postgres, ()>(
+            SUBSCRIPTION,
             page(&[1, 2], false),
             &keys,
             &[0],
@@ -326,7 +350,7 @@ mod tests {
             &mut seen,
             &mut present,
         );
-        assert!(matches!(outcome, KeyedPage::Answered));
+        assert!(matches!(outcome, Ok(KeyedPage::Answered)));
         assert_eq!(present.len(), 2, "both rows were kept");
         assert_eq!(columns, ["id", "status"], "the column names were adopted");
     }
@@ -338,7 +362,8 @@ mod tests {
         let mut columns = Vec::new();
         let mut seen = SeenKeys::new();
         let mut present = Vec::new();
-        let outcome = absorb_keyed_page(
+        let outcome = absorb_keyed_page::<Postgres, ()>(
+            SUBSCRIPTION,
             page(&[1], true),
             &keys,
             &[0],
@@ -346,7 +371,7 @@ mod tests {
             &mut seen,
             &mut present,
         );
-        let KeyedPage::Resume(remaining) = outcome else {
+        let Ok(KeyedPage::Resume(remaining)) = outcome else {
             panic!("a page claiming more with keys left resumes");
         };
         assert_eq!(
@@ -370,7 +395,8 @@ mod tests {
         let mut columns = Vec::new();
         let mut seen = SeenKeys::new();
         let mut present = Vec::new();
-        let first = absorb_keyed_page(
+        let first = absorb_keyed_page::<Postgres, ()>(
+            SUBSCRIPTION,
             page(&[1], true),
             &keys,
             &[0],
@@ -378,8 +404,9 @@ mod tests {
             &mut seen,
             &mut present,
         );
-        assert!(matches!(first, KeyedPage::Resume(_)));
-        let second = absorb_keyed_page(
+        assert!(matches!(first, Ok(KeyedPage::Resume(_))));
+        let second = absorb_keyed_page::<Postgres, ()>(
+            SUBSCRIPTION,
             page(&[2], true),
             &keys,
             &[0],
@@ -387,7 +414,7 @@ mod tests {
             &mut seen,
             &mut present,
         );
-        let KeyedPage::Resume(remaining) = second else {
+        let Ok(KeyedPage::Resume(remaining)) = second else {
             panic!("one key is still unanswered");
         };
         assert_eq!(
@@ -409,7 +436,8 @@ mod tests {
         let mut columns = Vec::new();
         let mut seen = SeenKeys::new();
         let mut present = Vec::new();
-        let outcome = absorb_keyed_page(
+        let outcome = absorb_keyed_page::<Postgres, ()>(
+            SUBSCRIPTION,
             page(&[], true),
             &keys,
             &[0],
@@ -418,9 +446,92 @@ mod tests {
             &mut present,
         );
         assert!(
-            matches!(outcome, KeyedPage::Answered),
+            matches!(outcome, Ok(KeyedPage::Answered)),
             "an empty page that claims more still ends the read"
         );
+    }
+
+    /// A page whose keys were all answered on an earlier page ends the read,
+    /// which the row count cannot tell: a repeat is a row without being a
+    /// key, and resuming on the same remaining set repeats the statement for
+    /// as long as the connector repeats itself.
+    #[test]
+    pub fn a_page_of_repeated_keys_ends_the_read() {
+        let keys = batch(&[1, 2]);
+        let mut columns = Vec::new();
+        let mut seen = SeenKeys::new();
+        let mut present = Vec::new();
+        let first = absorb_keyed_page::<Postgres, ()>(
+            SUBSCRIPTION,
+            page(&[1], true),
+            &keys,
+            &[0],
+            &mut columns,
+            &mut seen,
+            &mut present,
+        );
+        assert!(matches!(first, Ok(KeyedPage::Resume(_))));
+        let repeat = absorb_keyed_page::<Postgres, ()>(
+            SUBSCRIPTION,
+            page(&[1], true),
+            &keys,
+            &[0],
+            &mut columns,
+            &mut seen,
+            &mut present,
+        );
+        assert!(
+            matches!(repeat, Ok(KeyedPage::Answered)),
+            "a page carrying only keys already answered ends the read"
+        );
+    }
+
+    /// A row that does not carry every key column is refused, because the
+    /// key that could be formed from it is not the key that was asked about:
+    /// absorbing it upserts a row under a key nobody named and deletes the
+    /// row that was named.
+    #[test]
+    pub fn a_row_missing_a_key_column_is_refused() {
+        let keys = batch(&[1, 2]);
+        let mut columns = Vec::new();
+        let mut seen = SeenKeys::new();
+        let mut present = Vec::new();
+        let short = RowPage {
+            columns: alloc::vec![String::from("id"), String::from("status")],
+            rows: alloc::vec![alloc::vec![Value::Int(1)]],
+            more: false,
+        };
+        let refused = absorb_keyed_page::<Postgres, ()>(
+            SUBSCRIPTION,
+            short,
+            &keys,
+            &[0, 1],
+            &mut columns,
+            &mut seen,
+            &mut present,
+        );
+        assert!(
+            matches!(
+                refused,
+                Err(crate::reexec::ReExecError::KeyedRowShape {
+                    subscription: SUBSCRIPTION,
+                    position: 1
+                })
+            ),
+            "the missing key column is named, got {refused:?}"
+        );
+        assert!(present.is_empty(), "and no truncated key was absorbed");
+    }
+
+    /// A refused keyed row is not retryable: the same statement answers the
+    /// same row, so a retry can only repeat the refusal.
+    #[test]
+    pub fn a_refused_keyed_row_is_not_retryable() {
+        let refusal = crate::reexec::ReExecError::<()>::KeyedRowShape {
+            subscription: SUBSCRIPTION,
+            position: 1,
+        };
+        assert!(!refusal.is_retryable());
     }
 
     /// A grouped scalar read answers exactly one row, and anything else is
