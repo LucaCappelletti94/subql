@@ -299,7 +299,9 @@ where
     ///
     /// [`ReExecError::Connector`] and [`ReExecError::Cursor`] name the
     /// subscription whose read failed. Install errors mean the database
-    /// answer does not match the subscription and are not retryable.
+    /// answer does not match the subscription, and
+    /// [`ReExecError::KeyedRowShape`] that a keyed row does not carry every
+    /// key column the read named. Neither is retryable.
     pub async fn resolve<S>(&mut self, mut sink: S) -> Result<(), ReExecError<X::Error>>
     where
         S: FnMut(super::ReadDelivery<I, E::Backend, E::Checkpoint>) + Send,
