@@ -1324,3 +1324,372 @@ fn session_setup_runs_inside_each_read_transaction() {
         .expect("scalar read");
     assert_eq!(value, Value::Null, "an empty setup leaves the marker unset");
 }
+
+/// Backends parked inside a transaction, aborted or not. A failed cursor open
+/// aborts its transaction before it is rolled back, and an aborted one is a
+/// distinct `pg_stat_activity` state, so the plain probe above would miss it.
+const IDLE_IN_ANY_TXN: &str = "SELECT count(*) AS n FROM pg_stat_activity \
+     WHERE state LIKE 'idle in transaction%' AND xact_start IS NOT NULL";
+
+/// A backend running a cursor `FETCH` right now, which is what a reader
+/// holding the cursor looks like from another connection.
+const FETCH_RUNNING: &str = "SELECT count(*) AS n FROM pg_stat_activity \
+     WHERE state = 'active' AND query LIKE 'FETCH FORWARD%'";
+
+/// A cursor's held transaction is the same read snapshot every other read
+/// gets: repeatable read, and read only. The cursor's own SQL is what
+/// observes it, evaluated when the rows are fetched.
+#[test]
+#[ignore = "requires Docker; run with --ignored"]
+fn a_cursor_holds_a_read_only_repeatable_read_snapshot() {
+    common::assert_docker_available();
+    let container = common::pg_with_wal2json();
+    let port = common::pg_port(&container);
+    let mut conn = common::pg_connect(port);
+    setup_pg(&mut conn, &[(1, 5.0)]);
+
+    let connector = PgR2D2DieselConnector::new(build_pool(port));
+    let cursor = connector
+        .open_cursor(
+            &subql::reexec::ReadQuery::without_binds(
+                "SELECT current_setting('transaction_isolation') AS iso, \
+                 current_setting('transaction_read_only') AS ro",
+            ),
+            &(),
+        )
+        .expect("open cursor");
+    let page = connector.fetch_cursor(cursor, 4096).expect("fetch");
+    assert_eq!(
+        page.value.rows[0],
+        vec![
+            Value::String("repeatable read".into()),
+            Value::String("on".into())
+        ],
+        "the cursor pages one repeatable-read snapshot that refuses writes"
+    );
+    connector.close_cursor(cursor).expect("close");
+
+    // And a write reached through the cursor is refused for being read only,
+    // not merely absent. `DECLARE` rejects a data-modifying `WITH` outright,
+    // so the write has to be one a plain `SELECT` can carry: `nextval` is.
+    sql_query("CREATE SEQUENCE probe_seq")
+        .execute(&mut conn)
+        .expect("create the sequence");
+    let writing = connector
+        .open_cursor(
+            &subql::reexec::ReadQuery::without_binds("SELECT nextval('probe_seq') AS n"),
+            &(),
+        )
+        .expect("the declaration itself is accepted");
+    let refused = connector
+        .fetch_cursor(writing, 4096)
+        .expect_err("advancing a sequence inside the read snapshot is refused");
+    assert!(
+        refused.to_string().contains("read-only transaction"),
+        "refused for being read-only rather than for any other reason, got {refused}"
+    );
+}
+
+/// One page of a cursor as its integer first column, with the flag saying
+/// whether more rows are waiting. A tight budget, so a result of any size
+/// arrives over several pages.
+fn page_of_ids(
+    connector: &PgR2D2DieselConnector,
+    cursor: subql::reexec::CursorId,
+) -> (Vec<i64>, bool) {
+    let page = connector.fetch_cursor(cursor, 32).expect("fetch a page");
+    let ids = page
+        .value
+        .rows
+        .iter()
+        .map(|row| match &row[0] {
+            Value::Int(id) => *id,
+            other => panic!("id should decode as an integer, got {other:?}"),
+        })
+        .collect();
+    (ids, page.value.more)
+}
+
+/// Two cursors open at once are two cursors: distinct ids, distinct
+/// server-side names, and pages that do not bleed into each other. They share
+/// nothing but the pool.
+#[test]
+#[ignore = "requires Docker; run with --ignored"]
+fn two_cursors_open_at_once_page_independently() {
+    common::assert_docker_available();
+    let container = common::pg_with_wal2json();
+    let port = common::pg_port(&container);
+    let mut conn = common::pg_connect(port);
+    // Enough rows that each cursor is paged many times, so every page but the
+    // first has to resume a cursor the other one read from in between.
+    let seed: Vec<(i64, f64)> = (1..=40_u32)
+        .map(|id| (i64::from(id), f64::from(id)))
+        .collect();
+    setup_pg(&mut conn, &seed);
+
+    let connector = PgR2D2DieselConnector::new(build_pool(port));
+    let (ascending, descending) = open_ordered_cursors(&connector);
+    assert_ne!(
+        ascending, descending,
+        "each open must hand back its own cursor id"
+    );
+
+    let (up, down, rounds) = drain_interleaved(&connector, ascending, descending);
+    assert!(
+        rounds > 1,
+        "the budget must split both results, else nothing resumes, got {rounds} round(s)"
+    );
+    assert_eq!(
+        up,
+        (1..=40).collect::<Vec<_>>(),
+        "the ascending cursor's rows"
+    );
+    assert_eq!(
+        down,
+        (1..=40).rev().collect::<Vec<_>>(),
+        "the descending cursor's rows, unmixed with the other's"
+    );
+}
+
+/// One cursor over the ids ascending and one over them descending, so a page
+/// from either says plainly which cursor answered.
+fn open_ordered_cursors(
+    connector: &PgR2D2DieselConnector,
+) -> (subql::reexec::CursorId, subql::reexec::CursorId) {
+    let ascending = connector
+        .open_cursor(
+            &subql::reexec::ReadQuery::without_binds("SELECT id FROM orders ORDER BY id"),
+            &(),
+        )
+        .expect("open the ascending cursor");
+    let descending = connector
+        .open_cursor(
+            &subql::reexec::ReadQuery::without_binds("SELECT id FROM orders ORDER BY id DESC"),
+            &(),
+        )
+        .expect("open the descending cursor");
+    (ascending, descending)
+}
+
+/// Page both cursors to exhaustion, one page each in turn, so a shared
+/// registration would show up as one cursor answering both readers. Returns
+/// each cursor's ids and how many rounds it took.
+fn drain_interleaved(
+    connector: &PgR2D2DieselConnector,
+    ascending: subql::reexec::CursorId,
+    descending: subql::reexec::CursorId,
+) -> (Vec<i64>, Vec<i64>, usize) {
+    let mut up = Vec::new();
+    let mut down = Vec::new();
+    for round in 1..=100 {
+        let (ascending_page, ascending_more) = page_of_ids(connector, ascending);
+        let (descending_page, descending_more) = page_of_ids(connector, descending);
+        up.extend(ascending_page);
+        down.extend(descending_page);
+        if !ascending_more && !descending_more {
+            return (up, down, round);
+        }
+    }
+    panic!("both cursors should finish inside a hundred rounds");
+}
+
+/// A cursor whose every row costs a second of server-side sleep, so a read of
+/// it is demonstrably still in flight while another call is made.
+fn open_slow_cursor(connector: &PgR2D2DieselConnector) -> subql::reexec::CursorId {
+    connector
+        .open_cursor(
+            &subql::reexec::ReadQuery::without_binds(
+                "SELECT id, pg_sleep(1) IS NULL AS slept FROM orders ORDER BY id",
+            ),
+            &(),
+        )
+        .expect("open the slow cursor")
+}
+
+/// Block until the server reports a cursor `FETCH` running, which is the only
+/// moment that proves the reader holds the cursor. A channel send before the
+/// call would prove only that the thread was about to ask, and this thread
+/// could then take the cursor first and do the slow read itself.
+fn wait_for_a_running_fetch(observer: &mut PgConnection) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while scalar(observer, FETCH_RUNNING) == 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no reader ever reached the server"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// A cursor is serial, so a second reader arriving while one is in flight is
+/// told the cursor is busy rather than made to wait on a resource it cannot
+/// queue for. Waiting would hide the caller's own bug in a stall.
+#[test]
+#[ignore = "requires Docker; run with --ignored"]
+fn a_second_reader_of_one_cursor_is_told_it_is_busy() {
+    use subql::reexec::CursorError;
+
+    common::assert_docker_available();
+    let container = common::pg_with_wal2json();
+    let port = common::pg_port(&container);
+    let mut conn = common::pg_connect(port);
+    setup_pg(&mut conn, &[(1, 1.0), (2, 2.0), (3, 3.0)]);
+
+    let connector = Arc::new(PgR2D2DieselConnector::new(build_pool(port)));
+    let cursor = open_slow_cursor(&connector);
+    let reader = {
+        let connector = Arc::clone(&connector);
+        std::thread::spawn(move || connector.fetch_cursor(cursor, 1 << 20))
+    };
+    let mut observer = common::pg_connect(port);
+    wait_for_a_running_fetch(&mut observer);
+
+    let contended = connector.fetch_cursor(cursor, 1 << 20);
+    assert!(
+        matches!(contended, Err(CursorError::Busy(id)) if id == cursor),
+        "a second reader must be told this cursor is busy, naming it, rather \
+         than blocked until the first read ends, got {contended:?}"
+    );
+
+    reader
+        .join()
+        .expect("the reading thread finishes")
+        .expect("the first read succeeds");
+    connector.close_cursor(cursor).expect("close");
+}
+
+/// One cursor's read does not stall another's. The connector locks per cursor,
+/// so a second cursor is served while the first is still inside its `FETCH`,
+/// which a map-wide lock around the read would turn into a queue.
+#[test]
+#[ignore = "requires Docker; run with --ignored"]
+fn a_cursor_is_served_while_another_is_mid_fetch() {
+    common::assert_docker_available();
+    let container = common::pg_with_wal2json();
+    let port = common::pg_port(&container);
+    let mut conn = common::pg_connect(port);
+    setup_pg(&mut conn, &[(1, 1.0), (2, 2.0), (3, 3.0)]);
+
+    let connector = Arc::new(PgR2D2DieselConnector::new(build_pool(port)));
+    let slow = open_slow_cursor(&connector);
+    let quick = connector
+        .open_cursor(
+            &subql::reexec::ReadQuery::without_binds("SELECT id FROM orders ORDER BY id"),
+            &(),
+        )
+        .expect("open the quick cursor");
+
+    let reader = {
+        let connector = Arc::clone(&connector);
+        std::thread::spawn(move || connector.fetch_cursor(slow, 1 << 20))
+    };
+    let mut observer = common::pg_connect(port);
+    wait_for_a_running_fetch(&mut observer);
+
+    let page = connector
+        .fetch_cursor(quick, 1 << 20)
+        .expect("the other cursor is served");
+    assert_eq!(page.value.rows.len(), 3, "and answers in full");
+    assert!(
+        scalar(&mut observer, FETCH_RUNNING) > 0,
+        "the slow cursor must still be reading, else this proves no overlap"
+    );
+
+    reader
+        .join()
+        .expect("the reading thread finishes")
+        .expect("the slow read succeeds");
+    connector.close_cursor(slow).expect("close the slow cursor");
+    connector
+        .close_cursor(quick)
+        .expect("close the quick cursor");
+}
+
+/// A cursor that fails to open rolls its transaction back: it keeps the pooled
+/// connection, and leaves no backend parked in a transaction. Dropping the
+/// connection would also end the transaction, at the cost of the connection.
+#[test]
+#[ignore = "requires Docker; run with --ignored"]
+fn a_cursor_that_fails_to_open_keeps_its_connection_and_leaves_no_transaction() {
+    common::assert_docker_available();
+    let container = common::pg_with_wal2json();
+    let port = common::pg_port(&container);
+    let mut conn = common::pg_connect(port);
+    setup_pg(&mut conn, &[(1, 1.0)]);
+    let mut observer = common::pg_connect(port);
+
+    // One connection, so the pid before and after names the same slot.
+    let manager = ConnectionManager::<PgConnection>::new(common::pg_url(port));
+    let pool = r2d2::Pool::builder()
+        .max_size(1)
+        .connection_timeout(Duration::from_secs(10))
+        .build(manager)
+        .expect("build a single-connection pool");
+    let before = backend_pid(&mut pool.get().expect("borrow the connection"));
+
+    let connector = PgR2D2DieselConnector::new(pool.clone());
+    let failed = connector
+        .open_cursor(
+            &subql::reexec::ReadQuery::without_binds("SELECT id FROM no_such_table"),
+            &(),
+        )
+        .expect_err("a cursor over a missing table cannot open");
+    assert!(
+        failed.to_string().contains("no_such_table"),
+        "the failure names what the database refused, got {failed}"
+    );
+
+    assert_eq!(
+        scalar(&mut observer, IDLE_IN_ANY_TXN),
+        0,
+        "a failed open leaves no backend parked in a transaction"
+    );
+    assert_eq!(
+        backend_pid(&mut pool.get().expect("borrow the connection again")),
+        before,
+        "and the connection is reusable rather than discarded"
+    );
+}
+
+/// Every page of a cursor names its columns, including the last one. The
+/// terminal `FETCH` returns no rows, and a page whose names came from it would
+/// arrive unlabelled at a caller that decodes rows by column name.
+#[test]
+#[ignore = "requires Docker; run with --ignored"]
+fn every_page_of_a_cursor_names_its_columns() {
+    common::assert_docker_available();
+    let container = common::pg_with_wal2json();
+    let port = common::pg_port(&container);
+    let mut conn = common::pg_connect(port);
+    let seed: Vec<(i64, f64)> = (1..=8_u32)
+        .map(|id| (i64::from(id), f64::from(id)))
+        .collect();
+    setup_pg(&mut conn, &seed);
+
+    let connector = PgR2D2DieselConnector::new(build_pool(port));
+    let cursor = connector
+        .open_cursor(
+            &subql::reexec::ReadQuery::without_binds("SELECT id, status FROM orders ORDER BY id"),
+            &(),
+        )
+        .expect("open cursor");
+
+    let mut pages = 0;
+    loop {
+        // A tight budget, so the rows arrive over several pages and the last
+        // one is reached with the buffer already empty.
+        let page = connector.fetch_cursor(cursor, 24).expect("fetch a page");
+        pages += 1;
+        assert_eq!(
+            page.value.columns,
+            vec!["id".to_string(), "status".to_string()],
+            "page {pages} must name its columns, last page included"
+        );
+        if !page.value.more {
+            break;
+        }
+        assert!(pages < 50, "the cursor should finish");
+    }
+    assert!(pages > 1, "the budget should have split this result");
+    connector.close_cursor(cursor).expect("close");
+}

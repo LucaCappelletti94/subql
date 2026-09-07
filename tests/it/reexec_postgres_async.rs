@@ -1432,3 +1432,326 @@ fn async_page_reads_apply_typed_binds() {
         assert_eq!(page.value.rows[0][0], Value::Int(7));
     });
 }
+
+/// Backends parked inside a transaction, aborted or not. A failed cursor open
+/// aborts its transaction before rolling it back, and an aborted one is its
+/// own `pg_stat_activity` state, which [`IDLE_IN_TXN`] does not match.
+const IDLE_IN_ANY_TXN: &str = "SELECT count(*) AS n FROM pg_stat_activity \
+     WHERE state LIKE 'idle in transaction%' AND xact_start IS NOT NULL";
+
+/// One `current_setting` of the transaction an async scalar read runs in.
+async fn setting(connector: &PgAsyncDieselConnector, name: &str) -> Value<Postgres> {
+    let (value, _) = connector
+        .execute_scalar(
+            &subql::reexec::ReadQuery::owned(
+                format!("SELECT current_setting('{name}') AS v"),
+                Vec::new(),
+            ),
+            ScalarFamily::String,
+            &(),
+        )
+        .await
+        .expect("scalar read");
+    value
+}
+
+/// The isolation and read-only settings of the transaction an async cursor
+/// holds, read through the cursor itself.
+async fn cursor_settings(connector: &PgAsyncDieselConnector) -> Vec<Value<Postgres>> {
+    let cursor = connector
+        .open_cursor(
+            &subql::reexec::ReadQuery::without_binds(
+                "SELECT current_setting('transaction_isolation') AS iso, \
+                 current_setting('transaction_read_only') AS ro",
+            ),
+            &(),
+        )
+        .await
+        .expect("open the observing cursor");
+    let page = connector
+        .fetch_cursor(cursor, 4096)
+        .await
+        .expect("fetch the settings");
+    connector.close_cursor(cursor).await.expect("close");
+    page.value.rows[0].clone()
+}
+
+/// Every async read runs in the mode `PG_READ_SNAPSHOT` names, the same one
+/// the sync connector uses: a repeatable-read snapshot that refuses writes.
+/// The read's own SQL observes it, on the scalar path and inside a cursor.
+#[test]
+#[ignore = "requires Docker"]
+fn each_async_read_runs_read_only_at_repeatable_read() {
+    common::assert_docker_available();
+    let container = common::pg_with_wal2json();
+    let port = common::pg_port(&container);
+    let mut conn = common::pg_connect(port);
+    setup_pg(&mut conn, &[(1, 5.0)]);
+    sql_query("CREATE SEQUENCE probe_seq")
+        .execute(&mut conn)
+        .expect("create the sequence");
+
+    common::multi_thread_rt().block_on(async {
+        let connector = PgAsyncDieselConnector::new(pg_async_pool(port).await);
+        assert_eq!(
+            setting(&connector, "transaction_isolation").await,
+            Value::String("repeatable read".into())
+        );
+        assert_eq!(
+            setting(&connector, "transaction_read_only").await,
+            Value::String("on".into())
+        );
+
+        // The cursor's held transaction is the same snapshot, reported by the
+        // cursor's own SQL, and a write it can carry is refused there too.
+        // `nextval` is that write: `DECLARE` rejects a data-modifying `WITH`
+        // outright, so that cannot be the probe.
+        assert_eq!(
+            cursor_settings(&connector).await,
+            vec![
+                Value::String("repeatable read".into()),
+                Value::String("on".into())
+            ],
+            "the cursor pages one repeatable-read snapshot that refuses writes"
+        );
+
+        let cursor = connector
+            .open_cursor(
+                &subql::reexec::ReadQuery::without_binds("SELECT nextval('probe_seq') AS n"),
+                &(),
+            )
+            .await
+            .expect("the declaration itself is accepted");
+        let refused = connector
+            .fetch_cursor(cursor, 4096)
+            .await
+            .expect_err("advancing a sequence inside the read snapshot is refused");
+        assert!(
+            refused.to_string().contains("read-only transaction"),
+            "refused for being read-only rather than for any other reason, got {refused}"
+        );
+    });
+}
+
+/// One page of an async cursor as its integer first column, with the flag
+/// saying whether more rows are waiting. A tight budget, so a result of any
+/// size arrives over several pages.
+async fn page_of_ids(
+    connector: &PgAsyncDieselConnector,
+    cursor: subql::reexec::CursorId,
+) -> (Vec<i64>, bool) {
+    let page = connector
+        .fetch_cursor(cursor, 32)
+        .await
+        .expect("fetch a page");
+    let ids = page
+        .value
+        .rows
+        .iter()
+        .map(|row| match &row[0] {
+            Value::Int(id) => *id,
+            other => panic!("id should decode as an integer, got {other:?}"),
+        })
+        .collect();
+    (ids, page.value.more)
+}
+
+/// Two async cursors open at once are two cursors: distinct ids and pages
+/// that do not bleed into each other.
+#[test]
+#[ignore = "requires Docker"]
+fn two_async_cursors_open_at_once_page_independently() {
+    common::assert_docker_available();
+    let container = common::pg_with_wal2json();
+    let port = common::pg_port(&container);
+    let mut conn = common::pg_connect(port);
+    // Enough rows that each cursor is paged many times, so every page but the
+    // first has to resume a cursor the other one read from in between.
+    let seed: Vec<(i64, f64)> = (1..=40_u32)
+        .map(|id| (i64::from(id), f64::from(id)))
+        .collect();
+    setup_pg(&mut conn, &seed);
+
+    common::multi_thread_rt().block_on(async {
+        let connector = PgAsyncDieselConnector::new(pg_async_pool(port).await);
+        let (ascending, descending) = open_ordered_cursors(&connector).await;
+        assert_ne!(
+            ascending, descending,
+            "each open must hand back its own cursor id"
+        );
+
+        let (up, down, rounds) = drain_interleaved(&connector, ascending, descending).await;
+        assert!(
+            rounds > 1,
+            "the budget must split both results, else nothing resumes, got {rounds} round(s)"
+        );
+        assert_eq!(
+            up,
+            (1..=40).collect::<Vec<_>>(),
+            "the ascending cursor's rows"
+        );
+        assert_eq!(
+            down,
+            (1..=40).rev().collect::<Vec<_>>(),
+            "the descending cursor's rows, unmixed with the other's"
+        );
+        connector
+            .close_cursor(ascending)
+            .await
+            .expect("close ascending");
+        connector
+            .close_cursor(descending)
+            .await
+            .expect("close descending");
+    });
+}
+
+/// One cursor over the ids ascending and one over them descending, so a page
+/// from either says plainly which cursor answered.
+async fn open_ordered_cursors(
+    connector: &PgAsyncDieselConnector,
+) -> (subql::reexec::CursorId, subql::reexec::CursorId) {
+    let ascending = connector
+        .open_cursor(
+            &subql::reexec::ReadQuery::without_binds("SELECT id FROM orders ORDER BY id"),
+            &(),
+        )
+        .await
+        .expect("open the ascending cursor");
+    let descending = connector
+        .open_cursor(
+            &subql::reexec::ReadQuery::without_binds("SELECT id FROM orders ORDER BY id DESC"),
+            &(),
+        )
+        .await
+        .expect("open the descending cursor");
+    (ascending, descending)
+}
+
+/// Page both cursors to exhaustion, one page each in turn, so a shared
+/// registration would show up as one cursor answering both readers. Returns
+/// each cursor's ids and how many rounds it took.
+async fn drain_interleaved(
+    connector: &PgAsyncDieselConnector,
+    ascending: subql::reexec::CursorId,
+    descending: subql::reexec::CursorId,
+) -> (Vec<i64>, Vec<i64>, usize) {
+    let mut up = Vec::new();
+    let mut down = Vec::new();
+    for round in 1..=100 {
+        let (ascending_page, ascending_more) = page_of_ids(connector, ascending).await;
+        let (descending_page, descending_more) = page_of_ids(connector, descending).await;
+        up.extend(ascending_page);
+        down.extend(descending_page);
+        if !ascending_more && !descending_more {
+            return (up, down, round);
+        }
+    }
+    panic!("both cursors should finish inside a hundred rounds");
+}
+
+/// An async cursor that fails to open rolls its transaction back rather than
+/// leaving the pooled connection inside one. Rolling back keeps the
+/// connection: released still in a transaction, the pool can only discard it,
+/// which the backend pid before and after reports exactly.
+#[test]
+#[ignore = "requires Docker"]
+fn an_async_cursor_that_fails_to_open_keeps_its_connection() {
+    common::assert_docker_available();
+    let container = common::pg_with_wal2json();
+    let port = common::pg_port(&container);
+    let mut conn = common::pg_connect(port);
+    setup_pg(&mut conn, &[(1, 1.0)]);
+    let mut observer = common::pg_connect(port);
+
+    common::multi_thread_rt().block_on(async {
+        // One connection, so the pid names the same pool slot each time.
+        let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(common::pg_url(port));
+        let pool: Pool<AsyncPgConnection> = Pool::builder()
+            .max_size(1)
+            .build(manager)
+            .await
+            .expect("build a single-connection pool");
+        let connector = PgAsyncDieselConnector::new(pool);
+        let pid = subql::reexec::ReadQuery::without_binds("SELECT pg_backend_pid()::bigint AS n");
+        let (before, _) = connector
+            .execute_scalar(&pid, ScalarFamily::Int, &())
+            .await
+            .expect("read the backend pid");
+
+        let failed = connector
+            .open_cursor(
+                &subql::reexec::ReadQuery::without_binds("SELECT id FROM no_such_table"),
+                &(),
+            )
+            .await
+            .expect_err("a cursor over a missing table cannot open");
+        assert!(
+            failed.to_string().contains("no_such_table"),
+            "the failure names what the database refused, got {failed}"
+        );
+
+        assert_eq!(
+            count(&mut observer, IDLE_IN_ANY_TXN),
+            0,
+            "a failed open leaves no backend parked in a transaction"
+        );
+        let (after, _) = connector
+            .execute_scalar(&pid, ScalarFamily::Int, &())
+            .await
+            .expect("the pool still serves reads");
+        assert_eq!(
+            after, before,
+            "the connection is rolled back and reused rather than discarded"
+        );
+    });
+}
+
+/// Every page of an async cursor names its columns, the last one included.
+/// The terminal `FETCH` returns no rows, and a page taking its names from
+/// that arrives unlabelled.
+#[test]
+#[ignore = "requires Docker"]
+fn every_page_of_an_async_cursor_names_its_columns() {
+    common::assert_docker_available();
+    let container = common::pg_with_wal2json();
+    let port = common::pg_port(&container);
+    let mut conn = common::pg_connect(port);
+    let seed: Vec<(i64, f64)> = (1..=8_u32)
+        .map(|id| (i64::from(id), f64::from(id)))
+        .collect();
+    setup_pg(&mut conn, &seed);
+
+    common::multi_thread_rt().block_on(async {
+        let connector = PgAsyncDieselConnector::new(pg_async_pool(port).await);
+        let cursor = connector
+            .open_cursor(
+                &subql::reexec::ReadQuery::without_binds(
+                    "SELECT id, status FROM orders ORDER BY id",
+                ),
+                &(),
+            )
+            .await
+            .expect("open cursor");
+
+        let mut pages = 0;
+        loop {
+            let page = connector
+                .fetch_cursor(cursor, 24)
+                .await
+                .expect("fetch a page");
+            pages += 1;
+            assert_eq!(
+                page.value.columns,
+                vec!["id".to_string(), "status".to_string()],
+                "page {pages} must name its columns, last page included"
+            );
+            if !page.value.more {
+                break;
+            }
+            assert!(pages < 50, "the cursor should finish");
+        }
+        assert!(pages > 1, "the budget should have split this result");
+        connector.close_cursor(cursor).await.expect("close");
+    });
+}
