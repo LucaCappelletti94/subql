@@ -1420,7 +1420,9 @@ fn two_cursors_open_at_once_page_independently() {
     let container = common::pg_with_wal2json();
     let port = common::pg_port(&container);
     let mut conn = common::pg_connect(port);
-    let seed: Vec<(i64, f64)> = (1..=6_u32)
+    // Enough rows that each cursor is paged many times, so every page but the
+    // first has to resume a cursor the other one read from in between.
+    let seed: Vec<(i64, f64)> = (1..=40_u32)
         .map(|id| (i64::from(id), f64::from(id)))
         .collect();
     setup_pg(&mut conn, &seed);
@@ -1432,21 +1434,21 @@ fn two_cursors_open_at_once_page_independently() {
         "each open must hand back its own cursor id"
     );
 
-    let (up, down) = drain_interleaved(&connector, ascending, descending);
+    let (up, down, rounds) = drain_interleaved(&connector, ascending, descending);
+    assert!(
+        rounds > 1,
+        "the budget must split both results, else nothing resumes, got {rounds} round(s)"
+    );
     assert_eq!(
         up,
-        (1..=6).collect::<Vec<_>>(),
+        (1..=40).collect::<Vec<_>>(),
         "the ascending cursor's rows"
     );
     assert_eq!(
         down,
-        (1..=6).rev().collect::<Vec<_>>(),
+        (1..=40).rev().collect::<Vec<_>>(),
         "the descending cursor's rows, unmixed with the other's"
     );
-    connector.close_cursor(ascending).expect("close ascending");
-    connector
-        .close_cursor(descending)
-        .expect("close descending");
 }
 
 /// One cursor over the ids ascending and one over them descending, so a page
@@ -1470,26 +1472,52 @@ fn open_ordered_cursors(
 }
 
 /// Page both cursors to exhaustion, one page each in turn, so a shared
-/// registration would show up as one cursor answering both readers.
+/// registration would show up as one cursor answering both readers. Returns
+/// each cursor's ids and how many rounds it took.
 fn drain_interleaved(
     connector: &PgR2D2DieselConnector,
     ascending: subql::reexec::CursorId,
     descending: subql::reexec::CursorId,
-) -> (Vec<i64>, Vec<i64>) {
+) -> (Vec<i64>, Vec<i64>, usize) {
     let mut up = Vec::new();
     let mut down = Vec::new();
-    loop {
+    for round in 1..=100 {
         let (ascending_page, ascending_more) = page_of_ids(connector, ascending);
         let (descending_page, descending_more) = page_of_ids(connector, descending);
         up.extend(ascending_page);
         down.extend(descending_page);
-        assert!(
-            up.len() <= 6 && down.len() <= 6,
-            "both cursors should finish"
-        );
         if !ascending_more && !descending_more {
-            return (up, down);
+            return (up, down, round);
         }
+    }
+    panic!("both cursors should finish inside a hundred rounds");
+}
+
+/// A cursor whose every row costs a second of server-side sleep, so a read of
+/// it is demonstrably still in flight while another call is made.
+fn open_slow_cursor(connector: &PgR2D2DieselConnector) -> subql::reexec::CursorId {
+    connector
+        .open_cursor(
+            &subql::reexec::ReadQuery::without_binds(
+                "SELECT id, pg_sleep(1) IS NULL AS slept FROM orders ORDER BY id",
+            ),
+            &(),
+        )
+        .expect("open the slow cursor")
+}
+
+/// Block until the server reports a cursor `FETCH` running, which is the only
+/// moment that proves the reader holds the cursor. A channel send before the
+/// call would prove only that the thread was about to ask, and this thread
+/// could then take the cursor first and do the slow read itself.
+fn wait_for_a_running_fetch(observer: &mut PgConnection) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while scalar(observer, FETCH_RUNNING) == 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no reader ever reached the server"
+        );
+        std::thread::sleep(Duration::from_millis(20));
     }
 }
 
@@ -1499,7 +1527,6 @@ fn drain_interleaved(
 #[test]
 #[ignore = "requires Docker; run with --ignored"]
 fn a_second_reader_of_one_cursor_is_told_it_is_busy() {
-    use std::time::Instant;
     use subql::reexec::CursorError;
 
     common::assert_docker_available();
@@ -1509,36 +1536,13 @@ fn a_second_reader_of_one_cursor_is_told_it_is_busy() {
     setup_pg(&mut conn, &[(1, 1.0), (2, 2.0), (3, 3.0)]);
 
     let connector = Arc::new(PgR2D2DieselConnector::new(build_pool(port)));
-    // One second of server-side sleep per row, so the first read holds the
-    // cursor for seconds while the second one asks.
-    let cursor = connector
-        .open_cursor(
-            &subql::reexec::ReadQuery::without_binds(
-                "SELECT id, pg_sleep(1) IS NULL AS slept FROM orders ORDER BY id",
-            ),
-            &(),
-        )
-        .expect("open cursor");
-
+    let cursor = open_slow_cursor(&connector);
     let reader = {
         let connector = Arc::clone(&connector);
         std::thread::spawn(move || connector.fetch_cursor(cursor, 1 << 20))
     };
-
-    // Wait for the server to report the reader's `FETCH` running, which is
-    // the only moment that proves the reader holds the cursor. A channel send
-    // before the call would prove only that the thread was about to ask, and
-    // then this thread could take the cursor first and do the slow read
-    // itself, leaving nothing to contend with.
     let mut observer = common::pg_connect(port);
-    let deadline = Instant::now() + Duration::from_secs(30);
-    while scalar(&mut observer, FETCH_RUNNING) == 0 {
-        assert!(
-            Instant::now() < deadline,
-            "the first reader never reached the server"
-        );
-        std::thread::sleep(Duration::from_millis(20));
-    }
+    wait_for_a_running_fetch(&mut observer);
 
     let contended = connector.fetch_cursor(cursor, 1 << 20);
     assert!(
@@ -1552,6 +1556,53 @@ fn a_second_reader_of_one_cursor_is_told_it_is_busy() {
         .expect("the reading thread finishes")
         .expect("the first read succeeds");
     connector.close_cursor(cursor).expect("close");
+}
+
+/// One cursor's read does not stall another's. The connector locks per cursor,
+/// so a second cursor is served while the first is still inside its `FETCH`,
+/// which a map-wide lock around the read would turn into a queue.
+#[test]
+#[ignore = "requires Docker; run with --ignored"]
+fn a_cursor_is_served_while_another_is_mid_fetch() {
+    common::assert_docker_available();
+    let container = common::pg_with_wal2json();
+    let port = common::pg_port(&container);
+    let mut conn = common::pg_connect(port);
+    setup_pg(&mut conn, &[(1, 1.0), (2, 2.0), (3, 3.0)]);
+
+    let connector = Arc::new(PgR2D2DieselConnector::new(build_pool(port)));
+    let slow = open_slow_cursor(&connector);
+    let quick = connector
+        .open_cursor(
+            &subql::reexec::ReadQuery::without_binds("SELECT id FROM orders ORDER BY id"),
+            &(),
+        )
+        .expect("open the quick cursor");
+
+    let reader = {
+        let connector = Arc::clone(&connector);
+        std::thread::spawn(move || connector.fetch_cursor(slow, 1 << 20))
+    };
+    let mut observer = common::pg_connect(port);
+    wait_for_a_running_fetch(&mut observer);
+
+    let page = connector
+        .fetch_cursor(quick, 1 << 20)
+        .expect("the other cursor is served");
+    assert_eq!(page.value.rows.len(), 3, "and answers in full");
+    assert!(
+        scalar(&mut observer, FETCH_RUNNING) > 0,
+        "the slow cursor must still be reading, else this proves no overlap"
+    );
+
+    reader
+        .join()
+        .expect("the reading thread finishes")
+        .expect("the slow read succeeds");
+    connector.close_cursor(slow).expect("close the slow cursor");
+    connector
+        .close_cursor(quick)
+        .expect("close the quick cursor");
 }
 
 /// A cursor that fails to open rolls its transaction back: it keeps the pooled

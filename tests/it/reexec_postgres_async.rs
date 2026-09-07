@@ -1455,6 +1455,27 @@ async fn setting(connector: &PgAsyncDieselConnector, name: &str) -> Value<Postgr
     value
 }
 
+/// The isolation and read-only settings of the transaction an async cursor
+/// holds, read through the cursor itself.
+async fn cursor_settings(connector: &PgAsyncDieselConnector) -> Vec<Value<Postgres>> {
+    let cursor = connector
+        .open_cursor(
+            &subql::reexec::ReadQuery::without_binds(
+                "SELECT current_setting('transaction_isolation') AS iso, \
+                 current_setting('transaction_read_only') AS ro",
+            ),
+            &(),
+        )
+        .await
+        .expect("open the observing cursor");
+    let page = connector
+        .fetch_cursor(cursor, 4096)
+        .await
+        .expect("fetch the settings");
+    connector.close_cursor(cursor).await.expect("close");
+    page.value.rows[0].clone()
+}
+
 /// Every async read runs in the mode `PG_READ_SNAPSHOT` names, the same one
 /// the sync connector uses: a repeatable-read snapshot that refuses writes.
 /// The read's own SQL observes it, on the scalar path and inside a cursor.
@@ -1481,9 +1502,19 @@ fn each_async_read_runs_read_only_at_repeatable_read() {
             Value::String("on".into())
         );
 
-        // The cursor's held transaction is the same snapshot. A write it can
-        // carry, `nextval`, is refused for being read only: `DECLARE` rejects
-        // a data-modifying `WITH` outright, so that cannot be the probe.
+        // The cursor's held transaction is the same snapshot, reported by the
+        // cursor's own SQL, and a write it can carry is refused there too.
+        // `nextval` is that write: `DECLARE` rejects a data-modifying `WITH`
+        // outright, so that cannot be the probe.
+        assert_eq!(
+            cursor_settings(&connector).await,
+            vec![
+                Value::String("repeatable read".into()),
+                Value::String("on".into())
+            ],
+            "the cursor pages one repeatable-read snapshot that refuses writes"
+        );
+
         let cursor = connector
             .open_cursor(
                 &subql::reexec::ReadQuery::without_binds("SELECT nextval('probe_seq') AS n"),
@@ -1534,7 +1565,9 @@ fn two_async_cursors_open_at_once_page_independently() {
     let container = common::pg_with_wal2json();
     let port = common::pg_port(&container);
     let mut conn = common::pg_connect(port);
-    let seed: Vec<(i64, f64)> = (1..=6_u32)
+    // Enough rows that each cursor is paged many times, so every page but the
+    // first has to resume a cursor the other one read from in between.
+    let seed: Vec<(i64, f64)> = (1..=40_u32)
         .map(|id| (i64::from(id), f64::from(id)))
         .collect();
     setup_pg(&mut conn, &seed);
@@ -1547,15 +1580,19 @@ fn two_async_cursors_open_at_once_page_independently() {
             "each open must hand back its own cursor id"
         );
 
-        let (up, down) = drain_interleaved(&connector, ascending, descending).await;
+        let (up, down, rounds) = drain_interleaved(&connector, ascending, descending).await;
+        assert!(
+            rounds > 1,
+            "the budget must split both results, else nothing resumes, got {rounds} round(s)"
+        );
         assert_eq!(
             up,
-            (1..=6).collect::<Vec<_>>(),
+            (1..=40).collect::<Vec<_>>(),
             "the ascending cursor's rows"
         );
         assert_eq!(
             down,
-            (1..=6).rev().collect::<Vec<_>>(),
+            (1..=40).rev().collect::<Vec<_>>(),
             "the descending cursor's rows, unmixed with the other's"
         );
         connector
@@ -1592,27 +1629,25 @@ async fn open_ordered_cursors(
 }
 
 /// Page both cursors to exhaustion, one page each in turn, so a shared
-/// registration would show up as one cursor answering both readers.
+/// registration would show up as one cursor answering both readers. Returns
+/// each cursor's ids and how many rounds it took.
 async fn drain_interleaved(
     connector: &PgAsyncDieselConnector,
     ascending: subql::reexec::CursorId,
     descending: subql::reexec::CursorId,
-) -> (Vec<i64>, Vec<i64>) {
+) -> (Vec<i64>, Vec<i64>, usize) {
     let mut up = Vec::new();
     let mut down = Vec::new();
-    loop {
+    for round in 1..=100 {
         let (ascending_page, ascending_more) = page_of_ids(connector, ascending).await;
         let (descending_page, descending_more) = page_of_ids(connector, descending).await;
         up.extend(ascending_page);
         down.extend(descending_page);
-        assert!(
-            up.len() <= 6 && down.len() <= 6,
-            "both cursors should finish"
-        );
         if !ascending_more && !descending_more {
-            return (up, down);
+            return (up, down, round);
         }
     }
+    panic!("both cursors should finish inside a hundred rounds");
 }
 
 /// An async cursor that fails to open rolls its transaction back rather than
