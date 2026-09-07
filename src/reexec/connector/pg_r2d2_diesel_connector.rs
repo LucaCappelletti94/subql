@@ -337,6 +337,8 @@ impl<S: SessionSetup> Connector for PgR2D2DieselConnector<S> {
             return Ok(());
         };
         let held = &mut *entry.lock();
+        // `CLOSE` is a cursor command with no typed DSL spelling, so raw SQL
+        // is required. The name is the connector's own, never a caller's.
         let closed = diesel::sql_query(alloc::format!("CLOSE {}", held.name))
             .execute(&mut *held.conn)
             .and_then(|_| PgTxn::commit_transaction(&mut *held.conn));

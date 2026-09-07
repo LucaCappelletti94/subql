@@ -81,8 +81,10 @@ const IDLE_IN_TXN: &str = "SELECT count(*) AS n FROM pg_stat_activity \
 /// without `WITH HOLD` lives inside its transaction, so this is zero once the
 /// transaction ends. Named cursors only: diesel runs every query through an
 /// unnamed portal, which `pg_cursors` reports while the query itself runs.
+/// `starts_with` rather than `LIKE`, because the prefix contains underscores
+/// and `LIKE` would read them as wildcards.
 const SUBQL_CURSORS_OPEN: &str =
-    "SELECT count(*) AS n FROM pg_cursors WHERE name LIKE 'subql_cursor_%'";
+    "SELECT count(*) AS n FROM pg_cursors WHERE starts_with(name, 'subql_cursor_')";
 
 const SLOT: &str = "subql_test";
 const DDL: &str =
