@@ -1439,6 +1439,22 @@ fn async_page_reads_apply_typed_binds() {
 const IDLE_IN_ANY_TXN: &str = "SELECT count(*) AS n FROM pg_stat_activity \
      WHERE state LIKE 'idle in transaction%' AND xact_start IS NOT NULL";
 
+/// One `current_setting` of the transaction an async scalar read runs in.
+async fn setting(connector: &PgAsyncDieselConnector, name: &str) -> Value<Postgres> {
+    let (value, _) = connector
+        .execute_scalar(
+            &subql::reexec::ReadQuery::owned(
+                format!("SELECT current_setting('{name}') AS v"),
+                Vec::new(),
+            ),
+            ScalarFamily::String,
+            &(),
+        )
+        .await
+        .expect("scalar read");
+    value
+}
+
 /// Every async read runs in the mode `PG_READ_SNAPSHOT` names, the same one
 /// the sync connector uses: a repeatable-read snapshot that refuses writes.
 /// The read's own SQL observes it, on the scalar path and inside a cursor.
@@ -1456,29 +1472,14 @@ fn each_async_read_runs_read_only_at_repeatable_read() {
 
     common::multi_thread_rt().block_on(async {
         let connector = PgAsyncDieselConnector::new(pg_async_pool(port).await);
-        let (isolation, _) = connector
-            .execute_scalar(
-                &subql::reexec::ReadQuery::without_binds(
-                    "SELECT current_setting('transaction_isolation') AS v",
-                ),
-                ScalarFamily::String,
-                &(),
-            )
-            .await
-            .expect("scalar read");
-        assert_eq!(isolation, Value::String("repeatable read".into()));
-
-        let (read_only, _) = connector
-            .execute_scalar(
-                &subql::reexec::ReadQuery::without_binds(
-                    "SELECT current_setting('transaction_read_only') AS v",
-                ),
-                ScalarFamily::String,
-                &(),
-            )
-            .await
-            .expect("scalar read");
-        assert_eq!(read_only, Value::String("on".into()));
+        assert_eq!(
+            setting(&connector, "transaction_isolation").await,
+            Value::String("repeatable read".into())
+        );
+        assert_eq!(
+            setting(&connector, "transaction_read_only").await,
+            Value::String("on".into())
+        );
 
         // The cursor's held transaction is the same snapshot. A write it can
         // carry, `nextval`, is refused for being read only: `DECLARE` rejects
@@ -1540,41 +1541,13 @@ fn two_async_cursors_open_at_once_page_independently() {
 
     common::multi_thread_rt().block_on(async {
         let connector = PgAsyncDieselConnector::new(pg_async_pool(port).await);
-        let ascending = connector
-            .open_cursor(
-                &subql::reexec::ReadQuery::without_binds("SELECT id FROM orders ORDER BY id"),
-                &(),
-            )
-            .await
-            .expect("open the ascending cursor");
-        let descending = connector
-            .open_cursor(
-                &subql::reexec::ReadQuery::without_binds("SELECT id FROM orders ORDER BY id DESC"),
-                &(),
-            )
-            .await
-            .expect("open the descending cursor");
+        let (ascending, descending) = open_ordered_cursors(&connector).await;
         assert_ne!(
             ascending, descending,
             "each open must hand back its own cursor id"
         );
 
-        let mut up = Vec::new();
-        let mut down = Vec::new();
-        loop {
-            let (ascending_page, ascending_more) = page_of_ids(&connector, ascending).await;
-            let (descending_page, descending_more) = page_of_ids(&connector, descending).await;
-            up.extend(ascending_page);
-            down.extend(descending_page);
-            assert!(
-                up.len() <= 6 && down.len() <= 6,
-                "both cursors should finish"
-            );
-            if !ascending_more && !descending_more {
-                break;
-            }
-        }
-
+        let (up, down) = drain_interleaved(&connector, ascending, descending).await;
         assert_eq!(
             up,
             (1..=6).collect::<Vec<_>>(),
@@ -1594,6 +1567,52 @@ fn two_async_cursors_open_at_once_page_independently() {
             .await
             .expect("close descending");
     });
+}
+
+/// One cursor over the ids ascending and one over them descending, so a page
+/// from either says plainly which cursor answered.
+async fn open_ordered_cursors(
+    connector: &PgAsyncDieselConnector,
+) -> (subql::reexec::CursorId, subql::reexec::CursorId) {
+    let ascending = connector
+        .open_cursor(
+            &subql::reexec::ReadQuery::without_binds("SELECT id FROM orders ORDER BY id"),
+            &(),
+        )
+        .await
+        .expect("open the ascending cursor");
+    let descending = connector
+        .open_cursor(
+            &subql::reexec::ReadQuery::without_binds("SELECT id FROM orders ORDER BY id DESC"),
+            &(),
+        )
+        .await
+        .expect("open the descending cursor");
+    (ascending, descending)
+}
+
+/// Page both cursors to exhaustion, one page each in turn, so a shared
+/// registration would show up as one cursor answering both readers.
+async fn drain_interleaved(
+    connector: &PgAsyncDieselConnector,
+    ascending: subql::reexec::CursorId,
+    descending: subql::reexec::CursorId,
+) -> (Vec<i64>, Vec<i64>) {
+    let mut up = Vec::new();
+    let mut down = Vec::new();
+    loop {
+        let (ascending_page, ascending_more) = page_of_ids(connector, ascending).await;
+        let (descending_page, descending_more) = page_of_ids(connector, descending).await;
+        up.extend(ascending_page);
+        down.extend(descending_page);
+        assert!(
+            up.len() <= 6 && down.len() <= 6,
+            "both cursors should finish"
+        );
+        if !ascending_more && !descending_more {
+            return (up, down);
+        }
+    }
 }
 
 /// An async cursor that fails to open rolls its transaction back rather than

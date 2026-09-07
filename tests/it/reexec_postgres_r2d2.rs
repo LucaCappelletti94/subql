@@ -1426,41 +1426,13 @@ fn two_cursors_open_at_once_page_independently() {
     setup_pg(&mut conn, &seed);
 
     let connector = PgR2D2DieselConnector::new(build_pool(port));
-    let ascending = connector
-        .open_cursor(
-            &subql::reexec::ReadQuery::without_binds("SELECT id FROM orders ORDER BY id"),
-            &(),
-        )
-        .expect("open the ascending cursor");
-    let descending = connector
-        .open_cursor(
-            &subql::reexec::ReadQuery::without_binds("SELECT id FROM orders ORDER BY id DESC"),
-            &(),
-        )
-        .expect("open the descending cursor");
+    let (ascending, descending) = open_ordered_cursors(&connector);
     assert_ne!(
         ascending, descending,
         "each open must hand back its own cursor id"
     );
 
-    // Interleaved, one page each, so a shared registration would show up as
-    // one cursor answering both readers.
-    let mut up = Vec::new();
-    let mut down = Vec::new();
-    loop {
-        let (ascending_page, ascending_more) = page_of_ids(&connector, ascending);
-        let (descending_page, descending_more) = page_of_ids(&connector, descending);
-        up.extend(ascending_page);
-        down.extend(descending_page);
-        assert!(
-            up.len() <= 6 && down.len() <= 6,
-            "both cursors should finish"
-        );
-        if !ascending_more && !descending_more {
-            break;
-        }
-    }
-
+    let (up, down) = drain_interleaved(&connector, ascending, descending);
     assert_eq!(
         up,
         (1..=6).collect::<Vec<_>>(),
@@ -1475,6 +1447,50 @@ fn two_cursors_open_at_once_page_independently() {
     connector
         .close_cursor(descending)
         .expect("close descending");
+}
+
+/// One cursor over the ids ascending and one over them descending, so a page
+/// from either says plainly which cursor answered.
+fn open_ordered_cursors(
+    connector: &PgR2D2DieselConnector,
+) -> (subql::reexec::CursorId, subql::reexec::CursorId) {
+    let ascending = connector
+        .open_cursor(
+            &subql::reexec::ReadQuery::without_binds("SELECT id FROM orders ORDER BY id"),
+            &(),
+        )
+        .expect("open the ascending cursor");
+    let descending = connector
+        .open_cursor(
+            &subql::reexec::ReadQuery::without_binds("SELECT id FROM orders ORDER BY id DESC"),
+            &(),
+        )
+        .expect("open the descending cursor");
+    (ascending, descending)
+}
+
+/// Page both cursors to exhaustion, one page each in turn, so a shared
+/// registration would show up as one cursor answering both readers.
+fn drain_interleaved(
+    connector: &PgR2D2DieselConnector,
+    ascending: subql::reexec::CursorId,
+    descending: subql::reexec::CursorId,
+) -> (Vec<i64>, Vec<i64>) {
+    let mut up = Vec::new();
+    let mut down = Vec::new();
+    loop {
+        let (ascending_page, ascending_more) = page_of_ids(connector, ascending);
+        let (descending_page, descending_more) = page_of_ids(connector, descending);
+        up.extend(ascending_page);
+        down.extend(descending_page);
+        assert!(
+            up.len() <= 6 && down.len() <= 6,
+            "both cursors should finish"
+        );
+        if !ascending_more && !descending_more {
+            return (up, down);
+        }
+    }
 }
 
 /// A cursor is serial, so a second reader arriving while one is in flight is
