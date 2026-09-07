@@ -1,7 +1,5 @@
 //! The mock async connector and engine builder every topic below drives.
 
-#![allow(clippy::unwrap_used)]
-
 use super::*;
 
 /// `parking_lot::Mutex`-backed mock so the futures are `Send`.

@@ -77,16 +77,6 @@ fn async_engine_unregister_drops_context() {
     assert_eq!(e.contexts.len(), 0);
 }
 
-// Re-execution concurrency throttle
-//
-// The `MockAsyncConnector` futures complete in one poll, so the
-// tests here cannot observe the *peak* inflight count during a
-// batch (that needs a real multi-tasking runtime, integration
-// tests exercise it). Unit tests validate the invariants that DO
-// hold under `block_on`: the accessors, the post-batch invariant
-// (`inflight == 0`), the zero-cap normalisation, and the
-// result-preservation contract.
-
 #[test]
 fn async_unregister_subscription_resolves_either_registry() {
     let (mut e, _tid) = engine_with_values(vec![]);

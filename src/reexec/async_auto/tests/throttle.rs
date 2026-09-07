@@ -1,4 +1,10 @@
 //! The concurrency cap: accessors, occupancy and call counts.
+//!
+//! The `MockAsyncConnector` futures complete in one poll, so nothing here can
+//! observe peak occupancy during a batch, which needs a real multi-tasking
+//! runtime and lives in `tests/it/reexec_throttle.rs`. What holds under
+//! `block_on` is what these assert: the accessors, `inflight == 0` after a
+//! batch, the zero-cap normalisation, and that a cap changes no result.
 
 #![allow(clippy::unwrap_used)]
 

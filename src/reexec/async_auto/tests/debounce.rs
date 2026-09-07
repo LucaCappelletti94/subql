@@ -1,7 +1,5 @@
 //! The debounce window, per subscription and per group.
 
-#![allow(clippy::unwrap_used)]
-
 use super::fixtures::*;
 use super::*;
 

@@ -1,7 +1,5 @@
 //! The mock connector and engine builder every topic below drives.
 
-#![allow(clippy::unwrap_used)]
-
 use super::*;
 
 /// Records every call and serves a programmed value queue. Errors are
