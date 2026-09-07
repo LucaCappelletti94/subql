@@ -101,10 +101,13 @@ enum BindRefusal {
 
 #[cfg(test)]
 mod tests {
-    use super::{bind_error, shape_of, unknown_column_error};
+    use super::{bind_error, shape_of, unknown_column_error, ColumnIndex};
     use alloc::string::{String, ToString as _};
     use alloc::vec::Vec;
+    use sql_traits::prelude::{ColumnLike, DatabaseLike, TableLike as _};
+    use sql_traits::structs::ParserDB;
     use sqlite_diff_rs::Value;
+    use sqlparser::dialect::PostgreSqlDialect;
 
     /// Every adapter refuses a mismatched cell with the same sentence, naming
     /// the column, the shape it takes and the shape it got.
@@ -132,5 +135,52 @@ mod tests {
         ];
         let named: Vec<&str> = shapes.iter().map(shape_of).collect();
         assert_eq!(named, ["NULL", "INTEGER", "REAL", "TEXT", "BLOB"]);
+    }
+
+    /// Two schemas may declare the same bare table name. The index answers
+    /// with the columns of the first such table the catalog yields, matching
+    /// the linear scan it replaced, never with the last one's.
+    #[test]
+    fn the_first_table_with_a_bare_name_wins() {
+        fn names<'db>(
+            db: &'db ParserDB,
+            table: &'db <ParserDB as DatabaseLike>::Table,
+        ) -> Vec<&'db str> {
+            table
+                .columns(db)
+                .expect("the fixture catalog yields its columns")
+                .map(ColumnLike::column_name)
+                .collect()
+        }
+
+        let db = ParserDB::parse::<PostgreSqlDialect>(
+            "CREATE SCHEMA a; CREATE SCHEMA b; \
+             CREATE TABLE a.items (id INT PRIMARY KEY, left_text TEXT); \
+             CREATE TABLE b.items (id INT PRIMARY KEY, right_num INT);",
+        )
+        .expect("the fixture DDL parses");
+
+        let mut items = db.tables().filter(|table| table.table_name() == "items");
+        let first = names(&db, items.next().expect("the catalog holds a.items"));
+        let last = names(&db, items.next().expect("the catalog holds b.items"));
+        assert_ne!(
+            first, last,
+            "the fixture's two tables must differ for the tie-break to be visible"
+        );
+
+        let index = ColumnIndex::new(&db).expect("the catalog indexes");
+        let indexed: Vec<&str> = (0..first.len())
+            .map(|position| {
+                index
+                    .column_at("items", position)
+                    .expect("the index holds one items table")
+                    .column_name()
+            })
+            .collect();
+        assert_eq!(indexed, first, "the first table yielded wins the bare name");
+        assert!(
+            index.column_at("items", first.len()).is_none(),
+            "a position past the winning table's width is out of range"
+        );
     }
 }
