@@ -724,7 +724,6 @@ mod cursor_page_tests {
     use super::{drain_cursor_buffer, RowPage};
     use crate::backend::{Postgres, Value};
     use alloc::collections::VecDeque;
-    use alloc::string::String;
     use alloc::vec;
     use alloc::vec::Vec;
 
@@ -813,6 +812,8 @@ mod session_setup_tests {
 
         run_setup_statements(&mut conn, &statements).expect("each statement runs in turn");
 
+        // The table is one of the setup statements above, so no typed schema
+        // exists for it and `sql_query` is the only way to read it back.
         let markers: Vec<Marker> = sql_query("SELECT note FROM session")
             .load(&mut conn)
             .expect("read the marker back");

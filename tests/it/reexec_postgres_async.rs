@@ -1546,9 +1546,9 @@ fn two_async_cursors_open_at_once_page_independently() {
                     .await
                     .expect("fetch a page");
                 for row in &page.value.rows {
-                    match row[0] {
-                        Value::Int(id) => ids.push(id),
-                        ref other => panic!("id should decode as an integer, got {other:?}"),
+                    match &row[0] {
+                        Value::Int(id) => ids.push(*id),
+                        other => panic!("id should decode as an integer, got {other:?}"),
                     }
                 }
                 going |= page.value.more;

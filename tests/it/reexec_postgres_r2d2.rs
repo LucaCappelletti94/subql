@@ -1331,6 +1331,11 @@ fn session_setup_runs_inside_each_read_transaction() {
 const IDLE_IN_ANY_TXN: &str = "SELECT count(*) AS n FROM pg_stat_activity \
      WHERE state LIKE 'idle in transaction%' AND xact_start IS NOT NULL";
 
+/// A backend running a cursor `FETCH` right now, which is what a reader
+/// holding the cursor looks like from another connection.
+const FETCH_RUNNING: &str = "SELECT count(*) AS n FROM pg_stat_activity \
+     WHERE state = 'active' AND query LIKE 'FETCH FORWARD%'";
+
 /// A cursor's held transaction is the same read snapshot every other read
 /// gets: repeatable read, and read only. The cursor's own SQL is what
 /// observes it, evaluated when the rows are fetched.
@@ -1427,9 +1432,9 @@ fn two_cursors_open_at_once_page_independently() {
         for (cursor, ids) in [(ascending, &mut up), (descending, &mut down)] {
             let page = connector.fetch_cursor(cursor, 32).expect("fetch a page");
             for row in &page.value.rows {
-                match row[0] {
-                    Value::Int(id) => ids.push(id),
-                    ref other => panic!("id should decode as an integer, got {other:?}"),
+                match &row[0] {
+                    Value::Int(id) => ids.push(*id),
+                    other => panic!("id should decode as an integer, got {other:?}"),
                 }
             }
             going |= page.value.more;
@@ -1486,31 +1491,31 @@ fn a_second_reader_of_one_cursor_is_told_it_is_busy() {
         )
         .expect("open cursor");
 
-    let (started, holding) = std::sync::mpsc::channel();
     let reader = {
         let connector = Arc::clone(&connector);
-        std::thread::spawn(move || {
-            started.send(()).expect("the test is still listening");
-            connector.fetch_cursor(cursor, 1 << 20)
-        })
+        std::thread::spawn(move || connector.fetch_cursor(cursor, 1 << 20))
     };
-    holding.recv().expect("the first reader starts");
 
-    let deadline = Instant::now() + Duration::from_secs(10);
-    let mut busy = None;
-    while Instant::now() < deadline && busy.is_none() {
-        match connector.fetch_cursor(cursor, 1 << 20) {
-            Err(CursorError::Busy(id)) => busy = Some(id),
-            // The first reader has not reached the server yet. Its page is
-            // legitimate, so keep asking until it holds the cursor.
-            _ => std::thread::sleep(Duration::from_millis(20)),
-        }
+    // Wait for the server to report the reader's `FETCH` running, which is
+    // the only moment that proves the reader holds the cursor. A channel send
+    // before the call would prove only that the thread was about to ask, and
+    // then this thread could take the cursor first and do the slow read
+    // itself, leaving nothing to contend with.
+    let mut observer = common::pg_connect(port);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while scalar(&mut observer, FETCH_RUNNING) == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "the first reader never reached the server"
+        );
+        std::thread::sleep(Duration::from_millis(20));
     }
-    assert_eq!(
-        busy,
-        Some(cursor),
+
+    let contended = connector.fetch_cursor(cursor, 1 << 20);
+    assert!(
+        matches!(contended, Err(CursorError::Busy(id)) if id == cursor),
         "a second reader must be told this cursor is busy, naming it, rather \
-         than blocked until the first read ends"
+         than blocked until the first read ends, got {contended:?}"
     );
 
     reader
