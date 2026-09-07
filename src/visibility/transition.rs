@@ -254,44 +254,15 @@ mod tests {
     use alloc::vec;
     use alloc::vec::Vec;
     use core::future::Future;
-    use core::pin::{pin, Pin};
     use core::sync::atomic::{AtomicUsize, Ordering};
-    use core::task::{Context, Poll, Waker};
 
     use sqlparser::dialect::PostgreSqlDialect;
 
     use super::{transitions, Transition, TransitionError, Transitions};
     use crate::backend::{Postgres, Value};
-    use crate::testing::TestEvent;
+    use crate::testing::{block_on, TestEvent, YieldOnce};
     use crate::visibility::{RowView, RowWrite, Verdict, VisibilityPolicy};
     use crate::{catalog_helpers, ParserDB, TableId};
-
-    // Harness
-
-    fn block_on<F: Future>(fut: F) -> F::Output {
-        let mut ctx = Context::from_waker(Waker::noop());
-        let mut pinned = pin!(fut);
-        loop {
-            if let Poll::Ready(v) = pinned.as_mut().poll(&mut ctx) {
-                return v;
-            }
-        }
-    }
-
-    /// Returns `Pending` once so the policy genuinely suspends, which is
-    /// what every real implementation does on its round trip.
-    struct YieldOnce(bool);
-    impl Future for YieldOnce {
-        type Output = ();
-        fn poll(mut self: Pin<&mut Self>, ctx: &mut Context<'_>) -> Poll<()> {
-            if self.0 {
-                return Poll::Ready(());
-            }
-            self.0 = true;
-            ctx.waker().wake_by_ref();
-            Poll::Pending
-        }
-    }
 
     #[derive(Debug, PartialEq, Eq)]
     struct Unreachable;

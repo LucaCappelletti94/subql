@@ -275,28 +275,7 @@ mod tests {
 
     #[test]
     fn typed_sqlite_source_impls_cdc_source() {
-        use core::future::Future;
-        use core::pin::pin;
-        use core::task::{Context, Poll};
-        use std::sync::Arc;
-        use std::task::Wake;
-
-        struct NoopWake;
-        #[allow(unknown_lints, clippy::manual_noop_waker)]
-        impl Wake for NoopWake {
-            fn wake(self: Arc<Self>) {}
-        }
-
-        fn block_on<F: Future>(fut: F) -> F::Output {
-            let waker = Arc::new(NoopWake).into();
-            let mut ctx = Context::from_waker(&waker);
-            let mut pinned = pin!(fut);
-            loop {
-                if let Poll::Ready(v) = pinned.as_mut().poll(&mut ctx) {
-                    return v;
-                }
-            }
-        }
+        use crate::testing::block_on;
 
         fn assert_cdc_source_send<S: crate::CdcSource + Send>() {}
         assert_cdc_source_send::<SqliteCdcSource<ParserDB>>();

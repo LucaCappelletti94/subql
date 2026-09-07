@@ -1020,44 +1020,17 @@ mod tests {
     };
     use super::*;
     use crate::backend::{Postgres, ScalarFamily};
-    use crate::testing::TestEvent;
+    use crate::testing::{block_on, TestEvent, YieldOnce};
     use crate::{
         DefaultIds, NoCheckpoint, Registered, SubscriptionEngine, SubscriptionRequest, TableId,
         Tier,
     };
     use core::future::Future;
     use core::pin::pin;
-    use core::task::{Context, Poll};
+    use core::task::Context;
     use parking_lot::Mutex;
     use sql_traits::structs::ParserDB;
     use sqlparser::dialect::PostgreSqlDialect;
-    use std::task::Wake;
-
-    /// No-op `Wake` implementation: the `MockAsyncConnector` futures
-    /// never park, so `wake` is never invoked. Built on the safe `Wake`
-    /// trait so the workspace's `forbid(unsafe_code)` lint passes. The
-    /// nightly-only `Waker::noop` would be the alternative, hence the
-    /// `allow` below.
-    struct NoopWake;
-    #[allow(unknown_lints, clippy::manual_noop_waker)]
-    impl Wake for NoopWake {
-        fn wake(self: Arc<Self>) {}
-    }
-
-    /// Tiny block-on for the test futures (which never park). Drives the
-    /// future to completion by polling. If a real-world future returned
-    /// Pending it would loop forever, but the `MockAsyncConnector`
-    /// futures complete in one poll.
-    fn block_on<F: Future>(fut: F) -> F::Output {
-        let waker = Arc::new(NoopWake).into();
-        let mut ctx = Context::from_waker(&waker);
-        let mut pinned = pin!(fut);
-        loop {
-            if let Poll::Ready(v) = pinned.as_mut().poll(&mut ctx) {
-                return v;
-            }
-        }
-    }
 
     /// `parking_lot::Mutex`-backed mock so the futures are `Send`.
     struct MockAsyncConnector {
@@ -1114,23 +1087,6 @@ mod tests {
     impl core::fmt::Display for MockError {
         fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
             write!(f, "{}", self.0)
-        }
-    }
-
-    /// Pending on its first poll, ready on the second: the seam that lets a
-    /// test observe a resolve suspended inside a connector read.
-    struct YieldOnce(bool);
-
-    impl Future for YieldOnce {
-        type Output = ();
-        fn poll(mut self: core::pin::Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-            if self.0 {
-                Poll::Ready(())
-            } else {
-                self.0 = true;
-                cx.waker().wake_by_ref();
-                Poll::Pending
-            }
         }
     }
 
@@ -2715,8 +2671,7 @@ mod tests {
 
         *e.connector().pend_next_read.lock() = true;
         {
-            let waker = Arc::new(NoopWake).into();
-            let mut ctx = Context::from_waker(&waker);
+            let mut ctx = Context::from_waker(core::task::Waker::noop());
             let mut sink =
                 |_delivery: super::super::ReadDelivery<DefaultIds, Postgres, NoCheckpoint>| {};
             let fut = e.resolve(&mut sink);
@@ -2810,8 +2765,7 @@ mod tests {
         let partial = Arc::new(Mutex::new(Vec::new()));
         {
             let partial = Arc::clone(&partial);
-            let waker = Arc::new(NoopWake).into();
-            let mut ctx = Context::from_waker(&waker);
+            let mut ctx = Context::from_waker(core::task::Waker::noop());
             let fut = e.resolve(move |delivery| {
                 if let crate::reexec::ReadDelivery::Rows(page) = delivery {
                     partial.lock().push(page.generation);

@@ -696,3 +696,55 @@ fn session_setup_runs_inside_each_read_transaction_sync_pg() {
         .expect("scalar read");
     assert_eq!(value, Value::Null, "an empty setup leaves the marker unset");
 }
+
+/// Every connector read runs under the mode `PG_READ_SNAPSHOT` names, which
+/// the read's own SQL can observe: a repeatable-read snapshot that refuses
+/// writes.
+#[test]
+#[ignore = "requires Docker; run with --ignored"]
+fn each_read_runs_read_only_at_repeatable_read() {
+    common::assert_docker_available();
+    let container = common::pg_with_wal2json();
+    let port = common::pg_port(&container);
+    let mut conn = common::pg_connect(port);
+    setup_pg(&mut conn, &[(1, 5.0)]);
+
+    let connector = PgDieselConnector::new(common::pg_connect(port));
+    let (isolation, _) = connector
+        .execute_scalar(
+            &subql::reexec::ReadQuery::without_binds(
+                "SELECT current_setting('transaction_isolation') AS v",
+            ),
+            ScalarFamily::String,
+            &(),
+        )
+        .expect("scalar read");
+    assert_eq!(isolation, Value::String("repeatable read".into()));
+
+    let (read_only, _) = connector
+        .execute_scalar(
+            &subql::reexec::ReadQuery::without_binds(
+                "SELECT current_setting('transaction_read_only') AS v",
+            ),
+            ScalarFamily::String,
+            &(),
+        )
+        .expect("scalar read");
+    assert_eq!(read_only, Value::String("on".into()));
+
+    let refused = connector
+        .execute_scalar(
+            &subql::reexec::ReadQuery::without_binds(
+                "WITH wrote AS (INSERT INTO orders (id, price, quantity, status) \
+                 VALUES (99, 1.0, 1, 'paid') RETURNING id) \
+                 SELECT 'wrote' AS v FROM wrote LIMIT 1",
+            ),
+            ScalarFamily::String,
+            &(),
+        )
+        .expect_err("a write inside the read snapshot is refused");
+    assert!(
+        refused.to_string().contains("read-only transaction"),
+        "refused for being read-only rather than for any other reason, got {refused}"
+    );
+}

@@ -785,43 +785,20 @@ where
             negated,
             escape_char,
             ..
-        } => {
-            if escape_char.is_some() {
-                return Err(RegisterError::UnsupportedSql(
-                    "LIKE ESCAPE not yet supported".to_string(),
-                ));
-            }
-
-            compile_expr_recursive::<B, DB>(
-                expr,
-                table_id,
-                database,
-                out,
-                depth + 1,
-                ScalarFamily::String.into(),
-            )?;
-            compile_expr_recursive::<B, DB>(
-                pattern,
-                table_id,
-                database,
-                out,
-                depth + 1,
-                ScalarFamily::String.into(),
-            )?;
-
-            let cmp = out.comparison_for(
+        } => compile_pattern_match::<B, DB>(
+            PatternMatch {
                 expr,
                 pattern,
-                table_id,
-                database,
-                crate::backend::TextOperation::Pattern,
-            )?;
-            out.push(Instruction::Like { comparison: cmp });
-
-            if *negated {
-                out.push(Instruction::Not);
-            }
-        }
+                negated: *negated,
+                escaped: escape_char.is_some(),
+                keyword: "LIKE",
+                operation: crate::backend::TextOperation::Pattern,
+            },
+            table_id,
+            database,
+            out,
+            depth,
+        )?,
 
         Expr::ILike {
             expr,
@@ -829,43 +806,20 @@ where
             negated,
             escape_char,
             ..
-        } => {
-            if escape_char.is_some() {
-                return Err(RegisterError::UnsupportedSql(
-                    "ILIKE ESCAPE not yet supported".to_string(),
-                ));
-            }
-
-            compile_expr_recursive::<B, DB>(
-                expr,
-                table_id,
-                database,
-                out,
-                depth + 1,
-                ScalarFamily::String.into(),
-            )?;
-            compile_expr_recursive::<B, DB>(
-                pattern,
-                table_id,
-                database,
-                out,
-                depth + 1,
-                ScalarFamily::String.into(),
-            )?;
-
-            let cmp = out.comparison_for(
+        } => compile_pattern_match::<B, DB>(
+            PatternMatch {
                 expr,
                 pattern,
-                table_id,
-                database,
-                crate::backend::TextOperation::CaseInsensitivePattern,
-            )?;
-            out.push(Instruction::Like { comparison: cmp });
-
-            if *negated {
-                out.push(Instruction::Not);
-            }
-        }
+                negated: *negated,
+                escaped: escape_char.is_some(),
+                keyword: "ILIKE",
+                operation: crate::backend::TextOperation::CaseInsensitivePattern,
+            },
+            table_id,
+            database,
+            out,
+            depth,
+        )?,
 
         // Nested Expressions (parentheses)
         Expr::Nested(inner) => {
@@ -890,6 +844,57 @@ where
         }
     }
 
+    Ok(())
+}
+
+/// One `LIKE` or `ILIKE` node, named so the two arms lower through the same
+/// procedure.
+#[derive(Clone, Copy)]
+struct PatternMatch<'sql> {
+    expr: &'sql Expr,
+    pattern: &'sql Expr,
+    negated: bool,
+    escaped: bool,
+    /// The keyword to name in a refusal, `LIKE` or `ILIKE`.
+    keyword: &'static str,
+    operation: crate::backend::TextOperation,
+}
+
+/// Lower a pattern match: both operands as text, then the comparison the
+/// backend resolves for `operation`.
+fn compile_pattern_match<B, DB>(
+    node: PatternMatch<'_>,
+    table_id: TableId,
+    database: &DB,
+    out: &mut Compiling<B>,
+    depth: usize,
+) -> Result<(), RegisterError>
+where
+    B: Backend + SqlLiteralParse,
+    DB: DatabaseLike,
+{
+    if node.escaped {
+        return Err(RegisterError::UnsupportedSql(format!(
+            "{} ESCAPE not yet supported",
+            node.keyword
+        )));
+    }
+    for operand in [node.expr, node.pattern] {
+        compile_expr_recursive::<B, DB>(
+            operand,
+            table_id,
+            database,
+            out,
+            depth + 1,
+            ScalarFamily::String.into(),
+        )?;
+    }
+    let comparison =
+        out.comparison_for(node.expr, node.pattern, table_id, database, node.operation)?;
+    out.push(Instruction::Like { comparison });
+    if node.negated {
+        out.push(Instruction::Not);
+    }
     Ok(())
 }
 

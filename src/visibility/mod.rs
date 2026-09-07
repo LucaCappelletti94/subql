@@ -85,58 +85,15 @@ pub use visibility_policy::VisibilityPolicy;
 mod tests {
     use super::{EventRow, RowView, RowWrite, Verdict, VisibilityPolicy, WriteOp};
     use crate::backend::{CdcEvent, Postgres, RowKind, Value};
-    use crate::testing::TestEvent;
+    use crate::testing::{block_on, TestEvent, YieldOnce};
     use crate::{catalog_helpers, TableId};
     use alloc::sync::Arc;
-    use alloc::task::Wake;
     use alloc::vec;
     use alloc::vec::Vec;
     use core::future::Future;
-    use core::pin::{pin, Pin};
-    use core::task::{Context, Poll};
     use pg_walstream::{ChangeEvent, ColumnValue, EventType, Lsn, RowData};
     use sql_traits::structs::ParserDB;
     use sqlparser::dialect::PostgreSqlDialect;
-
-    /// No-op `Wake`: the test policies never park. Built on the safe
-    /// `Wake` trait so the crate's `forbid(unsafe_code)` holds.
-    struct NoopWake;
-    #[allow(unknown_lints, clippy::manual_noop_waker)]
-    impl Wake for NoopWake {
-        fn wake(self: Arc<Self>) {}
-    }
-
-    /// Drive a never-parking future to completion from a `#[test]`, which
-    /// is a top-level sync boundary rather than a runtime worker.
-    fn block_on<F: Future>(fut: F) -> F::Output {
-        let waker = Arc::new(NoopWake).into();
-        let mut ctx = Context::from_waker(&waker);
-        let mut pinned = pin!(fut);
-        loop {
-            if let Poll::Ready(v) = pinned.as_mut().poll(&mut ctx) {
-                return v;
-            }
-        }
-    }
-
-    /// Returns `Pending` exactly once, so the policy under test really
-    /// suspends. A policy that resolves in a single poll would let a
-    /// future that is not resumable elsewhere pass unnoticed, and every
-    /// real implementation of this trait makes a round trip.
-    struct YieldOnce(bool);
-
-    impl Future for YieldOnce {
-        type Output = ();
-
-        fn poll(mut self: Pin<&mut Self>, ctx: &mut Context<'_>) -> Poll<()> {
-            if self.0 {
-                return Poll::Ready(());
-            }
-            self.0 = true;
-            ctx.waker().wake_by_ref();
-            Poll::Pending
-        }
-    }
 
     fn catalog() -> (ParserDB, TableId) {
         let db = ParserDB::parse::<PostgreSqlDialect>(

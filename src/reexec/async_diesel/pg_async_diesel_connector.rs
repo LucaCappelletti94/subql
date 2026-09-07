@@ -5,7 +5,7 @@
 use super::super::async_connector::AsyncConnector;
 use super::super::connector::{
     boxed_postgres_read_query_owned, drain_cursor_buffer, CursorError, CursorId, PgLsnRow,
-    ReadQuery, RowPage, ScalarRowError, SessionSetup, Snapshot,
+    ReadQuery, RowPage, ScalarRowError, SessionSetup, Snapshot, PG_READ_SNAPSHOT,
 };
 use super::{
     load_page_postgres_async, load_scalar_postgres_async, load_scalar_row_postgres_async,
@@ -16,7 +16,6 @@ use alloc::vec::Vec;
 use core::future::Future;
 use diesel::sql_query;
 use diesel_async::pooled_connection::bb8::Pool;
-use diesel_async::scoped_futures::ScopedFutureExt;
 use diesel_async::{AsyncConnection, RunQueryDsl as _};
 
 /// Async LSN-aware [`AsyncConnector`] for PostgreSQL, the async peer of
@@ -252,6 +251,20 @@ async fn read_current_lsn_async(
     Ok(crate::PgLsn::parse(&row.lsn))
 }
 
+/// Put the open transaction on the read snapshot, then run `setup`.
+///
+/// The async peer of the prelude
+/// [`read_at_lsn`](crate::reexec::connector::PgDieselConnector) runs, sharing
+/// its [`PG_READ_SNAPSHOT`] statement.
+#[cfg(feature = "executor-diesel-async-postgres")]
+async fn begin_read_snapshot(
+    conn: &mut diesel_async::AsyncPgConnection,
+    setup: &[alloc::string::String],
+) -> diesel::QueryResult<()> {
+    sql_query(PG_READ_SNAPSHOT).execute(&mut *conn).await?;
+    run_setup_statements_async(conn, setup).await
+}
+
 #[cfg(feature = "executor-diesel-async-postgres")]
 impl<S: SessionSetup + Send + Sync> AsyncConnector for PgAsyncDieselConnector<S> {
     type AuthContext = S;
@@ -279,18 +292,10 @@ impl<S: SessionSetup + Send + Sync> AsyncConnector for PgAsyncDieselConnector<S>
                 .await
                 .map_err(DieselAsyncError::Diesel)?;
             conn.transaction::<(Value<Self::Backend>, Option<crate::PgLsn>), diesel::result::Error, _>(
-                |c| {
-                    async move {
-                        // SET TRANSACTION is DDL-like; no typed DSL equivalent exists.
-                        sql_query("SET TRANSACTION READ ONLY ISOLATION LEVEL REPEATABLE READ")
-                            .execute(c)
-                            .await?;
-                        run_setup_statements_async(c, auth.setup_statements()).await?;
-                        let value =
-                            load_scalar_postgres_async(c, &query, kind).await?;
-                        Ok((value, lsn))
-                    }
-                    .scope_boxed()
+                async move |c| {
+                    begin_read_snapshot(c, auth.setup_statements()).await?;
+                    let value = load_scalar_postgres_async(c, &query, kind).await?;
+                    Ok((value, lsn))
                 },
             )
             .await
@@ -318,21 +323,13 @@ impl<S: SessionSetup + Send + Sync> AsyncConnector for PgAsyncDieselConnector<S>
                 .await
                 .map_err(DieselAsyncError::Diesel)?;
             conn.transaction::<Snapshot<RowPage<Self::Backend>, crate::PgLsn>, diesel::result::Error, _>(
-                |c| {
-                    async move {
-                        // SET TRANSACTION is DDL-like; no typed DSL equivalent exists.
-                        sql_query("SET TRANSACTION READ ONLY ISOLATION LEVEL REPEATABLE READ")
-                            .execute(c)
-                            .await?;
-                        run_setup_statements_async(c, auth.setup_statements()).await?;
-                        let value =
-                            load_page_postgres_async(c, &query, max_bytes).await?;
-                        Ok(Snapshot {
-                            value,
-                            checkpoint: lsn,
-                        })
-                    }
-                    .scope_boxed()
+                async move |c| {
+                    begin_read_snapshot(c, auth.setup_statements()).await?;
+                    let value = load_page_postgres_async(c, &query, max_bytes).await?;
+                    Ok(Snapshot {
+                        value,
+                        checkpoint: lsn,
+                    })
                 },
             )
             .await
@@ -376,11 +373,7 @@ impl<S: SessionSetup + Send + Sync> AsyncConnector for PgAsyncDieselConnector<S>
                 // connection is clean, and the next caller inherits an open
                 // transaction: measured to swallow that caller's write whole.
                 PgAsyncTxn::begin_transaction(&mut *conn).await?;
-                // SET TRANSACTION is DDL-like; no typed DSL equivalent exists.
-                sql_query("SET TRANSACTION READ ONLY, ISOLATION LEVEL REPEATABLE READ")
-                    .execute(&mut *conn)
-                    .await?;
-                run_setup_statements_async(&mut *conn, auth.setup_statements()).await?;
+                begin_read_snapshot(&mut conn, auth.setup_statements()).await?;
                 let declaration = ReadQuery::owned(
                     alloc::format!("DECLARE {name} NO SCROLL CURSOR FOR {}", query.sql()),
                     query.binds().to_vec(),
@@ -552,18 +545,10 @@ impl<S: SessionSetup + Send + Sync> AsyncConnector for PgAsyncDieselConnector<S>
                 .await
                 .map_err(|e| ScalarRowError::Connector(DieselAsyncError::Diesel(e)))?;
             conn.transaction::<(Vec<Value<Self::Backend>>, Option<crate::PgLsn>), diesel::result::Error, _>(
-                |c| {
-                    async move {
-                        // SET TRANSACTION is DDL-like; no typed DSL equivalent exists.
-                        sql_query("SET TRANSACTION READ ONLY ISOLATION LEVEL REPEATABLE READ")
-                            .execute(c)
-                            .await?;
-                        run_setup_statements_async(c, auth.setup_statements()).await?;
-                        let values =
-                            load_scalar_row_postgres_async(c, &query, &kinds).await?;
-                        Ok((values, lsn))
-                    }
-                    .scope_boxed()
+                async move |c| {
+                    begin_read_snapshot(c, auth.setup_statements()).await?;
+                    let values = load_scalar_row_postgres_async(c, &query, &kinds).await?;
+                    Ok((values, lsn))
                 },
             )
             .await

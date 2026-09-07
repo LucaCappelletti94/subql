@@ -65,6 +65,23 @@ where
     }
 }
 
+/// Integer unary `-` on the standard `i64` carrier, applying `overflow` when
+/// negating `i64::MIN`.
+///
+/// # Errors
+///
+/// [`EvaluationRefusal::IntegerOverflow`] when the negation does not fit and
+/// this backend raises rather than promoting.
+pub fn checked_integer_negate<B>(
+    overflow: IntegerOverflow,
+    value: i64,
+) -> Result<Value<B>, EvaluationRefusal>
+where
+    B: Backend<Int = i64, Float = f64>,
+{
+    checked_integer_binary(overflow, ArithmeticOp::Negate, value, 0)
+}
+
 /// The overflowed result computed in `f64`, which is what SQLite carries.
 fn promoted(operation: ArithmeticOp, a: i64, b: i64) -> f64 {
     let (a, b) = (
@@ -362,6 +379,39 @@ pub fn quotient_at_significant_digits(dividend: &BigDecimal, divisor: &BigDecima
             scale,
             rounds: true,
         },
+    )
+}
+
+/// The decimal quotient a backend's [`crate::backend::Backend::DIVISION`]
+/// resolved `quotient` to, for a backend on the standard `bigdecimal` carrier.
+#[must_use]
+pub fn quotient_by_rule(
+    dividend: &BigDecimal,
+    divisor: &BigDecimal,
+    quotient: crate::compiler::bytecode::Quotient,
+) -> BigDecimal {
+    match quotient {
+        crate::compiler::bytecode::Quotient::FromTheOperands => {
+            quotient_at_significant_digits(dividend, divisor)
+        }
+        crate::compiler::bytecode::Quotient::InWordsAt(increment) => {
+            quotient_in_words(dividend, divisor, increment)
+        }
+    }
+}
+
+/// Two integers on the standard `i64` carrier divided to a decimal, for a
+/// backend whose `/` answers one.
+#[must_use]
+pub fn integer_quotient_in_words(
+    dividend: i64,
+    divisor: i64,
+    increment: DivisionPrecisionIncrement,
+) -> BigDecimal {
+    quotient_in_words(
+        &BigDecimal::from(dividend),
+        &BigDecimal::from(divisor),
+        increment,
     )
 }
 

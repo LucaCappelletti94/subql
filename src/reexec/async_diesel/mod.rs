@@ -48,8 +48,6 @@ use diesel::query_builder::SqlQuery;
 use diesel::sql_query;
 #[cfg(feature = "executor-diesel-async-mysql")]
 use diesel_async::pooled_connection::bb8::Pool;
-#[cfg(feature = "executor-diesel-async-mysql")]
-use diesel_async::scoped_futures::ScopedFutureExt;
 use diesel_async::{AsyncConnection, RunQueryDsl as _};
 use thiserror::Error;
 
@@ -326,13 +324,10 @@ impl<S: SessionSetup + Send + Sync> AsyncConnector for MysqlAsyncDieselConnector
             // commit.
             let pos = read_binlog_pos_async(conn).await;
             conn.transaction::<(Value<Self::Backend>, Option<crate::MysqlBinlogPos>), diesel::result::Error, _>(
-                |c| {
-                    async move {
-                        run_setup_statements_async(c, auth.setup_statements()).await?;
-                        let value = load_scalar_mysql_async(c, &query, kind).await?;
-                        Ok((value, pos))
-                    }
-                    .scope_boxed()
+                async move |c| {
+                    run_setup_statements_async(c, auth.setup_statements()).await?;
+                    let value = load_scalar_mysql_async(c, &query, kind).await?;
+                    Ok((value, pos))
                 },
             )
             .await
@@ -365,12 +360,9 @@ impl<S: SessionSetup + Send + Sync> AsyncConnector for MysqlAsyncDieselConnector
                     .map_err(DieselAsyncError::Diesel)?
             } else {
                 conn.transaction::<crate::reexec::RowPage<Self::Backend>, diesel::result::Error, _>(
-                    |c| {
-                        async move {
-                            run_setup_statements_async(c, setup).await?;
-                            load_page_mysql_async(c, &query, max_bytes).await
-                        }
-                        .scope_boxed()
+                    async move |c| {
+                        run_setup_statements_async(c, setup).await?;
+                        load_page_mysql_async(c, &query, max_bytes).await
                     },
                 )
                 .await
@@ -406,14 +398,10 @@ impl<S: SessionSetup + Send + Sync> AsyncConnector for MysqlAsyncDieselConnector
             // Position before snapshot, per `Connector::Checkpoint`.
             let pos = read_binlog_pos_async(conn).await;
             conn.transaction::<(Vec<Value<Self::Backend>>, Option<crate::MysqlBinlogPos>), diesel::result::Error, _>(
-                |c| {
-                    async move {
-                        run_setup_statements_async(c, auth.setup_statements()).await?;
-                        let values =
-                            load_scalar_row_mysql_async(c, &query, &kinds).await?;
-                        Ok((values, pos))
-                    }
-                    .scope_boxed()
+                async move |c| {
+                    run_setup_statements_async(c, auth.setup_statements()).await?;
+                    let values = load_scalar_row_mysql_async(c, &query, &kinds).await?;
+                    Ok((values, pos))
                 },
             )
             .await

@@ -45,10 +45,10 @@ use sqlite_diff_rs::pg_walstream::{
 };
 use sqlite_diff_rs::wal2json::{ConversionError, Wal2Json};
 use sqlite_diff_rs::{
-    ChangeSet, ChangesetFormat, ColumnNames, DiffOps, Digestable, DynTable, IndexableValues,
-    Insert, NamedColumns, PatchSet, PatchsetFormat, PgBinary, PgBinaryColumn, SchemaWithPK,
-    SimpleTable, TypeMap, UuidBlob16Decoder, Value as WireValue, WireAdapter, WireColumnTypes,
-    WireSchema, WireType,
+    ChangeSet, ChangesetFormat, ColumnNames, DiffFormat, DiffOps, DiffSetBuilder, Digestable,
+    DynTable, IndexableValues, Insert, NamedColumns, PatchSet, PatchsetFormat, PgBinary,
+    PgBinaryColumn, SchemaWithPK, SimpleTable, TypeMap, UuidBlob16Decoder, Value as WireValue,
+    WireAdapter, WireColumnTypes, WireSchema, WireType,
 };
 
 use crate::backend::ScalarFamily;
@@ -245,6 +245,33 @@ fn build_wire_table<DB: DatabaseLike>(
     Ok(WireTable { inner, wire_types })
 }
 
+/// Fold `events` into one diff set of format `F` over `database`, resolving
+/// each event's table through a [`WireCatalog`] and decoding its columns
+/// through `adapter`.
+///
+/// The one procedure behind every vehicle below: the format, the wire source
+/// and the decoder registry are the only things that differ. Every source in
+/// `sqlite-diff-rs` 0.12 reports the same [`ConversionError`], so the catalog
+/// failure has one spelling here rather than one per vehicle.
+fn fold_events<'a, F, DB, E>(
+    database: &DB,
+    adapter: &impl WireAdapter<E::Src, String, Vec<u8>>,
+    events: impl IntoIterator<Item = &'a E>,
+) -> Result<DiffSetBuilder<F, WireTable, String, Vec<u8>>, ConversionError>
+where
+    F: DiffFormat<String, Vec<u8>>,
+    DB: DatabaseLike,
+    E: Digestable<F, WireTable, String, Vec<u8>, Error = ConversionError> + 'a,
+{
+    let catalog = WireCatalog::from_database(database)
+        .map_err(|e| ConversionError::TableNotFound(e.to_string()))?;
+    let mut builder = DiffSetBuilder::<F, WireTable, String, Vec<u8>>::new();
+    for event in events {
+        builder = builder.digest(event, &catalog, adapter)?;
+    }
+    Ok(builder)
+}
+
 /// The wal2json decoder registry subql feeds to `digest`.
 ///
 /// `sqlite-diff-rs` keys the registry on [`WireType`], so one
@@ -291,14 +318,7 @@ where
         Error = ConversionError,
     >,
 {
-    let catalog = WireCatalog::from_database(database)
-        .map_err(|e| ConversionError::TableNotFound(e.to_string()))?;
-    let adapter = wal2json_adapter();
-    let mut builder = PatchSet::<WireTable, String, Vec<u8>>::new();
-    for event in events {
-        builder = builder.digest(event, &catalog, &adapter)?;
-    }
-    Ok(builder)
+    fold_events(database, &wal2json_adapter(), events)
 }
 
 /// Fold a batch of wal2json CDC events into one [`PatchsetFormat`]
@@ -356,14 +376,7 @@ where
         Error = ConversionError,
     >,
 {
-    let catalog = WireCatalog::from_database(database)
-        .map_err(|e| ConversionError::TableNotFound(e.to_string()))?;
-    let adapter = wal2json_adapter();
-    let mut builder = ChangeSet::<WireTable, String, Vec<u8>>::new();
-    for event in events {
-        builder = builder.digest(event, &catalog, &adapter)?;
-    }
-    Ok(builder)
+    fold_events(database, &wal2json_adapter(), events)
 }
 
 /// Fold a batch of wal2json CDC events into one [`ChangesetFormat`]
@@ -418,14 +431,11 @@ pub fn pgoutput_patchset_builder<DB: DatabaseLike>(
     database: &DB,
     events: &[PgChangeEvent],
 ) -> Result<PatchSet<WireTable, String, Vec<u8>>, PgConversionError> {
-    let catalog = WireCatalog::from_database(database)
-        .map_err(|e| PgConversionError::TableNotFound(e.to_string()))?;
-    let adapter = pgoutput_adapter();
-    let mut builder = PatchSet::<WireTable, String, Vec<u8>>::new();
-    for event in events {
-        builder = builder.digest(&event.event_type, &catalog, &adapter)?;
-    }
-    Ok(builder)
+    fold_events(
+        database,
+        &pgoutput_adapter(),
+        events.iter().map(|event| &event.event_type),
+    )
 }
 
 /// Serialize [`pgoutput_patchset_builder`] to wire bytes.
@@ -458,14 +468,11 @@ pub fn pgoutput_changeset_builder<DB: DatabaseLike>(
     database: &DB,
     events: &[PgChangeEvent],
 ) -> Result<ChangeSet<WireTable, String, Vec<u8>>, PgConversionError> {
-    let catalog = WireCatalog::from_database(database)
-        .map_err(|e| PgConversionError::TableNotFound(e.to_string()))?;
-    let adapter = pgoutput_adapter();
-    let mut builder = ChangeSet::<WireTable, String, Vec<u8>>::new();
-    for event in events {
-        builder = builder.digest(&event.event_type, &catalog, &adapter)?;
-    }
-    Ok(builder)
+    fold_events(
+        database,
+        &pgoutput_adapter(),
+        events.iter().map(|event| &event.event_type),
+    )
 }
 
 /// Serialize [`pgoutput_changeset_builder`] to wire bytes.
@@ -509,14 +516,7 @@ pub fn maxwell_patchset_builder<DB: DatabaseLike>(
     database: &DB,
     events: &[MaxwellMessage],
 ) -> Result<PatchSet<WireTable, String, Vec<u8>>, MaxwellConversionError> {
-    let catalog = WireCatalog::from_database(database)
-        .map_err(|e| MaxwellConversionError::TableNotFound(e.to_string()))?;
-    let adapter = maxwell_adapter();
-    let mut builder = PatchSet::<WireTable, String, Vec<u8>>::new();
-    for event in events {
-        builder = builder.digest(event, &catalog, &adapter)?;
-    }
-    Ok(builder)
+    fold_events(database, &maxwell_adapter(), events)
 }
 
 /// Serialize [`maxwell_patchset_builder`] to wire bytes.
@@ -547,14 +547,7 @@ pub fn maxwell_changeset_builder<DB: DatabaseLike>(
     database: &DB,
     events: &[MaxwellMessage],
 ) -> Result<ChangeSet<WireTable, String, Vec<u8>>, MaxwellConversionError> {
-    let catalog = WireCatalog::from_database(database)
-        .map_err(|e| MaxwellConversionError::TableNotFound(e.to_string()))?;
-    let adapter = maxwell_adapter();
-    let mut builder = ChangeSet::<WireTable, String, Vec<u8>>::new();
-    for event in events {
-        builder = builder.digest(event, &catalog, &adapter)?;
-    }
-    Ok(builder)
+    fold_events(database, &maxwell_adapter(), events)
 }
 
 /// Serialize [`maxwell_changeset_builder`] to wire bytes.

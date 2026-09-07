@@ -192,3 +192,46 @@ impl<B: Backend, C: Checkpoint> CdcEvent for TestEvent<B, C> {
         Ok(self.cell(row, col).cloned().unwrap_or(Value::Missing))
     }
 }
+
+/// Drive a future that never parks to completion on a synchronous boundary.
+///
+/// A `#[test]` is such a boundary, and a policy or connector fixture that
+/// resolves without a real runtime needs nothing more than a polling loop. A
+/// future that really parks would spin here.
+#[cfg(any(test, feature = "testing"))]
+pub fn block_on<F: core::future::Future>(future: F) -> F::Output {
+    let mut context = core::task::Context::from_waker(core::task::Waker::noop());
+    let mut pinned = core::pin::pin!(future);
+    loop {
+        if let core::task::Poll::Ready(value) = pinned.as_mut().poll(&mut context) {
+            return value;
+        }
+    }
+}
+
+/// A future that answers `Pending` exactly once, so the caller awaiting it
+/// really suspends.
+///
+/// Construct it as `YieldOnce(false)`. Without it a fixture that resolves in
+/// one poll lets a future that cannot be resumed elsewhere pass unnoticed,
+/// while every real implementation makes a round trip.
+#[cfg(any(test, feature = "testing"))]
+#[derive(Debug, Default)]
+pub struct YieldOnce(pub bool);
+
+#[cfg(any(test, feature = "testing"))]
+impl core::future::Future for YieldOnce {
+    type Output = ();
+
+    fn poll(
+        mut self: core::pin::Pin<&mut Self>,
+        context: &mut core::task::Context<'_>,
+    ) -> core::task::Poll<()> {
+        if self.0 {
+            return core::task::Poll::Ready(());
+        }
+        self.0 = true;
+        context.waker().wake_by_ref();
+        core::task::Poll::Pending
+    }
+}

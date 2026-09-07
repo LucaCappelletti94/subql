@@ -883,14 +883,7 @@ impl AggAccumulator {
             S::CountColumn { .. } => {
                 acc.contributions = row.first().and_then(|v| Self::seed_i64(v)).unwrap_or(0);
             }
-            S::Sum { .. } => {
-                if let Some(cell) = row.first() {
-                    acc.total.seed(cell);
-                }
-                acc.sum = row.first().and_then(|v| Self::seed_f64(v)).unwrap_or(0.0);
-                acc.contributions = row.get(1).and_then(|v| Self::seed_i64(v)).unwrap_or(0);
-            }
-            S::Avg { .. } => {
+            S::Sum { .. } | S::Avg { .. } => {
                 if let Some(cell) = row.first() {
                     acc.total.seed(cell);
                 }

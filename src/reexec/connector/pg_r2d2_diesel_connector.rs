@@ -3,14 +3,14 @@
 
 use super::diesel_backend::boxed_postgres_read_query;
 use super::diesel_connector::{load_page_postgres, load_scalar, load_scalar_row};
-use super::pg_diesel_connector::read_current_lsn;
+use super::pg_diesel_connector::{read_at_lsn, read_current_lsn};
 use super::{
     drain_cursor_buffer, run_setup_statements, Connector, CursorError, CursorId, ReadQuery,
-    RowPage, ScalarRowError, SessionSetup, Snapshot,
+    RowPage, ScalarRowError, SessionSetup, Snapshot, PG_READ_SNAPSHOT,
 };
 use crate::backend::{ScalarFamily, Value};
 use alloc::string::String;
-use diesel::{sql_query, Connection, QueryResult, RunQueryDsl};
+use diesel::{QueryResult, RunQueryDsl};
 use thiserror::Error;
 
 /// Pool-backed [`Connector`] for PostgreSQL.
@@ -182,25 +182,9 @@ impl<S: SessionSetup> Connector for PgR2D2DieselConnector<S> {
         auth: &S,
     ) -> Result<(Value<Self::Backend>, Option<Self::Checkpoint>), Self::Error> {
         let mut conn = self.pool.get()?;
-        // The position is read before the snapshot exists. A caller replays the
-        // change stream from it, so it must sit at or behind the snapshot:
-        // behind re-delivers a few changes the snapshot already holds, which
-        // keyed application absorbs, while ahead silently loses a transaction
-        // that committed after the position and is invisible to the snapshot.
-        // `pg_current_wal_lsn()` is not snapshot-bound, measured rather than
-        // assumed: inside one repeatable-read transaction it advances when
-        // another connection commits.
-        let lsn = read_current_lsn(&mut conn)?;
-        let result: Result<(Value<Self::Backend>, Option<crate::PgLsn>), diesel::result::Error> =
-            diesel::connection::Connection::transaction(&mut *conn, |conn| {
-                // SET TRANSACTION is DDL-like; no typed DSL equivalent exists.
-                sql_query("SET TRANSACTION READ ONLY ISOLATION LEVEL REPEATABLE READ")
-                    .execute(conn)?;
-                run_setup_statements(conn, auth.setup_statements())?;
-                let value = load_scalar::<_, Self::Backend>(conn, query, kind)?;
-                Ok((value, lsn))
-            });
-        Ok(result?)
+        Ok(read_at_lsn(&mut conn, auth.setup_statements(), |conn| {
+            load_scalar::<_, Self::Backend>(conn, query, kind)
+        })?)
     }
 
     fn read_page(
@@ -210,27 +194,10 @@ impl<S: SessionSetup> Connector for PgR2D2DieselConnector<S> {
         auth: &S,
     ) -> Result<Snapshot<RowPage<crate::backend::Postgres>, Self::Checkpoint>, Self::Error> {
         let mut conn = self.pool.get().map_err(PgR2D2Error::Pool)?;
-        // The position is read before the snapshot exists. A caller replays the
-        // change stream from it, so it must sit at or behind the snapshot:
-        // behind re-delivers a few changes the snapshot already holds, which
-        // keyed application absorbs, while ahead silently loses a transaction
-        // that committed after the position and is invisible to the snapshot.
-        // `pg_current_wal_lsn()` is not snapshot-bound, measured rather than
-        // assumed: inside one repeatable-read transaction it advances when
-        // another connection commits.
-        let lsn = read_current_lsn(&mut conn)?;
-        let result = conn.transaction::<_, diesel::result::Error, _>(|conn| {
-            // SET TRANSACTION is DDL-like; no typed DSL equivalent exists.
-            diesel::sql_query("SET TRANSACTION READ ONLY, ISOLATION LEVEL REPEATABLE READ")
-                .execute(conn)?;
-            run_setup_statements(conn, auth.setup_statements())?;
-            let value = load_page_postgres(conn, query, max_bytes)?;
-            Ok(Snapshot {
-                value,
-                checkpoint: lsn,
-            })
-        });
-        Ok(result?)
+        let (value, checkpoint) = read_at_lsn(&mut conn, auth.setup_statements(), |conn| {
+            load_page_postgres(conn, query, max_bytes)
+        })?;
+        Ok(Snapshot { value, checkpoint })
     }
 
     fn execute_scalar_row(
@@ -249,27 +216,10 @@ impl<S: SessionSetup> Connector for PgR2D2DieselConnector<S> {
             .pool
             .get()
             .map_err(|e| ScalarRowError::Connector(e.into()))?;
-        // The position is read before the snapshot exists. A caller replays the
-        // change stream from it, so it must sit at or behind the snapshot:
-        // behind re-delivers a few changes the snapshot already holds, which
-        // keyed application absorbs, while ahead silently loses a transaction
-        // that committed after the position and is invisible to the snapshot.
-        // `pg_current_wal_lsn()` is not snapshot-bound, measured rather than
-        // assumed: inside one repeatable-read transaction it advances when
-        // another connection commits.
-        let lsn = read_current_lsn(&mut conn)
-            .map_err(|e| ScalarRowError::Connector(PgR2D2Error::Diesel(e)))?;
-        let result: Result<
-            (alloc::vec::Vec<Value<Self::Backend>>, Option<crate::PgLsn>),
-            diesel::result::Error,
-        > = diesel::connection::Connection::transaction(&mut *conn, |conn| {
-            // SET TRANSACTION is DDL-like; no typed DSL equivalent exists.
-            sql_query("SET TRANSACTION READ ONLY ISOLATION LEVEL REPEATABLE READ").execute(conn)?;
-            run_setup_statements(conn, auth.setup_statements())?;
-            let values = load_scalar_row::<_, Self::Backend>(conn, query, kinds)?;
-            Ok((values, lsn))
-        });
-        result.map_err(|e| ScalarRowError::Connector(e.into()))
+        read_at_lsn(&mut conn, auth.setup_statements(), |conn| {
+            load_scalar_row::<_, Self::Backend>(conn, query, kinds)
+        })
+        .map_err(|e| ScalarRowError::Connector(e.into()))
     }
 
     fn open_cursor(
@@ -310,8 +260,7 @@ impl<S: SessionSetup> Connector for PgR2D2DieselConnector<S> {
             let lsn = read_current_lsn(&mut conn)?;
             PgTxn::begin_transaction(&mut *conn)?;
             // SET TRANSACTION is DDL-like; no typed DSL equivalent exists.
-            diesel::sql_query("SET TRANSACTION READ ONLY, ISOLATION LEVEL REPEATABLE READ")
-                .execute(&mut *conn)?;
+            diesel::sql_query(PG_READ_SNAPSHOT).execute(&mut *conn)?;
             run_setup_statements(&mut *conn, auth.setup_statements())?;
             let declaration = ReadQuery::owned(
                 alloc::format!("DECLARE {name} NO SCROLL CURSOR FOR {}", query.sql()),

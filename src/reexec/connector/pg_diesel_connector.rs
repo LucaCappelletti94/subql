@@ -9,6 +9,7 @@ use super::diesel_connector::{load_page_postgres, load_scalar, load_scalar_row};
 #[cfg(feature = "executor-diesel-postgres")]
 use super::{
     run_setup_statements, Connector, ReadQuery, RowPage, ScalarRowError, SessionSetup, Snapshot,
+    PG_READ_SNAPSHOT,
 };
 #[cfg(feature = "executor-diesel-postgres")]
 use crate::backend::{ScalarFamily, Value};
@@ -100,6 +101,29 @@ pub(super) fn read_current_lsn(
     Ok(crate::PgLsn::parse(&row.lsn))
 }
 
+/// Take the WAL position, then run `body` inside the read snapshot with
+/// `setup` applied.
+///
+/// The position is read before the snapshot exists, because a caller replays
+/// the change stream from it: behind the snapshot it re-delivers changes keyed
+/// application absorbs, ahead of it a commit the snapshot never saw is lost.
+/// Measured: `pg_current_wal_lsn()` advances inside an open repeatable-read
+/// transaction when another connection commits, so it is not snapshot-bound.
+#[cfg(feature = "executor-diesel-postgres")]
+pub(super) fn read_at_lsn<T>(
+    conn: &mut diesel::PgConnection,
+    setup: &[String],
+    body: impl FnOnce(&mut diesel::PgConnection) -> diesel::QueryResult<T>,
+) -> diesel::QueryResult<(T, Option<crate::PgLsn>)> {
+    let lsn = read_current_lsn(conn)?;
+    let value = conn.transaction(|conn| {
+        sql_query(PG_READ_SNAPSHOT).execute(conn)?;
+        run_setup_statements(conn, setup)?;
+        body(conn)
+    })?;
+    Ok((value, lsn))
+}
+
 #[cfg(feature = "executor-diesel-postgres")]
 impl<S: SessionSetup> Connector for PgDieselConnector<S> {
     type AuthContext = S;
@@ -114,21 +138,8 @@ impl<S: SessionSetup> Connector for PgDieselConnector<S> {
         auth: &S,
     ) -> Result<(Value<Self::Backend>, Option<Self::Checkpoint>), Self::Error> {
         let mut conn = self.conn.borrow_mut();
-        // The position is read before the snapshot exists. A caller replays the
-        // change stream from it, so it must sit at or behind the snapshot:
-        // behind re-delivers a few changes the snapshot already holds, which
-        // keyed application absorbs, while ahead silently loses a transaction
-        // that committed after the position and is invisible to the snapshot.
-        // `pg_current_wal_lsn()` is not snapshot-bound, measured rather than
-        // assumed: inside one repeatable-read transaction it advances when
-        // another connection commits.
-        let lsn = read_current_lsn(&mut conn)?;
-        diesel::connection::Connection::transaction(&mut *conn, |conn| {
-            // SET TRANSACTION is DDL-like; no typed DSL equivalent exists.
-            sql_query("SET TRANSACTION READ ONLY ISOLATION LEVEL REPEATABLE READ").execute(conn)?;
-            run_setup_statements(conn, auth.setup_statements())?;
-            let value = load_scalar::<_, Self::Backend>(conn, query, kind)?;
-            Ok((value, lsn))
+        read_at_lsn(&mut conn, auth.setup_statements(), |conn| {
+            load_scalar::<_, Self::Backend>(conn, query, kind)
         })
     }
 
@@ -141,26 +152,10 @@ impl<S: SessionSetup> Connector for PgDieselConnector<S> {
         let mut conn = self.conn.borrow_mut();
         // The page and the LSN share one snapshot, so a caller reconciling
         // pages against the change stream knows exactly where this one sits.
-        // The position is read before the snapshot exists. A caller replays the
-        // change stream from it, so it must sit at or behind the snapshot:
-        // behind re-delivers a few changes the snapshot already holds, which
-        // keyed application absorbs, while ahead silently loses a transaction
-        // that committed after the position and is invisible to the snapshot.
-        // `pg_current_wal_lsn()` is not snapshot-bound, measured rather than
-        // assumed: inside one repeatable-read transaction it advances when
-        // another connection commits.
-        let lsn = read_current_lsn(&mut conn)?;
-        conn.transaction(|conn| {
-            // SET TRANSACTION is DDL-like; no typed DSL equivalent exists.
-            diesel::sql_query("SET TRANSACTION READ ONLY, ISOLATION LEVEL REPEATABLE READ")
-                .execute(conn)?;
-            run_setup_statements(conn, auth.setup_statements())?;
-            let value = load_page_postgres(conn, query, max_bytes)?;
-            Ok(Snapshot {
-                value,
-                checkpoint: lsn,
-            })
-        })
+        let (value, checkpoint) = read_at_lsn(&mut conn, auth.setup_statements(), |conn| {
+            load_page_postgres(conn, query, max_bytes)
+        })?;
+        Ok(Snapshot { value, checkpoint })
     }
 
     fn execute_scalar_row(
@@ -176,21 +171,8 @@ impl<S: SessionSetup> Connector for PgDieselConnector<S> {
         ScalarRowError<Self::Error>,
     > {
         let mut conn = self.conn.borrow_mut();
-        // The position is read before the snapshot exists. A caller replays the
-        // change stream from it, so it must sit at or behind the snapshot:
-        // behind re-delivers a few changes the snapshot already holds, which
-        // keyed application absorbs, while ahead silently loses a transaction
-        // that committed after the position and is invisible to the snapshot.
-        // `pg_current_wal_lsn()` is not snapshot-bound, measured rather than
-        // assumed: inside one repeatable-read transaction it advances when
-        // another connection commits.
-        let lsn = read_current_lsn(&mut conn).map_err(ScalarRowError::Connector)?;
-        diesel::connection::Connection::transaction(&mut *conn, |conn| {
-            // SET TRANSACTION is DDL-like; no typed DSL equivalent exists.
-            sql_query("SET TRANSACTION READ ONLY ISOLATION LEVEL REPEATABLE READ").execute(conn)?;
-            run_setup_statements(conn, auth.setup_statements())?;
-            let values = load_scalar_row::<_, Self::Backend>(conn, query, kinds)?;
-            Ok((values, lsn))
+        read_at_lsn(&mut conn, auth.setup_statements(), |conn| {
+            load_scalar_row::<_, Self::Backend>(conn, query, kinds)
         })
         .map_err(ScalarRowError::Connector)
     }
