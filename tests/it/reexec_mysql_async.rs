@@ -426,3 +426,50 @@ fn session_setup_runs_on_the_transaction_free_read_page() {
         );
     });
 }
+
+/// A seed read declares one column kind per component, so a result of another
+/// width is refused rather than zipped short. A truncated seed would hand an
+/// aggregate a count without its sum.
+#[test]
+#[ignore = "requires Docker; run with --ignored"]
+fn a_seed_row_of_the_wrong_width_is_refused_async_mysql() {
+    use subql::reexec::ScalarRowError;
+
+    common::assert_docker_available();
+    let container = common::mysql_8();
+    let port = common::mysql_port(&container);
+
+    common::multi_thread_rt().block_on(async move {
+        let connector = MysqlAsyncDieselConnector::new(mysql_async_pool(port).await);
+        let refused = connector
+            .execute_scalar_row(
+                &subql::reexec::ReadQuery::without_binds("SELECT 1, 2"),
+                &[ScalarFamily::Int],
+                &(),
+            )
+            .await
+            .expect_err("a two-column seed against one kind is refused");
+        let ScalarRowError::Connector(error) = refused else {
+            panic!("the refusal comes from the connector");
+        };
+        assert!(
+            error.to_string().contains("arity"),
+            "the refusal names the shape, got {error}"
+        );
+
+        let values = connector
+            .execute_scalar_row(
+                &subql::reexec::ReadQuery::without_binds("SELECT 1, 2"),
+                &[ScalarFamily::Int, ScalarFamily::Int],
+                &(),
+            )
+            .await
+            .expect("a seed of the declared width reads")
+            .0;
+        assert_eq!(
+            values,
+            vec![Value::Int(1), Value::Int(2)],
+            "so the check refuses a shape rather than the path"
+        );
+    });
+}

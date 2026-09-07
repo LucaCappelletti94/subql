@@ -239,3 +239,53 @@ fn a_connector_without_cursors_refuses_them_by_name() {
         Err(CursorError::Unsupported)
     ));
 }
+
+/// A seed read declares one column kind per component, so a result of another
+/// width is refused rather than zipped short. A silently truncated seed would
+/// hand an aggregate a count without its sum.
+#[test]
+fn a_seed_row_of_the_wrong_width_is_refused() {
+    use subql::backend::ScalarFamily;
+    use subql::reexec::{Connector, ScalarRowError};
+
+    let connector: DieselConnector<SqliteConnection, subql::backend::Postgres> =
+        DieselConnector::new(conn());
+
+    let too_wide = connector.execute_scalar_row(
+        &subql::reexec::ReadQuery::without_binds("SELECT id, label FROM readings"),
+        &[ScalarFamily::Int],
+        &(),
+    );
+    let ScalarRowError::Connector(error) = too_wide.expect_err("a two-column seed is refused")
+    else {
+        panic!("the refusal comes from the connector");
+    };
+    assert_eq!(
+        error.to_string(),
+        "read returned 2 columns, expected 1",
+        "the refusal names both widths"
+    );
+
+    let too_narrow = connector.execute_scalar_row(
+        &subql::reexec::ReadQuery::without_binds("SELECT id FROM readings"),
+        &[ScalarFamily::Int, ScalarFamily::Int],
+        &(),
+    );
+    let ScalarRowError::Connector(error) = too_narrow.expect_err("a one-column seed is refused")
+    else {
+        panic!("the refusal comes from the connector");
+    };
+    assert_eq!(error.to_string(), "read returned 1 columns, expected 2");
+
+    // The right width still reads, so the check refuses a shape rather than
+    // the path.
+    let values = connector
+        .execute_scalar_row(
+            &subql::reexec::ReadQuery::without_binds("SELECT id, label FROM readings"),
+            &[ScalarFamily::Int, ScalarFamily::String],
+            &(),
+        )
+        .expect("a seed of the declared width reads")
+        .0;
+    assert_eq!(values, vec![Value::Int(7), Value::String("north".into())]);
+}

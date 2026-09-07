@@ -291,13 +291,7 @@ async fn read_binlog_pos_async(
     else {
         return None;
     };
-    // Binlog file like "mysql-bin.000003" -> numeric suffix 3.
-    let file = file.rsplit('.').next().and_then(|s| s.parse::<u32>().ok());
-    let pos = u32::try_from(position).ok();
-    match (file, pos) {
-        (Some(file), Some(pos)) => Some(crate::MysqlBinlogPos { file, pos }),
-        _ => None,
-    }
+    super::connector::binlog_pos_from(&file, position)
 }
 
 #[cfg(feature = "executor-diesel-async-mysql")]
@@ -466,5 +460,66 @@ fn finish_page<B: crate::backend::Backend>(
         columns,
         rows,
         more,
+    }
+}
+
+#[cfg(test)]
+mod finish_page_tests {
+    use super::finish_page;
+    use crate::backend::{Postgres, Value};
+    use crate::diesel_decode::DynamicRow;
+    use crate::reexec::RowPage;
+    use alloc::string::ToString as _;
+    use alloc::vec;
+    use alloc::vec::Vec;
+
+    fn row(id: i64) -> DynamicRow<Postgres> {
+        DynamicRow {
+            columns: vec!["id".to_string()],
+            values: vec![Value::Int(id)],
+        }
+    }
+
+    /// The budget stops the page at the row that would exceed it, and the page
+    /// says the result went on. A page that claimed to be the last would make
+    /// the caller drop every row behind it.
+    #[test]
+    fn the_budget_stops_the_page_and_says_the_result_went_on() {
+        let cost = RowPage::<Postgres>::row_bytes_of(&row(1).values);
+
+        let page = finish_page(vec![row(1), row(2), row(3)], cost * 2);
+
+        assert_eq!(page.rows.len(), 2, "two rows fit the budget");
+        assert!(page.more, "and the page says the result went on");
+        assert_eq!(page.columns, vec!["id".to_string()]);
+    }
+
+    /// A row wider than the whole budget is delivered anyway. An empty page
+    /// would make no progress, and the caller reads until a page says it is
+    /// the last, so the read would never end.
+    #[test]
+    fn a_row_wider_than_the_budget_is_still_delivered() {
+        let page = finish_page(vec![row(1), row(2)], 1);
+
+        assert_eq!(page.rows.len(), 1, "one row, never zero");
+        assert!(page.more, "and the result went on");
+    }
+
+    /// A whole result inside the budget is the last page, so a caller that
+    /// trusted `more` makes no wasted read.
+    #[test]
+    fn a_result_inside_the_budget_is_the_last_page() {
+        let page = finish_page(vec![row(1), row(2)], usize::MAX);
+
+        assert_eq!(page.rows.len(), 2);
+        assert!(!page.more);
+    }
+
+    /// An empty result still answers, with no rows and no more pages.
+    #[test]
+    fn an_empty_result_is_an_empty_last_page() {
+        let page = finish_page(Vec::<DynamicRow<Postgres>>::new(), 4096);
+
+        assert!(page.rows.is_empty() && page.columns.is_empty() && !page.more);
     }
 }
