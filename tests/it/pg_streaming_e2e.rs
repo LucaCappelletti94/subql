@@ -151,6 +151,9 @@ fn next_event_delivers_an_insert_without_waiting_for_a_tick() {
             .expect("the event must arrive on the wire, not on the status interval")
             .expect("next_event must not error")
             .expect("source must not have shut down");
+        // Reported, never asserted. The timeout above is the whole ceiling,
+        // and this number includes the blocking INSERT and whatever the
+        // runner was doing, so an assertion on it would measure them.
         let observed_latency = commit_at.elapsed();
 
         assert_eq!(
@@ -158,11 +161,6 @@ fn next_event_delivers_an_insert_without_waiting_for_a_tick() {
             EventKind::Insert,
             "first event must be the INSERT we just issued, got {:?}",
             event.kind()
-        );
-        assert!(
-            observed_latency < CEILING,
-            "delivery took {observed_latency:?}, which is the status interval's \
-             territory rather than the wire's"
         );
         println!(
             "COMMIT-to-event latency: {}us (ceiling: {}s, status interval: {}s)",
@@ -368,17 +366,15 @@ fn connection_survives_wal_sender_timeout() {
         // for that long. The periodic pump should keep us alive.
         tokio::time::sleep(Duration::from_secs(5)).await;
 
-        // The delivery below is the claim, not the tick count. A ten-pump
-        // floor is arithmetic on the runner's scheduling, and it would not
-        // even be the right mechanism: measured by stretching the pump's
-        // interval to an hour, the connection still survives, because the
-        // source also answers the server's own keepalive requests. So this
-        // asks only that the pump ran.
+        // The delivery below is the whole claim, so nothing is asserted about
+        // the counter. It cannot carry one: `status_updates_sent` counts
+        // periodic ticks, explicit acks and replies to the server's own
+        // keepalive requests alike, so a positive count would not prove the
+        // periodic arm fired. Measured, by stretching the pump's interval to
+        // an hour: the connection survives on the keepalive replies alone.
+        // What the periodic arm does on its own is
+        // `pump_increments_status_update_counter_during_idle`.
         let pumped = source.status_updates_sent();
-        assert!(
-            pumped > 0,
-            "the periodic pump must have fired during the idle period"
-        );
 
         // Drive an INSERT now. The connection must still be alive to
         // deliver it.
