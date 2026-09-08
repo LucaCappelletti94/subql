@@ -26,9 +26,9 @@ use crate::types::{ColumnId, TableId};
 
 /// Resolve a table name, written as SQL, to subql's compact [`TableId`].
 ///
-/// The text is read by sqlparser's identifier grammar, so quoting decides
-/// case sensitivity, a dot separates the qualifier only outside quotes,
-/// and a doubled quote stands for one. Resolution is the catalog's own
+/// The text is read by [`TargetName::parse`], so quoting decides case
+/// sensitivity, a dot separates the qualifier only outside quotes, and a
+/// doubled quote stands for one. Resolution is the catalog's own
 /// [`DatabaseLike::resolve_target_table`]: an unqualified name resolves
 /// through the search path, and a table stored without a schema resides
 /// in the default schema.
@@ -40,27 +40,7 @@ use crate::types::{ColumnId, TableId};
 /// is "which compact id, if any".
 #[must_use]
 pub fn table_id<DB: DatabaseLike>(database: &DB, table_name: &str) -> Option<TableId> {
-    let dialect = sqlparser::dialect::GenericDialect {};
-    let mut parser = sqlparser::parser::Parser::new(&dialect)
-        .try_with_sql(table_name)
-        .ok()?;
-    let name = parser.parse_object_name(false).ok()?;
-    // The whole text must be the name: trailing tokens would mean the
-    // grammar read less than the caller wrote.
-    if parser.peek_token_ref().token != sqlparser::tokenizer::Token::EOF {
-        return None;
-    }
-    let parts: Vec<&sqlparser::ast::Ident> = name
-        .0
-        .iter()
-        .map(sqlparser::ast::ObjectNamePart::as_ident)
-        .collect::<Option<_>>()?;
-    let target = match parts.as_slice() {
-        [name] => TargetName::new(&name.value, name.quote_style.is_some()),
-        [schema, name] => TargetName::new(&name.value, name.quote_style.is_some())
-            .with_schema(&schema.value, schema.quote_style.is_some()),
-        _ => return None,
-    };
+    let target = TargetName::parse(table_name).ok()?;
     let table = database.resolve_target_table(target).ok()??;
     let id = database.table_id(table)?;
     u32::try_from(id).ok()
@@ -566,6 +546,95 @@ mod tests {
         let db = make_db();
         assert_eq!(table_id(&db, "orders"), Some(0));
         assert_eq!(table_id(&db, "public.orders"), Some(0));
+    }
+
+    /// Text that does not spell one identifier, or a qualifier and a name,
+    /// resolves to nothing.
+    ///
+    /// The refusals are the part of this contract a caller can trip over by
+    /// passing text it did not build itself, so each spelling is named
+    /// rather than sampled. A three-part name is refused because subql's
+    /// catalog has no cross-database resolution to hand it to, not because
+    /// the text is unreadable.
+    ///
+    /// The fixture stores two tables whose real names are themselves
+    /// unreadable as written text, a dotted one and one carrying a quote.
+    /// Without them the test cannot tell a refusal from a name that simply
+    /// resolves to nothing: taking the whole text as one unquoted
+    /// identifier would answer `None` for every other spelling here and
+    /// still reach these two.
+    #[test]
+    fn table_id_refuses_text_that_is_not_one_written_name() {
+        let db = ParserDB::parse::<sqlparser::dialect::PostgreSqlDialect>(
+            r#"CREATE TABLE orders (id INT PRIMARY KEY);
+               CREATE TABLE "a.b.c" (id INT PRIMARY KEY);
+               CREATE TABLE "we""ird" (id INT PRIMARY KEY);"#,
+        )
+        .unwrap();
+        for text in [
+            "",
+            " ",
+            ".",
+            "orders.",
+            ".orders",
+            "\"orders",
+            "\"orders\"x",
+            "orders orders",
+            "orders,",
+            "public.public.orders",
+            "SELECT",
+            // Three parts, and the catalog does hold a table named `a.b.c`,
+            // which only its quoted spelling reaches.
+            "a.b.c",
+            // A quote where a dot or the end of the name was required, and
+            // the catalog does hold a table named `we"ird`.
+            "we\"ird",
+        ] {
+            assert_eq!(
+                table_id(&db, text),
+                None,
+                "`{text}` does not name one table"
+            );
+        }
+        // The spellings that do reach those two tables, so the refusals
+        // above are about how the text was written and not about the
+        // catalog missing them. The ids are not asserted by number: the
+        // catalog orders its tables by name, not by the order the DDL
+        // declared them.
+        let dotted = table_id(&db, r#""a.b.c""#).expect("the quoted dotted name resolves");
+        let quoted = table_id(&db, r#""we""ird""#).expect("the doubled quote resolves");
+        let plain = table_id(&db, "orders").expect("the bare name resolves");
+        assert_ne!(dotted, quoted);
+        assert_ne!(dotted, plain);
+        assert_ne!(quoted, plain);
+    }
+
+    /// A name whose parts are spelled unquoted resolves case-insensitively,
+    /// and a quoted part only matches what the catalog stored.
+    #[test]
+    fn table_id_reads_quoting_as_sql_would() {
+        let db = ParserDB::parse::<sqlparser::dialect::PostgreSqlDialect>(
+            r#"CREATE SCHEMA app; CREATE TABLE app."Items" (id INT PRIMARY KEY);"#,
+        )
+        .unwrap();
+        // The stored name is quoted and mixed case, so only that spelling
+        // reaches it.
+        assert_eq!(table_id(&db, r#"app."Items""#), Some(0));
+        assert_eq!(table_id(&db, r#""app"."Items""#), Some(0));
+        assert_eq!(table_id(&db, r#"app."items""#), None);
+        assert_eq!(table_id(&db, "app.Items"), None);
+    }
+
+    /// Whitespace around a written name, which SQL's tokenizer skips.
+    ///
+    /// Kept separate from the refusals because this is the case where the
+    /// text is a name and only its padding is in question.
+    #[test]
+    fn table_id_reads_a_padded_name() {
+        let db = make_db();
+        assert_eq!(table_id(&db, " orders"), Some(0));
+        assert_eq!(table_id(&db, "orders "), Some(0));
+        assert_eq!(table_id(&db, "public . orders"), Some(0));
     }
 
     #[test]
