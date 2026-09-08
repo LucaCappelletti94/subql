@@ -11,8 +11,8 @@ use diesel::sql_types::{BigInt, Binary, Double, HasSqlType, Text};
 use sql_traits::prelude::DatabaseLike;
 use sqlite_diff_rs::{
     Adapter, ApplyOps, ChangeDelete, ChangeSet, ChangesetFormat, ChangesetOp, DiffOps, DiffSet,
-    Insert, ParsedDiffSet, PatchDelete, PatchSet, PatchsetFormat, PatchsetOp, SimpleTable,
-    TableSchema, Update,
+    Insert, ParsedDiffSet, PatchDelete, PatchSet, PatchsetFormat, PatchsetOp, SchemaWithPK,
+    SimpleTable, TableSchema, Update,
 };
 
 #[cfg(any(
@@ -180,7 +180,10 @@ fn reconstruct_patchset<DB: DatabaseLike>(
                 builder = builder.insert(insert);
             }
             PatchsetOp::Update { pk, entries, .. } => {
-                let pk_indices = table.pk_indices();
+                // The wire's key columns, in key order, so the zip below pairs
+                // each key value with the column it belongs to. Collected
+                // because the loop after it asks the same question per column.
+                let pk_indices: Vec<usize> = table.primary_key_columns().collect();
                 let mut update = Update::<_, PatchsetFormat, String, Vec<u8>>::from(table);
                 for (value, &col) in pk.iter().zip(pk_indices.iter()) {
                     update = update

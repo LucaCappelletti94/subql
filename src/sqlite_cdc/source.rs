@@ -251,9 +251,16 @@ mod tests {
             .expect("update poll")
             .expect("one event");
         assert_eq!(update.kind(), crate::EventKind::Update);
+        // Bytes from a real session, which writes each key column of an UPDATE
+        // as an old-only pair: the row's identity, not a change. Only the
+        // touched column is listed.
         let mut changed = update.changed_columns(source.catalog());
         changed.sort_unstable();
-        assert!(changed.contains(&2u16));
+        assert_eq!(
+            changed,
+            alloc::vec![2u16],
+            "an UPDATE lists the columns it touched, and the key column is not one of them"
+        );
         assert_eq!(
             update.value_at(source.catalog(), RowKind::Pk, 0).unwrap(),
             Value::Int(5)

@@ -8,11 +8,17 @@
 //! 2. Rejecting a patchset-marker payload up front (subql only consumes
 //!    changesets so `UPDATE` and `DELETE` events carry full old-row
 //!    images, which patchsets omit).
-//! 3. Resolving each op's table name against the catalog, computing PK
-//!    column ordinals from the wire's `pk_flags`, and looking up the
-//!    per-column [`crate::backend::ScalarKind`] from the catalog to
-//!    route the wire's raw `Value<String, Vec<u8>>` into the correct
-//!    [`Value<SQLite>`] variant.
+//! 3. Resolving each op's table name against the catalog, asking the wire
+//!    schema for its key columns in key order, and looking up the per-column
+//!    [`crate::backend::ScalarKind`] from the catalog to route the wire's raw
+//!    `Value<String, Vec<u8>>` into the correct [`Value<SQLite>`] variant.
+//!
+//!    What the wire's bytes mean is answered by `sqlite-diff-rs`, which writes
+//!    them: which columns are the key and in what order through
+//!    [`sqlite_diff_rs::SchemaWithPK::primary_key_columns`], and whether an
+//!    update pair changed through
+//!    [`sqlite_diff_rs::ChangesetUpdatePairExt::is_changed`]. This module used
+//!    to re-derive both.
 //! 4. Materialising each row image as an arity-sized
 //!    `Box<[Value<SQLite>]>` with [`Value::Missing`] for cells the wire
 //!    did not carry on that side.
@@ -23,7 +29,8 @@ use alloc::vec::Vec;
 
 use sql_traits::prelude::DatabaseLike;
 use sqlite_diff_rs::{
-    ChangesetOp, ChangesetUpdatePair, ParseError, ParsedDiffSet, TableSchema, Value as WireValue,
+    ChangesetOp, ChangesetUpdatePair, ChangesetUpdatePairExt as _, ParseError, ParsedDiffSet,
+    SchemaWithPK as _, TableSchema, Value as WireValue,
 };
 
 use super::event::SqliteChangesetEvent;
@@ -75,6 +82,15 @@ fn convert_parse_error(err: ParseError) -> WalParseError {
         ParseError::InvalidTableName(_) | ParseError::UnterminatedTableName => {
             WalParseError::InvalidUtf8(err.to_string())
         }
+        // A table header whose nonzero key flag bytes are not the dense
+        // ordinals 1 to n. Upstream refuses it rather than hand over a schema
+        // it cannot represent faithfully, and for a reader that is a malformed
+        // payload: the bytes are not a changeset, and no retry changes that.
+        // Named rather than left to the arm below, because `ParseError` is
+        // `non_exhaustive` and a future variant deserves its own decision.
+        ParseError::InvalidPrimaryKeyFlags { .. } => {
+            WalParseError::MalformedPayload(err.to_string())
+        }
         _ => WalParseError::MalformedPayload(err.to_string()),
     }
 }
@@ -93,14 +109,20 @@ fn op_to_event<DB: DatabaseLike>(
             table: table_name.clone(),
         }
     })?;
-    if schema.pk_flags().len() != arity {
-        return Err(WalParseError::ArityMismatch {
-            table_id,
-            wal_count: schema.pk_flags().len(),
-            catalog_arity: arity,
-        });
-    }
-    let pk_columns = pk_columns_from_flags(schema.pk_flags());
+    // No width check here. The wire's own arity guards below, one per op, ask
+    // the same question of the same number: the parser sizes every op's cell
+    // list from the table header, so a header wider or narrower than the
+    // catalog is exactly a cell list wider or narrower than the catalog, and
+    // the refusal names the same two widths either way. Upstream validates the
+    // key flags themselves, which is a separate claim and not this one.
+    let pk_columns: Arc<[ColumnId]> = {
+        #[allow(clippy::cast_possible_truncation)]
+        let columns: Vec<ColumnId> = schema
+            .primary_key_columns()
+            .map(|col| col as ColumnId)
+            .collect();
+        Arc::from(columns)
+    };
     let scalar_kinds = column_scalar_kinds(database, table_id, arity);
 
     let (kind, new_row, old_row, changed_columns) = match op {
@@ -140,7 +162,7 @@ fn op_to_event<DB: DatabaseLike>(
             for (col, pair) in values.iter().enumerate() {
                 let kind = scalar_kind_for(&scalar_kinds, col);
                 let (old_v, new_v) = decode_update_pair(pair, kind);
-                if is_changed(pair) {
+                if pair.is_changed() {
                     #[allow(clippy::cast_possible_truncation)]
                     changed.push(col as ColumnId);
                 }
@@ -207,34 +229,6 @@ fn decode_update_pair(
         .as_ref()
         .map_or(Value::Missing, |v| decode_wire_cell(v.clone(), kind));
     (old, new)
-}
-
-/// A column counts as changed when the wire distinguishes its old and
-/// new values. Undefined-undefined pairs (unchanged non-PK columns)
-/// return false; equal-value pairs (unchanged PK columns) also return
-/// false so `changed_columns` stays semantically accurate.
-fn is_changed(pair: &ChangesetUpdatePair<alloc::string::String, Vec<u8>>) -> bool {
-    match (pair.0.as_ref(), pair.1.as_ref()) {
-        (None, None) => false,
-        (Some(a), Some(b)) => a != b,
-        _ => true,
-    }
-}
-
-fn pk_columns_from_flags(pk_flags: &[u8]) -> Arc<[ColumnId]> {
-    let mut pk_with_ord: Vec<(ColumnId, u8)> = pk_flags
-        .iter()
-        .enumerate()
-        .filter_map(|(i, &ord)| {
-            if ord == 0 {
-                return None;
-            }
-            #[allow(clippy::cast_possible_truncation)]
-            Some((i as ColumnId, ord))
-        })
-        .collect();
-    pk_with_ord.sort_by_key(|(_, ord)| *ord);
-    Arc::from(pk_with_ord.into_iter().map(|(c, _)| c).collect::<Vec<_>>())
 }
 
 fn column_scalar_kinds<DB: DatabaseLike>(
@@ -492,6 +486,136 @@ mod tests {
         let bytes: alloc::vec::Vec<u8> = alloc::vec![b'P', 0, 0];
         let result = SqliteChangesetParser.parse_wal_message(&bytes, &db);
         assert!(matches!(result, Err(WalParseError::MalformedPayload(_))));
+    }
+
+    /// The upstream parser refuses a table header whose nonzero key flag bytes
+    /// are not the dense ordinals 1 to n, because such a header describes a
+    /// key it cannot represent. subql reports that as a malformed payload: the
+    /// bytes are not a changeset, and retrying them changes nothing.
+    #[test]
+    fn typed_sqlite_invalid_primary_key_flags_are_rejected() {
+        let db = orders_db();
+        let orders = orders_table();
+        let changeset = ChangeSet::<_, alloc::string::String, Vec<u8>>::new().insert(
+            Insert::from(orders)
+                .set(0, 7_i64)
+                .unwrap()
+                .set(1, 250_i64)
+                .unwrap()
+                .set(2, "paid")
+                .unwrap(),
+        );
+        let mut bytes: Vec<u8> = changeset.into();
+        // A table header carries one flag byte per column, immediately before
+        // the table name, and the key column's byte is its position within the
+        // key counting from one. `orders` keys on its first column, so the
+        // three bytes before the name read `[1, 0, 0]`. Rewriting the one to a
+        // two leaves a key of width one whose only ordinal is two, which is
+        // exactly the sequence the parser refuses.
+        let name_at = bytes
+            .windows(6)
+            .position(|window| window == b"orders")
+            .expect("the header carries the table name");
+        let flags_at = name_at - 3;
+        assert_eq!(
+            &bytes[flags_at..name_at],
+            &[1, 0, 0],
+            "the flag bytes sit where this test expects them"
+        );
+        bytes[flags_at] = 2;
+
+        let refused = SqliteChangesetParser
+            .parse_wal_message(&bytes, &db)
+            .expect_err("a header with non-dense key ordinals is refused");
+        let WalParseError::MalformedPayload(message) = refused else {
+            panic!("the refusal is a malformed payload, got {refused:?}");
+        };
+        assert!(
+            message.contains("primary-key flags") && message.contains("orders"),
+            "the refusal names what is wrong and where, got {message:?}"
+        );
+    }
+
+    /// A composite key declared in an order the columns do not follow. The
+    /// wire's flag byte carries each key column's position within the key, so
+    /// `(status, id)` must read back as `[2, 0]`. Reading the flags as
+    /// booleans, or sorting the result by column index, answers `[0, 2]` and
+    /// pairs every key value with the wrong column.
+    #[test]
+    fn typed_sqlite_composite_key_keeps_its_declared_order() {
+        let db = ParserDB::parse::<sqlparser::dialect::SQLiteDialect>(
+            "CREATE TABLE lots (id INTEGER, amount INT, status TEXT, PRIMARY KEY (status, id));",
+        )
+        .expect("lots DDL parses");
+        // Key order `(status, id)`, which is columns 2 then 0.
+        let lots = SimpleTable::new("lots", &["id", "amount", "status"], &[2, 0]);
+        let changeset = ChangeSet::<_, alloc::string::String, Vec<u8>>::new().insert(
+            Insert::from(lots)
+                .set(0, 7_i64)
+                .unwrap()
+                .set(1, 250_i64)
+                .unwrap()
+                .set(2, "paid")
+                .unwrap(),
+        );
+        let bytes: Vec<u8> = changeset.into();
+        let events = SqliteChangesetParser
+            .parse_wal_message(&bytes, &db)
+            .expect("parse succeeds");
+        let ev = &events[0];
+
+        assert_eq!(
+            ev.pk_columns(&db),
+            &[2u16, 0u16],
+            "the key columns come back in key order, not column order"
+        );
+        // The key image is addressed by column, not by key position, so these
+        // read the two key columns and the non-key one between them.
+        assert_eq!(
+            ev.value_at(&db, RowKind::Pk, 2).unwrap(),
+            Value::String("paid".into())
+        );
+        assert_eq!(ev.value_at(&db, RowKind::Pk, 0).unwrap(), Value::Int(7));
+        assert_eq!(ev.value_at(&db, RowKind::Pk, 1).unwrap(), Value::Missing);
+    }
+
+    /// A wire table wider than the catalog's is refused. The upstream parser
+    /// validates the key flags but knows nothing about this catalog, so this
+    /// is the check that catches a schema change between recording a session
+    /// and reading it.
+    #[test]
+    fn typed_sqlite_wire_wider_than_the_catalog_is_refused() {
+        let db = ParserDB::parse::<sqlparser::dialect::SQLiteDialect>(
+            "CREATE TABLE orders (id INTEGER PRIMARY KEY, amount INT);",
+        )
+        .expect("narrow orders DDL parses");
+        // Three columns on the wire against two in the catalog, which is what
+        // an `ALTER TABLE ADD COLUMN` after the recording looks like.
+        let changeset = ChangeSet::<_, alloc::string::String, Vec<u8>>::new().insert(
+            Insert::from(orders_table())
+                .set(0, 7_i64)
+                .unwrap()
+                .set(1, 250_i64)
+                .unwrap()
+                .set(2, "paid")
+                .unwrap(),
+        );
+        let bytes: Vec<u8> = changeset.into();
+
+        let refused = SqliteChangesetParser
+            .parse_wal_message(&bytes, &db)
+            .expect_err("a wire table of another width is refused");
+        assert!(
+            matches!(
+                refused,
+                WalParseError::ArityMismatch {
+                    wal_count: 3,
+                    catalog_arity: 2,
+                    ..
+                }
+            ),
+            "the refusal names both widths, got {refused:?}"
+        );
     }
 
     #[test]
