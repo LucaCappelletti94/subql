@@ -40,7 +40,21 @@ use crate::types::{ColumnId, TableId};
 /// is "which compact id, if any".
 #[must_use]
 pub fn table_id<DB: DatabaseLike>(database: &DB, table_name: &str) -> Option<TableId> {
-    let target = TargetName::parse(table_name).ok()?;
+    table_id_for_name(database, TargetName::parse(table_name).ok()?)
+}
+
+/// Resolve a name whose parts a caller already holds, quoting included.
+///
+/// [`table_id`] is for text somebody wrote as SQL. This is for a caller that
+/// took the name off a parsed statement, where the identifier and its
+/// quoting arrive separately and rendering them back to text only to read
+/// them again would lose the quoting or invent a qualifier out of a dot
+/// inside a name.
+#[must_use]
+pub fn table_id_for_name<DB: DatabaseLike>(
+    database: &DB,
+    target: TargetName<'_>,
+) -> Option<TableId> {
     let table = database.resolve_target_table(target).ok()??;
     let id = database.table_id(table)?;
     u32::try_from(id).ok()

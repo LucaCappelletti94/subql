@@ -1,7 +1,9 @@
 use crate::{catalog_helpers, RegisterError};
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
-use sql_traits::prelude::DatabaseLike;
+use sql_traits::{
+    prelude::DatabaseLike, structs::TargetName, utils::identifier_resolution::identifiers_match,
+};
 use sqlparser::ast::{
     BinaryOperator, Distinct, DuplicateTreatment, Expr, Function, FunctionArg, FunctionArgExpr,
     FunctionArgumentList, FunctionArguments, GroupByExpr, Ident, LimitClause, ObjectName, Query,
@@ -2095,15 +2097,43 @@ fn conjuncts_of<'a>(expr: &'a Expr, out: &mut Vec<&'a Expr>) {
 }
 
 /// The qualifier and column of a one- or two-part column reference.
-const fn qualified_parts(expr: &Expr) -> Option<(Option<&str>, &str)> {
+///
+/// The qualifier stays an [`Ident`], because it names a table and the
+/// catalog resolves a table name by its text and its quoting together.
+const fn qualified_parts(expr: &Expr) -> Option<(Option<&Ident>, &str)> {
     match expr {
         Expr::Identifier(ident) => Some((None, ident.value.as_str())),
         Expr::CompoundIdentifier(parts) => match parts.as_slice() {
-            [qualifier, column] => Some((Some(qualifier.value.as_str()), column.value.as_str())),
+            [qualifier, column] => Some((Some(qualifier), column.value.as_str())),
             _ => None,
         },
         _ => None,
     }
+}
+
+/// The name a written table reference spells, quoting and qualifier kept.
+///
+/// `None` when the reference has more parts than a qualifier and a name,
+/// which subql's catalog has nothing to resolve against.
+fn written_table_name(name: &ObjectName) -> Option<TargetName<'_>> {
+    let parts: Vec<&Ident> = name
+        .0
+        .iter()
+        .map(sqlparser::ast::ObjectNamePart::as_ident)
+        .collect::<Option<_>>()?;
+    match parts.as_slice() {
+        [name] => Some(written_name_part(name)),
+        [schema, name] => {
+            Some(written_name_part(name).with_schema(&schema.value, schema.quote_style.is_some()))
+        }
+        _ => None,
+    }
+}
+
+/// One identifier as the catalog reads it: its text and whether it was
+/// quoted, which is what decides case sensitivity.
+fn written_name_part(ident: &Ident) -> TargetName<'_> {
+    TargetName::new(&ident.value, ident.quote_style.is_some())
 }
 
 /// Recognize and bound the membership `EXISTS` form.
@@ -2132,25 +2162,35 @@ pub(crate) fn membership_exists_parts<'a, DB: DatabaseLike>(
                 .to_string(),
         ));
     }
-    let member_table_name = member_name
-        .0
-        .last()
-        .and_then(sqlparser::ast::ObjectNamePart::as_ident)
-        .map(|ident| ident.value.as_str())
+    let member_target = written_table_name(member_name)
         .ok_or_else(|| exists_refusal("names its membership table in a form SubQL cannot read"))?;
-    let member_table = catalog_helpers::table_id(database, member_table_name)
+    let member_table = catalog_helpers::table_id_for_name(database, member_target)
         .ok_or_else(|| exists_refusal("reads a membership table the catalog does not know"))?;
     let alias = match &select.from[0].relation {
         TableFactor::Table { alias, .. } => alias.as_ref().map(|alias| alias.name.value.as_str()),
         _ => None,
     };
-    // A qualifier names the membership side when it is the alias or the
-    // membership table's own name, and the subscribed side when it resolves to
-    // the subscribed table. Checked in that order, because inside the subquery
-    // the alias shadows everything else.
-    let is_member_qualifier = |qualifier: &str| {
-        Some(qualifier) == alias
-            || catalog_helpers::table_id(database, qualifier) == Some(member_table)
+    // A qualifier names the membership side when it is the alias, the
+    // relation's own written name, or a name resolving to the same table.
+    // The written name is its own case because SQL exposes an unaliased
+    // relation under that name whatever schema it lives in, where resolving
+    // the name alone would need the search path to hold that schema.
+    let member_written = member_name
+        .0
+        .last()
+        .and_then(sqlparser::ast::ObjectNamePart::as_ident);
+    let is_member_qualifier = |qualifier: &Ident| {
+        Some(qualifier.value.as_str()) == alias
+            || member_written.is_some_and(|written| {
+                identifiers_match(
+                    written.value.as_str(),
+                    written.quote_style.is_some(),
+                    qualifier.value.as_str(),
+                    qualifier.quote_style.is_some(),
+                )
+            })
+            || catalog_helpers::table_id_for_name(database, written_name_part(qualifier))
+                == Some(member_table)
     };
     let member_column = |expr: &Expr| -> Option<crate::ColumnId> {
         let (qualifier, column) = qualified_parts(expr)?;
@@ -2163,7 +2203,8 @@ pub(crate) fn membership_exists_parts<'a, DB: DatabaseLike>(
         let (qualifier, column) = qualified_parts(expr)?;
         let qualifier = qualifier?;
         if is_member_qualifier(qualifier)
-            || catalog_helpers::table_id(database, qualifier) != Some(table_id)
+            || catalog_helpers::table_id_for_name(database, written_name_part(qualifier))
+                != Some(table_id)
         {
             return None;
         }
@@ -2473,5 +2514,117 @@ mod sanity_tests {
         check_sql_sanity("SELECT * FROM t WHERE x IN (1, 2, 3)").unwrap();
         // PG array subscript with balanced brackets is fine.
         check_sql_sanity("SELECT * FROM t WHERE arr[1] = 5").unwrap();
+    }
+}
+
+/// How the membership `EXISTS` reads the names its subquery wrote.
+///
+/// The names arrive as `Ident`s, which carry their text and their quoting
+/// separately, and the catalog resolves a name by both. A test here rather
+/// than at the engine's edge because the question is which table the parts
+/// name, and the answer is the same for every consumer of the form.
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod membership_naming_tests {
+    use super::{membership_exists_parts, RegisterError};
+    use crate::catalog_helpers;
+    use sql_traits::structs::ParserDB;
+    use sqlparser::dialect::PostgreSqlDialect;
+
+    const DDL: &str = r#"CREATE SCHEMA app;
+        CREATE TABLE docs (id INT PRIMARY KEY, title TEXT);
+        CREATE TABLE "my.shares" (doc_id INT, viewer TEXT);
+        CREATE TABLE app."Shares" (doc_id INT, viewer TEXT);"#;
+
+    /// The `EXISTS` subquery of `sql`, which the parser hands back verbatim.
+    fn exists_subquery(sql: &str) -> sqlparser::ast::Query {
+        let statements = sqlparser::parser::Parser::parse_sql(&PostgreSqlDialect {}, sql).unwrap();
+        let [sqlparser::ast::Statement::Query(query)] = statements.as_slice() else {
+            panic!("one query");
+        };
+        let sqlparser::ast::SetExpr::Select(select) = query.body.as_ref() else {
+            panic!("a select");
+        };
+        let selection = select.selection.as_ref().expect("the filter has a WHERE");
+        let sqlparser::ast::Expr::Exists { subquery, .. } = selection else {
+            panic!("the filter is one EXISTS");
+        };
+        subquery.as_ref().clone()
+    }
+
+    /// A membership table whose real name carries a dot is named by its
+    /// quoted spelling, and the dot belongs to the name.
+    #[test]
+    fn a_membership_table_named_with_a_dot_resolves() {
+        let db = ParserDB::parse::<PostgreSqlDialect>(DDL).unwrap();
+        let docs = catalog_helpers::table_id(&db, "docs").unwrap();
+        let subquery = exists_subquery(
+            r#"SELECT * FROM docs WHERE EXISTS (SELECT 1 FROM "my.shares" s
+               WHERE s.doc_id = docs.id
+                 AND s.viewer = current_setting('app.user_id', true))"#,
+        );
+
+        let parts = membership_exists_parts(&subquery, docs, &db)
+            .expect("the catalog knows a table named `my.shares`");
+        assert_eq!(parts.pairs.len(), 1);
+    }
+
+    /// A qualified, quoted membership table is named by both its parts.
+    #[test]
+    fn a_qualified_quoted_membership_table_resolves() {
+        let db = ParserDB::parse::<PostgreSqlDialect>(DDL).unwrap();
+        let docs = catalog_helpers::table_id(&db, "docs").unwrap();
+        let subquery = exists_subquery(
+            r#"SELECT * FROM docs WHERE EXISTS (SELECT 1 FROM app."Shares" s
+               WHERE s.doc_id = docs.id
+                 AND s.viewer = current_setting('app.user_id', true))"#,
+        );
+
+        let parts = membership_exists_parts(&subquery, docs, &db)
+            .expect("the catalog knows `app.\"Shares\"`");
+        assert_eq!(parts.pairs.len(), 1);
+    }
+
+    /// A three-part name is refused rather than read as its last two parts.
+    ///
+    /// subql's catalog resolves a qualifier and a name, so a name carrying
+    /// a database in front of them names something it cannot reach. Reading
+    /// the tail would resolve a table in this database while the filter
+    /// asked for another one's.
+    #[test]
+    fn a_three_part_membership_name_is_refused() {
+        let db = ParserDB::parse::<PostgreSqlDialect>(DDL).unwrap();
+        let docs = catalog_helpers::table_id(&db, "docs").unwrap();
+        let subquery = exists_subquery(
+            r#"SELECT * FROM docs WHERE EXISTS (SELECT 1 FROM other.app."Shares" s
+               WHERE s.doc_id = docs.id
+                 AND s.viewer = current_setting('app.user_id', true))"#,
+        );
+
+        let Err(error) = membership_exists_parts(&subquery, docs, &db) else {
+            panic!("a database-qualified name names nothing this catalog holds");
+        };
+        assert!(
+            matches!(&error, RegisterError::UnsupportedSql(message)
+                if message.contains("in a form SubQL cannot read")),
+            "{error:?}"
+        );
+    }
+
+    /// A membership table the qualifier names by its own written spelling,
+    /// rather than by an alias, still classifies the pair's two sides.
+    #[test]
+    fn a_written_membership_qualifier_names_the_membership_side() {
+        let db = ParserDB::parse::<PostgreSqlDialect>(DDL).unwrap();
+        let docs = catalog_helpers::table_id(&db, "docs").unwrap();
+        let subquery = exists_subquery(
+            r#"SELECT * FROM docs WHERE EXISTS (SELECT 1 FROM app."Shares"
+               WHERE "Shares".doc_id = docs.id
+                 AND "Shares".viewer = current_setting('app.user_id', true))"#,
+        );
+
+        let parts = membership_exists_parts(&subquery, docs, &db)
+            .expect("the qualifier names the membership table");
+        assert_eq!(parts.pairs.len(), 1);
     }
 }
