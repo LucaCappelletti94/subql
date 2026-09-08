@@ -136,10 +136,7 @@ fn op_to_event<DB: DatabaseLike>(
             }
             let mut row: Vec<Value<SQLite>> = Vec::with_capacity(arity);
             for (col, wire) in values.iter().enumerate() {
-                row.push(decode_wire_cell(
-                    wire.clone(),
-                    scalar_kind_for(&scalar_kinds, col),
-                ));
+                row.push(decode_wire_cell(wire, scalar_kind_for(&scalar_kinds, col)));
             }
             (
                 EventKind::Insert,
@@ -186,10 +183,7 @@ fn op_to_event<DB: DatabaseLike>(
             }
             let mut row: Vec<Value<SQLite>> = Vec::with_capacity(arity);
             for (col, wire) in old_values.iter().enumerate() {
-                row.push(decode_wire_cell(
-                    wire.clone(),
-                    scalar_kind_for(&scalar_kinds, col),
-                ));
+                row.push(decode_wire_cell(wire, scalar_kind_for(&scalar_kinds, col)));
             }
             (
                 EventKind::Delete,
@@ -223,11 +217,11 @@ fn decode_update_pair(
     let old = pair
         .0
         .as_ref()
-        .map_or(Value::Missing, |v| decode_wire_cell(v.clone(), kind));
+        .map_or(Value::Missing, |v| decode_wire_cell(v, kind));
     let new = pair
         .1
         .as_ref()
-        .map_or(Value::Missing, |v| decode_wire_cell(v.clone(), kind));
+        .map_or(Value::Missing, |v| decode_wire_cell(v, kind));
     (old, new)
 }
 
@@ -257,8 +251,13 @@ fn scalar_kind_for(
 /// Mirrors [`crate::backend::decode_cell`] for a path that reports a failure
 /// as [`Value::Missing`] rather than an error: this stream escalates an
 /// undecodable cell to re-execution, so nothing here has an error to carry.
+///
+/// Borrows the cell, so only the arms that keep a payload pay for one. The
+/// four temporal families and `Decimal` parse from a `&str` and drop it, and
+/// every wrong-shape refusal drops it too, which is where an owning signature
+/// spent an allocation per cell for nothing.
 fn decode_wire_cell(
-    wire: WireValue<alloc::string::String, Vec<u8>>,
+    wire: &WireValue<alloc::string::String, Vec<u8>>,
     kind: Option<ScalarKindOf<SQLite>>,
 ) -> Value<SQLite> {
     match kind {
@@ -287,50 +286,50 @@ fn decode_wire_cell(
 /// resolve to [`Value::Missing`], mirroring the "wrong-shape accessor"
 /// contract from the [`crate::backend::CdcEvent`] trait.
 fn decode_wire_value(
-    wire: WireValue<alloc::string::String, Vec<u8>>,
+    wire: &WireValue<alloc::string::String, Vec<u8>>,
     kind: Option<ScalarFamily>,
 ) -> Value<SQLite> {
     match wire {
         WireValue::Null => Value::Null,
         WireValue::Integer(i) => match kind {
-            Some(ScalarFamily::Bool) => Value::Bool(i),
-            Some(ScalarFamily::Int) | None => Value::Int(i),
-            Some(ScalarFamily::Json) => Value::Json(SqliteJson::integer(i)),
-            Some(ScalarFamily::Jsonb) => Value::Jsonb(SqliteJson::integer(i)),
+            Some(ScalarFamily::Bool) => Value::Bool(*i),
+            Some(ScalarFamily::Int) | None => Value::Int(*i),
+            Some(ScalarFamily::Json) => Value::Json(SqliteJson::integer(*i)),
+            Some(ScalarFamily::Jsonb) => Value::Jsonb(SqliteJson::integer(*i)),
             _ => Value::Missing,
         },
         WireValue::Real(f) => match kind {
-            Some(ScalarFamily::Float) | None => Value::Float(f),
-            Some(ScalarFamily::Json) => Value::Json(SqliteJson::real(f)),
-            Some(ScalarFamily::Jsonb) => Value::Jsonb(SqliteJson::real(f)),
+            Some(ScalarFamily::Float) | None => Value::Float(*f),
+            Some(ScalarFamily::Json) => Value::Json(SqliteJson::real(*f)),
+            Some(ScalarFamily::Jsonb) => Value::Jsonb(SqliteJson::real(*f)),
             _ => Value::Missing,
         },
         WireValue::Text(s) => match kind {
-            Some(ScalarFamily::String) | None => Value::String(s),
-            Some(ScalarFamily::Uuid) => Value::Uuid(s),
+            Some(ScalarFamily::String) | None => Value::String(s.clone()),
+            Some(ScalarFamily::Uuid) => Value::Uuid(s.clone()),
             Some(ScalarFamily::Timestamp) => {
-                sql_scalar_text::parse_timestamp(&s).map_or(Value::Missing, Value::Timestamp)
+                sql_scalar_text::parse_timestamp(s).map_or(Value::Missing, Value::Timestamp)
             }
             Some(ScalarFamily::TimestampTz) => {
-                sql_scalar_text::parse_timestamp_tz(&s).map_or(Value::Missing, Value::TimestampTz)
+                sql_scalar_text::parse_timestamp_tz(s).map_or(Value::Missing, Value::TimestampTz)
             }
             Some(ScalarFamily::Date) => {
-                sql_scalar_text::parse_date(&s).map_or(Value::Missing, Value::Date)
+                sql_scalar_text::parse_date(s).map_or(Value::Missing, Value::Date)
             }
             Some(ScalarFamily::Time) => {
-                sql_scalar_text::parse_time(&s).map_or(Value::Missing, Value::Time)
+                sql_scalar_text::parse_time(s).map_or(Value::Missing, Value::Time)
             }
             Some(ScalarFamily::Decimal) => {
-                sql_scalar_text::parse_decimal(&s).map_or(Value::Missing, Value::Decimal)
+                sql_scalar_text::parse_decimal(s).map_or(Value::Missing, Value::Decimal)
             }
-            Some(ScalarFamily::Json) => Value::Json(SqliteJson::text(s)),
-            Some(ScalarFamily::Jsonb) => Value::Jsonb(SqliteJson::text(s)),
+            Some(ScalarFamily::Json) => Value::Json(SqliteJson::text(s.clone())),
+            Some(ScalarFamily::Jsonb) => Value::Jsonb(SqliteJson::text(s.clone())),
             _ => Value::Missing,
         },
         WireValue::Blob(b) => match kind {
-            Some(ScalarFamily::Bytes) | None => Value::Bytes(b),
-            Some(ScalarFamily::Json) => Value::Json(SqliteJson::blob(b)),
-            Some(ScalarFamily::Jsonb) => Value::Jsonb(SqliteJson::blob(b)),
+            Some(ScalarFamily::Bytes) | None => Value::Bytes(b.clone()),
+            Some(ScalarFamily::Json) => Value::Json(SqliteJson::blob(b.clone())),
+            Some(ScalarFamily::Jsonb) => Value::Jsonb(SqliteJson::blob(b.clone())),
             _ => Value::Missing,
         },
     }
@@ -669,7 +668,7 @@ mod tests {
             Some(ScalarFamily::Timestamp),
         ] {
             assert_eq!(
-                decode_wire_value(WireValue::Null, kind),
+                decode_wire_value(&WireValue::Null, kind),
                 Value::Null,
                 "a NULL cell on a {kind:?} column"
             );
@@ -685,19 +684,19 @@ mod tests {
     #[test]
     fn an_integer_cell_routes_by_the_declared_kind() {
         assert_eq!(
-            decode_wire_value(WireValue::Integer(1), Some(ScalarFamily::Bool)),
+            decode_wire_value(&WireValue::Integer(1), Some(ScalarFamily::Bool)),
             Value::Bool(1)
         );
         assert_eq!(
-            decode_wire_value(WireValue::Integer(0), Some(ScalarFamily::Bool)),
+            decode_wire_value(&WireValue::Integer(0), Some(ScalarFamily::Bool)),
             Value::Bool(0)
         );
         assert_eq!(
-            decode_wire_value(WireValue::Integer(7), Some(ScalarFamily::Int)),
+            decode_wire_value(&WireValue::Integer(7), Some(ScalarFamily::Int)),
             Value::Int(7)
         );
         assert_eq!(
-            decode_wire_value(WireValue::Integer(7), None),
+            decode_wire_value(&WireValue::Integer(7), None),
             Value::Int(7),
             "an undeclared column keeps the wire's own shape"
         );
@@ -709,7 +708,7 @@ mod tests {
             ScalarFamily::Decimal,
         ] {
             assert_eq!(
-                decode_wire_value(WireValue::Integer(7), Some(refused)),
+                decode_wire_value(&WireValue::Integer(7), Some(refused)),
                 Value::Missing,
                 "an integer on a {refused:?} column is the wrong shape"
             );
@@ -721,11 +720,11 @@ mod tests {
     #[test]
     fn a_real_cell_routes_by_the_declared_kind() {
         assert_eq!(
-            decode_wire_value(WireValue::Real(1.5), Some(ScalarFamily::Float)),
+            decode_wire_value(&WireValue::Real(1.5), Some(ScalarFamily::Float)),
             Value::Float(1.5)
         );
         assert_eq!(
-            decode_wire_value(WireValue::Real(1.5), None),
+            decode_wire_value(&WireValue::Real(1.5), None),
             Value::Float(1.5)
         );
         for refused in [
@@ -735,7 +734,7 @@ mod tests {
             ScalarFamily::Decimal,
         ] {
             assert_eq!(
-                decode_wire_value(WireValue::Real(1.5), Some(refused)),
+                decode_wire_value(&WireValue::Real(1.5), Some(refused)),
                 Value::Missing,
                 "a real on a {refused:?} column is the wrong shape"
             );
@@ -749,28 +748,31 @@ mod tests {
     #[test]
     fn a_text_cell_routes_by_the_declared_kind() {
         assert_eq!(
-            decode_wire_value(WireValue::Text("hello".into()), Some(ScalarFamily::String)),
+            decode_wire_value(&WireValue::Text("hello".into()), Some(ScalarFamily::String)),
             Value::String("hello".into())
         );
         assert_eq!(
-            decode_wire_value(WireValue::Text("hello".into()), None),
+            decode_wire_value(&WireValue::Text("hello".into()), None),
             Value::String("hello".into())
         );
         assert_eq!(
             decode_wire_value(
-                WireValue::Text("not a uuid at all".into()),
+                &WireValue::Text("not a uuid at all".into()),
                 Some(ScalarFamily::Uuid)
             ),
             Value::Uuid("not a uuid at all".into()),
             "a UUID column carries the stored text as it stands"
         );
         assert_eq!(
-            decode_wire_value(WireValue::Text("12.50".into()), Some(ScalarFamily::Decimal)),
+            decode_wire_value(
+                &WireValue::Text("12.50".into()),
+                Some(ScalarFamily::Decimal)
+            ),
             Value::Decimal("12.50".parse().expect("a decimal literal parses"))
         );
         assert_eq!(
             decode_wire_value(
-                WireValue::Text("twelve".into()),
+                &WireValue::Text("twelve".into()),
                 Some(ScalarFamily::Decimal)
             ),
             Value::Missing,
@@ -778,7 +780,7 @@ mod tests {
         );
         for refused in [ScalarFamily::Int, ScalarFamily::Bool, ScalarFamily::Bytes] {
             assert_eq!(
-                decode_wire_value(WireValue::Text("hello".into()), Some(refused)),
+                decode_wire_value(&WireValue::Text("hello".into()), Some(refused)),
                 Value::Missing,
                 "text on a {refused:?} column is the wrong shape"
             );
@@ -790,11 +792,11 @@ mod tests {
     #[test]
     fn a_blob_cell_routes_by_the_declared_kind() {
         assert_eq!(
-            decode_wire_value(WireValue::Blob(vec![1, 2]), Some(ScalarFamily::Bytes)),
+            decode_wire_value(&WireValue::Blob(vec![1, 2]), Some(ScalarFamily::Bytes)),
             Value::Bytes(vec![1, 2])
         );
         assert_eq!(
-            decode_wire_value(WireValue::Blob(vec![1, 2]), None),
+            decode_wire_value(&WireValue::Blob(vec![1, 2]), None),
             Value::Bytes(vec![1, 2])
         );
         for refused in [
@@ -804,7 +806,7 @@ mod tests {
             ScalarFamily::Decimal,
         ] {
             assert_eq!(
-                decode_wire_value(WireValue::Blob(vec![1, 2]), Some(refused)),
+                decode_wire_value(&WireValue::Blob(vec![1, 2]), Some(refused)),
                 Value::Missing,
                 "a blob on a {refused:?} column is the wrong shape"
             );
@@ -815,7 +817,7 @@ mod tests {
         use chrono::{DateTime, Utc};
         assert!(matches!(
             decode_wire_value(
-                WireValue::Text("2026-01-01 00:00:00".into()),
+                &WireValue::Text("2026-01-01 00:00:00".into()),
                 Some(ScalarFamily::Timestamp)
             ),
             Value::Timestamp(_)
@@ -823,21 +825,21 @@ mod tests {
         let expected: DateTime<Utc> = "2026-01-01T00:00:00Z".parse().unwrap();
         assert_eq!(
             decode_wire_value(
-                WireValue::Text("2025-12-31 22:00:00-02".into()),
+                &WireValue::Text("2025-12-31 22:00:00-02".into()),
                 Some(ScalarFamily::TimestampTz)
             ),
             Value::TimestampTz(expected)
         );
         assert!(matches!(
             decode_wire_value(
-                WireValue::Text("2026-01-01".into()),
+                &WireValue::Text("2026-01-01".into()),
                 Some(ScalarFamily::Date)
             ),
             Value::Date(_)
         ));
         assert!(matches!(
             decode_wire_value(
-                WireValue::Text("12:34:56.789".into()),
+                &WireValue::Text("12:34:56.789".into()),
                 Some(ScalarFamily::Time)
             ),
             Value::Time(_)
@@ -848,14 +850,14 @@ mod tests {
     fn temporal_text_cell_rejects_key_boundaries() {
         assert_eq!(
             decode_wire_value(
-                WireValue::Text("2026-01-01 00:00:00".into()),
+                &WireValue::Text("2026-01-01 00:00:00".into()),
                 Some(ScalarFamily::TimestampTz)
             ),
             Value::Missing
         );
         assert_eq!(
             decode_wire_value(
-                WireValue::Text("2026-01-01 00:00:00+00".into()),
+                &WireValue::Text("2026-01-01 00:00:00+00".into()),
                 Some(ScalarFamily::Timestamp)
             ),
             Value::Missing
@@ -869,21 +871,21 @@ mod tests {
         let values = [
             (
                 decode_wire_value(
-                    WireValue::Text(String::from("{ \"a\": 1 }")),
+                    &WireValue::Text(String::from("{ \"a\": 1 }")),
                     Some(ScalarFamily::Json),
                 ),
                 SqliteJsonStorage::Text(String::from("{ \"a\": 1 }")),
             ),
             (
-                decode_wire_value(WireValue::Integer(1), Some(ScalarFamily::Json)),
+                decode_wire_value(&WireValue::Integer(1), Some(ScalarFamily::Json)),
                 SqliteJsonStorage::Integer(1),
             ),
             (
-                decode_wire_value(WireValue::Real(1.5), Some(ScalarFamily::Json)),
+                decode_wire_value(&WireValue::Real(1.5), Some(ScalarFamily::Json)),
                 SqliteJsonStorage::Real(1.5),
             ),
             (
-                decode_wire_value(WireValue::Blob(vec![1, 2]), Some(ScalarFamily::Json)),
+                decode_wire_value(&WireValue::Blob(vec![1, 2]), Some(ScalarFamily::Json)),
                 SqliteJsonStorage::Blob(vec![1, 2]),
             ),
         ];
