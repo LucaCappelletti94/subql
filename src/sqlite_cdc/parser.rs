@@ -262,6 +262,11 @@ fn decode_wire_cell(
     kind: Option<ScalarKindOf<SQLite>>,
 ) -> Value<SQLite> {
     match kind {
+        // No test reaches this arm, and none can: `SQLite`'s custom scalars
+        // are `NoCustomScalars`, whose `Kind` is uninhabited, so no
+        // `ScalarKind::Custom` value exists for this backend. The arm is kept
+        // because it is what the shape of `ScalarKind` asks for, and because a
+        // SQLite that ever declares a custom scalar needs exactly this.
         Some(ScalarKind::Custom(custom)) => {
             let carrier = <<SQLite as Backend>::Custom as CustomScalars>::carrier(custom);
             let raw = decode_wire_value(wire, Some(carrier));
@@ -651,6 +656,160 @@ mod tests {
         assert_eq!(notifs.inserted(), alloc::vec![99u64]);
     }
 
+    /// A NULL cell is NULL whatever the column declares. It is the one wire
+    /// shape every kind accepts, and the one shape that must not be confused
+    /// with [`Value::Missing`], which means the wire carried nothing at all.
+    #[test]
+    fn a_null_cell_stays_null_whatever_the_column_declares() {
+        for kind in [
+            None,
+            Some(ScalarFamily::Int),
+            Some(ScalarFamily::String),
+            Some(ScalarFamily::Json),
+            Some(ScalarFamily::Timestamp),
+        ] {
+            assert_eq!(
+                decode_wire_value(WireValue::Null, kind),
+                Value::Null,
+                "a NULL cell on a {kind:?} column"
+            );
+        }
+    }
+
+    /// An integer cell routes by the declared kind. SQLite has no boolean
+    /// storage class, so a boolean column arrives as an integer and keeps it:
+    /// `Value::Bool` carries an `i64` on this backend, and truthiness is the
+    /// reader's business. A column whose kind no integer can inhabit answers
+    /// [`Value::Missing`], which is the wrong-shape contract rather than a
+    /// silent coercion.
+    #[test]
+    fn an_integer_cell_routes_by_the_declared_kind() {
+        assert_eq!(
+            decode_wire_value(WireValue::Integer(1), Some(ScalarFamily::Bool)),
+            Value::Bool(1)
+        );
+        assert_eq!(
+            decode_wire_value(WireValue::Integer(0), Some(ScalarFamily::Bool)),
+            Value::Bool(0)
+        );
+        assert_eq!(
+            decode_wire_value(WireValue::Integer(7), Some(ScalarFamily::Int)),
+            Value::Int(7)
+        );
+        assert_eq!(
+            decode_wire_value(WireValue::Integer(7), None),
+            Value::Int(7),
+            "an undeclared column keeps the wire's own shape"
+        );
+        for refused in [
+            ScalarFamily::String,
+            ScalarFamily::Bytes,
+            ScalarFamily::Uuid,
+            ScalarFamily::Timestamp,
+            ScalarFamily::Decimal,
+        ] {
+            assert_eq!(
+                decode_wire_value(WireValue::Integer(7), Some(refused)),
+                Value::Missing,
+                "an integer on a {refused:?} column is the wrong shape"
+            );
+        }
+    }
+
+    /// A real cell routes the same way: its own kind, or JSON's storage
+    /// classes, or a refusal.
+    #[test]
+    fn a_real_cell_routes_by_the_declared_kind() {
+        assert_eq!(
+            decode_wire_value(WireValue::Real(1.5), Some(ScalarFamily::Float)),
+            Value::Float(1.5)
+        );
+        assert_eq!(
+            decode_wire_value(WireValue::Real(1.5), None),
+            Value::Float(1.5)
+        );
+        for refused in [
+            ScalarFamily::Int,
+            ScalarFamily::Bool,
+            ScalarFamily::String,
+            ScalarFamily::Decimal,
+        ] {
+            assert_eq!(
+                decode_wire_value(WireValue::Real(1.5), Some(refused)),
+                Value::Missing,
+                "a real on a {refused:?} column is the wrong shape"
+            );
+        }
+    }
+
+    /// A text cell has the most destinations, so it has the most ways to be
+    /// wrong. A UUID column keeps the text verbatim, because SQLite stores a
+    /// UUID as text and this backend's UUID type IS that text: nothing here
+    /// validates it. A decimal column parses, and refuses what does not parse.
+    #[test]
+    fn a_text_cell_routes_by_the_declared_kind() {
+        assert_eq!(
+            decode_wire_value(WireValue::Text("hello".into()), Some(ScalarFamily::String)),
+            Value::String("hello".into())
+        );
+        assert_eq!(
+            decode_wire_value(WireValue::Text("hello".into()), None),
+            Value::String("hello".into())
+        );
+        assert_eq!(
+            decode_wire_value(
+                WireValue::Text("not a uuid at all".into()),
+                Some(ScalarFamily::Uuid)
+            ),
+            Value::Uuid("not a uuid at all".into()),
+            "a UUID column carries the stored text as it stands"
+        );
+        assert_eq!(
+            decode_wire_value(WireValue::Text("12.50".into()), Some(ScalarFamily::Decimal)),
+            Value::Decimal("12.50".parse().expect("a decimal literal parses"))
+        );
+        assert_eq!(
+            decode_wire_value(
+                WireValue::Text("twelve".into()),
+                Some(ScalarFamily::Decimal)
+            ),
+            Value::Missing,
+            "a decimal column refuses text that is not a number"
+        );
+        for refused in [ScalarFamily::Int, ScalarFamily::Bool, ScalarFamily::Bytes] {
+            assert_eq!(
+                decode_wire_value(WireValue::Text("hello".into()), Some(refused)),
+                Value::Missing,
+                "text on a {refused:?} column is the wrong shape"
+            );
+        }
+    }
+
+    /// A blob cell routes to bytes, to JSON's blob storage class, or to a
+    /// refusal.
+    #[test]
+    fn a_blob_cell_routes_by_the_declared_kind() {
+        assert_eq!(
+            decode_wire_value(WireValue::Blob(vec![1, 2]), Some(ScalarFamily::Bytes)),
+            Value::Bytes(vec![1, 2])
+        );
+        assert_eq!(
+            decode_wire_value(WireValue::Blob(vec![1, 2]), None),
+            Value::Bytes(vec![1, 2])
+        );
+        for refused in [
+            ScalarFamily::String,
+            ScalarFamily::Int,
+            ScalarFamily::Uuid,
+            ScalarFamily::Decimal,
+        ] {
+            assert_eq!(
+                decode_wire_value(WireValue::Blob(vec![1, 2]), Some(refused)),
+                Value::Missing,
+                "a blob on a {refused:?} column is the wrong shape"
+            );
+        }
+    }
     #[test]
     fn temporal_text_cell_maps_representative_values() {
         use chrono::{DateTime, Utc};
