@@ -1755,3 +1755,50 @@ fn every_page_of_an_async_cursor_names_its_columns() {
         connector.close_cursor(cursor).await.expect("close");
     });
 }
+
+/// A seed read declares one column kind per component, so a result of another
+/// width is refused rather than zipped short. A truncated seed would hand an
+/// aggregate a count without its sum.
+#[test]
+#[ignore = "requires Docker"]
+fn a_seed_row_of_the_wrong_width_is_refused_async_pg() {
+    use subql::reexec::ScalarRowError;
+
+    common::assert_docker_available();
+    let container = common::pg_with_wal2json();
+    let port = common::pg_port(&container);
+
+    common::multi_thread_rt().block_on(async {
+        let connector = PgAsyncDieselConnector::new(pg_async_pool(port).await);
+        let refused = connector
+            .execute_scalar_row(
+                &subql::reexec::ReadQuery::without_binds("SELECT 1, 2"),
+                &[ScalarFamily::Int],
+                &(),
+            )
+            .await
+            .expect_err("a two-column seed against one kind is refused");
+        let ScalarRowError::Connector(error) = refused else {
+            panic!("the refusal comes from the connector");
+        };
+        assert!(
+            error.to_string().contains("arity"),
+            "the refusal names the shape, got {error}"
+        );
+
+        let values = connector
+            .execute_scalar_row(
+                &subql::reexec::ReadQuery::without_binds("SELECT 1, 2"),
+                &[ScalarFamily::Int, ScalarFamily::Int],
+                &(),
+            )
+            .await
+            .expect("a seed of the declared width reads")
+            .0;
+        assert_eq!(
+            values,
+            vec![Value::Int(1), Value::Int(2)],
+            "so the check refuses a shape rather than the path"
+        );
+    });
+}

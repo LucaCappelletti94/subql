@@ -96,6 +96,31 @@ pub struct LogStatusRow {
     pub position: Option<u64>,
 }
 
+/// Turn a `log_status` coordinate into the compact [`crate::MysqlBinlogPos`],
+/// or `None` when it does not fit one.
+///
+/// Shared by the sync and async connectors, which read the same two columns
+/// off the same table and so must agree on what they mean.
+///
+/// A binlog file is named like `mysql-bin.000003`, and only the numeric suffix
+/// is kept, so the suffix is taken from the LAST dot: a server whose
+/// `log_bin_basename` itself contains one, `/var/log/my.db/bin.000003`, would
+/// otherwise parse to nothing. A name with no dot at all is not a binlog name
+/// and reports nothing, rather than being read whole as a file number. The
+/// offset is kept as `u32`, so an offset past four gibibytes reports no
+/// coordinate rather than a wrapped one: the checkpoint is informational, and
+/// a wrong position is worse than none.
+#[cfg(any(
+    feature = "executor-diesel-mysql",
+    feature = "executor-diesel-async-mysql"
+))]
+pub fn binlog_pos_from(file: &str, position: u64) -> Option<crate::MysqlBinlogPos> {
+    let (_, suffix) = file.rsplit_once('.')?;
+    let file = suffix.parse::<u32>().ok()?;
+    let pos = u32::try_from(position).ok()?;
+    Some(crate::MysqlBinlogPos { file, pos })
+}
+
 /// Read the current binlog coordinate from `performance_schema.log_status`.
 ///
 /// `SHOW MASTER STATUS` returns no result-set metadata over diesel's
@@ -128,13 +153,7 @@ fn read_binlog_pos(conn: &mut diesel::MysqlConnection) -> Option<crate::MysqlBin
     else {
         return None;
     };
-    // Binlog file like "mysql-bin.000003" -> numeric suffix 3.
-    let file = file.rsplit('.').next().and_then(|s| s.parse::<u32>().ok());
-    let pos = u32::try_from(position).ok();
-    match (file, pos) {
-        (Some(file), Some(pos)) => Some(crate::MysqlBinlogPos { file, pos }),
-        _ => None,
-    }
+    binlog_pos_from(&file, position)
 }
 
 #[cfg(feature = "executor-diesel-mysql")]
@@ -201,5 +220,61 @@ impl<S: SessionSetup> Connector for MysqlDieselConnector<S> {
             Ok((values, pos))
         })
         .map_err(ScalarRowError::Connector)
+    }
+}
+
+#[cfg(all(
+    test,
+    any(
+        feature = "executor-diesel-mysql",
+        feature = "executor-diesel-async-mysql"
+    )
+))]
+mod binlog_pos_tests {
+    use super::binlog_pos_from;
+
+    /// The ordinary shape: a binlog name's numeric suffix is the file number.
+    #[test]
+    fn a_binlog_name_reports_its_numeric_suffix() {
+        let pos = binlog_pos_from("mysql-bin.000003", 155).expect("an ordinary coordinate parses");
+        assert_eq!((pos.file, pos.pos), (3, 155));
+    }
+
+    /// The suffix comes from the last dot, so a basename carrying one of its
+    /// own still parses. `log_bin_basename` is a path, and a path may.
+    #[test]
+    fn the_suffix_comes_from_the_last_dot() {
+        let pos = binlog_pos_from("/var/log/my.db/bin.000012", 4).expect("the suffix is the tail");
+        assert_eq!((pos.file, pos.pos), (12, 4));
+    }
+
+    /// A name whose tail is not a number reports no coordinate, rather than a
+    /// made-up file number. Nor does a name with no dot at all: reading `3`
+    /// whole would invent a coordinate out of something that is not a binlog
+    /// name.
+    #[test]
+    fn a_name_that_is_not_a_binlog_name_reports_no_coordinate() {
+        assert!(binlog_pos_from("mysql-bin.index", 155).is_none());
+        assert!(binlog_pos_from("", 155).is_none());
+        assert!(binlog_pos_from("mysql-bin.", 155).is_none());
+        assert!(binlog_pos_from("3", 155).is_none());
+        assert!(binlog_pos_from("mysql-bin", 155).is_none());
+    }
+
+    /// An offset past four gibibytes does not fit the compact position, so it
+    /// reports no coordinate. Wrapping it would name a byte the server has
+    /// long passed, and a replay would resume in the wrong place.
+    #[test]
+    fn an_offset_too_wide_for_the_position_reports_no_coordinate() {
+        assert!(binlog_pos_from("mysql-bin.000003", u64::from(u32::MAX)).is_some());
+        assert!(binlog_pos_from("mysql-bin.000003", u64::from(u32::MAX) + 1).is_none());
+    }
+
+    /// A file number past the compact width reports nothing either, for the
+    /// same reason.
+    #[test]
+    fn a_file_number_too_wide_reports_no_coordinate() {
+        assert!(binlog_pos_from("mysql-bin.4294967295", 1).is_some());
+        assert!(binlog_pos_from("mysql-bin.4294967296", 1).is_none());
     }
 }

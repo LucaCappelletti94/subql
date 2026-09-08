@@ -76,6 +76,13 @@ pub use diesel_connector::DieselConnector;
 pub use diesel_connector::{FloatRow, IntRow, TextRow};
 #[cfg(feature = "executor-diesel-async-mysql")]
 pub use mysql_diesel_connector::LogStatusRow;
+// The parse is shared with the async MySQL connector, which reads the same
+// two `log_status` columns.
+#[cfg(any(
+    feature = "executor-diesel-mysql",
+    feature = "executor-diesel-async-mysql"
+))]
+pub(super) use mysql_diesel_connector::binlog_pos_from;
 #[cfg(feature = "executor-diesel-mysql")]
 pub use mysql_diesel_connector::MysqlDieselConnector;
 #[cfg(feature = "executor-diesel-postgres")]
