@@ -10,11 +10,11 @@ use subql::backend::Pg18;
 use bigdecimal::BigDecimal;
 use diesel::connection::SimpleConnection;
 use diesel::prelude::*;
-use sql_traits::traits::MySqlCollationPadding;
+use sql_traits::{structs::TargetName, traits::MySqlCollationPadding};
 use std::str::FromStr;
 use subql::backend::{
-    Backend, CollationFacts, CollationName, ColumnComparison, MySql, NoCustom, Postgres, SQLite,
-    ScalarFamily, SqliteJson, Value,
+    Backend, ColumnCollation, ColumnComparison, MySql, NamedColumnCollation, NoCustom, Postgres,
+    SQLite, ScalarFamily, SqliteJson, Value,
 };
 #[cfg(feature = "executor-diesel-mysql")]
 use subql::reexec::MysqlDieselConnector;
@@ -65,7 +65,7 @@ struct CountRow {
 
 fn column(
     kind: subql::backend::ScalarFamily,
-    collation: CollationFacts,
+    collation: ColumnCollation<'static>,
 ) -> ColumnComparison<NoCustom> {
     ColumnComparison {
         kind: kind.into(),
@@ -78,17 +78,13 @@ fn named(
     name: &str,
     postgres_deterministic: Option<bool>,
     padding: Option<MySqlCollationPadding>,
-) -> CollationFacts {
-    CollationFacts::Named {
-        name: CollationName {
-            name: String::from(name),
-            name_is_quoted: false,
-            schema: None,
-            schema_is_quoted: false,
-        },
-        postgres_deterministic,
-        padding: padding.map(Into::into),
-    }
+) -> ColumnCollation<'static> {
+    ColumnCollation::Named(
+        NamedColumnCollation::new(TargetName::new(name, false))
+            .with_postgres_deterministic(postgres_deterministic)
+            .with_mysql_padding(padding),
+    )
+    .into_owned()
 }
 
 #[derive(Insertable)]
@@ -231,7 +227,7 @@ fn postgres_keys_match_group_by_equality() {
     assert_eq!(float_groups.len(), 2);
     let float_encoder = Postgres::<Pg18>::group_key_encoder(vec![column(
         ScalarFamily::Float,
-        CollationFacts::DatabaseDefault,
+        ColumnCollation::DatabaseDefault,
     )])
     .unwrap();
     assert_eq!(
@@ -275,7 +271,7 @@ fn postgres_keys_match_group_by_equality() {
     assert_eq!(jsonb_groups.len(), 7);
     let jsonb_encoder = Postgres::<Pg18>::group_key_encoder(vec![column(
         ScalarFamily::Jsonb,
-        CollationFacts::DatabaseDefault,
+        ColumnCollation::DatabaseDefault,
     )])
     .unwrap();
     assert_eq!(
@@ -410,7 +406,7 @@ fn mysql_keys_match_binary_collations_and_decimal_equality() {
     assert_eq!(single_groups.len(), 2);
     assert!(MySql::group_key_encoder(vec![column(
         ScalarFamily::Float,
-        CollationFacts::DatabaseDefault,
+        ColumnCollation::DatabaseDefault,
     )])
     .is_none());
 
@@ -512,7 +508,7 @@ fn sqlite_keys_match_builtin_collations_and_dynamic_numeric_equality() {
     assert_eq!(groups.count, 1);
     let json_encoder = SQLite::group_key_encoder(vec![column(
         ScalarFamily::Json,
-        CollationFacts::DatabaseDefault,
+        ColumnCollation::DatabaseDefault,
     )])
     .unwrap();
     assert_eq!(

@@ -58,12 +58,12 @@ pub(crate) use scalar_value::jsonb_payloads_equal;
 pub use scalar_value::single_column_rule;
 pub use scalar_value::widen_i64_to_f64;
 pub use scalar_value::{
-    Carried, CollationFacts, CollationName, ColumnComparison, ColumnComparisonOf,
-    ComparisonContext, CustomScalars, DeclaredType, DivisionPrecisionIncrement, DivisionRule,
-    FloatOrder, FloatSumOverflow, FloatWidth, GroupKeyEncoder, IntWidth, MeanRule, NoCustom,
-    NoCustomScalars, NumericWidening, ScalarFamily, ScalarKind, ScalarKindOf, SumRule, TextCase,
-    TextOperation, TextResolution, TextRule, TextWidth, TrailingSpacePadding, TrailingSpaces,
-    Value, ValueKind, ValueKindOf, VarianceSeed,
+    Carried, ColumnCollation, ColumnComparison, ColumnComparisonOf, ComparisonContext,
+    CustomScalars, DeclaredType, DivisionPrecisionIncrement, DivisionRule, FloatOrder,
+    FloatSumOverflow, FloatWidth, GroupKeyEncoder, IntWidth, MeanRule, MySqlCollationPadding,
+    NamedColumnCollation, NoCustom, NoCustomScalars, NumericWidening, ScalarFamily, ScalarKind,
+    ScalarKindOf, SumRule, TextCase, TextOperation, TextResolution, TextRule, TextWidth,
+    TrailingSpaces, Value, ValueKind, ValueKindOf, VarianceSeed,
 };
 pub use scalars_and_backend::{
     Backend, JsonDocument, ScalarCore, ScalarKey, ScalarText, ScalarTruth, SqliteJson,

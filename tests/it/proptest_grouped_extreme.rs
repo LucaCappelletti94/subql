@@ -8,7 +8,7 @@ use proptest::prelude::*;
 use sql_traits::structs::ParserDB;
 use sqlparser::dialect::PostgreSqlDialect;
 use subql::backend::{
-    Backend, CollationFacts, ColumnComparison, NoCustom, Postgres, ScalarFamily, Value,
+    Backend, ColumnCollation, ColumnComparison, NoCustom, Postgres, ScalarFamily, Value,
 };
 use subql::reexec::ReExecutionRead;
 use subql::testing::TestEvent;
@@ -36,7 +36,7 @@ fn text_group_key(name: &str) -> Vec<u8> {
     let encoder = Postgres::<Pg18>::group_key_encoder(vec![ColumnComparison::<NoCustom> {
         kind: ScalarFamily::String.into(),
         declared_type: String::from("TEXT"),
-        collation: CollationFacts::DatabaseDefault,
+        collation: ColumnCollation::DatabaseDefault,
     }])
     .expect("Postgres default text has a canonical key");
     encoder

@@ -92,8 +92,9 @@ sqlparser = { version = "0.62", default-features = false, features = ["visitor"]
 
 # Generic SQL schema traits + canonical SchemaFingerprint (FINGERPRINT_SPEC).
 # `default-features = false` follows sql-traits' own gating. The `std`
-# feature is propagated below.
-sql-traits = { git = "https://github.com/earth-metabolome-initiative/sql-traits", branch = "main", default-features = false }
+# feature is propagated below. `serde` derives the names and collation facts
+# a compiled program persists, which is why subql carries no copy of them.
+sql-traits = { git = "https://github.com/earth-metabolome-initiative/sql-traits", branch = "main", default-features = false, features = ["serde"] }
 
 sql-scalar-text = { version = "0.1.0", features = ["decimal"] }
 
