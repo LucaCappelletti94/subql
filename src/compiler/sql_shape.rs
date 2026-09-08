@@ -2098,17 +2098,33 @@ fn conjuncts_of<'a>(expr: &'a Expr, out: &mut Vec<&'a Expr>) {
 
 /// The qualifier and column of a one- or two-part column reference.
 ///
-/// The qualifier stays an [`Ident`], because it names a table and the
-/// catalog resolves a table name by its text and its quoting together.
-const fn qualified_parts(expr: &Expr) -> Option<(Option<&Ident>, &str)> {
+/// Both stay [`Ident`]s: each names a catalog object, and the catalog
+/// resolves a name by its text and its quoting together, so a written
+/// `"Owner"` reaches the column stored under that spelling rather than the
+/// `owner` beside it.
+const fn qualified_parts(expr: &Expr) -> Option<(Option<&Ident>, &Ident)> {
     match expr {
-        Expr::Identifier(ident) => Some((None, ident.value.as_str())),
+        Expr::Identifier(ident) => Some((None, ident)),
         Expr::CompoundIdentifier(parts) => match parts.as_slice() {
-            [qualifier, column] => Some((Some(qualifier), column.value.as_str())),
+            [qualifier, column] => Some((Some(qualifier), column)),
             _ => None,
         },
         _ => None,
     }
+}
+
+/// The column a written reference names, quoting kept.
+fn written_column<DB: DatabaseLike>(
+    database: &DB,
+    table_id: crate::TableId,
+    column: &Ident,
+) -> Option<crate::ColumnId> {
+    catalog_helpers::column_id_for_name(
+        database,
+        table_id,
+        &column.value,
+        column.quote_style.is_some(),
+    )
 }
 
 /// The name a written table reference spells, quoting and qualifier kept.
@@ -2203,7 +2219,7 @@ pub(crate) fn membership_exists_parts<'a, DB: DatabaseLike>(
         if qualifier.is_some_and(|qualifier| !is_member_qualifier(qualifier)) {
             return None;
         }
-        catalog_helpers::column_id(database, member_table, column)
+        written_column(database, member_table, column)
     };
     let subscribed_column = |expr: &Expr| -> Option<crate::ColumnId> {
         let (qualifier, column) = qualified_parts(expr)?;
@@ -2214,7 +2230,7 @@ pub(crate) fn membership_exists_parts<'a, DB: DatabaseLike>(
         {
             return None;
         }
-        catalog_helpers::column_id(database, table_id, column)
+        written_column(database, table_id, column)
     };
     // Both builds resolve the membership column to classify the pair. Only
     // the `membership-term` half stores it.
@@ -2538,9 +2554,9 @@ mod membership_naming_tests {
     use sqlparser::dialect::PostgreSqlDialect;
 
     const DDL: &str = r#"CREATE SCHEMA app;
-        CREATE TABLE docs (id INT PRIMARY KEY, title TEXT);
+        CREATE TABLE docs (id INT PRIMARY KEY, title TEXT, "Owner" INT, owner INT);
         CREATE TABLE "my.shares" (doc_id INT, viewer TEXT);
-        CREATE TABLE app."Shares" (doc_id INT, viewer TEXT);
+        CREATE TABLE app."Shares" (doc_id INT, viewer TEXT, "Doc.Id" INT);
         CREATE TABLE "Shares" (id INT PRIMARY KEY);"#;
 
     /// The `EXISTS` subquery of `sql`, which the parser hands back verbatim.
@@ -2655,5 +2671,58 @@ mod membership_naming_tests {
         let parts = membership_exists_parts(&subquery, shares, &db)
             .expect("the alias names the membership side, the written name the subscribed one");
         assert_eq!(parts.pairs.len(), 1);
+    }
+
+    /// A column written quoted reaches the column stored under that exact
+    /// spelling, and the unquoted spelling reaches the other one.
+    ///
+    /// `docs` declares `"Owner"` and `owner` side by side, which is two
+    /// columns in PostgreSQL, so the pair's subscribed side has to carry
+    /// the quoting the filter wrote to name either of them.
+    #[test]
+    fn a_quoted_column_names_the_column_stored_quoted() {
+        let db = ParserDB::parse::<PostgreSqlDialect>(DDL).unwrap();
+        let docs = catalog_helpers::table_id(&db, "docs").unwrap();
+        let quoted_owner = catalog_helpers::column_id(&db, docs, r#""Owner""#).unwrap();
+        let bare_owner = catalog_helpers::column_id(&db, docs, "owner").unwrap();
+        assert_ne!(quoted_owner, bare_owner);
+
+        for (written, expected) in [(r#""Owner""#, quoted_owner), ("owner", bare_owner)] {
+            let subquery = exists_subquery(&alloc::format!(
+                r#"SELECT * FROM docs WHERE EXISTS (SELECT 1 FROM app."Shares" s
+                   WHERE s.doc_id = docs.{written}
+                     AND s.viewer = current_setting('app.user_id', true))"#
+            ));
+
+            let parts = membership_exists_parts(&subquery, docs, &db)
+                .expect("the subscribed column is named as written");
+            let [pair] = parts.pairs.as_slice() else {
+                panic!("one pair");
+            };
+            assert_eq!(pair.outer, expected, "`docs.{written}`");
+        }
+    }
+
+    /// A membership column whose real name carries a dot is named by its
+    /// quoted spelling, the same way its table is.
+    #[cfg(feature = "membership-term")]
+    #[test]
+    fn a_membership_column_named_with_a_dot_resolves() {
+        let db = ParserDB::parse::<PostgreSqlDialect>(DDL).unwrap();
+        let docs = catalog_helpers::table_id(&db, "docs").unwrap();
+        let shares = catalog_helpers::table_id(&db, r#"app."Shares""#).unwrap();
+        let dotted = catalog_helpers::column_id(&db, shares, r#""Doc.Id""#).unwrap();
+        let subquery = exists_subquery(
+            r#"SELECT * FROM docs WHERE EXISTS (SELECT 1 FROM app."Shares" s
+               WHERE s."Doc.Id" = docs.id
+                 AND s.viewer = current_setting('app.user_id', true))"#,
+        );
+
+        let parts = membership_exists_parts(&subquery, docs, &db)
+            .expect("the membership column is named as written");
+        let [pair] = parts.pairs.as_slice() else {
+            panic!("one pair");
+        };
+        assert_eq!(pair.inner, dotted);
     }
 }

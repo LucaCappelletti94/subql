@@ -17,7 +17,7 @@ use alloc::vec::Vec;
 use sql_traits::{
     prelude::{ColumnLike, DatabaseLike, TableLike},
     structs::{FingerprintError, SchemaFingerprint, TargetName},
-    utils::scalar_family::scalar_family,
+    utils::{identifier_resolution::identifiers_match, scalar_family::scalar_family},
 };
 use sqlite_diff_rs::SimpleTable;
 
@@ -116,6 +116,35 @@ pub fn column_id<DB: DatabaseLike>(
 ) -> Option<ColumnId> {
     let table = database.table_by_id(table_id as usize)?;
     let ordinal = table.column_id_by_name(column_name, database).ok()??;
+    u16::try_from(ordinal).ok()
+}
+
+/// Resolve a column whose name a caller already holds, quoting included.
+///
+/// [`column_id`] is for text spelled as SQL, where the lookup carries its
+/// own quotes. This is for a caller holding a parsed identifier, whose text
+/// and quoting arrive separately: rendering them back to a lookup string
+/// would either lose the quoting, which silently reaches a differently
+/// spelled column, or need an allocation per lookup to put the quotes back.
+///
+/// **Complexity**: O(n) per call where `n = table.number_of_columns()`, the
+/// same walk [`column_id`] performs.
+#[must_use]
+pub fn column_id_for_name<DB: DatabaseLike>(
+    database: &DB,
+    table_id: TableId,
+    column_name: &str,
+    column_name_is_quoted: bool,
+) -> Option<ColumnId> {
+    let table = database.table_by_id(table_id as usize)?;
+    let ordinal = table.columns(database).ok()?.position(|column| {
+        identifiers_match(
+            column.column_name(),
+            column.column_name_is_quoted(),
+            column_name,
+            column_name_is_quoted,
+        )
+    })?;
     u16::try_from(ordinal).ok()
 }
 
