@@ -619,9 +619,10 @@ mod streamed_tests {
     }
     /// How long a replication read may take before the test gives up.
     ///
-    /// A hang guard, not a latency budget. The suite asserts streaming
-    /// latency in `pg_streaming_e2e::next_event_delivers_insert_within_latency_budget`
-    /// and nowhere else; here the deadline exists only so a stalled slot
+    /// A hang guard, not a latency budget. That delivery rides the wire rather
+    /// than a tick is asserted in
+    /// `pg_streaming_e2e::next_event_delivers_an_insert_without_waiting_for_a_tick`
+    /// and nowhere else. Here the deadline exists only so a stalled slot
     /// fails instead of hanging the run. Thirty seconds is what the rest of
     /// the container suite uses for the same purpose, at
     /// `cdc_equivalence::DRAIN_HANG_GUARD` and `cdc_cross_db.rs:351`.

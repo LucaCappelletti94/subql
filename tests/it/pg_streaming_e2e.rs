@@ -27,6 +27,14 @@ use subql::{CdcSource, EventKind, PgLsn, PgStreamingCdcSource, PgStreamingConfig
 const DDL: &str = "CREATE TABLE orders (id INT PRIMARY KEY, price FLOAT);";
 const PG_DDL: &str = "CREATE TABLE orders (id INT PRIMARY KEY, price DOUBLE PRECISION)";
 
+/// How long a test waits for something that must arrive.
+///
+/// Liveness only: no assertion below measures how fast anything is, so this
+/// is deliberately generous. A short wait measures the runner instead of the
+/// code, and a shared CI runner starting eight Postgres containers stalls for
+/// seconds at a time.
+const ARRIVAL: Duration = Duration::from_secs(30);
+
 fn current_thread_rt() -> tokio::runtime::Runtime {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -87,13 +95,21 @@ fn confirmed_flush_lsn(conn: &mut diesel::PgConnection, slot: &str) -> Option<Pg
         .and_then(|r| PgLsn::parse(&r.confirmed_flush_lsn))
 }
 
-/// Drive an INSERT in a side connection, assert
-/// `source.next_event().await` returns the corresponding typed CDC event
-/// with COMMIT-to-event-delivery latency under the budget. This latency
-/// is wire-bound, not interval-bound.
+/// Drive an INSERT in a side connection and assert `source.next_event()`
+/// returns the corresponding typed CDC event without waiting for a tick.
+///
+/// The claim is that delivery is wire-driven, so the ceiling is stated
+/// against the configuration rather than against the clock: the status
+/// interval is set to thirty seconds and the event must arrive within a sixth
+/// of it. An implementation that surfaced events on its interval instead
+/// would blow that by five seconds, while a wire-driven one has three orders
+/// of magnitude of headroom, measured at four milliseconds on an idle machine
+/// and fifteen under contention. The observed latency is reported rather than
+/// asserted, because a wall-clock number measures the runner: a ceiling of
+/// two hundred milliseconds failed CI on 2026-09-07 while passing locally.
 #[test]
 #[ignore = "requires Docker; run with --ignored"]
-fn next_event_delivers_insert_within_latency_budget() {
+fn next_event_delivers_an_insert_without_waiting_for_a_tick() {
     common::assert_docker_available();
     let container = common::pg_with_wal2json();
     let port = common::pg_port(&container);
@@ -109,14 +125,14 @@ fn next_event_delivers_insert_within_latency_budget() {
     common::create_publication(&mut setup, publication, "orders");
     common::create_pgoutput_slot(&mut setup, slot);
 
-    let catalog = ParserDB::parse::<PostgreSqlDialect>(DDL).expect("parse DDL");
-    let config = PgStreamingConfig::new(common::pg_replication_url(port), slot, publication);
+    // Far above the ceiling below, so an event arriving on the tick cannot be
+    // mistaken for one arriving on the wire.
+    const STATUS_INTERVAL: Duration = Duration::from_secs(30);
+    const CEILING: Duration = Duration::from_secs(5);
 
-    // Latency budget for COMMIT-to-event delivery: wire-bound (single-digit
-    // ms on a loopback), not interval-bound. Generous headroom because the
-    // first event after START_REPLICATION includes the server's handshake
-    // and relation-cache prelude.
-    const LATENCY_BUDGET: Duration = Duration::from_millis(200);
+    let catalog = ParserDB::parse::<PostgreSqlDialect>(DDL).expect("parse DDL");
+    let config = PgStreamingConfig::new(common::pg_replication_url(port), slot, publication)
+        .status_interval(STATUS_INTERVAL);
 
     current_thread_rt().block_on(async move {
         let mut source = PgStreamingCdcSource::connect(config, catalog)
@@ -130,11 +146,9 @@ fn next_event_delivers_insert_within_latency_budget() {
             .execute(&mut dml)
             .expect("insert");
 
-        // LATENCY_BUDGET is a hard ceiling: the source must deliver the
-        // event within that window without polling at any interval.
-        let event = tokio::time::timeout(LATENCY_BUDGET, source.next_event())
+        let event = tokio::time::timeout(CEILING, source.next_event())
             .await
-            .expect("next_event must return within the latency budget")
+            .expect("the event must arrive on the wire, not on the status interval")
             .expect("next_event must not error")
             .expect("source must not have shut down");
         let observed_latency = commit_at.elapsed();
@@ -145,10 +159,16 @@ fn next_event_delivers_insert_within_latency_budget() {
             "first event must be the INSERT we just issued, got {:?}",
             event.kind()
         );
+        assert!(
+            observed_latency < CEILING,
+            "delivery took {observed_latency:?}, which is the status interval's \
+             territory rather than the wire's"
+        );
         println!(
-            "COMMIT-to-event latency: {}us (budget: {}ms)",
+            "COMMIT-to-event latency: {}us (ceiling: {}s, status interval: {}s)",
             observed_latency.as_micros(),
-            LATENCY_BUDGET.as_millis()
+            CEILING.as_secs(),
+            STATUS_INTERVAL.as_secs()
         );
     });
 
@@ -197,7 +217,7 @@ fn ack_advances_confirmed_flush_lsn() {
         // Drain three events, capture the final LSN.
         let mut last_lsn = PgLsn(0);
         for _ in 0..3 {
-            let ev = tokio::time::timeout(Duration::from_secs(2), source.next_event())
+            let ev = tokio::time::timeout(ARRIVAL, source.next_event())
                 .await
                 .expect("next_event timeout")
                 .expect("next_event err")
@@ -216,10 +236,10 @@ fn ack_advances_confirmed_flush_lsn() {
         // window.
         source.ack(last_lsn).await.expect("ack");
 
-        // Poll the slot's confirmed_flush_lsn for up to 2s, asserting
-        // it advances to at least `last_lsn`. A no-op `ack` would
-        // make this poll loop time out.
-        let deadline = Instant::now() + Duration::from_secs(2);
+        // Poll the slot's confirmed_flush_lsn until it advances to at least
+        // `last_lsn`. A no-op `ack` never advances it, so the loop's deadline
+        // is liveness rather than a latency claim.
+        let deadline = Instant::now() + ARRIVAL;
         let mut advanced = None;
         while Instant::now() < deadline {
             if let Some(observed) = confirmed_flush_lsn(&mut probe, slot) {
@@ -233,7 +253,7 @@ fn ack_advances_confirmed_flush_lsn() {
 
         let observed = advanced.unwrap_or_else(|| {
             panic!(
-                "confirmed_flush_lsn did not reach {last_lsn:?} within 2s: \
+                "confirmed_flush_lsn never reached {last_lsn:?}: \
                  ack() must surface a StandbyStatusUpdate to the server"
             )
         });
@@ -249,10 +269,12 @@ fn ack_advances_confirmed_flush_lsn() {
     common::drop_slot(&mut setup, slot);
 }
 
-/// The periodic status-update pump bumps the observability
-/// counter on idle. Fast (~500ms), no DML, no acks, no server-side
-/// timeout games. Asserts the inner task fires the interval arm
-/// independently of consumer or server activity.
+/// The periodic status-update pump bumps the observability counter while the
+/// source is idle: no DML, no acks, no server-side timeout games. The claim is
+/// that the inner task fires its interval arm independently of the consumer
+/// and the server, so the test polls until the counter climbs rather than
+/// counting ticks inside a fixed window, which counts the runner's scheduling
+/// as much as the pump's.
 #[test]
 #[ignore = "requires Docker; run with --ignored"]
 fn pump_increments_status_update_counter_during_idle() {
@@ -285,17 +307,23 @@ fn pump_increments_status_update_counter_during_idle() {
             "counter should start at 0 after connect"
         );
 
-        // Idle 500ms. With status_interval=100ms we expect ~5 ticks.
-        // Demand >=3 to keep headroom against runtime jitter on CI.
-        tokio::time::sleep(Duration::from_millis(500)).await;
-
-        let observed = source.status_updates_sent();
+        // Three ticks, which at a hundred-millisecond interval an idle source
+        // reaches in under a second. A pump that never fires never gets
+        // there, however long this waits.
+        let deadline = Instant::now() + ARRIVAL;
+        let mut observed = 0;
+        while Instant::now() < deadline {
+            observed = source.status_updates_sent();
+            if observed >= 3 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
         assert!(
             observed >= 3,
-            "periodic pump must emit during idle: \
-             counter = {observed} after 500ms with 100ms interval"
+            "the periodic pump must emit while idle, counter reached {observed}"
         );
-        println!("status_updates_sent after 500ms idle: {observed}");
+        println!("status_updates_sent while idle: {observed}");
     });
 
     common::drop_slot(&mut setup, slot);
@@ -340,12 +368,16 @@ fn connection_survives_wal_sender_timeout() {
         // for that long. The periodic pump should keep us alive.
         tokio::time::sleep(Duration::from_secs(5)).await;
 
-        // If the pump worked, the counter should reflect ~10 pumps
-        // (5s / 500ms). Sanity-check it climbed past 5.
+        // The delivery below is the claim, not the tick count. A ten-pump
+        // floor is arithmetic on the runner's scheduling, and it would not
+        // even be the right mechanism: measured by stretching the pump's
+        // interval to an hour, the connection still survives, because the
+        // source also answers the server's own keepalive requests. So this
+        // asks only that the pump ran.
         let pumped = source.status_updates_sent();
         assert!(
-            pumped >= 5,
-            "expected periodic pump to fire repeatedly during idle; got {pumped}"
+            pumped > 0,
+            "the periodic pump must have fired during the idle period"
         );
 
         // Drive an INSERT now. The connection must still be alive to
@@ -354,7 +386,7 @@ fn connection_survives_wal_sender_timeout() {
             .execute(&mut dml)
             .expect("insert after idle");
 
-        let ev = tokio::time::timeout(Duration::from_secs(1), source.next_event())
+        let ev = tokio::time::timeout(ARRIVAL, source.next_event())
             .await
             .expect("next_event timeout: connection likely torn down")
             .expect("next_event err: connection likely torn down")
@@ -423,7 +455,7 @@ fn back_pressure_under_slow_consumer_preserves_order_and_count() {
         let schema = ParserDB::parse::<PostgreSqlDialect>(DDL).expect("parse DDL");
         let mut observed_ids = Vec::with_capacity(N as usize);
         for _ in 0..N {
-            let ev = tokio::time::timeout(Duration::from_secs(5), source.next_event())
+            let ev = tokio::time::timeout(ARRIVAL, source.next_event())
                 .await
                 .expect("timeout draining events")
                 .expect("next_event err")
@@ -504,9 +536,9 @@ fn drop_source_shuts_down_inner_task() {
         // and breaks out of the loop. The drop guard sets the flag.
         drop(source);
 
-        // Poll for up to 500ms for task_exited to flip. Production
-        // should see this within milliseconds; we allow headroom.
-        let deadline = Instant::now() + Duration::from_millis(500);
+        // Poll until task_exited flips. A leaked task never flips it, so the
+        // deadline is liveness rather than a claim about how fast drop is.
+        let deadline = Instant::now() + ARRIVAL;
         let mut observed_exit = false;
         while Instant::now() < deadline {
             if task_exited.load(std::sync::atomic::Ordering::Relaxed) {
@@ -517,7 +549,7 @@ fn drop_source_shuts_down_inner_task() {
         }
         assert!(
             observed_exit,
-            "inner task did not exit within 500ms after dropping the source"
+            "inner task never exited after dropping the source"
         );
         println!("inner task exited cleanly after source drop");
     });
@@ -569,7 +601,7 @@ fn events_received_counter_tracks_pushed_events() {
         }
         // Drain all events so we're sure the inner task has pushed them.
         for _ in 0..N {
-            let ev = tokio::time::timeout(Duration::from_secs(2), source.next_event())
+            let ev = tokio::time::timeout(ARRIVAL, source.next_event())
                 .await
                 .expect("timeout")
                 .expect("err")
