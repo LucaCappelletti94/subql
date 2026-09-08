@@ -1446,8 +1446,8 @@ pub(super) fn postgres_reproduces(
     use TextOperation;
 
     let byte_ordered = |collation: &NamedColumnCollation<'_>| {
-        let name = collation.name();
-        name.name().eq_ignore_ascii_case("C") || name.name().eq_ignore_ascii_case("POSIX")
+        let name = collation.name().name();
+        name.eq_ignore_ascii_case("C") || name.eq_ignore_ascii_case("POSIX")
     };
     match (&column.collation, operation) {
         // A byte-ordered collation reproduces every operation.
@@ -1474,8 +1474,7 @@ pub(super) fn mysql_binary_text_rule(column: &ColumnComparisonOf<MySql>) -> Opti
     let ColumnCollation::Named(collation) = &column.collation else {
         return None;
     };
-    let target = collation.name();
-    let name = target.name();
+    let name = collation.name().name();
     if !name.to_ascii_lowercase().ends_with("_bin") {
         return None;
     }
@@ -1497,12 +1496,11 @@ pub(super) fn mysql_binary_text_rule(column: &ColumnComparisonOf<MySql>) -> Opti
 /// rule serves every operation. `NOCASE` folds ASCII case only, measured:
 /// it leaves a ligature and the NFC/NFD distinction alone.
 pub(super) fn sqlite_text_rule(column: &ColumnComparisonOf<SQLite>) -> Option<TextRule> {
-    let named = match &column.collation {
+    let name = match &column.collation {
         ColumnCollation::DatabaseDefault => return Some(TextRule::EXACT),
-        ColumnCollation::Named(collation) => collation.name(),
+        ColumnCollation::Named(collation) => collation.name().name(),
         ColumnCollation::Unknown => return None,
     };
-    let name = named.name();
     if name.eq_ignore_ascii_case("binary") {
         Some(TextRule::EXACT)
     } else if name.eq_ignore_ascii_case("nocase") {
