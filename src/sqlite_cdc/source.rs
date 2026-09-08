@@ -96,6 +96,10 @@ impl<DB: DatabaseLike> SqliteCdcSource<DB> {
     /// `.changeset()`. [`SqliteCdcError::Parse`] when the emitted
     /// changeset bytes cannot be decoded.
     pub fn poll_next_event(&mut self) -> Result<Option<SqliteChangesetEvent>, SqliteCdcError> {
+        // The buffer half of this guard is about eagerness, not order: a drain
+        // taken while events are still buffered would deliver the same events
+        // in the same sequence, since the export appends behind them. It only
+        // avoids exporting a changeset nobody is waiting for.
         if self.pending.is_empty() && !self.session.is_empty() {
             let bytes = self.session.changeset()?;
             let events = SqliteChangesetParser.parse_wal_message(&bytes, &self.catalog)?;
@@ -227,6 +231,17 @@ mod tests {
         for ev in &drained {
             assert_eq!(ev.kind(), crate::EventKind::Insert);
         }
+        // In the order they were written. The buffer is drained front first,
+        // and a consumer that applies these downstream depends on that: three
+        // writes to one row arriving backwards leave the wrong row behind.
+        let ids: alloc::vec::Vec<Value<crate::backend::SQLite>> = drained
+            .iter()
+            .map(|ev| ev.value_at(source.catalog(), RowKind::New, 0).unwrap())
+            .collect();
+        assert_eq!(
+            ids,
+            alloc::vec![Value::Int(1), Value::Int(2), Value::Int(3)]
+        );
         assert!(source.poll_next_event().expect("post-drain poll").is_none());
     }
 
