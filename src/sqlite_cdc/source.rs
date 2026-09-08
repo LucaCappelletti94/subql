@@ -223,6 +223,28 @@ mod tests {
             .execute(source.connection())
             .expect("insert");
         }
+
+        // What the parser will make of the accumulated session, read before
+        // the source drains it. `changeset()` snapshots rather than consumes,
+        // so this does not disturb the poll below. The expectation comes from
+        // here rather than from the order the rows were written, because
+        // SQLite leaves the order of changes within one table undefined and
+        // this test is about the buffer, not about SQLite.
+        let expected: alloc::vec::Vec<Value<crate::backend::SQLite>> = {
+            let bytes = source.session.changeset().expect("snapshot the session");
+            let events = crate::wal::WalParser::parse_wal_message(
+                &SqliteChangesetParser,
+                &bytes,
+                source.catalog(),
+            )
+            .expect("the snapshot parses");
+            events
+                .iter()
+                .map(|ev| ev.value_at(source.catalog(), RowKind::New, 0).unwrap())
+                .collect()
+        };
+        assert_eq!(expected.len(), 3, "three inserts, three events");
+
         let mut drained = alloc::vec::Vec::new();
         while let Some(ev) = source.poll_next_event().expect("poll") {
             drained.push(ev);
@@ -231,17 +253,14 @@ mod tests {
         for ev in &drained {
             assert_eq!(ev.kind(), crate::EventKind::Insert);
         }
-        // In the order they were written. The buffer is drained front first,
-        // and a consumer that applies these downstream depends on that: three
-        // writes to one row arriving backwards leave the wrong row behind.
+        // Front first, in the parser's order. A consumer applying these
+        // downstream depends on it: writes to one row arriving backwards leave
+        // the wrong row behind.
         let ids: alloc::vec::Vec<Value<crate::backend::SQLite>> = drained
             .iter()
             .map(|ev| ev.value_at(source.catalog(), RowKind::New, 0).unwrap())
             .collect();
-        assert_eq!(
-            ids,
-            alloc::vec![Value::Int(1), Value::Int(2), Value::Int(3)]
-        );
+        assert_eq!(ids, expected, "the buffer delivers in the parser's order");
         assert!(source.poll_next_event().expect("post-drain poll").is_none());
     }
 
