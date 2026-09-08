@@ -226,11 +226,11 @@ impl<B: Backend> Compiling<B> {
                     .or(reference.right)
                     .and_then(|slot| self.comparisons.get(usize::from(slot)))
                     .and_then(|facts| match &facts.collation {
-                        crate::backend::CollationFacts::Named { name, .. } => {
-                            Some(name.name.clone())
+                        crate::backend::ColumnCollation::Named(collation) => {
+                            Some(alloc::string::String::from(collation.name().name()))
                         }
-                        crate::backend::CollationFacts::DatabaseDefault
-                        | crate::backend::CollationFacts::Unknown => None,
+                        crate::backend::ColumnCollation::DatabaseDefault
+                        | crate::backend::ColumnCollation::Unknown => None,
                     });
                 return Err(RegisterError::NotServedInProcess(
                     crate::errors::Refusal::CollationNotReproducible { column, collation },

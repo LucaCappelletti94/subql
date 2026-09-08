@@ -27,6 +27,14 @@ pub enum ScalarKind<C> {
 /// takes it for one cannot be corrected by the compiler.
 pub use sql_traits::utils::scalar_family::ScalarFamily;
 
+/// Collations are resolved and owned by sql-traits, and persisted here
+/// through that crate's `serde` feature.
+///
+/// Re-exported for the same reason as [`ScalarFamily`]: a call site names
+/// whose concept it is using. subql held a mirror of these three until the
+/// upstream types could be written down and read back.
+pub use sql_traits::traits::{ColumnCollation, MySqlCollationPadding, NamedColumnCollation};
+
 /// The width a declared floating-point type fixes.
 ///
 /// Measured: PostgreSQL's `real` and MySQL's `FLOAT` are float4, their
@@ -356,6 +364,20 @@ mod scalar_kind_serde_tests {
         Named,
     }
 
+    /// The collation facts a declared `COLLATE` resolves to.
+    fn named_collation(
+        name: &str,
+        name_is_quoted: bool,
+        schema: Option<&str>,
+        schema_is_quoted: bool,
+    ) -> super::ColumnCollation<'static> {
+        let mut target = sql_traits::structs::TargetName::new(name, name_is_quoted);
+        if let Some(schema) = schema {
+            target = target.with_schema(schema, schema_is_quoted);
+        }
+        super::ColumnCollation::Named(super::NamedColumnCollation::new(target)).into_owned()
+    }
+
     #[test]
     fn builtin_and_custom_kinds_round_trip_with_stable_tags() {
         let families = [
@@ -442,56 +464,45 @@ mod scalar_kind_serde_tests {
     fn scalar_kind_rejects_an_unknown_builtin_tag() {
         assert!(postcard::from_bytes::<ScalarKind<TestCustom>>(&[0, 16]).is_err());
     }
-}
-/// Owned SQL name for a column's declared collation.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
-pub struct CollationName {
-    /// Identifier without surrounding quotes.
-    pub name: alloc::string::String,
-    /// Whether the identifier was quoted.
-    pub name_is_quoted: bool,
-    /// Optional schema identifier without surrounding quotes.
-    pub schema: Option<alloc::string::String>,
-    /// Whether the schema identifier was quoted.
-    pub schema_is_quoted: bool,
-}
 
-/// Whether a collation ignores trailing spaces, mirrored from
-/// [`sql_traits::traits::MySqlCollationPadding`] so a persisted descriptor
-/// carries no foreign type.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
-pub enum TrailingSpacePadding {
-    /// Comparisons ignore trailing spaces.
-    PadSpace,
-    /// Comparisons keep trailing spaces significant.
-    NoPad,
-}
+    /// A comparison's persisted bytes, pinned because the compiled program
+    /// carries them and a reader refuses only a version it was told about.
+    ///
+    /// `postcard` writes no field names, so a change in the collation's
+    /// shape is invisible to a reader that still accepts the version.
+    /// Asserting the bytes makes that change fail here instead.
+    #[test]
+    fn a_collated_comparison_has_a_pinned_persisted_shape() {
+        use super::{ColumnComparison, DeclaredType, TextWidth};
 
-impl From<sql_traits::traits::MySqlCollationPadding> for TrailingSpacePadding {
-    fn from(padding: sql_traits::traits::MySqlCollationPadding) -> Self {
-        match padding {
-            sql_traits::traits::MySqlCollationPadding::PadSpace => Self::PadSpace,
-            sql_traits::traits::MySqlCollationPadding::NoPad => Self::NoPad,
-        }
+        let comparison = ColumnComparison::<TestCustom> {
+            kind: ScalarKind::Builtin(DeclaredType::Text(TextWidth::Varying)),
+            declared_type: alloc::string::String::from("TEXT"),
+            collation: named_collation("und-x-icu", true, Some("app"), false),
+        };
+
+        let encoded = postcard::to_allocvec(&comparison).unwrap();
+        assert_eq!(
+            encoded,
+            [
+                // `ScalarKind::Builtin(Text(Varying))`.
+                0, 4, //
+                // `declared_type`, length then text.
+                4, b'T', b'E', b'X', b'T', //
+                // `ColumnCollation::Named`.
+                1, //
+                // The name, quoted, and the schema, unquoted.
+                9, b'u', b'n', b'd', b'-', b'x', b'-', b'i', b'c', b'u', 1, //
+                1, 3, b'a', b'p', b'p', 0, //
+                // No PostgreSQL determinism and no padding.
+                0, 0,
+            ]
+        );
+        assert_eq!(
+            postcard::from_bytes::<ColumnComparison<TestCustom>>(&encoded),
+            Ok(comparison)
+        );
     }
-}
-
-/// Comparison metadata a column's declared collation carries.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
-pub enum CollationFacts {
-    /// The database default applies.
-    DatabaseDefault,
-    /// The column declares a named collation.
-    Named {
-        /// Declared collation name.
-        name: CollationName,
-        /// PostgreSQL determinism when known.
-        postgres_deterministic: Option<bool>,
-        /// Trailing-space rule when known.
-        padding: Option<TrailingSpacePadding>,
-    },
-    /// Comparison rules changed without a resolved collation name.
-    Unknown,
 }
 
 /// The catalog facts a comparison of one column depends on.
@@ -506,8 +517,14 @@ pub struct ColumnComparison<C> {
     pub kind: ScalarKind<C>,
     /// Canonical declared SQL type.
     pub declared_type: alloc::string::String,
-    /// Column comparison metadata.
-    pub collation: CollationFacts,
+    /// Column comparison metadata, as `sql-traits` resolves it.
+    ///
+    /// Persisted inside the compiled program through that crate's `serde`
+    /// feature, so subql keeps no copy of the shape. The postcard encoding
+    /// is pinned by `a_collated_comparison_has_a_pinned_persisted_shape`,
+    /// because a reader refuses only a format version it was told about and
+    /// an upstream field would otherwise change the bytes silently.
+    pub collation: ColumnCollation<'static>,
 }
 
 impl<C> ColumnComparison<C> {
@@ -532,15 +549,16 @@ impl<C> ColumnComparison<C> {
 
     /// Whether the column's collation declares that comparisons ignore
     /// trailing spaces, which is MySQL's `PAD SPACE`.
+    ///
+    /// Not `const`: the padding is behind an accessor upstream.
     #[must_use]
-    pub const fn collation_pads_trailing_spaces(&self) -> bool {
-        matches!(
-            &self.collation,
-            CollationFacts::Named {
-                padding: Some(TrailingSpacePadding::PadSpace),
-                ..
+    pub fn collation_pads_trailing_spaces(&self) -> bool {
+        match &self.collation {
+            ColumnCollation::Named(collation) => {
+                collation.mysql_padding() == Some(MySqlCollationPadding::PadSpace)
             }
-        )
+            ColumnCollation::DatabaseDefault | ColumnCollation::Unknown => false,
+        }
     }
 }
 
@@ -883,7 +901,9 @@ impl TextResolution {
 /// ```
 pub(super) fn named_collations_conflict<B: Backend>(comparison: &ComparisonContext<'_, B>) -> bool {
     let named = |side: Option<&ColumnComparisonOf<B>>| match side.map(|facts| &facts.collation) {
-        Some(CollationFacts::Named { name, .. }) => Some(name.name.to_ascii_lowercase()),
+        Some(ColumnCollation::Named(collation)) => {
+            Some(collation.name().name().to_ascii_lowercase())
+        }
         _ => None,
     };
     match (named(comparison.left), named(comparison.right)) {
@@ -1425,24 +1445,19 @@ pub(super) fn postgres_reproduces(
 ) -> bool {
     use TextOperation;
 
-    let byte_ordered = |name: &CollationName| {
-        name.name.eq_ignore_ascii_case("C") || name.name.eq_ignore_ascii_case("POSIX")
+    let byte_ordered = |collation: &NamedColumnCollation<'_>| {
+        let name = collation.name();
+        name.name().eq_ignore_ascii_case("C") || name.name().eq_ignore_ascii_case("POSIX")
     };
     match (&column.collation, operation) {
         // A byte-ordered collation reproduces every operation.
-        (CollationFacts::Named { name, .. }, _) if byte_ordered(name) => true,
+        (ColumnCollation::Named(collation), _) if byte_ordered(collation) => true,
         // Ordering and case folding under any other collation are the
         // locale's.
         (_, TextOperation::Ordering | TextOperation::CaseInsensitivePattern) => false,
-        (CollationFacts::DatabaseDefault, _) => true,
-        (
-            CollationFacts::Named {
-                postgres_deterministic: Some(true),
-                ..
-            },
-            _,
-        ) => true,
-        (CollationFacts::Named { .. } | CollationFacts::Unknown, _) => false,
+        (ColumnCollation::DatabaseDefault, _) => true,
+        (ColumnCollation::Named(collation), _) => collation.postgres_deterministic() == Some(true),
+        (ColumnCollation::Unknown, _) => false,
     }
 }
 
@@ -1456,19 +1471,19 @@ pub(super) fn postgres_reproduces(
 /// `information_schema.COLLATIONS.PAD_ATTRIBUTE` names: `utf8mb4_bin` is
 /// `PAD SPACE` and `utf8mb4_0900_bin` is `NO PAD`, both measured.
 pub(super) fn mysql_binary_text_rule(column: &ColumnComparisonOf<MySql>) -> Option<TextRule> {
-    let CollationFacts::Named { name, padding, .. } = &column.collation else {
+    let ColumnCollation::Named(collation) = &column.collation else {
         return None;
     };
-    if !name.name.to_ascii_lowercase().ends_with("_bin") {
+    let target = collation.name();
+    let name = target.name();
+    if !name.to_ascii_lowercase().ends_with("_bin") {
         return None;
     }
-    let spaces = match padding {
-        Some(TrailingSpacePadding::PadSpace) => TrailingSpaces::BothIgnored,
-        Some(TrailingSpacePadding::NoPad) => TrailingSpaces::BothSignificant,
-        None if name.name.eq_ignore_ascii_case("utf8mb4_bin") => TrailingSpaces::BothIgnored,
-        None if name.name.eq_ignore_ascii_case("utf8mb4_0900_bin") => {
-            TrailingSpaces::BothSignificant
-        }
+    let spaces = match collation.mysql_padding() {
+        Some(MySqlCollationPadding::PadSpace) => TrailingSpaces::BothIgnored,
+        Some(MySqlCollationPadding::NoPad) => TrailingSpaces::BothSignificant,
+        None if name.eq_ignore_ascii_case("utf8mb4_bin") => TrailingSpaces::BothIgnored,
+        None if name.eq_ignore_ascii_case("utf8mb4_0900_bin") => TrailingSpaces::BothSignificant,
         // A binary collation this build cannot place on either side of the
         // padding question is not reproduced, rather than guessed.
         None => return None,
@@ -1482,21 +1497,23 @@ pub(super) fn mysql_binary_text_rule(column: &ColumnComparisonOf<MySql>) -> Opti
 /// rule serves every operation. `NOCASE` folds ASCII case only, measured:
 /// it leaves a ligature and the NFC/NFD distinction alone.
 pub(super) fn sqlite_text_rule(column: &ColumnComparisonOf<SQLite>) -> Option<TextRule> {
-    match &column.collation {
-        CollationFacts::DatabaseDefault => Some(TextRule::EXACT),
-        CollationFacts::Named { name, .. } if name.name.eq_ignore_ascii_case("binary") => {
-            Some(TextRule::EXACT)
-        }
-        CollationFacts::Named { name, .. } if name.name.eq_ignore_ascii_case("nocase") => {
-            Some(TextRule {
-                case: TextCase::AsciiNoCase,
-                spaces: TrailingSpaces::BothSignificant,
-            })
-        }
-        CollationFacts::Named { name, .. } if name.name.eq_ignore_ascii_case("rtrim") => {
-            Some(TextRule::EXACT.with_spaces(TrailingSpaces::BothIgnored))
-        }
-        CollationFacts::Named { .. } | CollationFacts::Unknown => None,
+    let named = match &column.collation {
+        ColumnCollation::DatabaseDefault => return Some(TextRule::EXACT),
+        ColumnCollation::Named(collation) => collation.name(),
+        ColumnCollation::Unknown => return None,
+    };
+    let name = named.name();
+    if name.eq_ignore_ascii_case("binary") {
+        Some(TextRule::EXACT)
+    } else if name.eq_ignore_ascii_case("nocase") {
+        Some(TextRule {
+            case: TextCase::AsciiNoCase,
+            spaces: TrailingSpaces::BothSignificant,
+        })
+    } else if name.eq_ignore_ascii_case("rtrim") {
+        Some(TextRule::EXACT.with_spaces(TrailingSpaces::BothIgnored))
+    } else {
+        None
     }
 }
 

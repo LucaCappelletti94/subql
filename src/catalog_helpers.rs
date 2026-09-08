@@ -21,9 +21,7 @@ use sql_traits::{
 };
 use sqlite_diff_rs::SimpleTable;
 
-use crate::backend::{
-    CollationFacts, CollationName, ColumnComparison, ColumnComparisonOf, ScalarKind, ScalarKindOf,
-};
+use crate::backend::{ColumnComparison, ColumnComparisonOf, ScalarKind, ScalarKindOf};
 use crate::types::{ColumnId, TableId};
 
 /// Resolve a table name, written as SQL, to subql's compact [`TableId`].
@@ -357,23 +355,7 @@ pub fn column_comparison<B: crate::backend::Backend, DB: DatabaseLike>(
         .ok()??;
     let declared_type = column.data_type(database).into_owned();
     let kind = classify_scalar_kind::<B>(&declared_type)?;
-    let collation = match column.collation(database).ok()? {
-        sql_traits::traits::ColumnCollation::DatabaseDefault => CollationFacts::DatabaseDefault,
-        sql_traits::traits::ColumnCollation::Named(collation) => {
-            let target = collation.name();
-            CollationFacts::Named {
-                name: CollationName {
-                    name: target.name().to_string(),
-                    name_is_quoted: target.name_is_quoted(),
-                    schema: target.schema().map(ToString::to_string),
-                    schema_is_quoted: target.schema_is_quoted(),
-                },
-                postgres_deterministic: collation.postgres_deterministic(),
-                padding: collation.mysql_padding().map(Into::into),
-            }
-        }
-        sql_traits::traits::ColumnCollation::Unknown => CollationFacts::Unknown,
-    };
+    let collation = column.collation(database).ok()?.into_owned();
     Some(ColumnComparison {
         kind,
         declared_type,
@@ -802,7 +784,7 @@ mod tests {
 
     #[test]
     fn column_comparison_preserves_postgres_collation_facts() {
-        use crate::backend::{CollationFacts, ColumnComparisonOf};
+        use crate::backend::{ColumnCollation, ColumnComparisonOf};
 
         let db = ParserDB::parse::<sqlparser::dialect::PostgreSqlDialect>(
             "CREATE COLLATION ci (provider = icu, locale = 'und-u-ks-level2', deterministic = false);
@@ -815,21 +797,16 @@ mod tests {
             column_comparison::<Postgres, _>(&db, table, 0).unwrap();
         assert_eq!(column.kind, ScalarFamily::String.into());
         assert_eq!(column.declared_type, "TEXT");
-        let CollationFacts::Named {
-            name,
-            postgres_deterministic,
-            ..
-        } = column.collation
-        else {
+        let ColumnCollation::Named(collation) = column.collation else {
             panic!("expected named collation")
         };
-        assert_eq!(name.name, "ci");
-        assert_eq!(postgres_deterministic, Some(false));
+        assert_eq!(collation.name().name(), "ci");
+        assert_eq!(collation.postgres_deterministic(), Some(false));
     }
 
     #[test]
     fn column_comparison_distinguishes_default_and_unknown_collations() {
-        use crate::backend::{CollationFacts, ColumnComparisonOf};
+        use crate::backend::{ColumnCollation, ColumnComparisonOf};
 
         let default_db = ParserDB::parse::<sqlparser::dialect::SQLiteDialect>(
             "CREATE TABLE labels (name TEXT);",
@@ -838,7 +815,7 @@ mod tests {
         let table = table_id(&default_db, "labels").unwrap();
         let column: ColumnComparisonOf<crate::backend::SQLite> =
             column_comparison::<crate::backend::SQLite, _>(&default_db, table, 0).unwrap();
-        assert_eq!(column.collation, CollationFacts::DatabaseDefault);
+        assert_eq!(column.collation, ColumnCollation::DatabaseDefault);
 
         let unknown_db = ParserDB::parse::<sqlparser::dialect::MySqlDialect>(
             "CREATE TABLE labels (name TEXT CHARACTER SET utf8mb4);",
@@ -847,6 +824,6 @@ mod tests {
         let table = table_id(&unknown_db, "labels").unwrap();
         let column: ColumnComparisonOf<crate::backend::MySql> =
             column_comparison::<crate::backend::MySql, _>(&unknown_db, table, 0).unwrap();
-        assert_eq!(column.collation, CollationFacts::Unknown);
+        assert_eq!(column.collation, ColumnCollation::Unknown);
     }
 }

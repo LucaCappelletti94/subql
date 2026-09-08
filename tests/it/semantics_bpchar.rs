@@ -21,11 +21,11 @@
 //! * SQLite: `CHAR(n)` is just `TEXT`, stored as given, compared exactly.
 #![allow(clippy::unwrap_used)]
 
-use sql_traits::structs::ParserDB;
+use sql_traits::structs::{ParserDB, TargetName};
 use sqlparser::dialect::{MySqlDialect, PostgreSqlDialect, SQLiteDialect};
 use subql::backend::{
-    Backend, CollationFacts, CollationName, ColumnComparison, ComparisonContext, MySql, Postgres,
-    SQLite, ScalarFamily, TextOperation, Value,
+    Backend, ColumnCollation, ColumnComparison, ComparisonContext, MySql, NamedColumnCollation,
+    Postgres, SQLite, ScalarFamily, TextOperation, Value,
 };
 use subql::testing::TestEvent;
 use subql::{catalog_helpers, DefaultIds, SubscriptionEngine, SubscriptionRequest};
@@ -199,16 +199,10 @@ fn mysql_binary_collation_padding_is_per_collation() {
     let facts = |collation: &str| ColumnComparison {
         kind: ScalarFamily::String.into(),
         declared_type: "CHAR".to_string(),
-        collation: CollationFacts::Named {
-            name: CollationName {
-                name: collation.to_string(),
-                name_is_quoted: false,
-                schema: None,
-                schema_is_quoted: false,
-            },
-            postgres_deterministic: None,
-            padding: None,
-        },
+        collation: ColumnCollation::Named(NamedColumnCollation::new(TargetName::new(
+            collation, false,
+        )))
+        .into_owned(),
     };
     let padded = Value::<MySql>::String("ab   ".to_string());
     let bare = Value::<MySql>::String("ab".to_string());
@@ -311,16 +305,10 @@ fn a_pattern_keeps_trailing_spaces_whatever_the_collation_pads() {
     let facts = |collation: &str| ColumnComparison {
         kind: ScalarFamily::String.into(),
         declared_type: "VARCHAR".to_string(),
-        collation: CollationFacts::Named {
-            name: CollationName {
-                name: collation.to_string(),
-                name_is_quoted: false,
-                schema: None,
-                schema_is_quoted: false,
-            },
-            postgres_deterministic: None,
-            padding: None,
-        },
+        collation: ColumnCollation::Named(NamedColumnCollation::new(TargetName::new(
+            collation, false,
+        )))
+        .into_owned(),
     };
 
     let rule_for = |collation: &str, operation| {
@@ -350,16 +338,10 @@ fn a_pattern_keeps_trailing_spaces_whatever_the_collation_pads() {
         let facts = ColumnComparison {
             kind: ScalarFamily::String.into(),
             declared_type: "TEXT".to_string(),
-            collation: CollationFacts::Named {
-                name: CollationName {
-                    name: collation.to_string(),
-                    name_is_quoted: false,
-                    schema: None,
-                    schema_is_quoted: false,
-                },
-                postgres_deterministic: None,
-                padding: None,
-            },
+            collation: ColumnCollation::Named(NamedColumnCollation::new(TargetName::new(
+                collation, false,
+            )))
+            .into_owned(),
         };
         let context = ComparisonContext {
             left: Some(&facts),

@@ -568,19 +568,19 @@ mod value_key_tests {
 #[allow(clippy::unwrap_used)]
 mod canonical_group_key_tests {
     use crate::backend::{
-        Backend, CollationFacts, CollationName, ColumnComparison, MySql, NoCustom, Pg18, Postgres,
-        SQLite, ScalarFamily, SqliteJson, Value,
+        Backend, ColumnCollation, ColumnComparison, MySql, NamedColumnCollation, NoCustom, Pg18,
+        Postgres, SQLite, ScalarFamily, SqliteJson, Value,
     };
     use alloc::{string::String, vec};
-    use sql_traits::traits::MySqlCollationPadding;
+    use sql_traits::{structs::TargetName, traits::MySqlCollationPadding};
 
     fn column(kind: ScalarFamily) -> ColumnComparison<NoCustom> {
-        column_with_collation(kind, CollationFacts::DatabaseDefault)
+        column_with_collation(kind, ColumnCollation::DatabaseDefault)
     }
 
     fn column_with_collation(
         kind: ScalarFamily,
-        collation: CollationFacts,
+        collation: ColumnCollation<'static>,
     ) -> ColumnComparison<NoCustom> {
         ColumnComparison {
             kind: kind.into(),
@@ -593,17 +593,13 @@ mod canonical_group_key_tests {
         name: &str,
         postgres_deterministic: Option<bool>,
         padding: Option<MySqlCollationPadding>,
-    ) -> CollationFacts {
-        CollationFacts::Named {
-            name: CollationName {
-                name: String::from(name),
-                name_is_quoted: false,
-                schema: None,
-                schema_is_quoted: false,
-            },
-            postgres_deterministic,
-            padding: padding.map(Into::into),
-        }
+    ) -> ColumnCollation<'static> {
+        ColumnCollation::Named(
+            NamedColumnCollation::new(TargetName::new(name, false))
+                .with_postgres_deterministic(postgres_deterministic)
+                .with_mysql_padding(padding),
+        )
+        .into_owned()
     }
 
     #[test]
@@ -677,7 +673,7 @@ mod canonical_group_key_tests {
         assert!(
             Postgres::<Pg18>::group_key_encoder(vec![column_with_collation(
                 ScalarFamily::String,
-                CollationFacts::Unknown,
+                ColumnCollation::Unknown,
             )])
             .is_none()
         );
