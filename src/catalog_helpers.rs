@@ -17,9 +17,7 @@ use alloc::vec::Vec;
 use sql_traits::{
     prelude::{ColumnLike, DatabaseLike, TableLike},
     structs::{FingerprintError, SchemaFingerprint, TargetName},
-    utils::{
-        identifier_resolution::stored_identifier_matches_lookup, scalar_family::scalar_family,
-    },
+    utils::scalar_family::scalar_family,
 };
 use sqlite_diff_rs::SimpleTable;
 
@@ -104,14 +102,20 @@ pub fn table_name<DB: DatabaseLike>(database: &DB, table_id: TableId) -> Option<
 
 /// Resolve a column name within a table to subql's compact [`ColumnId`].
 ///
-/// Identifier matching uses sql-traits' PostgreSQL semantics
-/// (quoted/unquoted aware). Returns `None` when the table is unknown,
-/// the column is not present, or the column's ordinal exceeds `u16::MAX`
-/// (>= 65536 columns in a single table, unreachable in any sane schema).
+/// Identifier matching is upstream's, through
+/// [`TableLike::column_id_by_name`], which applies the same quoting rule
+/// `DatabaseLike::table` applies to relations: a quoted lookup of an already
+/// folded spelling reaches a bare column, so `"id"` and `id` answer the same
+/// ordinal, while `"ID"` answers a separately declared quoted column.
+///
+/// Returns `None` when the table is unknown, the column is not present, or the
+/// column's ordinal exceeds `u16::MAX`, which is 65536 columns in one table
+/// and unreachable in any sane schema.
 ///
 /// **Complexity**: O(n) per call where `n = table.number_of_columns()`.
-/// Callers that need repeated lookups should cache results: this helper
-/// performs a linear scan over the table's columns on every invocation.
+/// Upstream answers with one walk rather than the nested walk this used to
+/// perform, but it is still a walk: callers needing repeated lookups should
+/// keep the result.
 #[must_use]
 pub fn column_id<DB: DatabaseLike>(
     database: &DB,
@@ -119,14 +123,7 @@ pub fn column_id<DB: DatabaseLike>(
     column_name: &str,
 ) -> Option<ColumnId> {
     let table = database.table_by_id(table_id as usize)?;
-    let column = table.columns(database).ok()?.find(|col| {
-        stored_identifier_matches_lookup(
-            col.column_name(),
-            col.column_name_is_quoted(),
-            column_name,
-        )
-    })?;
-    let ordinal = column.column_id(database).ok().flatten()?;
+    let ordinal = table.column_id_by_name(column_name, database).ok()??;
     u16::try_from(ordinal).ok()
 }
 
@@ -184,42 +181,41 @@ pub fn schema_fingerprint<DB: DatabaseLike>(
 
 /// Primary-key column ordinals for the table, in declaration order.
 ///
-/// `Ok(vec![])` is a table with no declared primary key. Failure is typed:
-/// a key column this helper cannot resolve is an error, never a silently
-/// shorter key.
+/// `Ok(vec![])` is a table with no declared primary key. Failure stays typed
+/// the whole way: upstream's
+/// [`TableLike::primary_key_column_ids`] answers
+/// [`LookupError::ColumnNotFound`](sql_traits::errors::LookupError::ColumnNotFound)
+/// for a key column that resolves to no ordinal rather than handing back a
+/// shorter key, and this maps that onto
+/// [`CatalogError::Lookup`](crate::CatalogError::Lookup), which is a refusal
+/// and never an empty key.
 ///
 /// # Errors
 /// [`CatalogError`](crate::CatalogError) when the table is unknown, a lookup
-/// fails, or a key column has no resolvable ordinal.
+/// fails, or a key column has no resolvable ordinal or one too wide for
+/// [`ColumnId`].
 pub fn primary_key_columns<DB: DatabaseLike>(
     database: &DB,
     table_id: TableId,
 ) -> Result<Vec<ColumnId>, crate::CatalogError> {
     let table = lookup_table(database, table_id)?;
-    let lookup = |error| crate::CatalogError::Lookup { table_id, error };
-    let mut ordinals = Vec::new();
-    for column in table.primary_key_columns(database).map_err(lookup)? {
-        let ordinal = column.column_id(database).map_err(lookup)?.ok_or_else(|| {
-            crate::CatalogError::Lookup {
-                table_id,
-                error: sql_traits::errors::LookupError::ColumnNotFound {
-                    table_name: table.table_name().to_string(),
-                    column_name: column.column_name().to_string(),
-                },
-            }
-        })?;
-        ordinals.push(
+    let ordinals = table
+        .primary_key_column_ids(database)
+        .map_err(|error| crate::CatalogError::Lookup { table_id, error })?;
+    ordinals
+        .into_iter()
+        .map(|ordinal| {
             u16::try_from(ordinal)
-                .map_err(|_| crate::CatalogError::UnknownColumn { table_id, ordinal })?,
-        );
-    }
-    Ok(ordinals)
+                .map_err(|_| crate::CatalogError::UnknownColumn { table_id, ordinal })
+        })
+        .collect()
 }
 
 /// Resolve a column's stored name from its compact [`ColumnId`].
 ///
-/// The inverse of [`column_id`]. Returns `None` when the table or column id is
-/// unknown.
+/// The inverse of [`column_id`], through
+/// [`TableLike::column_name_by_id`]. Returns `None` when the table or column
+/// id is unknown.
 #[must_use]
 pub fn column_name<DB: DatabaseLike>(
     database: &DB,
@@ -228,10 +224,10 @@ pub fn column_name<DB: DatabaseLike>(
 ) -> Option<alloc::string::String> {
     use alloc::string::ToString;
     let table = database.table_by_id(usize::try_from(table_id).ok()?)?;
-    let column = table
-        .column_by_id(usize::from(column_id), database)
+    let name = table
+        .column_name_by_id(usize::from(column_id), database)
         .ok()??;
-    Some(column.column_name().to_string())
+    Some(name.to_string())
 }
 
 /// Build a [`SimpleTable`] from the catalog for `table_id`.
@@ -653,6 +649,46 @@ mod tests {
         assert_eq!(primary_key_columns(&db, tid), Ok(vec![]));
     }
 
+    /// The identifier rule for a column lookup is upstream's, and it is not a
+    /// string compare: the lookup text is read as SQL would read it. A quoted
+    /// lookup of an already folded spelling reaches a bare column, so `"id"`
+    /// and `id` answer the same ordinal, while `"ID"` answers the separately
+    /// declared quoted column beside it.
+    #[test]
+    fn column_id_reads_the_lookup_as_sql_would() {
+        let db = ParserDB::parse::<GenericDialect>(
+            r#"CREATE TABLE mixed (id INT, "ID" INT, amount INT);"#,
+        )
+        .expect("DDL parses");
+        let tid = table_id(&db, "mixed").expect("mixed exists");
+
+        assert_eq!(column_id(&db, tid, "id"), Some(0));
+        assert_eq!(column_id(&db, tid, "\"id\""), Some(0));
+        assert_eq!(column_id(&db, tid, "\"ID\""), Some(1));
+        assert_eq!(
+            column_id(&db, tid, "ID"),
+            Some(0),
+            "an unquoted lookup folds, so it reaches the bare column"
+        );
+        // And the inverse answers the stored spelling of each.
+        assert_eq!(column_name(&db, tid, 0).as_deref(), Some("id"));
+        assert_eq!(column_name(&db, tid, 1).as_deref(), Some("ID"));
+    }
+
+    /// A composite key declared in an order the columns do not follow comes
+    /// back in key order. Sorting the ordinals, or reading the columns rather
+    /// than the key, answers `[0, 2]` and pairs every key value with the wrong
+    /// column.
+    #[test]
+    fn primary_key_columns_keeps_the_declared_key_order() {
+        let db = ParserDB::parse::<GenericDialect>(
+            "CREATE TABLE lots (id INT, amount INT, status TEXT, PRIMARY KEY (status, id));",
+        )
+        .expect("DDL parses");
+        let tid = table_id(&db, "lots").expect("lots exists");
+
+        assert_eq!(primary_key_columns(&db, tid), Ok(alloc::vec![2, 0]));
+    }
     /// A table id the catalog does not know is a typed refusal on every
     /// metadata helper, never a silent empty or false answer.
     #[test]

@@ -849,10 +849,11 @@ checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
 [[package]]
 name = "pg2sqlite"
 version = "0.1.0"
-source = "git+https://github.com/LucaCappelletti94/pg2sqlite?branch=main#683123173c611c03f0784ce7cc45e1fabb01d3bd"
+source = "git+https://github.com/LucaCappelletti94/pg2sqlite?branch=main#c6e9b9984799501842ab0d2b6a7b743f556adf78"
 dependencies = [
  "sql-traits",
  "sqlparser",
+ "sqlparser-plpgsql",
  "thiserror",
 ]
 
@@ -1204,7 +1205,7 @@ dependencies = [
 [[package]]
 name = "sql-traits"
 version = "0.1.0"
-source = "git+https://github.com/earth-metabolome-initiative/sql-traits?branch=main#e6b2a8da40f2af2ad44e8c119320dfb3604137dc"
+source = "git+https://github.com/earth-metabolome-initiative/sql-traits?branch=main#8c0ef445cb71e8b9f8b4b27b5c10385e9054a0b9"
 dependencies = [
  "geometric-traits",
  "sha2",
@@ -1266,6 +1267,15 @@ version = "0.1.0"
 source = "git+https://github.com/LucaCappelletti94/sqlparser-canonicalize?branch=main#1f6d7b5f7bf61cec3708e4c3e922dad39a3a95b1"
 dependencies = [
  "seahash",
+ "sqlparser",
+ "thiserror",
+]
+
+[[package]]
+name = "sqlparser-plpgsql"
+version = "0.1.0"
+source = "git+https://github.com/LucaCappelletti94/sqlparser-plpgsql?branch=main#ffdd5c9a3e134f42e5080e7bcca4f3ed5b1274a6"
+dependencies = [
  "sqlparser",
  "thiserror",
 ]
