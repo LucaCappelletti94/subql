@@ -481,23 +481,23 @@ mod scalar_kind_serde_tests {
             collation: named_collation("und-x-icu", true, Some("app"), false),
         };
 
+        let mut expected = alloc::vec::Vec::new();
+        // `ScalarKind::Builtin(Text(Varying))`.
+        expected.extend_from_slice(&[0, 4]);
+        // `declared_type`, length then text.
+        expected.push(4);
+        expected.extend_from_slice(b"TEXT");
+        // `ColumnCollation::Named`, then the name's length.
+        expected.extend_from_slice(&[1, 9]);
+        expected.extend_from_slice(b"und-x-icu");
+        // The name was quoted, a schema is present, and it is three bytes.
+        expected.extend_from_slice(&[1, 1, 3]);
+        expected.extend_from_slice(b"app");
+        // The schema was unquoted, and neither catalog fact is known.
+        expected.extend_from_slice(&[0, 0, 0]);
+
         let encoded = postcard::to_allocvec(&comparison).unwrap();
-        assert_eq!(
-            encoded,
-            [
-                // `ScalarKind::Builtin(Text(Varying))`.
-                0, 4, //
-                // `declared_type`, length then text.
-                4, b'T', b'E', b'X', b'T', //
-                // `ColumnCollation::Named`.
-                1, //
-                // The name, quoted, and the schema, unquoted.
-                9, b'u', b'n', b'd', b'-', b'x', b'-', b'i', b'c', b'u', 1, //
-                1, 3, b'a', b'p', b'p', 0, //
-                // No PostgreSQL determinism and no padding.
-                0, 0,
-            ]
-        );
+        assert_eq!(encoded, expected);
         assert_eq!(
             postcard::from_bytes::<ColumnComparison<TestCustom>>(&encoded),
             Ok(comparison)
