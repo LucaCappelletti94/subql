@@ -2170,15 +2170,21 @@ pub(crate) fn membership_exists_parts<'a, DB: DatabaseLike>(
         TableFactor::Table { alias, .. } => alias.as_ref().map(|alias| alias.name.value.as_str()),
         _ => None,
     };
-    // A qualifier names the membership side when it is the alias, the
-    // relation's own written name, or a name resolving to the same table.
+    // A qualifier names the membership side when it is the alias, or, when
+    // the relation carries no alias, its own written name or a name
+    // resolving to the same table.
+    //
     // The written name is its own case because SQL exposes an unaliased
     // relation under that name whatever schema it lives in, where resolving
-    // the name alone would need the search path to hold that schema.
+    // the name alone would need the search path to hold that schema. An
+    // alias hides the name, so once one is written the name belongs to
+    // whatever else carries it, which is how `FROM app."Shares" s` leaves
+    // `"Shares"` naming the subscribed table.
     let member_written = member_name
         .0
         .last()
-        .and_then(sqlparser::ast::ObjectNamePart::as_ident);
+        .and_then(sqlparser::ast::ObjectNamePart::as_ident)
+        .filter(|_| alias.is_none());
     let is_member_qualifier = |qualifier: &Ident| {
         Some(qualifier.value.as_str()) == alias
             || member_written.is_some_and(|written| {
@@ -2534,7 +2540,8 @@ mod membership_naming_tests {
     const DDL: &str = r#"CREATE SCHEMA app;
         CREATE TABLE docs (id INT PRIMARY KEY, title TEXT);
         CREATE TABLE "my.shares" (doc_id INT, viewer TEXT);
-        CREATE TABLE app."Shares" (doc_id INT, viewer TEXT);"#;
+        CREATE TABLE app."Shares" (doc_id INT, viewer TEXT);
+        CREATE TABLE "Shares" (id INT PRIMARY KEY);"#;
 
     /// The `EXISTS` subquery of `sql`, which the parser hands back verbatim.
     fn exists_subquery(sql: &str) -> sqlparser::ast::Query {
@@ -2625,6 +2632,28 @@ mod membership_naming_tests {
 
         let parts = membership_exists_parts(&subquery, docs, &db)
             .expect("the qualifier names the membership table");
+        assert_eq!(parts.pairs.len(), 1);
+    }
+
+    /// An alias hides the relation's own name, which then belongs to
+    /// whatever else carries it.
+    ///
+    /// SQL exposes an aliased relation under the alias alone, so a
+    /// qualifier spelling the relation's name names the subscribed table
+    /// when that is what the name resolves to. Reported by a reviewer on
+    /// the change that started comparing written names.
+    #[test]
+    fn an_alias_hides_the_membership_relation_name() {
+        let db = ParserDB::parse::<PostgreSqlDialect>(DDL).unwrap();
+        let shares = catalog_helpers::table_id(&db, r#""Shares""#).unwrap();
+        let subquery = exists_subquery(
+            r#"SELECT * FROM "Shares" WHERE EXISTS (SELECT 1 FROM app."Shares" s
+               WHERE s.doc_id = "Shares".id
+                 AND s.viewer = current_setting('app.user_id', true))"#,
+        );
+
+        let parts = membership_exists_parts(&subquery, shares, &db)
+            .expect("the alias names the membership side, the written name the subscribed one");
         assert_eq!(parts.pairs.len(), 1);
     }
 }
