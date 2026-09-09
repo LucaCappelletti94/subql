@@ -8,7 +8,7 @@ use testcontainers::core::{IntoContainerPort, Mount, WaitFor};
 use testcontainers::runners::SyncRunner;
 use testcontainers::{Container, ContainerRequest, GenericImage, ImageExt};
 
-use super::{fresh_db_name, network_name, run_id, shared_server, PASSWORD};
+use super::{docker, fresh_db_name, network_name, run_id, shared_server, PASSWORD};
 
 const MAXWELL_IMAGE: &str = "zendesk/maxwell";
 const MAXWELL_TAG: &str = "v1.44.0";
@@ -54,9 +54,19 @@ pub struct MysqlDatabase {
     run: String,
 }
 
+/// Create this run's network if it does not exist yet, ignoring the race
+/// where another process just did. testcontainers removes a network it
+/// created as soon as a losing container start drops it, which pulled the
+/// network from under sibling processes mid-start, so the network is never
+/// testcontainers' to own: the reaper removes it with the run's servers.
+fn ensure_network(run: &str) {
+    docker(&["network", "create", &network_name(run)]);
+}
+
 /// Acquire the shared MySQL and create a fresh database on it.
 pub fn mysql_database() -> MysqlDatabase {
     let run = run_id();
+    ensure_network(&run);
     let port = shared_server(
         "mysql",
         || mysql_request(&run),
