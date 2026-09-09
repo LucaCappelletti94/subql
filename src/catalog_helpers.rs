@@ -661,10 +661,14 @@ mod tests {
     /// the whole test.
     #[test]
     fn the_mysql_adapters_carry_the_case_marker() {
-        use crate::backend::{Backend, MySql, NamesFoldedAtLookup, NamesStoredLowercased};
+        use crate::backend::{Backend, NamesStoredLowercased};
 
         fn assert_folds<B: Backend>() {
             assert!(B::TABLE_NAMES_FOLD_CASE);
+        }
+
+        fn assert_keeps_case<B: Backend>() {
+            assert!(!B::TABLE_NAMES_FOLD_CASE);
         }
 
         // The bind path, whose `BindDecode` is implemented on diesel's own
@@ -672,7 +676,7 @@ mod tests {
         #[cfg(feature = "diesel-typed-mysql")]
         fn bind_path_holds<C: crate::backend::MySqlTableNameCase>()
         where
-            diesel::mysql::Mysql: crate::diesel_api::BindDecode<MySql<C>>,
+            diesel::mysql::Mysql: crate::diesel_api::BindDecode<crate::backend::MySql<C>>,
         {
         }
         #[cfg(feature = "diesel-typed-mysql")]
@@ -682,16 +686,14 @@ mod tests {
         #[cfg(feature = "executor-diesel-mysql")]
         assert_folds::<<crate::reexec::MysqlDieselConnector<(), NamesStoredLowercased> as crate::reexec::Connector>::Backend>();
         #[cfg(feature = "executor-diesel-async-mysql")]
-        assert_folds::<<crate::reexec::MysqlAsyncDieselConnector<(), NamesFoldedAtLookup> as crate::reexec::AsyncConnector>::Backend>();
+        assert_folds::<<crate::reexec::MysqlAsyncDieselConnector<(), crate::backend::NamesFoldedAtLookup> as crate::reexec::AsyncConnector>::Backend>();
 
         // The Maxwell event, wrapped because its message type is another
         // crate's and has no slot for the marker.
         assert_folds::<
             <crate::wal::MaxwellEvent<NamesStoredLowercased> as crate::backend::CdcEvent>::Backend,
         >();
-        assert!(
-            !<crate::wal::MaxwellEvent as crate::backend::CdcEvent>::Backend::TABLE_NAMES_FOLD_CASE
-        );
+        assert_keeps_case::<<crate::wal::MaxwellEvent as crate::backend::CdcEvent>::Backend>();
     }
 
     /// A non-default marker is usable where the default is, which is the

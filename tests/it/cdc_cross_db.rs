@@ -71,166 +71,9 @@ fn iot_catalog_mysql() -> ParserDB {
     .expect("iot fixture MySQL DDL parses")
 }
 
-mod container_setup {
-    use std::time::Duration;
-    use testcontainers::core::{IntoContainerPort, Mount, WaitFor};
-    use testcontainers::runners::SyncRunner;
-    use testcontainers::{GenericImage, ImageExt};
-
-    const PG_IMAGE: &str = "subql-test/postgres-wal2json";
-    const PG_TAG: &str = "16";
-    const MAXWELL_IMAGE: &str = "zendesk/maxwell";
-    const MAXWELL_TAG: &str = "v1.44.0";
-
-    /// Build the custom Postgres image with wal2json (cached by Docker layer cache).
-    fn ensure_postgres_image() {
-        let output = std::process::Command::new("docker")
-            .args(["images", "-q", &format!("{PG_IMAGE}:{PG_TAG}")])
-            .output()
-            .expect("docker images");
-
-        if !output.stdout.is_empty() {
-            return; // Already built
-        }
-
-        let dockerfile = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/tests/fixtures/Dockerfile.postgres"
-        );
-        let build_out = std::process::Command::new("docker")
-            .args([
-                "build",
-                "-t",
-                &format!("{PG_IMAGE}:{PG_TAG}"),
-                "-f",
-                dockerfile,
-                ".",
-            ])
-            .output()
-            .expect("docker build");
-        assert!(
-            build_out.status.success(),
-            "Failed to build postgres-wal2json image"
-        );
-    }
-
-    /// Start PostgreSQL with wal2json plugin.
-    pub(super) fn start_postgres() -> testcontainers::Container<GenericImage> {
-        ensure_postgres_image();
-
-        GenericImage::new(PG_IMAGE, PG_TAG)
-            .with_wait_for(WaitFor::message_on_stderr("ready to accept connections"))
-            .with_exposed_port(5432.tcp())
-            .with_mount(Mount::tmpfs_mount("/var/lib/postgresql/data"))
-            .with_env_var("POSTGRES_USER", "subql_test")
-            .with_env_var("POSTGRES_PASSWORD", "subql_test")
-            .with_env_var("POSTGRES_DB", "testdb")
-            .with_cmd([
-                "postgres",
-                "-c",
-                "wal_level=logical",
-                "-c",
-                "max_wal_senders=4",
-                "-c",
-                "max_replication_slots=4",
-                "-c",
-                // PostgreSQL 16.15 made this an allow-list, and setting it replaces
-                // rather than extends, so the two it ships with are repeated here.
-                "output_plugin_libraries=pgoutput,test_decoding,wal2json",
-            ])
-            // 180s: parallel sweeps start many containers at once, see
-            // `common::pg_with_wal2json`.
-            .with_startup_timeout(Duration::from_secs(180))
-            .start()
-            .expect("start postgres")
-    }
-
-    /// Start MySQL 8.0 with binlog enabled.
-    ///
-    /// Uses `with_container_name` so Maxwell can reach it as `mysql` on the shared network.
-    pub(super) fn start_mysql(
-        network: &str,
-        container_name: &str,
-    ) -> testcontainers::Container<GenericImage> {
-        // Note: MySQL 8.0 prints "ready for connections" twice during startup
-        // (once for temp server, once for real). We match "port: 3306" which
-        // only appears in the final ready message.
-        GenericImage::new("mysql", "8.0")
-            .with_wait_for(WaitFor::message_on_stderr("port: 3306"))
-            .with_exposed_port(3306.tcp())
-            .with_mount(Mount::tmpfs_mount("/var/lib/mysql"))
-            .with_env_var("MYSQL_ROOT_PASSWORD", "subql_test")
-            .with_env_var("MYSQL_DATABASE", "testdb")
-            .with_env_var("MYSQL_USER", "subql_test")
-            .with_env_var("MYSQL_PASSWORD", "subql_test")
-            .with_cmd([
-                "--server-id=1",
-                "--log-bin=mysql-bin",
-                "--binlog-format=ROW",
-                "--binlog-row-image=FULL",
-            ])
-            .with_network(network)
-            .with_container_name(container_name)
-            .with_startup_timeout(Duration::from_secs(120))
-            .start()
-            .unwrap_or_else(|e| {
-                panic!("start mysql network={network} container_name={container_name}: {e}")
-            })
-    }
-
-    /// Start Maxwell daemon, reading from MySQL on the shared network.
-    pub(super) fn start_maxwell(
-        network: &str,
-        mysql_name: &str,
-        output_dir: &str,
-    ) -> testcontainers::Container<GenericImage> {
-        let host_flag = format!("--host={mysql_name}");
-        GenericImage::new(MAXWELL_IMAGE, MAXWELL_TAG)
-            .with_wait_for(WaitFor::message_on_stderr("Binlog connected"))
-            .with_network(network)
-            .with_mount(Mount::bind_mount(output_dir, "/output"))
-            .with_cmd([
-                "bin/maxwell",
-                "--producer=file",
-                "--output_file=/output/maxwell.jsonl",
-                "--output_primary_key_columns=true",
-                &host_flag,
-                "--port=3306",
-                "--user=root",
-                "--password=subql_test",
-            ])
-            .with_startup_timeout(Duration::from_secs(90))
-            .start()
-            .unwrap_or_else(|e| {
-                panic!(
-                    "start maxwell image={MAXWELL_IMAGE} tag={MAXWELL_TAG} network={network} \
-                 mysql_name={mysql_name}: {e}"
-                )
-            })
-    }
-
-    /// Fail fast with actionable diagnostics if Docker is unavailable.
-    pub(super) fn assert_docker_available() {
-        let output = std::process::Command::new("docker")
-            .args(["info", "--format", "{{.ServerVersion}}"])
-            .output()
-            .unwrap_or_else(|e| panic!("docker preflight: failed to execute `docker info`: {e}"));
-
-        assert!(
-        output.status.success(),
-        "docker preflight failed: `docker info` exited with status {}.\nstdout: {}\nstderr: {}\n\
-         Ensure Docker daemon is running and this user can access /var/run/docker.sock.",
-        output.status,
-        String::from_utf8_lossy(&output.stdout).trim(),
-        String::from_utf8_lossy(&output.stderr).trim()
-    );
-    }
-}
-
 mod dml_setup {
     use super::NewReading;
     use diesel::prelude::*;
-    use std::time::Duration;
 
     pub(super) fn setup_postgres(pg: &mut PgConnection) {
         diesel::sql_query(
@@ -343,53 +186,15 @@ mod dml_setup {
 
         changes.into_iter().map(|c| c.data).collect()
     }
-
-    // CDC capture: MySQL via Maxwell file output
-
-    pub(super) fn maxwell_read_changes(output_dir: &str, expected_count: usize) -> Vec<String> {
-        let jsonl_path = std::path::Path::new(output_dir).join("maxwell.jsonl");
-        let timeout = Duration::from_secs(30);
-        let poll_interval = Duration::from_millis(500);
-        let start = std::time::Instant::now();
-
-        loop {
-            assert!(
-                start.elapsed() <= timeout,
-                "Timed out waiting for Maxwell CDC messages at {}",
-                jsonl_path.display()
-            );
-
-            if jsonl_path.exists() {
-                let content = std::fs::read_to_string(&jsonl_path).unwrap_or_default();
-                let matching: Vec<String> = content
-                    .lines()
-                    .filter(|line| {
-                        line.contains("\"table\":\"readings\"")
-                            && (line.contains("\"type\":\"insert\"")
-                                || line.contains("\"type\":\"update\"")
-                                || line.contains("\"type\":\"delete\""))
-                    })
-                    .map(String::from)
-                    .collect();
-
-                if matching.len() >= expected_count {
-                    return matching;
-                }
-            }
-
-            std::thread::sleep(poll_interval);
-        }
-    }
 }
 
 mod engine_setup {
-    use super::container_setup::{
-        assert_docker_available, start_maxwell, start_mysql, start_postgres,
-    };
-    use super::dml_setup::{
-        apply_dml, maxwell_read_changes, pg_read_changes, setup_mysql, setup_postgres,
-    };
+    use super::dml_setup::{apply_dml, pg_read_changes, setup_mysql, setup_postgres};
     use super::iot_catalog;
+    use crate::common::{
+        assert_docker_available, maxwell_collect, mysql_networked, mysql_port, mysql_url, pg_port,
+        pg_url, pg_with_wal2json, start_maxwell,
+    };
     use diesel::prelude::*;
     use sql_traits::structs::ParserDB;
     use sqlparser::dialect::{MySqlDialect, PostgreSqlDialect};
@@ -399,7 +204,6 @@ mod engine_setup {
         parse_maxwell, parse_wal2json_v2, DefaultIds, MaxwellEvent, MessageV2, SubscriptionEngine,
         SubscriptionRequest,
     };
-    use testcontainers::core::IntoContainerPort;
 
     const SUBSCRIPTIONS: &[(u64, &str)] = &[
         (1, "SELECT * FROM readings WHERE temperature > 30"),
@@ -501,23 +305,13 @@ mod engine_setup {
             .expect("tempdir path")
             .to_string();
 
-        // Start containers (PG is standalone; MySQL + Maxwell share a network)
-        let pg_container = start_postgres();
-        let mysql_container = start_mysql(&network, &mysql_name);
+        let pg_container = pg_with_wal2json();
+        let mysql_container = mysql_networked(&network, &mysql_name);
 
         let _maxwell_container = start_maxwell(&network, &mysql_name, &maxwell_path);
 
-        // Get mapped host ports
-        let pg_port = pg_container
-            .get_host_port_ipv4(5432.tcp())
-            .expect("pg port");
-        let my_port = mysql_container
-            .get_host_port_ipv4(3306.tcp())
-            .expect("mysql port");
-
-        // Connect via diesel
-        let pg_url = format!("postgres://subql_test:subql_test@127.0.0.1:{pg_port}/testdb");
-        let my_url = format!("mysql://subql_test:subql_test@127.0.0.1:{my_port}/testdb");
+        let pg_url = pg_url(pg_port(&pg_container));
+        let my_url = mysql_url(mysql_port(&mysql_container));
 
         let mut pg = PgConnection::establish(&pg_url).expect("PG connection");
         let mut my = MysqlConnection::establish(&my_url).expect("MySQL connection");
@@ -531,7 +325,7 @@ mod engine_setup {
 
         // Capture CDC events
         let pg_messages = pg_read_changes(&mut pg);
-        let mx_messages = maxwell_read_changes(&maxwell_path, 4);
+        let mx_messages = maxwell_collect(&maxwell_path, "readings", 4);
 
         // Set up engines, one per CDC source
         let mut pg_engine = setup_pg_engine(iot_catalog());

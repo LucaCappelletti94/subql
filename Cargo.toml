@@ -638,14 +638,9 @@ inherits = "release"
 lto = false
 codegen-units = 16
 
-# Iteration profile for local test runs. Relaxes release's fat-LTO,
-# single-codegen-unit link and adds incremental compilation. With the merged
-# `tests/it` target (2026-08-29): cold build 2m16s, touch rebuild ~6s.
-# Codegen stays at the inherited opt-level 3 on measurement: opt-level 1
-# saved 26% of the cold build but pushed the 1039-test run phase from 8s to
-# 12s (opt-level 0: 33s), all of it in the VM-eval harness test, and the
-# touch rebuild barely moved since the lib compile dominates it.
-# Use via `cargo +1.88 nextest run --cargo-profile testfast`.
+# Local iteration profile: `cargo +1.88 nextest run --cargo-profile testfast`.
+# Workspace code at opt-level 1 cuts the touch rebuild by 13 to 19 percent
+# with no change to the run phase, dependencies stay at 3.
 [profile.testfast]
 inherits = "release"
 lto = false
