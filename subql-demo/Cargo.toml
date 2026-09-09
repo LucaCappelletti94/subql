@@ -38,18 +38,7 @@ diesel = { version = "2", default-features = false, features = ["sqlite"] }
 # only build for type-checking.
 dioxus = { version = "0.7", features = ["web"] }
 
-# Syntax-highlighted code blocks + editable SQL surface for the query
-# console and consumer panel. `default-features = false` drops the
-# compile-time `code!` macro path (which we do not use) and keeps the
-# dep tree small. Build note (mirrors pg2sqlite/examples/web-playground):
-# these crates pull in `arborium-tree-sitter`, whose C grammars do not
-# link cleanly under cargo's `dev` profile (undefined `stderr` from the
-# wasm-shim header set). They link fine under `release` (LTO + opt-level
-# = "z" DCEs the cold `fprintf(stderr, ...)` branches in
-# `arborium-tree-sitter/src/alloc.c` before lld sees them). Use
-# `dx serve --release` for the demo - debug iteration is fine because
-# the demo's Rust is small. The cost is the one-shot `arborium-*` C
-# build.
+# Runtime SQL highlighting, with arborium's wasm-dev link defect handled at the root.
 dioxus-code = { version = "0.1", default-features = false, features = ["lang-sql"] }
 dioxus-code-editor = "0.1"
 
