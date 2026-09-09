@@ -27,7 +27,7 @@ use testcontainers::{GenericImage, ImageExt};
 
 use sql_traits::structs::ParserDB;
 use subql::backend::MySql;
-use subql::{parse_maxwell, DefaultIds, MaxwellMessage, SubscriptionEngine, SubscriptionRequest};
+use subql::{parse_maxwell, DefaultIds, MaxwellEvent, SubscriptionEngine, SubscriptionRequest};
 
 const MAXWELL_IMAGE: &str = "zendesk/maxwell";
 const MAXWELL_TAG: &str = "v1.44.0";
@@ -227,7 +227,7 @@ fn mysql_maxwell_cdc_e2e() {
     );
 
     let consumer: u64 = 1;
-    let mut engine: SubscriptionEngine<MaxwellMessage, DefaultIds, ParserDB> =
+    let mut engine: SubscriptionEngine<MaxwellEvent, DefaultIds, ParserDB> =
         SubscriptionEngine::new(events_catalog(), MySqlDialect {});
     engine
         .register(SubscriptionRequest::<DefaultIds, MySql>::new(
@@ -242,8 +242,11 @@ fn mysql_maxwell_cdc_e2e() {
     let mut deleted: Vec<Vec<u64>> = Vec::new();
 
     for (i, msg) in messages.iter().enumerate() {
-        let events = parse_maxwell(msg.as_bytes())
-            .unwrap_or_else(|e| panic!("Maxwell parse failed for message {i}: {e}"));
+        let events: Vec<MaxwellEvent> = parse_maxwell(msg.as_bytes())
+            .unwrap_or_else(|e| panic!("Maxwell parse failed for message {i}: {e}"))
+            .into_iter()
+            .map(MaxwellEvent::new)
+            .collect();
         for event in &events {
             let notifs = engine
                 .consumers(event)

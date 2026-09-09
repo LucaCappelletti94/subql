@@ -352,7 +352,8 @@ std = [
     "rls2fga-types?/std",
     "rls2fga?/std",
 ]
-testing = ["dep:arbitrary"]
+# `std` because the harnesses replay persisted shards, which is std-only I/O.
+testing = ["std", "dep:arbitrary"]
 observability = ["dep:tracing", "tracing/std"]
 # Opt-in: ship `DieselConnector` plus the auto-resolving engine's diesel
 # bindings. Does NOT imply `std`: diesel's core is `no_std` and carries no
@@ -650,6 +651,10 @@ inherits = "release"
 lto = false
 codegen-units = 16
 incremental = true
+opt-level = 1
+
+[profile.testfast.package."*"]
+opt-level = 3
 
 [lints]
 workspace = true

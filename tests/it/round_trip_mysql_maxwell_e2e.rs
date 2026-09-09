@@ -51,7 +51,7 @@ use subql::backend::SQLite as SqliteBackend;
 use subql::emit::{maxwell_patchset_builder, WireTable};
 use subql::patchset::{MysqlAdapter, SqliteAdapter};
 use subql::testing::TestEvent;
-use subql::{parse_maxwell, DefaultIds, MaxwellMessage, SubscriptionEngine};
+use subql::{parse_maxwell, DefaultIds, MaxwellEvent, MaxwellMessage, SubscriptionEngine};
 
 // UUID stored as BINARY(16). MySQL has no native UUID type, so the column
 // classifies as bytes and the 16-byte blob rides WireType::Bytes.
@@ -471,7 +471,7 @@ fn finish_loop(
     // which reconstructs the ops from the raw bytes.
     sql_query("TRUNCATE orders").execute(my).unwrap();
 
-    let my_engine: SubscriptionEngine<MaxwellMessage, DefaultIds, ParserDB> =
+    let my_engine: SubscriptionEngine<MaxwellEvent, DefaultIds, ParserDB> =
         SubscriptionEngine::new(subql_catalog(), MySqlDialect {});
     let my_adapter = MysqlAdapter::new(my_engine.database()).expect("the catalog indexes");
 

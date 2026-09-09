@@ -396,8 +396,8 @@ mod engine_setup {
     use std::collections::BTreeSet;
     use subql::backend::{MySql, Postgres};
     use subql::{
-        parse_maxwell, parse_wal2json_v2, DefaultIds, MaxwellMessage, MessageV2,
-        SubscriptionEngine, SubscriptionRequest,
+        parse_maxwell, parse_wal2json_v2, DefaultIds, MaxwellEvent, MessageV2, SubscriptionEngine,
+        SubscriptionRequest,
     };
     use testcontainers::core::IntoContainerPort;
 
@@ -426,7 +426,7 @@ mod engine_setup {
 
     fn setup_mysql_engine(
         catalog: ParserDB,
-    ) -> SubscriptionEngine<MaxwellMessage, DefaultIds, ParserDB> {
+    ) -> SubscriptionEngine<MaxwellEvent, DefaultIds, ParserDB> {
         let mut engine = SubscriptionEngine::new(catalog, MySqlDialect {});
         for (consumer_id, sql) in SUBSCRIPTIONS {
             engine
@@ -539,7 +539,13 @@ mod engine_setup {
 
         // Dispatch and collect results
         let pg_results = dispatch_events(&mut pg_engine, parse_wal2json_v2, &pg_messages);
-        let mx_results = dispatch_events(&mut mx_engine, parse_maxwell, &mx_messages);
+        let mx_results = dispatch_events(
+            &mut mx_engine,
+            |bytes| {
+                parse_maxwell(bytes).map(|msgs| msgs.into_iter().map(MaxwellEvent::new).collect())
+            },
+            &mx_messages,
+        );
 
         // Expected matched consumer IDs per event.
         //

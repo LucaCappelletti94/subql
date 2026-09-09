@@ -7,6 +7,8 @@
     clippy::match_same_arms
 )]
 
+use std::sync::LazyLock;
+
 use arbitrary::{Arbitrary, Unstructured};
 use sql_traits::structs::ParserDB;
 use sqlparser::dialect::PostgreSqlDialect;
@@ -24,22 +26,25 @@ use crate::testing::TestEvent;
 use crate::wal::{parse_maxwell, parse_wal2json_v1, parse_wal2json_v2};
 use crate::DefaultIds;
 
-/// Build a permissive fuzz schema as a [`ParserDB`].
+/// The permissive fuzz schema as a [`ParserDB`], parsed once per process.
 ///
 /// Declares an `orders` table with column names the SQL fuzzer commonly
 /// produces (`amount`, `status`, `id`, plus generic `c0`-`c15`). SQL
 /// referencing columns or tables absent from this fixture fails SQL
 /// resolution, which is fine for crash testing.
 #[must_use]
-pub fn fuzz_catalog() -> ParserDB {
-    ParserDB::parse::<PostgreSqlDialect>(
-        "CREATE TABLE orders (\
-             id INT PRIMARY KEY, amount INT, status TEXT, \
-             c0 INT, c1 INT, c2 INT, c3 INT, c4 INT, c5 INT, c6 INT, c7 INT, \
-             c8 INT, c9 INT, c10 INT, c11 INT, c12 INT, c13 INT, c14 INT, c15 INT \
-         );",
-    )
-    .expect("fuzz fixture DDL parses")
+pub fn fuzz_catalog() -> &'static ParserDB {
+    static CATALOG: LazyLock<ParserDB> = LazyLock::new(|| {
+        ParserDB::parse::<PostgreSqlDialect>(
+            "CREATE TABLE orders (\
+                 id INT PRIMARY KEY, amount INT, status TEXT, \
+                 c0 INT, c1 INT, c2 INT, c3 INT, c4 INT, c5 INT, c6 INT, c7 INT, \
+                 c8 INT, c9 INT, c10 INT, c11 INT, c12 INT, c13 INT, c14 INT, c15 INT \
+             );",
+        )
+        .expect("fuzz fixture DDL parses")
+    });
+    &CATALOG
 }
 
 /// Generate a [`Value<Postgres>`] from fuzzer-controlled bytes.
@@ -164,10 +169,9 @@ pub fn harness_parse_sql(data: &[u8]) {
     let Ok(sql) = core::str::from_utf8(data) else {
         return;
     };
-    let catalog = fuzz_catalog();
     let pg = PostgreSqlDialect {};
 
-    let _ = parse_and_compile::<Postgres, _>(sql, &pg, &catalog);
+    let _ = parse_and_compile::<Postgres, _>(sql, &pg, fuzz_catalog());
 }
 
 /// Generate random bytecode + row and evaluate with the VM.
@@ -202,13 +206,12 @@ pub fn harness_vm_eval(data: &[u8]) {
     let event = TestEvent::<Postgres>::insert(0, cells);
 
     let mut vm = Vm::<Postgres>::new();
-    let _ = vm.eval(&program, &event, RowKind::New, &fuzz_catalog());
+    let _ = vm.eval(&program, &event, RowKind::New, fuzz_catalog());
 }
 
 /// Feed raw bytes to shard deserialization.
 pub fn harness_deserialize_shard(data: &[u8]) {
-    let catalog = fuzz_catalog();
-    let _ = deserialize_shard::<DefaultIds, _>(data, &catalog);
+    let _ = deserialize_shard::<DefaultIds, _>(data, fuzz_catalog());
 }
 
 /// Normalize and hash SQL, asserting determinism. PostgreSqlDialect only.

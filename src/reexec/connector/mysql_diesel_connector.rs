@@ -48,9 +48,10 @@ use diesel::{sql_query, Connection, RunQueryDsl};
 ///
 /// Returns [`diesel::result::Error`] for any underlying database failure.
 #[cfg(feature = "executor-diesel-mysql")]
-pub struct MysqlDieselConnector<S = ()> {
+pub struct MysqlDieselConnector<S = (), C = crate::backend::NamesStoredAsWritten> {
     conn: RefCell<diesel::MysqlConnection>,
     _setup: core::marker::PhantomData<fn() -> S>,
+    _table_name_case: core::marker::PhantomData<fn() -> C>,
 }
 
 #[cfg(feature = "executor-diesel-mysql")]
@@ -63,12 +64,13 @@ impl MysqlDieselConnector {
         Self {
             conn: RefCell::new(conn),
             _setup: core::marker::PhantomData,
+            _table_name_case: core::marker::PhantomData,
         }
     }
 }
 
 #[cfg(feature = "executor-diesel-mysql")]
-impl<S: SessionSetup> MysqlDieselConnector<S> {
+impl<S: SessionSetup, C: crate::backend::MySqlTableNameCase> MysqlDieselConnector<S, C> {
     /// Wrap an owned [`MysqlConnection`](diesel::MysqlConnection) whose reads
     /// run the setup statements carried by the per-read [`SessionSetup`] `S`.
     #[must_use]
@@ -76,6 +78,7 @@ impl<S: SessionSetup> MysqlDieselConnector<S> {
         Self {
             conn: RefCell::new(conn),
             _setup: core::marker::PhantomData,
+            _table_name_case: core::marker::PhantomData,
         }
     }
 }
@@ -157,11 +160,13 @@ fn read_binlog_pos(conn: &mut diesel::MysqlConnection) -> Option<crate::MysqlBin
 }
 
 #[cfg(feature = "executor-diesel-mysql")]
-impl<S: SessionSetup> Connector for MysqlDieselConnector<S> {
+impl<S: SessionSetup, C: crate::backend::MySqlTableNameCase> Connector
+    for MysqlDieselConnector<S, C>
+{
     type AuthContext = S;
     type Error = diesel::result::Error;
     type Checkpoint = crate::MysqlBinlogPos;
-    type Backend = crate::backend::MySql;
+    type Backend = crate::backend::MySql<C>;
 
     fn execute_scalar(
         &self,
@@ -186,13 +191,13 @@ impl<S: SessionSetup> Connector for MysqlDieselConnector<S> {
         query: &ReadQuery<'_, Self::Backend>,
         max_bytes: usize,
         auth: &S,
-    ) -> Result<Snapshot<RowPage<crate::backend::MySql>, Self::Checkpoint>, Self::Error> {
+    ) -> Result<Snapshot<RowPage<Self::Backend>, Self::Checkpoint>, Self::Error> {
         let mut conn = self.conn.borrow_mut();
         // Position before snapshot, per `Connector::Checkpoint`.
         let pos = read_binlog_pos(&mut conn);
         conn.transaction(|conn| {
             run_setup_statements(conn, auth.setup_statements())?;
-            let value = load_page::<_, crate::backend::MySql>(conn, query, max_bytes)?;
+            let value = load_page::<_, Self::Backend>(conn, query, max_bytes)?;
             Ok(Snapshot {
                 value,
                 checkpoint: pos,

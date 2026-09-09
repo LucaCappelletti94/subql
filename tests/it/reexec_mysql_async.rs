@@ -395,7 +395,9 @@ fn session_setup_runs_on_the_transaction_free_read_page() {
     common::multi_thread_rt().block_on(async move {
         let read_marker = "SELECT @@max_sort_length AS v";
         let setup = MarkerSetup(vec!["SET SESSION max_sort_length = 1234".to_string()]);
-        let with = MysqlAsyncDieselConnector::with_session_setup(mysql_async_pool(port).await);
+        let with = MysqlAsyncDieselConnector::<MarkerSetup>::with_session_setup(
+            mysql_async_pool(port).await,
+        );
         let page = with
             .read_page(
                 &subql::reexec::ReadQuery::without_binds(read_marker),

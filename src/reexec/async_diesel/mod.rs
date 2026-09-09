@@ -134,11 +134,11 @@ pub(super) async fn load_scalar_postgres_async(
 }
 
 #[cfg(feature = "executor-diesel-async-mysql")]
-pub(super) async fn load_scalar_mysql_async(
+pub(super) async fn load_scalar_mysql_async<C: crate::backend::MySqlTableNameCase>(
     conn: &mut diesel_async::AsyncMysqlConnection,
-    query: &ReadQuery<'_, crate::backend::MySql>,
+    query: &ReadQuery<'_, crate::backend::MySql<C>>,
     kind: ScalarFamily,
-) -> diesel::QueryResult<Value<crate::backend::MySql>> {
+) -> diesel::QueryResult<Value<crate::backend::MySql<C>>> {
     let value = match kind {
         ScalarFamily::Int => {
             let sql = alloc::format!("SELECT CAST(({}) AS SIGNED) AS v", query.sql());
@@ -192,13 +192,13 @@ pub(super) async fn load_scalar_row_postgres_async(
 }
 
 #[cfg(feature = "executor-diesel-async-mysql")]
-pub(super) async fn load_scalar_row_mysql_async(
+pub(super) async fn load_scalar_row_mysql_async<C: crate::backend::MySqlTableNameCase>(
     conn: &mut diesel_async::AsyncMysqlConnection,
-    query: &ReadQuery<'_, crate::backend::MySql>,
+    query: &ReadQuery<'_, crate::backend::MySql<C>>,
     kinds: &[ScalarFamily],
-) -> diesel::QueryResult<Vec<Value<crate::backend::MySql>>> {
+) -> diesel::QueryResult<Vec<Value<crate::backend::MySql<C>>>> {
     let row = boxed_mysql_read_query_owned(query)?
-        .get_result::<crate::diesel_decode::DynamicRow<crate::backend::MySql>>(conn)
+        .get_result::<crate::diesel_decode::DynamicRow<crate::backend::MySql<C>>>(conn)
         .await?;
     if row.values.len() != kinds.len() {
         return Err(diesel::result::Error::DeserializationError(
@@ -210,8 +210,11 @@ pub(super) async fn load_scalar_row_mysql_async(
         .into_iter()
         .zip(kinds)
         .map(|(value, kind)| {
-            crate::backend::MySql::decode_group_value(crate::backend::ValueKind::from(*kind), value)
-                .unwrap_or(Value::Missing)
+            crate::backend::MySql::<C>::decode_group_value(
+                crate::backend::ValueKind::from(*kind),
+                value,
+            )
+            .unwrap_or(Value::Missing)
         })
         .collect())
 }
@@ -234,9 +237,10 @@ pub(super) async fn load_scalar_row_mysql_async(
 ///
 /// Returns [`DieselAsyncError`] for pool or database failures.
 #[cfg(feature = "executor-diesel-async-mysql")]
-pub struct MysqlAsyncDieselConnector<S = ()> {
+pub struct MysqlAsyncDieselConnector<S = (), C = crate::backend::NamesStoredAsWritten> {
     pool: Pool<diesel_async::AsyncMysqlConnection>,
     _setup: core::marker::PhantomData<fn() -> S>,
+    _table_name_case: core::marker::PhantomData<fn() -> C>,
 }
 
 #[cfg(feature = "executor-diesel-async-mysql")]
@@ -247,12 +251,15 @@ impl MysqlAsyncDieselConnector {
         Self {
             pool,
             _setup: core::marker::PhantomData,
+            _table_name_case: core::marker::PhantomData,
         }
     }
 }
 
 #[cfg(feature = "executor-diesel-async-mysql")]
-impl<S: SessionSetup + Send + Sync> MysqlAsyncDieselConnector<S> {
+impl<S: SessionSetup + Send + Sync, C: crate::backend::MySqlTableNameCase>
+    MysqlAsyncDieselConnector<S, C>
+{
     /// Wrap a `bb8` pool over `AsyncMysqlConnection` whose reads run the setup
     /// statements carried by the per-read [`SessionSetup`] value `S`.
     #[must_use]
@@ -260,6 +267,7 @@ impl<S: SessionSetup + Send + Sync> MysqlAsyncDieselConnector<S> {
         Self {
             pool,
             _setup: core::marker::PhantomData,
+            _table_name_case: core::marker::PhantomData,
         }
     }
 }
@@ -295,11 +303,13 @@ async fn read_binlog_pos_async(
 }
 
 #[cfg(feature = "executor-diesel-async-mysql")]
-impl<S: SessionSetup + Send + Sync> AsyncConnector for MysqlAsyncDieselConnector<S> {
+impl<S: SessionSetup + Send + Sync, C: crate::backend::MySqlTableNameCase> AsyncConnector
+    for MysqlAsyncDieselConnector<S, C>
+{
     type AuthContext = S;
     type Error = DieselAsyncError;
     type Checkpoint = crate::MysqlBinlogPos;
-    type Backend = crate::backend::MySql;
+    type Backend = crate::backend::MySql<C>;
 
     fn execute_scalar(
         &self,
@@ -428,14 +438,14 @@ pub(super) async fn load_page_postgres_async(
 }
 
 #[cfg(feature = "executor-diesel-async-mysql")]
-async fn load_page_mysql_async(
+async fn load_page_mysql_async<C: crate::backend::MySqlTableNameCase>(
     conn: &mut diesel_async::AsyncMysqlConnection,
-    query: &ReadQuery<'_, crate::backend::MySql>,
+    query: &ReadQuery<'_, crate::backend::MySql<C>>,
     max_bytes: usize,
-) -> diesel::QueryResult<crate::reexec::RowPage<crate::backend::MySql>> {
+) -> diesel::QueryResult<crate::reexec::RowPage<crate::backend::MySql<C>>> {
     use diesel_async::RunQueryDsl;
 
-    let decoded: Vec<crate::diesel_decode::DynamicRow<crate::backend::MySql>> =
+    let decoded: Vec<crate::diesel_decode::DynamicRow<crate::backend::MySql<C>>> =
         boxed_mysql_read_query_owned(query)?.load(conn).await?;
     Ok(finish_page(decoded, max_bytes))
 }

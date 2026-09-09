@@ -651,6 +651,49 @@ mod tests {
         );
     }
 
+    /// The shipped MySQL adapters carry the marker too, not only the
+    /// backend trait.
+    ///
+    /// Each of these is an associated type that used to name the default,
+    /// so a Windows or macOS embedder could pick a marker and still get the
+    /// Unix rule underneath. Written as a compile-time assertion because
+    /// what broke was type resolution, not behaviour: naming the types is
+    /// the whole test.
+    #[test]
+    fn the_mysql_adapters_carry_the_case_marker() {
+        use crate::backend::{Backend, MySql, NamesFoldedAtLookup, NamesStoredLowercased};
+
+        fn assert_folds<B: Backend>() {
+            assert!(B::TABLE_NAMES_FOLD_CASE);
+        }
+
+        // The bind path, whose `BindDecode` is implemented on diesel's own
+        // `Mysql` and therefore takes the subql backend as a parameter.
+        #[cfg(feature = "diesel-typed-mysql")]
+        fn bind_path_holds<C: crate::backend::MySqlTableNameCase>()
+        where
+            diesel::mysql::Mysql: crate::diesel_api::BindDecode<MySql<C>>,
+        {
+        }
+        #[cfg(feature = "diesel-typed-mysql")]
+        bind_path_holds::<NamesStoredLowercased>();
+
+        // The executors, whose connectors carry the marker on the type.
+        #[cfg(feature = "executor-diesel-mysql")]
+        assert_folds::<<crate::reexec::MysqlDieselConnector<(), NamesStoredLowercased> as crate::reexec::Connector>::Backend>();
+        #[cfg(feature = "executor-diesel-async-mysql")]
+        assert_folds::<<crate::reexec::MysqlAsyncDieselConnector<(), NamesFoldedAtLookup> as crate::reexec::AsyncConnector>::Backend>();
+
+        // The Maxwell event, wrapped because its message type is another
+        // crate's and has no slot for the marker.
+        assert_folds::<
+            <crate::wal::MaxwellEvent<NamesStoredLowercased> as crate::backend::CdcEvent>::Backend,
+        >();
+        assert!(
+            !<crate::wal::MaxwellEvent as crate::backend::CdcEvent>::Backend::TABLE_NAMES_FOLD_CASE
+        );
+    }
+
     /// A non-default marker is usable where the default is, which is the
     /// point of carrying the setting on the type.
     ///
