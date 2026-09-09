@@ -76,12 +76,14 @@ pub trait WireEvent {
 /// Every wire format's impl is the same delegation, so it is spelled once
 /// here rather than four times over.
 macro_rules! wire_cdc_event {
+    // The one body, taking zero or more type parameters. A wire type that
+    // carries parameters, such as the Maxwell event carrying its server's
+    // identifier-case marker, names them; the plain form below forwards with
+    // none, so the delegation exists once.
     // A wire type that carries type parameters, such as the Maxwell event
     // carrying its server's identifier-case marker.
-    // A wire type that carries type parameters, such as the Maxwell event
-    // carrying its server's identifier-case marker.
-    (<$($param:ident: $bound:path),+> $wire:ty, $backend:ty, $checkpoint:ty) => {
-        impl<$($param: $bound),+> $crate::backend::CdcEvent for $wire {
+    (<$($param:ident: $bound:path),*> $wire:ty, $backend:ty, $checkpoint:ty) => {
+        impl<$($param: $bound),*> $crate::backend::CdcEvent for $wire {
             type Backend = $backend;
             type Checkpoint = $checkpoint;
 
@@ -172,96 +174,9 @@ macro_rules! wire_cdc_event {
         }
     };
     ($wire:ty, $backend:ty, $checkpoint:ty) => {
-        impl $crate::backend::CdcEvent for $wire {
-            type Backend = $backend;
-            type Checkpoint = $checkpoint;
-
-            fn kind(&self) -> $crate::types::EventKind {
-                $crate::wal::wire_event::WireEvent::wire_kind(self)
-            }
-
-            fn table_id<DB: sql_traits::prelude::DatabaseLike>(
-                &self,
-                db: &DB,
-            ) -> $crate::types::TableId {
-                $crate::wal::wire_event::WireEvent::wire_table_id(self, db)
-            }
-
-            fn checkpoint(&self) -> Option<Self::Checkpoint> {
-                $crate::wal::wire_event::WireEvent::wire_checkpoint(self)
-            }
-
-            fn pk_columns<DB: sql_traits::prelude::DatabaseLike>(
-                &self,
-                db: &DB,
-            ) -> alloc::vec::Vec<$crate::types::ColumnId> {
-                let table_id = $crate::wal::wire_event::WireEvent::wire_table_id(self, db);
-                $crate::wal::wire_event::WireEvent::wire_pk_columns(self, db, table_id)
-            }
-
-            fn pk_columns_resolved<DB: sql_traits::prelude::DatabaseLike>(
-                &self,
-                db: &DB,
-                table_id: $crate::types::TableId,
-            ) -> alloc::vec::Vec<$crate::types::ColumnId> {
-                $crate::wal::wire_event::WireEvent::wire_pk_columns(self, db, table_id)
-            }
-
-            fn changed_columns<DB: sql_traits::prelude::DatabaseLike>(
-                &self,
-                db: &DB,
-            ) -> alloc::vec::Vec<$crate::types::ColumnId> {
-                let table_id = $crate::wal::wire_event::WireEvent::wire_table_id(self, db);
-                $crate::wal::wire_event::WireEvent::wire_changed_columns(self, db, table_id)
-            }
-
-            fn changed_columns_resolved<DB: sql_traits::prelude::DatabaseLike>(
-                &self,
-                db: &DB,
-                table_id: $crate::types::TableId,
-            ) -> alloc::vec::Vec<$crate::types::ColumnId> {
-                $crate::wal::wire_event::WireEvent::wire_changed_columns(self, db, table_id)
-            }
-
-            fn value_at<DB: sql_traits::prelude::DatabaseLike>(
-                &self,
-                db: &DB,
-                row: $crate::backend::RowKind,
-                col: $crate::types::ColumnId,
-            ) -> Result<$crate::backend::Value<Self::Backend>, $crate::ValueError> {
-                let table_id = $crate::wal::wire_event::WireEvent::wire_table_id(self, db);
-                $crate::wal::wire_event::WireEvent::wire_value_at(self, db, table_id, row, col)
-            }
-
-            fn value_at_resolved<DB: sql_traits::prelude::DatabaseLike>(
-                &self,
-                db: &DB,
-                table_id: $crate::types::TableId,
-                row: $crate::backend::RowKind,
-                col: $crate::types::ColumnId,
-            ) -> Result<$crate::backend::Value<Self::Backend>, $crate::ValueError> {
-                $crate::wal::wire_event::WireEvent::wire_value_at(self, db, table_id, row, col)
-            }
-
-            fn value_at_known_pk<DB: sql_traits::prelude::DatabaseLike>(
-                &self,
-                db: &DB,
-                col: $crate::types::ColumnId,
-            ) -> Result<$crate::backend::Value<Self::Backend>, $crate::ValueError> {
-                let table_id = $crate::wal::wire_event::WireEvent::wire_table_id(self, db);
-                $crate::wal::wire_event::WireEvent::wire_value_at_known_pk(self, db, table_id, col)
-            }
-
-            fn value_at_known_pk_resolved<DB: sql_traits::prelude::DatabaseLike>(
-                &self,
-                db: &DB,
-                table_id: $crate::types::TableId,
-                col: $crate::types::ColumnId,
-            ) -> Result<$crate::backend::Value<Self::Backend>, $crate::ValueError> {
-                $crate::wal::wire_event::WireEvent::wire_value_at_known_pk(self, db, table_id, col)
-            }
-        }
+        $crate::wal::wire_event::wire_cdc_event!(<> $wire, $backend, $checkpoint);
     };
+
 }
 
 pub(crate) use wire_cdc_event;
