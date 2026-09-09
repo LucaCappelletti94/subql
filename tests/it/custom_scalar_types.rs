@@ -110,7 +110,11 @@ impl Backend for Custom {
     /// identifiers keep their case.
     const DELIMITED_IDENTIFIERS_FOLD_CASE: bool = false;
 
-    const TABLE_NAMES_FOLD_CASE: bool = false;
+    const WRITTEN_TABLE_NAME_CASE: sql_traits::structs::IdentifierCase =
+        sql_traits::structs::IdentifierCase::AsWritten;
+
+    const WIRE_TABLE_NAME_CASE: sql_traits::structs::IdentifierCase =
+        sql_traits::structs::IdentifierCase::Exact;
 
     /// This backend speaks the PostgreSQL dialect, so it takes
     /// PostgreSQL's `LIKE` escape rule with it.

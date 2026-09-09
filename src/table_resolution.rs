@@ -29,20 +29,16 @@ pub fn resolve_table_reference<B: crate::backend::Backend, DB: DatabaseLike>(
     })
 }
 
-/// Resolve a table from name parts a wire message carried, which are
-/// identifier values rather than written SQL.
-///
-/// Both branches ask the catalog for parts, so a name carrying a dot stays
-/// one name and no engine question arises: the quoting a written name would
-/// have carried is not present to interpret.
-pub fn resolve_table_parts<DB: DatabaseLike>(
+/// Resolve table-name parts carried as wire identifier values.
+pub fn resolve_table_parts<B: crate::backend::Backend, DB: DatabaseLike>(
     schema: Option<&str>,
     table: &str,
     database: &DB,
 ) -> Result<TableId, TableResolutionError> {
-    let qualified_id = schema
-        .and_then(|schema| catalog_helpers::table_id_in_schema(database, Some(schema), table));
-    let unqualified_id = catalog_helpers::table_id_in_schema(database, None, table);
+    let qualified_id = schema.and_then(|schema| {
+        catalog_helpers::table_id_in_schema::<B, DB>(database, Some(schema), table)
+    });
+    let unqualified_id = catalog_helpers::table_id_in_schema::<B, DB>(database, None, table);
     resolve_table_ids(qualified_id, unqualified_id, table, || {
         schema.map(|schema| alloc::format!("{schema}.{table}"))
     })
@@ -108,11 +104,65 @@ mod tests {
             catalog_helpers::table_id::<crate::backend::Postgres, _>(&db, r#""my.table""#)
                 .expect("the quoted spelling resolves");
 
-        assert_eq!(resolve_table_parts(None, "my.table", &db), Ok(expected));
         assert_eq!(
-            resolve_table_parts(Some("public"), "my.table", &db),
+            resolve_table_parts::<crate::backend::Postgres, _>(None, "my.table", &db),
+            Ok(expected)
+        );
+        assert_eq!(
+            resolve_table_parts::<crate::backend::Postgres, _>(Some("public"), "my.table", &db),
             Ok(expected),
             "and the schema the catalog stores it under reaches it too"
+        );
+    }
+
+    #[test]
+    fn wire_parts_match_a_stored_mixed_case_name_exactly() {
+        let db = ParserDB::parse::<sqlparser::dialect::PostgreSqlDialect>(
+            r#"CREATE SCHEMA app;
+               CREATE SCHEMA "App";
+               CREATE TABLE app.docs (id INT);
+               CREATE TABLE "App"."Docs" (id INT);"#,
+        )
+        .expect("DDL parses");
+        let expected =
+            catalog_helpers::table_id::<crate::backend::Postgres, _>(&db, r#""App"."Docs""#)
+                .expect("the mixed-case table exists");
+        let folded = catalog_helpers::table_id::<crate::backend::Postgres, _>(&db, "app.docs")
+            .expect("the folded table exists");
+
+        assert_ne!(expected, folded);
+        assert_eq!(
+            resolve_table_parts::<crate::backend::Postgres, _>(Some("App"), "Docs", &db),
+            Ok(expected)
+        );
+    }
+
+    #[test]
+    fn mysql_wire_names_follow_lower_case_table_names() {
+        use crate::backend::{MySql, NamesFoldedAtLookup, NamesStoredLowercased};
+
+        let db = ParserDB::parse::<sqlparser::dialect::MySqlDialect>("CREATE TABLE Docs (id INT);")
+            .expect("DDL parses");
+
+        assert_eq!(
+            resolve_table_parts::<MySql<NamesStoredLowercased>, _>(None, "docs", &db),
+            Ok(0)
+        );
+        assert_eq!(
+            resolve_table_parts::<MySql<NamesFoldedAtLookup>, _>(None, "docs", &db),
+            Ok(0)
+        );
+    }
+
+    #[test]
+    fn sqlite_wire_names_fold_like_the_engine() {
+        let db =
+            ParserDB::parse::<sqlparser::dialect::SQLiteDialect>("CREATE TABLE Docs (id INT);")
+                .expect("DDL parses");
+
+        assert_eq!(
+            resolve_table_parts::<crate::backend::SQLite, _>(None, "docs", &db),
+            Ok(0)
         );
     }
 

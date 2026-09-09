@@ -292,20 +292,16 @@ pub trait Backend: 'static {
     /// did not name, and neither is a safe guess.
     const DELIMITED_IDENTIFIERS_FOLD_CASE: bool;
 
-    /// Whether the engine folds a table name's case, quoting included.
+    /// Table-name comparison for SQL identifiers with quote metadata.
     ///
-    /// A separate answer from `DELIMITED_IDENTIFIERS_FOLD_CASE`, because the
-    /// engines separate them. MySQL's manual puts table and database names
-    /// under `lower_case_table_names` while stating that column, index and
-    /// routine names "are not case-sensitive on any platform", so one
-    /// constant cannot serve both. PostgreSQL keeps a quoted table name as
-    /// written, SQLite folds a table name for ASCII whether or not it was
-    /// quoted, and MySQL answers whatever its server was initialized with.
+    /// Required because engines disagree and an incorrect default can resolve
+    /// a different table.
+    const WRITTEN_TABLE_NAME_CASE: sql_traits::structs::IdentifierCase;
+
+    /// Table-name comparison for identifier values reported by this engine.
     ///
-    /// Required rather than defaulted, for the same reason as the column
-    /// rule: guessing either refuses a name the engine resolves or resolves
-    /// one it would not.
-    const TABLE_NAMES_FOLD_CASE: bool;
+    /// Required because PostgreSQL wire values and written identifiers differ.
+    const WIRE_TABLE_NAME_CASE: sql_traits::structs::IdentifierCase;
 
     /// The width an arithmetic result is held at, given each operand's
     /// width, or `None` when the operation is not on floats.

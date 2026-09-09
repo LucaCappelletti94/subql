@@ -33,7 +33,7 @@ use crate::types::{ColumnId, TableId};
 /// without a schema resides in the default schema.
 ///
 /// What the quoting means is the engine's, through
-/// [`Backend::TABLE_NAMES_FOLD_CASE`](crate::backend::Backend::TABLE_NAMES_FOLD_CASE).
+/// [`Backend::WRITTEN_TABLE_NAME_CASE`](crate::backend::Backend::WRITTEN_TABLE_NAME_CASE).
 ///
 /// Returns `None` when the text is not one valid identifier or a
 /// qualified pair, when the catalog holds no such table, when the name is
@@ -56,74 +56,85 @@ pub fn table_id<B: crate::backend::Backend, DB: DatabaseLike>(
 /// them again would lose the quoting or invent a qualifier out of a dot
 /// inside a name.
 ///
-/// On an engine that folds a table name's case, the quoting is dropped
-/// before resolution, so a written `"Docs"` reaches the table declared
-/// `Docs`.
-///
-/// What the lookup cannot reach is the stored side, which `sql-traits`
-/// normalises with one rule and no mode: an unquoted stored name folds and
-/// a quoted one keeps its case, whatever the engine. Two consequences,
-/// both recorded in
-/// `upstream/sql-traits-case-insensitive-relation-lookup.md`. A table the
-/// catalog stores under a quoted spelling is reachable only by that
-/// spelling even where the engine folds. And an unquoted name is folded
-/// even where the engine compares exactly, which is MySQL with
-/// `lower_case_table_names = 0`, so `docs` reaches a table declared `Docs`
-/// there although that server would not resolve it. Both need the same
-/// upstream primitive, a comparison the caller chooses.
+/// The comparison is the engine's
+/// [`Backend::WRITTEN_TABLE_NAME_CASE`](crate::backend::Backend::WRITTEN_TABLE_NAME_CASE).
 #[must_use]
 pub fn table_id_for_name<B: crate::backend::Backend, DB: DatabaseLike>(
     database: &DB,
     target: TargetName<'_>,
 ) -> Option<TableId> {
-    let folded = if B::TABLE_NAMES_FOLD_CASE {
-        unquoted_name(&target)
-    } else {
-        None
-    };
-    let resolved = folded.map_or_else(
-        || database.resolve_target_table(target),
-        |folded| database.resolve_target_table(folded),
-    );
-    let id = database.table_id(resolved.ok()??)?;
+    let table = database
+        .resolve_target_table(target, B::WRITTEN_TABLE_NAME_CASE)
+        .ok()??;
+    let id = database.table_id(table)?;
     u32::try_from(id).ok()
 }
 
-/// The same name with its quoting dropped, or `None` when nothing was
-/// quoted and the name already reads the way a folding engine reads it.
-///
-/// Owned, because the parts are lent by `target` and the name outlives it.
-/// The allocation is paid only by a quoted name on a folding engine.
-fn unquoted_name(target: &TargetName<'_>) -> Option<TargetName<'static>> {
-    if !target.name_is_quoted() && !target.schema_is_quoted() {
-        return None;
+/// Build a target from identifier values without SQL quote metadata.
+fn parts_target<'a>(schema: Option<&'a str>, name: &'a str) -> TargetName<'a> {
+    let target = TargetName::new(name, false);
+    match schema {
+        Some(schema) => target.with_schema(schema, false),
+        None => target,
     }
-    let unquoted = TargetName::new(target.name(), false);
-    Some(match target.schema() {
-        Some(schema) => unquoted.with_schema(schema, false).into_owned(),
-        None => unquoted.into_owned(),
-    })
 }
 
-/// Resolve a table from separate schema and relation names.
+fn table_id_for_parts<DB: DatabaseLike>(
+    database: &DB,
+    schema: Option<&str>,
+    table_name: &str,
+    case: sql_traits::structs::IdentifierCase,
+) -> Option<TableId> {
+    let table = database
+        .table_by_target(parts_target(schema, table_name), case)
+        .ok()??;
+    let id = database.table_id(table)?;
+    u32::try_from(id).ok()
+}
+
+/// Resolve the exact stored name carried by a patchset.
+#[cfg(any(
+    feature = "apply-patchset-postgres",
+    feature = "apply-patchset-mysql",
+    feature = "apply-patchset-sqlite",
+    feature = "apply-patchset-postgres-async",
+    feature = "apply-patchset-mysql-async"
+))]
 #[must_use]
-pub(crate) fn table_id_in_schema<DB: DatabaseLike>(
+pub(crate) fn table_id_by_stored_name<DB: DatabaseLike>(
+    database: &DB,
+    table_name: &str,
+) -> Option<TableId> {
+    table_id_for_parts(
+        database,
+        None,
+        table_name,
+        sql_traits::structs::IdentifierCase::Exact,
+    )
+}
+
+/// Resolve separate schema and relation values under the engine's wire policy.
+#[must_use]
+pub(crate) fn table_id_in_schema<B: crate::backend::Backend, DB: DatabaseLike>(
     database: &DB,
     schema: Option<&str>,
     table_name: &str,
 ) -> Option<TableId> {
-    let table = database.table(schema, table_name)?;
-    let id = database.table_id(table)?;
-    u32::try_from(id).ok()
+    table_id_for_parts(database, schema, table_name, B::WIRE_TABLE_NAME_CASE)
 }
+
+/// Resolve the exact stored table identity carried by a visibility contract.
 #[cfg(feature = "visibility-records")]
 pub(crate) fn contract_table_id<DB: DatabaseLike>(
     database: &DB,
     table: &rls2fga_types::TableId,
 ) -> Option<TableId> {
-    let table = database.table(table.schema(), table.name())?;
-    let id = database.table_id(table)?;
-    u32::try_from(id).ok()
+    table_id_for_parts(
+        database,
+        table.schema(),
+        table.name(),
+        sql_traits::structs::IdentifierCase::Exact,
+    )
 }
 
 /// The name the catalog stores for `table_id`, or [`None`] when it knows no such
@@ -140,14 +151,15 @@ pub fn table_name<DB: DatabaseLike>(database: &DB, table_id: TableId) -> Option<
 /// Resolve a column name within a table to subql's compact [`ColumnId`].
 ///
 /// Identifier matching is upstream's, through
-/// [`TableLike::column_id_by_name`], which applies the same quoting rule
-/// `DatabaseLike::table` applies to relations: a quoted lookup of an already
-/// folded spelling reaches a bare column, so `"id"` and `id` answer the same
-/// ordinal, while `"ID"` answers a separately declared quoted column.
+/// [`TableLike::column_id_by_name`], which applies the same quoting rule a
+/// relation lookup applies under `IdentifierCase::AsWritten`: a quoted
+/// lookup of an already folded spelling reaches a bare column, so `"id"`
+/// and `id` answer the same ordinal, while `"ID"` answers a separately
+/// declared quoted column.
 ///
-/// Returns `None` when the table is unknown, the column is not present, or the
-/// column's ordinal exceeds `u16::MAX`, which is 65536 columns in one table
-/// and unreachable in any sane schema.
+/// Returns `None` when the table is unknown, the column is not present, or
+/// the column's ordinal exceeds `u16::MAX`, which is 65536 columns in one
+/// table and unreachable in any sane schema.
 ///
 /// **Complexity**: O(n) per call where `n = table.number_of_columns()`.
 /// Upstream answers with one walk rather than the nested walk this used to
@@ -620,10 +632,20 @@ mod tests {
             Some(0),
             "SQLite folds a table name quoted or not"
         );
+        // Exact comparison, so the written spelling reaches the stored one
+        // and a differing case does not. This asserted `None` while subql
+        // could only fold, which was the missing primitive rather than
+        // MySQL: a server at `lower_case_table_names = 0` stores `Docs` and
+        // answers `` `Docs` `` while refusing `docs`.
         assert_eq!(
             table_id::<MySql<NamesStoredAsWritten>, _>(&my, r#""Docs""#),
+            Some(0),
+            "lower_case_table_names = 0 compares exactly, so the spelling matches"
+        );
+        assert_eq!(
+            table_id::<MySql<NamesStoredAsWritten>, _>(&my, "docs"),
             None,
-            "lower_case_table_names = 0 compares case-sensitively"
+            "and a differing case is another table"
         );
         assert_eq!(
             table_id::<MySql<NamesFoldedAtLookup>, _>(&my, r#""Docs""#),
@@ -644,11 +666,91 @@ mod tests {
             Some(0),
             "a quoted qualifier folds where the engine folds names"
         );
+        // Exact, so the written spelling matches the stored one and only a
+        // differing case misses. This asserted `None` while subql could
+        // only fold, which was the workaround rather than the engine.
         assert_eq!(
             table_id::<MySql<NamesStoredAsWritten>, _>(&qualified, r#""App"."Docs""#),
-            None,
-            "and stays exact where it does not"
+            Some(0),
+            "mode 0 compares exactly, and the spelling is the stored one"
         );
+        assert_eq!(
+            table_id::<MySql<NamesStoredAsWritten>, _>(&qualified, r#""app"."docs""#),
+            None,
+            "while a differing case names nothing this catalog holds"
+        );
+    }
+
+    /// A name a changeset carried is the catalog's own spelling, so it is
+    /// compared exactly.
+    ///
+    /// The fixture holds both spellings, which is two tables in PostgreSQL.
+    /// Folding the lookup would match both and answer nothing, and letting
+    /// quoting decide would fold the unquoted lookup onto the wrong one.
+    #[cfg(any(
+        feature = "apply-patchset-postgres",
+        feature = "apply-patchset-mysql",
+        feature = "apply-patchset-sqlite",
+        feature = "apply-patchset-postgres-async",
+        feature = "apply-patchset-mysql-async"
+    ))]
+    #[test]
+    fn a_changeset_name_reaches_the_table_it_was_read_from() {
+        let db = ParserDB::parse::<sqlparser::dialect::PostgreSqlDialect>(
+            r#"CREATE TABLE "Docs" (id INT PRIMARY KEY); CREATE TABLE docs (id INT PRIMARY KEY);"#,
+        )
+        .unwrap();
+        let quoted = table_id::<Postgres, _>(&db, r#""Docs""#).expect("the quoted table");
+        let folded = table_id::<Postgres, _>(&db, "docs").expect("the folded table");
+        assert_ne!(quoted, folded);
+
+        assert_eq!(table_id_by_stored_name(&db, "Docs"), Some(quoted));
+        assert_eq!(table_id_by_stored_name(&db, "docs"), Some(folded));
+        assert_eq!(
+            table_id_by_stored_name(&db, "DOCS"),
+            None,
+            "a spelling the catalog does not hold reaches nothing"
+        );
+    }
+
+    /// The two spellings no lookup could reach before the comparison was
+    /// the caller's.
+    ///
+    /// `table_id_for_name` used to document both as unreachable: a stored
+    /// quoted name where the engine folds, and an unquoted stored name
+    /// where the engine compares exactly. Upstream now takes the rule, so
+    /// each engine answers what it answers.
+    #[test]
+    fn the_engine_rule_reaches_both_stored_spellings() {
+        use crate::backend::{MySql, NamesStoredAsWritten, SQLite};
+
+        let lite = ParserDB::parse::<sqlparser::dialect::SQLiteDialect>(
+            r#"CREATE TABLE "Docs" (id INT PRIMARY KEY);"#,
+        )
+        .unwrap();
+        for written in [r#""Docs""#, "Docs", "docs", r#""docs""#] {
+            assert_eq!(
+                table_id::<SQLite, _>(&lite, written),
+                Some(0),
+                "SQLite folds a table name, so `{written}` reaches the stored `Docs`"
+            );
+        }
+
+        let my = ParserDB::parse::<sqlparser::dialect::MySqlDialect>(
+            "CREATE TABLE Docs (id INT PRIMARY KEY);",
+        )
+        .unwrap();
+        assert_eq!(
+            table_id::<MySql<NamesStoredAsWritten>, _>(&my, "Docs"),
+            Some(0)
+        );
+        for written in ["docs", r#""docs""#] {
+            assert_eq!(
+                table_id::<MySql<NamesStoredAsWritten>, _>(&my, written),
+                None,
+                "lower_case_table_names = 0 compares exactly, so `{written}` is another table"
+            );
+        }
     }
 
     /// The shipped MySQL adapters carry the marker too, not only the
@@ -662,13 +764,16 @@ mod tests {
     #[test]
     fn the_mysql_adapters_carry_the_case_marker() {
         use crate::backend::{Backend, NamesStoredLowercased};
+        use sql_traits::structs::IdentifierCase;
 
         fn assert_folds<B: Backend>() {
-            assert!(B::TABLE_NAMES_FOLD_CASE);
+            assert_eq!(B::WRITTEN_TABLE_NAME_CASE, IdentifierCase::Folded);
+            assert_eq!(B::WIRE_TABLE_NAME_CASE, IdentifierCase::Folded);
         }
 
         fn assert_keeps_case<B: Backend>() {
-            assert!(!B::TABLE_NAMES_FOLD_CASE);
+            assert_eq!(B::WRITTEN_TABLE_NAME_CASE, IdentifierCase::Exact);
+            assert_eq!(B::WIRE_TABLE_NAME_CASE, IdentifierCase::Exact);
         }
 
         // The bind path, whose `BindDecode` is implemented on diesel's own
@@ -936,10 +1041,34 @@ mod tests {
         )
         .expect("DDL parses");
 
-        let east = table_id_in_schema(&db, Some("east"), "orders").expect("east orders exists");
-        let west = table_id_in_schema(&db, Some("west"), "orders").expect("west orders exists");
+        let east = table_id_in_schema::<Postgres, _>(&db, Some("east"), "orders")
+            .expect("east orders exists");
+        let west = table_id_in_schema::<Postgres, _>(&db, Some("west"), "orders")
+            .expect("west orders exists");
 
         assert_ne!(east, west);
+    }
+
+    #[cfg(feature = "visibility-records")]
+    #[test]
+    fn contract_names_match_a_stored_mixed_case_name_exactly() {
+        let db = ParserDB::parse::<sqlparser::dialect::PostgreSqlDialect>(
+            r#"CREATE SCHEMA app;
+               CREATE SCHEMA "App";
+               CREATE TABLE app.docs (id INT);
+               CREATE TABLE "App"."Docs" (id INT);"#,
+        )
+        .expect("DDL parses");
+        let contract = rls2fga_types::TableId::from_stored(
+            Some(alloc::string::String::from("App")),
+            alloc::string::String::from("Docs"),
+        );
+        let expected =
+            table_id::<Postgres, _>(&db, r#""App"."Docs""#).expect("the mixed-case table exists");
+        let folded = table_id::<Postgres, _>(&db, "app.docs").expect("the folded table exists");
+
+        assert_ne!(expected, folded);
+        assert_eq!(contract_table_id(&db, &contract), Some(expected));
     }
 
     #[test]

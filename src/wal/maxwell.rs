@@ -90,9 +90,12 @@ fn image_for(msg: &Message, image: RowKind) -> Option<&Map<String, JsonValue>> {
 }
 
 /// The catalog table `msg` names, when it carries a row that resolves.
-fn table_of<DB: DatabaseLike>(msg: &Message, db: &DB) -> Option<TableId> {
+fn table_of<C: crate::backend::MySqlTableNameCase, DB: DatabaseLike>(
+    msg: &Message,
+    db: &DB,
+) -> Option<TableId> {
     let payload = row(msg)?;
-    resolve_table(&payload.database, &payload.table, db).ok()
+    resolve_table::<MySql<C>, DB>(&payload.database, &payload.table, db).ok()
 }
 
 /// A parsed Maxwell message viewed as a subql event, carrying the server's
@@ -155,7 +158,7 @@ impl<C: crate::backend::MySqlTableNameCase> WireEvent for MaxwellEvent<C> {
     fn wire_table_id<DB: DatabaseLike>(&self, db: &DB) -> TableId {
         // Infallible in the trait, so an unresolved name yields the `u32`
         // sentinel, which the engine reports as an unknown table.
-        table_of(&self.message, db).unwrap_or(TableId::MAX)
+        table_of::<C, DB>(&self.message, db).unwrap_or(TableId::MAX)
     }
 
     fn wire_checkpoint(&self) -> Option<Self::Checkpoint> {

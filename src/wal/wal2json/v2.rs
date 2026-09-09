@@ -49,7 +49,7 @@ fn v2_index(columns: &[Column]) -> HashMap<IndexedName<'_>, &Column> {
 fn v2_table_id<DB: DatabaseLike>(msg: &MessageV2, db: &DB) -> Option<TableId> {
     let schema = msg.schema().unwrap_or("");
     let table = msg.table()?;
-    resolve_table(schema, table, db).ok()
+    resolve_table::<crate::backend::Postgres, DB>(schema, table, db).ok()
 }
 
 wire_cdc_event!(MessageV2, Postgres, crate::PgLsn);

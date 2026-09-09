@@ -196,8 +196,13 @@ impl<V: postgres_jsonb_canonical::PgVersion + 'static> Backend for Postgres<V> {
     /// what makes `"Owner"` and `owner` two columns.
     const DELIMITED_IDENTIFIERS_FOLD_CASE: bool = false;
 
-    /// The same rule reaches relations: `"Docs"` and `docs` are two tables.
-    const TABLE_NAMES_FOLD_CASE: bool = false;
+    /// PostgreSQL folds unquoted written names and preserves quoted names.
+    const WRITTEN_TABLE_NAME_CASE: sql_traits::structs::IdentifierCase =
+        sql_traits::structs::IdentifierCase::AsWritten;
+
+    /// PostgreSQL reports the stored schema and relation spellings.
+    const WIRE_TABLE_NAME_CASE: sql_traits::structs::IdentifierCase =
+        sql_traits::structs::IdentifierCase::Exact;
 
     /// Measured on 16.11. Equality under a deterministic collation is byte
     /// equality, including for the database default, since `CREATE
@@ -382,9 +387,10 @@ pub trait MySqlTableNameCase: 'static {
     /// The value `SELECT @@lower_case_table_names` answers.
     const LOWER_CASE_TABLE_NAMES: u8;
 
-    /// Whether a table name comparison ignores case, which values `1` and
-    /// `2` do and value `0` does not.
-    const FOLDS_CASE: bool;
+    /// The comparison this setting gives a table name: values `1` and `2`
+    /// fold, and value `0` compares exactly, which is what makes a table
+    /// created `Docs` unreachable as `docs` on a Unix server.
+    const TABLE_NAME_CASE: sql_traits::structs::IdentifierCase;
 }
 
 /// `lower_case_table_names = 0`, the Unix default: a name is stored as
@@ -394,7 +400,8 @@ pub struct NamesStoredAsWritten;
 
 impl MySqlTableNameCase for NamesStoredAsWritten {
     const LOWER_CASE_TABLE_NAMES: u8 = 0;
-    const FOLDS_CASE: bool = false;
+    const TABLE_NAME_CASE: sql_traits::structs::IdentifierCase =
+        sql_traits::structs::IdentifierCase::Exact;
 }
 
 /// `lower_case_table_names = 1`, the Windows default: a name is lowercased
@@ -404,7 +411,8 @@ pub struct NamesStoredLowercased;
 
 impl MySqlTableNameCase for NamesStoredLowercased {
     const LOWER_CASE_TABLE_NAMES: u8 = 1;
-    const FOLDS_CASE: bool = true;
+    const TABLE_NAME_CASE: sql_traits::structs::IdentifierCase =
+        sql_traits::structs::IdentifierCase::Folded;
 }
 
 /// `lower_case_table_names = 2`, the macOS default: a name is stored as
@@ -414,7 +422,8 @@ pub struct NamesFoldedAtLookup;
 
 impl MySqlTableNameCase for NamesFoldedAtLookup {
     const LOWER_CASE_TABLE_NAMES: u8 = 2;
-    const FOLDS_CASE: bool = true;
+    const TABLE_NAME_CASE: sql_traits::structs::IdentifierCase =
+        sql_traits::structs::IdentifierCase::Folded;
 }
 
 /// MySQL backend marker, parameterised by the server's
@@ -474,9 +483,11 @@ impl<C: MySqlTableNameCase> Backend for MySql<C> {
     /// was written in backticks.
     const DELIMITED_IDENTIFIERS_FOLD_CASE: bool = true;
 
-    /// Table names follow the server's own `lower_case_table_names`, which
-    /// the marker carries because no platform-independent answer exists.
-    const TABLE_NAMES_FOLD_CASE: bool = C::FOLDS_CASE;
+    /// Written names follow the server's `lower_case_table_names` setting.
+    const WRITTEN_TABLE_NAME_CASE: sql_traits::structs::IdentifierCase = C::TABLE_NAME_CASE;
+
+    /// Reported names follow the same server setting.
+    const WIRE_TABLE_NAME_CASE: sql_traits::structs::IdentifierCase = C::TABLE_NAME_CASE;
 
     /// Measured: MySQL answers `NULL` with warning 1365, even with
     /// `ERROR_FOR_DIVISION_BY_ZERO` in `sql_mode`, which raises on writes.
@@ -835,9 +846,13 @@ impl Backend for SQLite {
     /// SQLite compares a column name case-insensitively, quoted or not.
     const DELIMITED_IDENTIFIERS_FOLD_CASE: bool = true;
 
-    /// And a table name the same way: every schema lookup goes through the
-    /// ASCII-folding comparison, with no setting that changes it.
-    const TABLE_NAMES_FOLD_CASE: bool = true;
+    /// SQLite folds written table names with ASCII case comparison.
+    const WRITTEN_TABLE_NAME_CASE: sql_traits::structs::IdentifierCase =
+        sql_traits::structs::IdentifierCase::Folded;
+
+    /// SQLite reports names under the same folded comparison.
+    const WIRE_TABLE_NAME_CASE: sql_traits::structs::IdentifierCase =
+        sql_traits::structs::IdentifierCase::Folded;
 
     fn compare_cross_kind_numeric(
         left: &Value<Self>,
