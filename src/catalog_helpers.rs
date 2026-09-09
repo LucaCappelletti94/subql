@@ -17,7 +17,7 @@ use alloc::vec::Vec;
 use sql_traits::{
     prelude::{ColumnLike, DatabaseLike, TableLike},
     structs::{FingerprintError, SchemaFingerprint, TargetName},
-    utils::scalar_family::scalar_family,
+    utils::{identifier_resolution::identifiers_match, scalar_family::scalar_family},
 };
 use sqlite_diff_rs::SimpleTable;
 
@@ -40,7 +40,21 @@ use crate::types::{ColumnId, TableId};
 /// is "which compact id, if any".
 #[must_use]
 pub fn table_id<DB: DatabaseLike>(database: &DB, table_name: &str) -> Option<TableId> {
-    let target = TargetName::parse(table_name).ok()?;
+    table_id_for_name(database, TargetName::parse(table_name).ok()?)
+}
+
+/// Resolve a name whose parts a caller already holds, quoting included.
+///
+/// [`table_id`] is for text somebody wrote as SQL. This is for a caller that
+/// took the name off a parsed statement, where the identifier and its
+/// quoting arrive separately and rendering them back to text only to read
+/// them again would lose the quoting or invent a qualifier out of a dot
+/// inside a name.
+#[must_use]
+pub fn table_id_for_name<DB: DatabaseLike>(
+    database: &DB,
+    target: TargetName<'_>,
+) -> Option<TableId> {
     let table = database.resolve_target_table(target).ok()??;
     let id = database.table_id(table)?;
     u32::try_from(id).ok()
@@ -102,6 +116,35 @@ pub fn column_id<DB: DatabaseLike>(
 ) -> Option<ColumnId> {
     let table = database.table_by_id(table_id as usize)?;
     let ordinal = table.column_id_by_name(column_name, database).ok()??;
+    u16::try_from(ordinal).ok()
+}
+
+/// Resolve a column whose name a caller already holds, quoting included.
+///
+/// [`column_id`] is for text spelled as SQL, where the lookup carries its
+/// own quotes. This is for a caller holding a parsed identifier, whose text
+/// and quoting arrive separately: rendering them back to a lookup string
+/// would either lose the quoting, which silently reaches a differently
+/// spelled column, or need an allocation per lookup to put the quotes back.
+///
+/// **Complexity**: O(n) per call where `n = table.number_of_columns()`, the
+/// same walk [`column_id`] performs.
+#[must_use]
+pub fn column_id_for_name<DB: DatabaseLike>(
+    database: &DB,
+    table_id: TableId,
+    column_name: &str,
+    column_name_is_quoted: bool,
+) -> Option<ColumnId> {
+    let table = database.table_by_id(table_id as usize)?;
+    let ordinal = table.columns(database).ok()?.position(|column| {
+        identifiers_match(
+            column.column_name(),
+            column.column_name_is_quoted(),
+            column_name,
+            column_name_is_quoted,
+        )
+    })?;
     u16::try_from(ordinal).ok()
 }
 
