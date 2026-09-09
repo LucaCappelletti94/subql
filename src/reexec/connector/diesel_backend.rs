@@ -108,7 +108,7 @@ impl DieselBackend for crate::backend::Postgres {
 }
 
 #[cfg(feature = "executor-diesel")]
-impl DieselBackend for crate::backend::MySql {
+impl<C: crate::backend::MySqlTableNameCase> DieselBackend for crate::backend::MySql<C> {
     fn value_from_i64(x: i64) -> Value<Self> {
         Value::Int(x)
     }

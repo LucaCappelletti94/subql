@@ -223,7 +223,7 @@ mod tests {
         ));
         let time = SqlValue::SingleQuotedString("12:34:56.789".to_string());
         assert!(matches!(
-            MySql::parse_literal(&time, ScalarFamily::Time.into()),
+            <MySql as SqlLiteralParse>::parse_literal(&time, ScalarFamily::Time.into()),
             Ok(Value::Time(_))
         ));
     }

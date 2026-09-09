@@ -689,7 +689,7 @@ impl SpellCanonical for Postgres {
     }
 }
 
-impl SpellCanonical for crate::backend::MySql {
+impl<C: crate::backend::MySqlTableNameCase> SpellCanonical for crate::backend::MySql<C> {
     fn value_from_canonical(value: Canonical) -> Value<Self> {
         match value {
             Canonical::Bool(b) => Value::Bool(b),

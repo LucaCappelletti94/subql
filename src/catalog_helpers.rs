@@ -58,10 +58,19 @@ pub fn table_id<B: crate::backend::Backend, DB: DatabaseLike>(
 ///
 /// On an engine that folds a table name's case, the quoting is dropped
 /// before resolution, so a written `"Docs"` reaches the table declared
-/// `Docs`. A table the catalog itself stores under a quoted spelling is
-/// still matched as PostgreSQL matches it, because the stored side belongs
-/// to `sql-traits` and its resolution has no folding mode: recorded in
-/// `upstream/sql-traits-case-insensitive-relation-lookup.md`.
+/// `Docs`.
+///
+/// What the lookup cannot reach is the stored side, which `sql-traits`
+/// normalises with one rule and no mode: an unquoted stored name folds and
+/// a quoted one keeps its case, whatever the engine. Two consequences,
+/// both recorded in
+/// `upstream/sql-traits-case-insensitive-relation-lookup.md`. A table the
+/// catalog stores under a quoted spelling is reachable only by that
+/// spelling even where the engine folds. And an unquoted name is folded
+/// even where the engine compares exactly, which is MySQL with
+/// `lower_case_table_names = 0`, so `docs` reaches a table declared `Docs`
+/// there although that server would not resolve it. Both need the same
+/// upstream primitive, a comparison the caller chooses.
 #[must_use]
 pub fn table_id_for_name<B: crate::backend::Backend, DB: DatabaseLike>(
     database: &DB,
@@ -640,6 +649,38 @@ mod tests {
             None,
             "and stays exact where it does not"
         );
+    }
+
+    /// A non-default marker is usable where the default is, which is the
+    /// point of carrying the setting on the type.
+    ///
+    /// The reviewer's own example: an engine driven by a test event whose
+    /// backend is `MySql<NamesStoredLowercased>` registers a filter, which
+    /// needs `SqlLiteralParse`, `Backend` and the rest to hold for every
+    /// marker rather than only the default.
+    #[test]
+    fn a_non_default_mysql_marker_registers_a_filter() {
+        use crate::backend::{MySql, NamesStoredLowercased};
+        use crate::testing::TestEvent;
+        use crate::{DefaultIds, SubscriptionEngine, SubscriptionRequest};
+
+        let db = ParserDB::parse::<sqlparser::dialect::MySqlDialect>(
+            "CREATE TABLE Docs (id INT PRIMARY KEY, title TEXT);",
+        )
+        .unwrap();
+        let mut engine: SubscriptionEngine<
+            TestEvent<MySql<NamesStoredLowercased>>,
+            DefaultIds,
+            ParserDB,
+        > = SubscriptionEngine::new(db, sqlparser::dialect::MySqlDialect {});
+
+        let registered = engine
+            .register(SubscriptionRequest::new(
+                1u64,
+                r#"SELECT * FROM "Docs" WHERE id = 1"#,
+            ))
+            .expect("the quoted name resolves where the server folds it");
+        assert!(registered.served().is_some());
     }
 
     #[test]

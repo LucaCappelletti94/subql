@@ -123,7 +123,7 @@ impl JsonWireScalars for Postgres {
     }
 }
 
-impl JsonWireScalars for MySql {
+impl<C: crate::backend::MySqlTableNameCase> JsonWireScalars for MySql<C> {
     fn uuid_cell(value: &serde_json::Value) -> Value<Self> {
         value
             .as_str()
