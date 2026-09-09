@@ -7,8 +7,35 @@ publish = false
 description = "Dioxus web demo of subql: PG schema -> sqlite-wasm-rs -> CDC events via diesel hooks"
 license = "MIT"
 
-[lints]
-workspace = true
+# Its own workspace, so the `arborium-*` grammar graph stays out of the
+# library's resolution and lockfile, and so the profile overrides below are
+# possible at all: a workspace member cannot set them.
+[workspace]
+# Resolver 3 resolves under this crate's `rust-version`, so a dependency that
+# raises its MSRV in a patch release is simply not selected.
+resolver = "3"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+cargo = { level = "warn", priority = -1 }
+clone_on_ref_ptr = "warn"
+dbg_macro = "warn"
+print_stdout = "warn"
+print_stderr = "warn"
+implicit_clone = "warn"
+todo = "warn"
+unimplemented = "warn"
+unwrap_used = "warn"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+doc_markdown = "allow"
+module_name_repetitions = "allow"
+multiple_crate_versions = "allow"
 
 [dependencies]
 # Core engine, built in no_std + alloc mode (wasm-friendly).
@@ -69,3 +96,28 @@ sqlite-wasm-rs = "0.5"
 console_error_panic_hook = "0.1"
 wasm-bindgen-futures = "0.4"
 gloo-timers = { version = "0.3", features = ["futures"] }
+
+# Inherited from the library's workspace until this crate left it: the
+# sqlparser and diesel redirects are load-bearing here, because `subql` is
+# built from path and must resolve the same `sqlparser` this crate does.
+[patch.crates-io]
+diesel = { git = "https://github.com/LucaCappelletti94/diesel", branch = "future" }
+sqlparser = { git = "https://github.com/apache/datafusion-sqlparser-rs", branch = "main" }
+sqlparser_derive = { git = "https://github.com/apache/datafusion-sqlparser-rs", branch = "main" }
+
+[patch."https://github.com/diesel-rs/diesel"]
+diesel = { git = "https://github.com/LucaCappelletti94/diesel", branch = "future" }
+
+# The highlighter's grammars link a wasm C sysroot: `arborium-sysroot`
+# compiles C defining libc globals (`stderr` and friends) and
+# `arborium-tree-sitter`'s C references them. At opt-level 0, which is the
+# dev and `wasm-dev` default, rust-lld drops the defining object and the
+# link fails with `undefined symbol: stderr`. Building those two crates at
+# opt-level 1 resolves it while the rest of the dev graph stays fast, which
+# is what `rls2fga/web` does. Release already links, its opt-level being
+# non-zero.
+[profile.dev.package.arborium-sysroot]
+opt-level = 1
+
+[profile.dev.package.arborium-tree-sitter]
+opt-level = 1

@@ -40,3 +40,12 @@ fuzz/hfuzz_target/
 # Added by cargo
 
 /target
+
+# Lockfiles are not committed: every `git =` dependency resolves to a commit
+# hash, and committing that hash freezes the dependency wherever upstream has
+# moved. The manifests are the contract; the resolved graph is a build
+# artifact of the moment, which is why CI resolves it per run rather than
+# passing `--locked`.
+/Cargo.lock
+/fuzz/Cargo.lock
+/subql-demo/Cargo.lock

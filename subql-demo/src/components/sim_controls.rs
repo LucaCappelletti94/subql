@@ -156,7 +156,13 @@ fn start_auto_loop(state: SharedState, mut tick: TickSignal) {
             if !running {
                 break;
             }
-            let interval_ms = (1000.0 / rate.max(0.5)).max(50.0) as u32;
+            // `max(0.5)` pins NaN and non-positive rates, so the clamp holds [50, 2000].
+            #[allow(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                reason = "clamped to [50, 2000], the cast is the intended truncation to whole milliseconds"
+            )]
+            let interval_ms = (1000.0 / rate.max(0.5)).clamp(50.0, 2000.0) as u32;
             TimeoutFuture::new(interval_ms).await;
             if !state.borrow().auto_running {
                 break;
