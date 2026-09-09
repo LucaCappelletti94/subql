@@ -71,7 +71,8 @@ fn mysql_matches(
     cells: Vec<Value<MySql>>,
 ) -> bool {
     let db = ParserDB::parse::<MySqlDialect>(MYSQL_DDL).expect("DDL parses");
-    let table = catalog_helpers::table_id(&db, "t").expect("t is in the catalog");
+    let table = catalog_helpers::table_id::<subql::backend::Postgres, _>(&db, "t")
+        .expect("t is in the catalog");
     let mut engine: SubscriptionEngine<TestEvent<MySql>, DefaultIds, ParserDB> =
         SubscriptionEngine::new(db, MySqlDialect {}).with_division_precision_increment(increment);
     engine
@@ -132,7 +133,8 @@ fn mysql_scaled_pair(dividend: &str, divisor: &str, wide: bool) -> Vec<Value<MyS
 /// As [`mysql_matches`], for PostgreSQL, which needs no declared setting.
 fn pg_matches(predicate: &str, cells: Vec<Value<Postgres>>) -> bool {
     let db = ParserDB::parse::<PostgreSqlDialect>(PG_DDL).expect("DDL parses");
-    let table = catalog_helpers::table_id(&db, "t").expect("t is in the catalog");
+    let table = catalog_helpers::table_id::<subql::backend::Postgres, _>(&db, "t")
+        .expect("t is in the catalog");
     let mut engine: SubscriptionEngine<TestEvent<Postgres>, DefaultIds, ParserDB> =
         SubscriptionEngine::new(db, PostgreSqlDialect {});
     engine
@@ -410,7 +412,8 @@ fn pg_integer_division_still_truncates() {
 #[test]
 fn sqlite_integer_division_still_truncates() {
     let db = ParserDB::parse::<SQLiteDialect>(SQLITE_DDL).expect("DDL parses");
-    let table = catalog_helpers::table_id(&db, "t").expect("t is in the catalog");
+    let table = catalog_helpers::table_id::<subql::backend::Postgres, _>(&db, "t")
+        .expect("t is in the catalog");
     let mut engine: SubscriptionEngine<TestEvent<SQLite>, DefaultIds, ParserDB> =
         SubscriptionEngine::new(db, SQLiteDialect {});
     engine

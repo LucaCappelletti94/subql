@@ -266,11 +266,12 @@ fn reconstruct_changeset<DB: DatabaseLike>(
 
 /// Resolve a [`SimpleTable`] for `name` from `catalog`.
 fn catalog_table<DB: DatabaseLike>(catalog: &DB, name: &str) -> QueryResult<SimpleTable> {
-    let table_id = crate::catalog_helpers::table_id(catalog, name).ok_or_else(|| {
-        ingest_error(alloc::format!(
-            "uploaded patchset names table `{name}`, which is absent from the catalog"
-        ))
-    })?;
+    let table_id =
+        crate::catalog_helpers::table_id_in_schema(catalog, None, name).ok_or_else(|| {
+            ingest_error(alloc::format!(
+                "uploaded patchset names table `{name}`, which is absent from the catalog"
+            ))
+        })?;
     crate::catalog_helpers::simple_table(catalog, table_id).map_err(|error| {
         ingest_error(alloc::format!(
             "catalog table `{name}` could not be resolved to a schema: {error}"

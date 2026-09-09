@@ -26,7 +26,7 @@ type Engine = SubscriptionEngine<Event, DefaultIds, ParserDB>;
 
 fn engine() -> (Engine, TableId) {
     let database = ParserDB::parse::<PostgreSqlDialect>(DDL).unwrap();
-    let orders = catalog_helpers::table_id(&database, "orders").unwrap();
+    let orders = catalog_helpers::table_id::<Postgres, _>(&database, "orders").unwrap();
     (
         SubscriptionEngine::new(database, PostgreSqlDialect {}),
         orders,
@@ -266,7 +266,7 @@ fn a_quiet_read_is_installed_without_any_position() {
 fn more_changes_during_the_read_than_the_cap_refuse_the_seed() {
     let (database, orders) = {
         let database = ParserDB::parse::<PostgreSqlDialect>(DDL).unwrap();
-        let orders = catalog_helpers::table_id(&database, "orders").unwrap();
+        let orders = catalog_helpers::table_id::<Postgres, _>(&database, "orders").unwrap();
         (database, orders)
     };
     let mut engine: Engine = SubscriptionEngine::new(database, PostgreSqlDialect {})

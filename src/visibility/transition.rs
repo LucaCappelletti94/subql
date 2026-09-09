@@ -343,7 +343,7 @@ mod tests {
             "CREATE TABLE docs (id INT PRIMARY KEY, owner INT);",
         )
         .unwrap();
-        let docs = catalog_helpers::table_id(&db, "docs").unwrap();
+        let docs = catalog_helpers::table_id::<crate::backend::Postgres, _>(&db, "docs").unwrap();
         (db, docs)
     }
 
@@ -633,7 +633,7 @@ mod tests {
             "CREATE TABLE docs (id INT PRIMARY KEY, owner INT, body TEXT);",
         )
         .unwrap();
-        let docs = catalog_helpers::table_id(&db, "docs").unwrap();
+        let docs = catalog_helpers::table_id::<crate::backend::Postgres, _>(&db, "docs").unwrap();
         let partial = vec![Value::Int(1), Value::Int(7), Value::Missing];
         let after = vec![Value::Int(1), Value::Int(9), Value::Missing];
         let event = TestEvent::update(docs, partial, after).with_pk_columns([0u16]);
@@ -652,7 +652,7 @@ mod tests {
             "CREATE TABLE edges (src INT, dst INT, PRIMARY KEY (src, dst));",
         )
         .unwrap();
-        let edges = catalog_helpers::table_id(&db, "edges").unwrap();
+        let edges = catalog_helpers::table_id::<crate::backend::Postgres, _>(&db, "edges").unwrap();
         let event = TestEvent::delete(edges, vec![Value::Int(1), Value::Int(2)])
             .with_pk_columns([0u16, 1u16]);
         let policy = OwnerPolicy::default();

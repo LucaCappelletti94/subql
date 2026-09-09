@@ -41,7 +41,8 @@ use subql::{catalog_helpers, DefaultIds, NotServed, SubscriptionEngine, Subscrip
 macro_rules! notifies {
     ($backend:ty, $dialect:ty, $ddl:expr, $predicate:expr, $cell:expr) => {{
         let db = ParserDB::parse::<$dialect>($ddl).expect("DDL parses");
-        let table = catalog_helpers::table_id(&db, "people").expect("people is in the catalog");
+        let table = catalog_helpers::table_id::<subql::backend::Postgres, _>(&db, "people")
+            .expect("people is in the catalog");
         let mut engine: SubscriptionEngine<TestEvent<$backend>, DefaultIds, ParserDB> =
             SubscriptionEngine::new(db, <$dialect>::default());
         engine
@@ -177,7 +178,7 @@ fn locale_ordering_is_classified_not_served() {
     );
     let column = catalog_helpers::column_id(
         &ParserDB::parse::<PostgreSqlDialect>(PG_DDL).expect("DDL parses"),
-        catalog_helpers::table_id(
+        catalog_helpers::table_id::<subql::backend::Postgres, _>(
             &ParserDB::parse::<PostgreSqlDialect>(PG_DDL).expect("DDL parses"),
             "people",
         )

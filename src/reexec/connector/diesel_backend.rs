@@ -108,7 +108,7 @@ impl DieselBackend for crate::backend::Postgres {
 }
 
 #[cfg(feature = "executor-diesel")]
-impl DieselBackend for crate::backend::MySql {
+impl<C: crate::backend::MySqlTableNameCase> DieselBackend for crate::backend::MySql<C> {
     fn value_from_i64(x: i64) -> Value<Self> {
         Value::Int(x)
     }
@@ -301,8 +301,8 @@ pub fn boxed_postgres_read_query_owned(
 ///
 /// Uses `sql_query` because the re-execution query is user-supplied SQL.
 #[cfg(feature = "executor-diesel-async-mysql")]
-pub fn boxed_mysql_read_query_owned(
-    query: &ReadQuery<'_, crate::backend::MySql>,
+pub fn boxed_mysql_read_query_owned<C: crate::backend::MySqlTableNameCase>(
+    query: &ReadQuery<'_, crate::backend::MySql<C>>,
 ) -> QueryResult<BoxedSqlQuery<'static, diesel::mysql::Mysql, SqlQuery>> {
     let mut boxed = sql_query(query.sql()).into_boxed::<diesel::mysql::Mysql>();
     for value in query.binds() {

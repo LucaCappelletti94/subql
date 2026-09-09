@@ -20,6 +20,7 @@ pub(crate) mod wire_event;
 #[cfg(any(feature = "pg-streaming", feature = "pg-sqlite-emu"))]
 pub(crate) use change_event::into_engine_events;
 pub use maxwell::parse_messages as parse_maxwell;
+pub use maxwell::MaxwellEvent;
 pub use maxwell_cdc::Message as MaxwellMessage;
 #[cfg(feature = "pg-streaming")]
 pub use pg_streaming::{PgStreamingCdcSource, PgStreamingConfig, PgStreamingError};

@@ -63,7 +63,7 @@ fn evict_oldest_drops_subscription_from_dispatch_path() {
     common::create_slot(&mut setup, slot);
 
     let catalog = ParserDB::parse::<PostgreSqlDialect>(DDL).expect("parse DDL");
-    let _orders_id = catalog_helpers::table_id(&catalog, "orders").unwrap();
+    let _orders_id = catalog_helpers::table_id::<Postgres, _>(&catalog, "orders").unwrap();
     let mut engine: SubscriptionEngine<MessageV2, DefaultIds, ParserDB> = SubscriptionEngine::new(
         ParserDB::parse::<PostgreSqlDialect>(DDL).expect("parse DDL"),
         PostgreSqlDialect {},

@@ -599,13 +599,13 @@ pub fn pgbinary_adapter() -> TypeMap<PgBinary, String, Vec<u8>> {
 /// row's width does not match `column_names`, and
 /// [`ConversionError::Decode`] when a column's bytes do not decode for its
 /// type.
-pub fn pgbinary_patchset_builder<DB: DatabaseLike>(
+pub fn pgbinary_patchset_builder<B: crate::backend::Backend, DB: DatabaseLike>(
     database: &DB,
     table: &str,
     column_names: &[&str],
     rows: &[Vec<Option<&[u8]>>],
 ) -> Result<PatchSet<SimpleTable, String, Vec<u8>>, ConversionError> {
-    let table_id = catalog_helpers::table_id(database, table)
+    let table_id = catalog_helpers::table_id::<B, DB>(database, table)
         .ok_or_else(|| ConversionError::TableNotFound(table.to_string()))?;
     let simple = catalog_helpers::simple_table(database, table_id)
         .map_err(|e| ConversionError::TableNotFound(e.to_string()))?;
@@ -670,13 +670,13 @@ pub fn pgbinary_patchset_builder<DB: DatabaseLike>(
 /// # Errors
 ///
 /// Propagates [`ConversionError`], as [`pgbinary_patchset_builder`] does.
-pub fn pgbinary_patchset<DB: DatabaseLike>(
+pub fn pgbinary_patchset<B: crate::backend::Backend, DB: DatabaseLike>(
     database: &DB,
     table: &str,
     column_names: &[&str],
     rows: &[Vec<Option<&[u8]>>],
 ) -> Result<Vec<u8>, ConversionError> {
-    Ok(pgbinary_patchset_builder(database, table, column_names, rows)?.build())
+    Ok(pgbinary_patchset_builder::<B, DB>(database, table, column_names, rows)?.build())
 }
 
 #[cfg(test)]
@@ -1024,7 +1024,13 @@ mod tests {
         let uuid_bytes: [u8; 16] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
         let qty = 42i64.to_be_bytes();
         let rows = vec![vec![Some(uuid_bytes.as_slice()), Some(qty.as_slice())]];
-        let bytes = pgbinary_patchset(&db, "orders", &["id", "quantity"], &rows).unwrap();
+        let bytes = pgbinary_patchset::<crate::backend::Postgres, _>(
+            &db,
+            "orders",
+            &["id", "quantity"],
+            &rows,
+        )
+        .unwrap();
         assert_eq!(
             only_insert_values(&bytes),
             vec![WireValue::Blob(uuid_bytes.to_vec()), WireValue::Integer(42),]
@@ -1046,7 +1052,13 @@ mod tests {
         // Snapshot path: raw 16 binary bytes.
         let qty = 7i64.to_be_bytes();
         let rows = vec![vec![Some(uuid_bytes.as_slice()), Some(qty.as_slice())]];
-        let binary_bytes = pgbinary_patchset(&db, "orders", &["id", "quantity"], &rows).unwrap();
+        let binary_bytes = pgbinary_patchset::<crate::backend::Postgres, _>(
+            &db,
+            "orders",
+            &["id", "quantity"],
+            &rows,
+        )
+        .unwrap();
 
         // CDC path: the same uuid as pgoutput text.
         let ev = PgChangeEvent {
@@ -1079,7 +1091,13 @@ mod tests {
         let db = orders_uuid_db();
         let uuid_bytes: [u8; 16] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
         let rows = vec![vec![Some(uuid_bytes.as_slice()), None]];
-        let bytes = pgbinary_patchset(&db, "orders", &["id", "quantity"], &rows).unwrap();
+        let bytes = pgbinary_patchset::<crate::backend::Postgres, _>(
+            &db,
+            "orders",
+            &["id", "quantity"],
+            &rows,
+        )
+        .unwrap();
         assert_eq!(
             only_insert_values(&bytes),
             vec![WireValue::Blob(uuid_bytes.to_vec()), WireValue::Null]
@@ -1093,7 +1111,8 @@ mod tests {
         // The result projects only `id`; `quantity` is absent, so the
         // catalog stores it as NULL.
         let rows = vec![vec![Some(uuid_bytes.as_slice())]];
-        let bytes = pgbinary_patchset(&db, "orders", &["id"], &rows).unwrap();
+        let bytes = pgbinary_patchset::<crate::backend::Postgres, _>(&db, "orders", &["id"], &rows)
+            .unwrap();
         assert_eq!(
             only_insert_values(&bytes),
             vec![WireValue::Blob(uuid_bytes.to_vec()), WireValue::Null]
@@ -1106,7 +1125,13 @@ mod tests {
         let uuid_bytes: [u8; 16] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
         // Two column names but a one-cell row.
         let rows = vec![vec![Some(uuid_bytes.as_slice())]];
-        let err = pgbinary_patchset(&db, "orders", &["id", "quantity"], &rows).unwrap_err();
+        let err = pgbinary_patchset::<crate::backend::Postgres, _>(
+            &db,
+            "orders",
+            &["id", "quantity"],
+            &rows,
+        )
+        .unwrap_err();
         assert!(matches!(err, ConversionError::MissingColumns));
     }
 
@@ -1115,7 +1140,8 @@ mod tests {
         let db = orders_uuid_db();
         let uuid_bytes: [u8; 16] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
         let rows = vec![vec![Some(uuid_bytes.as_slice())]];
-        let err = pgbinary_patchset(&db, "absent", &["id"], &rows).unwrap_err();
+        let err = pgbinary_patchset::<crate::backend::Postgres, _>(&db, "absent", &["id"], &rows)
+            .unwrap_err();
         assert!(matches!(err, ConversionError::TableNotFound(name) if name == "absent"));
     }
 

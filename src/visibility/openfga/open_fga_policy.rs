@@ -1817,7 +1817,11 @@ ALTER TABLE ledger ENABLE ROW LEVEL SECURITY;
     #[test]
     fn a_write_the_model_refuses_is_denied_without_asking() {
         let policy = policy_over(CLOSED);
-        let ledger = catalog_helpers::table_id(policy.shapes().catalog(), "ledger").unwrap();
+        let ledger = catalog_helpers::table_id::<crate::backend::Postgres, _>(
+            policy.shapes().catalog(),
+            "ledger",
+        )
+        .unwrap();
         let event = TestEvent::<Postgres>::insert(ledger, vec![Value::Int(4), Value::Int(7)])
             .with_pk_columns([0u16]);
         let view = EventRow::current(&event, policy.shapes().catalog()).unwrap();
@@ -1833,7 +1837,11 @@ ALTER TABLE ledger ENABLE ROW LEVEL SECURITY;
     #[test]
     fn a_read_the_model_refuses_denies_every_watcher_without_asking() {
         let policy = policy_over(CLOSED);
-        let ledger = catalog_helpers::table_id(policy.shapes().catalog(), "ledger").unwrap();
+        let ledger = catalog_helpers::table_id::<crate::backend::Postgres, _>(
+            policy.shapes().catalog(),
+            "ledger",
+        )
+        .unwrap();
         let event = TestEvent::<Postgres>::insert(ledger, vec![Value::Int(4), Value::Int(7)])
             .with_pk_columns([0u16]);
         let view = EventRow::current(&event, policy.shapes().catalog()).unwrap();
@@ -1859,7 +1867,11 @@ ALTER TABLE ledger ENABLE ROW LEVEL SECURITY;
              ALTER TABLE docs ENABLE ROW LEVEL SECURITY;
              CREATE POLICY p ON docs FOR SELECT USING (owner_id = current_user);",
         );
-        let docs = catalog_helpers::table_id(policy.shapes().catalog(), "docs").unwrap();
+        let docs = catalog_helpers::table_id::<crate::backend::Postgres, _>(
+            policy.shapes().catalog(),
+            "docs",
+        )
+        .unwrap();
 
         let asked = policy.read_relation(docs).unwrap();
         let Asked::Ask(relation) = asked else {

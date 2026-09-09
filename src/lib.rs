@@ -25,8 +25,8 @@ pub use types::*;
 #[cfg(feature = "std")]
 pub use wal::CdcSource;
 pub use wal::{
-    parse_maxwell, parse_wal2json_v1, parse_wal2json_v2, ChangeEvent, ChangeV1, MaxwellMessage,
-    MessageV2, WalParseError, WalParser,
+    parse_maxwell, parse_wal2json_v1, parse_wal2json_v2, ChangeEvent, ChangeV1, MaxwellEvent,
+    MaxwellMessage, MessageV2, WalParseError, WalParser,
 };
 #[cfg(feature = "pg-streaming")]
 pub use wal::{PgStreamingCdcSource, PgStreamingConfig, PgStreamingError};

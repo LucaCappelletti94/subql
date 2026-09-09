@@ -185,7 +185,7 @@ pub fn harness_snapshot_restore_roundtrip(data: &[u8]) {
     }
 
     let database = agg_catalog();
-    let Some(table_id) = catalog_helpers::table_id(&database, "orders") else {
+    let Some(table_id) = catalog_helpers::table_id::<Postgres, _>(&database, "orders") else {
         return;
     };
     let pk_col = match catalog_helpers::column_id(&database, table_id, "id") {
@@ -390,7 +390,7 @@ impl E2eFixture {
     fn init() -> Self {
         let source = crate::PgSqliteEmuSource::open_in_memory(Self::PG_DDL)
             .expect("PgSqliteEmuSource fixture must construct from fixed PG DDL");
-        let table_id = catalog_helpers::table_id(source.pg_catalog(), "orders")
+        let table_id = catalog_helpers::table_id::<Postgres, _>(source.pg_catalog(), "orders")
             .expect("fuzz fixture orders table must resolve");
 
         let mut engine: SubscriptionEngine<crate::ChangeEvent, DefaultIds, ParserDB> =

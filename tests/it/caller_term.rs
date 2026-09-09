@@ -43,7 +43,8 @@ fn translator() -> Translator {
 
 fn engine() -> (Engine, TableId) {
     let db = ParserDB::parse::<PostgreSqlDialect>(DDL).expect("DDL parses");
-    let notes = catalog_helpers::table_id(&db, "notes").expect("notes is in the catalog");
+    let notes = catalog_helpers::table_id::<subql::backend::Postgres, _>(&db, "notes")
+        .expect("notes is in the catalog");
     let engine = SubscriptionEngine::new(db, PostgreSqlDialect {}).with_translator(translator());
     (engine, notes)
 }
@@ -78,8 +79,11 @@ fn refusal(engine: &mut Engine, spec: SubscriptionRequest<DefaultIds, Postgres>)
 #[test]
 fn the_finding_reproduction_registers_and_filters() {
     let (mut engine, _) = engine();
-    let members =
-        catalog_helpers::table_id(engine.database(), "project_members").expect("in the catalog");
+    let members = catalog_helpers::table_id::<subql::backend::Postgres, _>(
+        engine.database(),
+        "project_members",
+    )
+    .expect("in the catalog");
     engine
         .register(
             SubscriptionRequest::new(

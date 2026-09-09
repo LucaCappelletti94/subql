@@ -97,9 +97,10 @@ impl PgMetadataLookup for NoLookup {
 /// Returns [`RegisterError::UnsupportedSql`] if diesel fails to render
 /// the query or a bind uses a type outside the supported scalar set
 /// (bool, integer, float, text, uuid).
-pub fn render_typed<D, Q>(query: &Q) -> Result<(String, Vec<Value<D::SubqlBackend>>), RegisterError>
+pub fn render_typed<B, D, Q>(query: &Q) -> Result<(String, Vec<Value<B>>), RegisterError>
 where
-    D: BindDecode,
+    B: crate::backend::Backend,
+    D: BindDecode<B>,
     Q: QueryFragment<D>,
 {
     D::render_sql_and_binds(query)
@@ -123,33 +124,28 @@ where
 /// Render a typed diesel query to placeholder SQL plus its bind
 /// [`Value<B>`](crate::backend::Value)s.
 ///
-/// One diesel backend `D` whose associated
-/// [`SubqlBackend`](BindDecode::SubqlBackend) picks the subql
-/// [`crate::backend::Backend`] to type the values against. The bind
+/// One diesel backend `D`, parameterised by the subql
+/// [`crate::backend::Backend`] whose [`Value`] shape its binds decode to.
+/// A parameter rather than an associated type, because one diesel backend
+/// serves several subql markers: `diesel::mysql::Mysql` decodes binds for
+/// every [`MySql<C>`](crate::backend::MySql), whose `C` names the server's
+/// `lower_case_table_names`. The bind
 /// side is backend-specific: Postgres decodes the binary wire format
 /// by OID, SQLite reads its typed bind values. This is the input-side
 /// counterpart to [`RowFieldDecode`], which reads the values an
 /// executed query hands back.
-pub trait BindDecode: Backend {
-    /// The subql [`crate::backend::Backend`] whose [`Value`] shape this
-    /// diesel backend's binds decode to.
-    type SubqlBackend: crate::backend::Backend;
-
+pub trait BindDecode<B: crate::backend::Backend>: Backend {
     /// Render `query` to `(placeholder SQL, ordered bind values)`.
     ///
     /// # Errors
     /// [`RegisterError::UnsupportedSql`] if rendering fails or a bind
     /// uses a type outside the supported scalar set.
-    fn render_sql_and_binds<Q>(
-        query: &Q,
-    ) -> Result<(String, Vec<Value<Self::SubqlBackend>>), RegisterError>
+    fn render_sql_and_binds<Q>(query: &Q) -> Result<(String, Vec<Value<B>>), RegisterError>
     where
         Q: QueryFragment<Self>;
 }
 
-impl BindDecode for Pg {
-    type SubqlBackend = Postgres;
-
+impl BindDecode<Postgres> for Pg {
     fn render_sql_and_binds<Q>(query: &Q) -> Result<(String, Vec<Value<Postgres>>), RegisterError>
     where
         Q: QueryFragment<Self>,
@@ -179,9 +175,7 @@ impl BindDecode for Pg {
 }
 
 #[cfg(feature = "diesel-typed-sqlite")]
-impl BindDecode for diesel::sqlite::Sqlite {
-    type SubqlBackend = crate::backend::SQLite;
-
+impl BindDecode<crate::backend::SQLite> for diesel::sqlite::Sqlite {
     fn render_sql_and_binds<Q>(
         query: &Q,
     ) -> Result<(String, Vec<Value<crate::backend::SQLite>>), RegisterError>
@@ -211,12 +205,12 @@ impl BindDecode for diesel::sqlite::Sqlite {
 }
 
 #[cfg(feature = "diesel-typed-mysql")]
-impl BindDecode for diesel::mysql::Mysql {
-    type SubqlBackend = crate::backend::MySql;
-
+impl<C: crate::backend::MySqlTableNameCase> BindDecode<crate::backend::MySql<C>>
+    for diesel::mysql::Mysql
+{
     fn render_sql_and_binds<Q>(
         query: &Q,
-    ) -> Result<(String, Vec<Value<crate::backend::MySql>>), RegisterError>
+    ) -> Result<(String, Vec<Value<crate::backend::MySql<C>>>), RegisterError>
     where
         Q: QueryFragment<Self>,
     {
@@ -298,10 +292,10 @@ where
         query: &Q,
     ) -> Result<Registered<E::Backend>, RegisterError>
     where
-        D: BindDecode<SubqlBackend = E::Backend>,
+        D: BindDecode<E::Backend>,
         Q: QueryFragment<D>,
     {
-        let (sql, binds) = render_typed::<D, _>(query)?;
+        let (sql, binds) = render_typed::<E::Backend, D, _>(query)?;
         self.register(SubscriptionRequest::new(consumer_id, sql).binds(binds))
     }
 
@@ -312,10 +306,10 @@ where
         update: &Q,
     ) -> Result<Registered<E::Backend>, RegisterError>
     where
-        D: BindDecode<SubqlBackend = E::Backend>,
+        D: BindDecode<E::Backend>,
         Q: QueryFragment<D>,
     {
-        let (sql, binds) = render_typed::<D, _>(update)?;
+        let (sql, binds) = render_typed::<E::Backend, D, _>(update)?;
         // Diesel emits binds in placeholder order (SET first, then WHERE).
         // The follow SELECT drops the SET clause, so its `?` positional
         // placeholders bind against the wrong end of the collected list
@@ -559,7 +553,7 @@ mod render_tests {
             .filter(readings::docb.eq(docb.clone()))
             .filter(readings::raw.eq(raw.clone()));
 
-        let (_sql, binds) = render_typed::<Pg, _>(&query).expect("render");
+        let (_sql, binds) = render_typed::<Postgres, Pg, _>(&query).expect("render");
         assert_eq!(
             binds,
             alloc::vec![
@@ -583,7 +577,7 @@ mod render_tests {
         use core::str::FromStr;
         use diesel::sql_types;
 
-        let encoded = render_typed::<Pg, _>(
+        let encoded = render_typed::<Postgres, Pg, _>(
             &diesel::dsl::sql::<sql_types::Bool>("")
                 .bind::<sql_types::Numeric, _>(bigdecimal::BigDecimal::from_str("-0.5").unwrap()),
         )
@@ -602,7 +596,7 @@ mod render_tests {
             .filter(users::id.eq(5))
             .filter(users::name.eq("ann"))
             .filter(users::active.eq(true));
-        let (sql, binds) = render_typed::<Pg, _>(&query).expect("render");
+        let (sql, binds) = render_typed::<Postgres, Pg, _>(&query).expect("render");
         assert!(sql.contains("$1"), "sql: {sql}");
         assert_eq!(
             binds,
@@ -679,7 +673,8 @@ mod render_tests {
             .filter(users::id.eq(5))
             .filter(users::name.eq("ann"))
             .filter(users::active.eq(true));
-        let (sql, binds) = render_typed::<Sqlite, _>(&query).expect("render sqlite");
+        let (sql, binds) =
+            render_typed::<crate::backend::SQLite, Sqlite, _>(&query).expect("render sqlite");
         // SQLite renders positional `?` placeholders, not `$N`.
         assert!(sql.contains('?'), "sql: {sql}");
         // SQLite has no boolean storage class: `true` binds as an integer, so it
@@ -733,7 +728,8 @@ mod render_tests {
             .filter(users::id.eq(5))
             .filter(users::name.eq("ann"))
             .filter(users::active.eq(true));
-        let (sql, binds) = render_typed::<Mysql, _>(&query).expect("render mysql");
+        let (sql, binds) =
+            render_typed::<crate::backend::MySql, Mysql, _>(&query).expect("render mysql");
         // MySQL renders positional `?` placeholders.
         assert!(sql.contains('?'), "sql: {sql}");
         // Like SQLite, MySQL has no boolean type: `true` binds as an integer.
@@ -774,7 +770,8 @@ mod render_tests {
             .filter(readings::amount.eq(amount.clone()))
             .filter(readings::raw.eq(raw.clone()));
 
-        let (_sql, binds) = render_typed::<Mysql, _>(&query).expect("render mysql");
+        let (_sql, binds) =
+            render_typed::<crate::backend::MySql, Mysql, _>(&query).expect("render mysql");
         assert_eq!(
             binds,
             alloc::vec![
@@ -787,8 +784,10 @@ mod render_tests {
         );
 
         // MySQL's own `Datetime` tag, which no `Timestamp` column reaches.
-        let (_sql, binds) = render_typed::<Mysql, _>(&stamps::table.filter(stamps::at_dt.eq(at)))
-            .expect("render mysql datetime");
+        let (_sql, binds) = render_typed::<crate::backend::MySql, Mysql, _>(
+            &stamps::table.filter(stamps::at_dt.eq(at)),
+        )
+        .expect("render mysql datetime");
         assert_eq!(
             binds,
             alloc::vec![Value::<crate::backend::MySql>::Timestamp(at)]
@@ -864,7 +863,8 @@ mod render_tests {
         use diesel::sqlite::Sqlite;
 
         let query = blobs::table.filter(blobs::payload.eq(alloc::vec![1u8, 2, 3]));
-        let (sql, binds) = render_typed::<Sqlite, _>(&query).expect("render blob");
+        let (sql, binds) =
+            render_typed::<crate::backend::SQLite, Sqlite, _>(&query).expect("render blob");
         assert!(sql.contains('?'), "sql: {sql}");
         // The value rides as a bind, never inlined as a hex literal.
         assert!(!sql.contains("X'"), "blob must not be inlined: {sql}");
@@ -874,7 +874,8 @@ mod render_tests {
         );
 
         let empty = blobs::table.filter(blobs::payload.eq(alloc::vec::Vec::<u8>::new()));
-        let (_, binds) = render_typed::<Sqlite, _>(&empty).expect("render empty blob");
+        let (_, binds) =
+            render_typed::<crate::backend::SQLite, Sqlite, _>(&empty).expect("render empty blob");
         assert_eq!(
             binds,
             alloc::vec![Value::<crate::backend::SQLite>::Bytes(alloc::vec![])]
@@ -893,7 +894,8 @@ mod render_tests {
             .filter(blobs::name.eq("ann"))
             .filter(blobs::payload.eq(alloc::vec![0xaau8, 0xbb]))
             .filter(blobs::id.eq(7));
-        let (_, binds) = render_typed::<Sqlite, _>(&query).expect("render ordered");
+        let (_, binds) =
+            render_typed::<crate::backend::SQLite, Sqlite, _>(&query).expect("render ordered");
         assert_eq!(
             binds,
             alloc::vec![
@@ -948,7 +950,9 @@ mod render_tests {
             "CREATE TABLE blobs (id INTEGER PRIMARY KEY, name TEXT, payload BLOB);",
         )
         .expect("catalog");
-        let table_id = crate::catalog_helpers::table_id(&catalog, "blobs").expect("blobs table");
+        let table_id =
+            crate::catalog_helpers::table_id::<crate::backend::Postgres, _>(&catalog, "blobs")
+                .expect("blobs table");
         let mut engine = SubscriptionEngine::<TestEvent<SQLite>, crate::DefaultIds, _>::new(
             catalog,
             SQLiteDialect {},
@@ -998,7 +1002,9 @@ mod render_tests {
             "CREATE TABLE blobs (id INTEGER PRIMARY KEY, name TEXT, payload BLOB);",
         )
         .expect("catalog");
-        let table_id = crate::catalog_helpers::table_id(&catalog, "blobs").expect("blobs table");
+        let table_id =
+            crate::catalog_helpers::table_id::<crate::backend::Postgres, _>(&catalog, "blobs")
+                .expect("blobs table");
         let mut engine = SubscriptionEngine::<TestEvent<SQLite>, crate::DefaultIds, _>::new(
             catalog,
             SQLiteDialect {},

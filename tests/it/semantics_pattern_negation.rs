@@ -14,7 +14,8 @@ const DDL: &str = "CREATE TABLE names (id INT PRIMARY KEY, name TEXT COLLATE \"C
 
 fn notifies(predicate: &str, name: &str) -> bool {
     let db = ParserDB::parse::<PostgreSqlDialect>(DDL).expect("DDL parses");
-    let table = catalog_helpers::table_id(&db, "names").expect("names is in the catalog");
+    let table = catalog_helpers::table_id::<subql::backend::Postgres, _>(&db, "names")
+        .expect("names is in the catalog");
     let mut engine: SubscriptionEngine<TestEvent<Postgres>, DefaultIds, ParserDB> =
         SubscriptionEngine::new(db, PostgreSqlDialect {});
     engine

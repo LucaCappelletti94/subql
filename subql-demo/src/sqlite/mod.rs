@@ -59,9 +59,13 @@ impl SqliteHarness {
         let database = ParserDB::parse::<PostgreSqlDialect>(preset.pg_ddl)
             .map_err(|e| HarnessError::ParserDb(format!("{e}")))?;
 
-        let resolved = catalog_helpers::resolve_table(&database, preset.table_name, preset.columns)
-            .map_err(|e| HarnessError::ParserDb(format!("{e}")))?
-            .ok_or_else(|| HarnessError::UnknownTable(preset.table_name.into()))?;
+        let resolved = catalog_helpers::resolve_table::<subql::backend::SQLite, _, _>(
+            &database,
+            preset.table_name,
+            preset.columns,
+        )
+        .map_err(|e| HarnessError::ParserDb(format!("{e}")))?
+        .ok_or_else(|| HarnessError::UnknownTable(preset.table_name.into()))?;
         let table_id = resolved.table_id;
         let column_ids = resolved.column_ids;
 

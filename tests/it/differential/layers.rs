@@ -114,7 +114,8 @@ where
 {
     let database = ParserDB::parse::<<E::Backend as Backend>::Dialect>(catalog_ddl)
         .expect("the catalog DDL parses");
-    let table = catalog_helpers::table_id(&database, "t").expect("the table is in the catalog");
+    let table = catalog_helpers::table_id::<subql::backend::Postgres, _>(&database, "t")
+        .expect("the table is in the catalog");
 
     let mut cells = Vec::new();
     let mut wide = None;
@@ -389,7 +390,8 @@ mod tests {
     #[test]
     fn the_three_answers_come_from_one_event() {
         let database = ParserDB::parse::<PostgreSqlDialect>(DDL).expect("the DDL parses");
-        let table = catalog_helpers::table_id(&database, "t").expect("the table is in the catalog");
+        let table = catalog_helpers::table_id::<subql::backend::Postgres, _>(&database, "t")
+            .expect("the table is in the catalog");
         let event: TestEvent<Postgres, PgLsn> = TestEvent::insert(
             table,
             vec![
@@ -840,7 +842,8 @@ mod streamed_tests {
         });
 
         let database = ParserDB::parse::<PostgreSqlDialect>(DDL).expect("the DDL parses");
-        let table = catalog_helpers::table_id(&database, "t").expect("the table is in the catalog");
+        let table = catalog_helpers::table_id::<subql::backend::Postgres, _>(&database, "t")
+            .expect("the table is in the catalog");
         let bulky_column =
             catalog_helpers::column_id(&database, table, "bulky").expect("`bulky` is a column");
 

@@ -519,7 +519,8 @@ fn a_key_column_needing_quotes_is_still_readable() {
         r#"CREATE TABLE quoted ("OrderId" INT PRIMARY KEY, status TEXT);"#,
     )
     .expect("catalog");
-    let table = subql::catalog_helpers::table_id(&cat, "quoted").expect("quoted");
+    let table = subql::catalog_helpers::table_id::<subql::backend::Postgres, _>(&cat, "quoted")
+        .expect("quoted");
     let inner = SubscriptionEngine::<TestEvent<Postgres>, DefaultIds, ParserDB>::new(
         cat,
         PostgreSqlDialect {},

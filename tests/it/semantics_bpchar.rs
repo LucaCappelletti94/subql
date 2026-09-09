@@ -24,8 +24,8 @@
 use sql_traits::structs::{ParserDB, TargetName};
 use sqlparser::dialect::{MySqlDialect, PostgreSqlDialect, SQLiteDialect};
 use subql::backend::{
-    Backend, ColumnCollation, ColumnComparison, ComparisonContext, MySql, NamedColumnCollation,
-    Postgres, SQLite, ScalarFamily, TextOperation, Value,
+    Backend, ColumnCollation, ColumnComparison, ColumnComparisonOf, ComparisonContext, MySql,
+    NamedColumnCollation, Postgres, SQLite, ScalarFamily, TextOperation, Value,
 };
 use subql::testing::TestEvent;
 use subql::{catalog_helpers, DefaultIds, SubscriptionEngine, SubscriptionRequest};
@@ -38,7 +38,8 @@ const PG_DDL: &str = "CREATE TABLE codes (id INT PRIMARY KEY, code CHAR(5), \
 macro_rules! notifies {
     ($backend:ty, $dialect:ty, $ddl:expr, $predicate:expr, $cells:expr) => {{
         let db = ParserDB::parse::<$dialect>($ddl).expect("DDL parses");
-        let table = catalog_helpers::table_id(&db, "codes").expect("codes is in the catalog");
+        let table = catalog_helpers::table_id::<subql::backend::Postgres, _>(&db, "codes")
+            .expect("codes is in the catalog");
         let mut engine: SubscriptionEngine<TestEvent<$backend>, DefaultIds, ParserDB> =
             SubscriptionEngine::new(db, <$dialect>::default());
         engine
@@ -302,7 +303,7 @@ fn sqlite_char_keeps_trailing_spaces() {
 /// than reading the padding.
 #[test]
 fn a_pattern_keeps_trailing_spaces_whatever_the_collation_pads() {
-    let facts = |collation: &str| ColumnComparison {
+    let facts = |collation: &str| ColumnComparisonOf::<MySql> {
         kind: ScalarFamily::String.into(),
         declared_type: "VARCHAR".to_string(),
         collation: ColumnCollation::Named(NamedColumnCollation::new(TargetName::new(
@@ -313,7 +314,7 @@ fn a_pattern_keeps_trailing_spaces_whatever_the_collation_pads() {
 
     let rule_for = |collation: &str, operation| {
         let facts = facts(collation);
-        let context = ComparisonContext {
+        let context = ComparisonContext::<MySql> {
             left: Some(&facts),
             right: None,
             text: None,
@@ -343,7 +344,7 @@ fn a_pattern_keeps_trailing_spaces_whatever_the_collation_pads() {
             )))
             .into_owned(),
         };
-        let context = ComparisonContext {
+        let context = ComparisonContext::<SQLite> {
             left: Some(&facts),
             right: None,
             text: None,

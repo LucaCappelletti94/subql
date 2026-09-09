@@ -82,7 +82,7 @@ impl<V: postgres_jsonb_canonical::PgVersion + 'static> SqlLiteralParse for Postg
     }
 }
 
-impl SqlLiteralParse for MySql {
+impl<C: crate::backend::MySqlTableNameCase> SqlLiteralParse for MySql<C> {
     fn parse_literal(
         sql: &SqlValue,
         target: ValueKindOf<Self>,

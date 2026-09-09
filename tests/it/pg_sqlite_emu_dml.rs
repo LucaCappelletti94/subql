@@ -37,7 +37,8 @@ fn drain_one(source: &mut PgSqliteEmuSource) -> ChangeEvent {
 fn single_pk_insert_update_delete_round_trip() {
     let mut source = PgSqliteEmuSource::open_in_memory(SINGLE_PK_PG_DDL).expect("build source");
     let table_id =
-        catalog_helpers::table_id(source.pg_catalog(), "orders").expect("orders resolves");
+        catalog_helpers::table_id::<subql::backend::Postgres, _>(source.pg_catalog(), "orders")
+            .expect("orders resolves");
 
     source
         .execute_sql("INSERT INTO orders (id, price, status) VALUES (1, 5.0, 'paid')")
@@ -209,7 +210,9 @@ fn single_pk_partial_update_uses_row_lookup_fallback() {
 #[allow(clippy::too_many_lines)]
 fn composite_pk_insert_update_delete_round_trip() {
     let mut source = PgSqliteEmuSource::open_in_memory(COMPOSITE_PK_PG_DDL).expect("build source");
-    let table_id = catalog_helpers::table_id(source.pg_catalog(), "items").expect("items resolves");
+    let table_id =
+        catalog_helpers::table_id::<subql::backend::Postgres, _>(source.pg_catalog(), "items")
+            .expect("items resolves");
 
     source
         .execute_sql("INSERT INTO items (region_id, item_id, name) VALUES (1, 100, 'widget')")

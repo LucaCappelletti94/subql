@@ -28,11 +28,13 @@ mod test_schema {
     }
 
     pub(super) fn items_id(database: &ParserDB) -> TableId {
-        catalog_helpers::table_id(database, "items").expect("items table exists")
+        catalog_helpers::table_id::<subql::backend::Postgres, _>(database, "items")
+            .expect("items table exists")
     }
 
     pub(super) fn pad_id(database: &ParserDB) -> TableId {
-        catalog_helpers::table_id(database, "_items_pad").expect("_items_pad table exists")
+        catalog_helpers::table_id::<subql::backend::Postgres, _>(database, "_items_pad")
+            .expect("_items_pad table exists")
     }
 }
 

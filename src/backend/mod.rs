@@ -69,4 +69,7 @@ pub use scalars_and_backend::{
     Backend, JsonDocument, ScalarCore, ScalarKey, ScalarText, ScalarTruth, SqliteJson,
     SqliteJsonStorage,
 };
-pub use shipped::{MySql, Postgres, SQLite};
+pub use shipped::{
+    MySql, MySqlTableNameCase, NamesFoldedAtLookup, NamesStoredAsWritten, NamesStoredLowercased,
+    Postgres, SQLite,
+};

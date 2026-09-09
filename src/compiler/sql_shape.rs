@@ -2181,7 +2181,7 @@ pub(crate) fn membership_exists_parts<'a, B: crate::backend::Backend, DB: Databa
     }
     let member_target = written_table_name(member_name)
         .ok_or_else(|| exists_refusal("names its membership table in a form SubQL cannot read"))?;
-    let member_table = catalog_helpers::table_id_for_name(database, member_target)
+    let member_table = catalog_helpers::table_id_for_name::<B, DB>(database, member_target)
         .ok_or_else(|| exists_refusal("reads a membership table the catalog does not know"))?;
     let alias = match &select.from[0].relation {
         TableFactor::Table { alias, .. } => alias.as_ref().map(|alias| alias.name.value.as_str()),
@@ -2212,7 +2212,7 @@ pub(crate) fn membership_exists_parts<'a, B: crate::backend::Backend, DB: Databa
                     qualifier.quote_style.is_some(),
                 )
             })
-            || catalog_helpers::table_id_for_name(database, written_name_part(qualifier))
+            || catalog_helpers::table_id_for_name::<B, DB>(database, written_name_part(qualifier))
                 == Some(member_table)
     };
     let member_column = |expr: &Expr| -> Option<crate::ColumnId> {
@@ -2226,7 +2226,7 @@ pub(crate) fn membership_exists_parts<'a, B: crate::backend::Backend, DB: Databa
         let (qualifier, column) = qualified_parts(expr)?;
         let qualifier = qualifier?;
         if is_member_qualifier(qualifier)
-            || catalog_helpers::table_id_for_name(database, written_name_part(qualifier))
+            || catalog_helpers::table_id_for_name::<B, DB>(database, written_name_part(qualifier))
                 != Some(table_id)
         {
             return None;
@@ -2581,7 +2581,7 @@ mod membership_naming_tests {
     #[test]
     fn a_membership_table_named_with_a_dot_resolves() {
         let db = ParserDB::parse::<PostgreSqlDialect>(DDL).unwrap();
-        let docs = catalog_helpers::table_id(&db, "docs").unwrap();
+        let docs = catalog_helpers::table_id::<crate::backend::Postgres, _>(&db, "docs").unwrap();
         let subquery = exists_subquery(
             r#"SELECT * FROM docs WHERE EXISTS (SELECT 1 FROM "my.shares" s
                WHERE s.doc_id = docs.id
@@ -2597,7 +2597,7 @@ mod membership_naming_tests {
     #[test]
     fn a_qualified_quoted_membership_table_resolves() {
         let db = ParserDB::parse::<PostgreSqlDialect>(DDL).unwrap();
-        let docs = catalog_helpers::table_id(&db, "docs").unwrap();
+        let docs = catalog_helpers::table_id::<crate::backend::Postgres, _>(&db, "docs").unwrap();
         let subquery = exists_subquery(
             r#"SELECT * FROM docs WHERE EXISTS (SELECT 1 FROM app."Shares" s
                WHERE s.doc_id = docs.id
@@ -2618,7 +2618,7 @@ mod membership_naming_tests {
     #[test]
     fn a_three_part_membership_name_is_refused() {
         let db = ParserDB::parse::<PostgreSqlDialect>(DDL).unwrap();
-        let docs = catalog_helpers::table_id(&db, "docs").unwrap();
+        let docs = catalog_helpers::table_id::<crate::backend::Postgres, _>(&db, "docs").unwrap();
         let subquery = exists_subquery(
             r#"SELECT * FROM docs WHERE EXISTS (SELECT 1 FROM other.app."Shares" s
                WHERE s.doc_id = docs.id
@@ -2642,7 +2642,7 @@ mod membership_naming_tests {
     #[test]
     fn a_written_membership_qualifier_names_the_membership_side() {
         let db = ParserDB::parse::<PostgreSqlDialect>(DDL).unwrap();
-        let docs = catalog_helpers::table_id(&db, "docs").unwrap();
+        let docs = catalog_helpers::table_id::<crate::backend::Postgres, _>(&db, "docs").unwrap();
         let subquery = exists_subquery(
             r#"SELECT * FROM docs WHERE EXISTS (SELECT 1 FROM app."Shares"
                WHERE "Shares".doc_id = docs.id
@@ -2664,7 +2664,8 @@ mod membership_naming_tests {
     #[test]
     fn an_alias_hides_the_membership_relation_name() {
         let db = ParserDB::parse::<PostgreSqlDialect>(DDL).unwrap();
-        let shares = catalog_helpers::table_id(&db, r#""Shares""#).unwrap();
+        let shares =
+            catalog_helpers::table_id::<crate::backend::Postgres, _>(&db, r#""Shares""#).unwrap();
         let subquery = exists_subquery(
             r#"SELECT * FROM "Shares" WHERE EXISTS (SELECT 1 FROM app."Shares" s
                WHERE s.doc_id = "Shares".id
@@ -2685,7 +2686,7 @@ mod membership_naming_tests {
     #[test]
     fn a_quoted_column_names_the_column_stored_quoted() {
         let db = ParserDB::parse::<PostgreSqlDialect>(DDL).unwrap();
-        let docs = catalog_helpers::table_id(&db, "docs").unwrap();
+        let docs = catalog_helpers::table_id::<crate::backend::Postgres, _>(&db, "docs").unwrap();
         let quoted_owner = catalog_helpers::column_id(&db, docs, r#""Owner""#).unwrap();
         let bare_owner = catalog_helpers::column_id(&db, docs, "owner").unwrap();
         assert_ne!(quoted_owner, bare_owner);
@@ -2713,8 +2714,10 @@ mod membership_naming_tests {
     #[test]
     fn a_membership_column_named_with_a_dot_resolves() {
         let db = ParserDB::parse::<PostgreSqlDialect>(DDL).unwrap();
-        let docs = catalog_helpers::table_id(&db, "docs").unwrap();
-        let shares = catalog_helpers::table_id(&db, r#"app."Shares""#).unwrap();
+        let docs = catalog_helpers::table_id::<crate::backend::Postgres, _>(&db, "docs").unwrap();
+        let shares =
+            catalog_helpers::table_id::<crate::backend::Postgres, _>(&db, r#"app."Shares""#)
+                .unwrap();
         let dotted = catalog_helpers::column_id(&db, shares, r#""Doc.Id""#).unwrap();
         let subquery = exists_subquery(
             r#"SELECT * FROM docs WHERE EXISTS (SELECT 1 FROM app."Shares" s
@@ -2752,7 +2755,7 @@ mod written_column_tests {
         );"#;
     /// The ordinals of the quoted column and of the folded one beside it.
     fn columns(db: &ParserDB) -> (crate::TableId, crate::ColumnId, crate::ColumnId) {
-        let docs = catalog_helpers::table_id(db, "docs").unwrap();
+        let docs = catalog_helpers::table_id::<crate::backend::Postgres, _>(db, "docs").unwrap();
         let quoted = catalog_helpers::column_id(db, docs, r#""Owner""#).unwrap();
         let folded = catalog_helpers::column_id(db, docs, "owner").unwrap();
         assert_ne!(quoted, folded);
@@ -2818,7 +2821,8 @@ mod written_column_tests {
         let folded_ddl = "CREATE TABLE docs (id INT PRIMARY KEY, Owner INT);";
 
         let lite = ParserDB::parse::<sqlparser::dialect::SQLiteDialect>(folded_ddl).unwrap();
-        let lite_docs = catalog_helpers::table_id(&lite, "docs").unwrap();
+        let lite_docs =
+            catalog_helpers::table_id::<crate::backend::Postgres, _>(&lite, "docs").unwrap();
         let expr = expr_of(r#"SELECT * FROM docs WHERE "Owner" = 1"#);
         assert_eq!(
             crate::compiler::literals::resolve_column_ref::<crate::backend::SQLite, _>(
@@ -2829,7 +2833,8 @@ mod written_column_tests {
         );
 
         let my = ParserDB::parse::<sqlparser::dialect::MySqlDialect>(folded_ddl).unwrap();
-        let my_docs = catalog_helpers::table_id(&my, "docs").unwrap();
+        let my_docs =
+            catalog_helpers::table_id::<crate::backend::Postgres, _>(&my, "docs").unwrap();
         assert_eq!(
             crate::compiler::literals::resolve_column_ref::<crate::backend::MySql, _>(
                 &expr, my_docs, &my
@@ -2844,7 +2849,8 @@ mod written_column_tests {
             "CREATE TABLE docs (id INT PRIMARY KEY, owner INT);",
         )
         .unwrap();
-        let pg_docs = catalog_helpers::table_id(&pg, "docs").unwrap();
+        let pg_docs =
+            catalog_helpers::table_id::<crate::backend::Postgres, _>(&pg, "docs").unwrap();
         assert_eq!(
             crate::compiler::literals::resolve_column_ref::<crate::backend::Postgres, _>(
                 &expr, pg_docs, &pg

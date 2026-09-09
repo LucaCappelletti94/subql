@@ -44,7 +44,7 @@ fn engine_with(sql: &str) -> (Engine, TableId) {
 
 fn engine_and_subscription(sql: &str) -> (Engine, TableId, SubscriptionId) {
     let db = ParserDB::parse::<PostgreSqlDialect>(DDL).unwrap();
-    let orders = catalog_helpers::table_id(&db, "orders").unwrap();
+    let orders = catalog_helpers::table_id::<subql::backend::Postgres, _>(&db, "orders").unwrap();
     let mut engine = Engine::new(db, PostgreSqlDialect {});
     let registered = engine
         .register(SubscriptionRequest::<DefaultIds, Postgres>::new(

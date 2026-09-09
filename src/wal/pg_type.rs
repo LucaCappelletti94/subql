@@ -123,7 +123,7 @@ impl JsonWireScalars for Postgres {
     }
 }
 
-impl JsonWireScalars for MySql {
+impl<C: crate::backend::MySqlTableNameCase> JsonWireScalars for MySql<C> {
     fn uuid_cell(value: &serde_json::Value) -> Value<Self> {
         value
             .as_str()
@@ -189,10 +189,10 @@ pub(super) fn json_value_to_pg_value_by_kind(
 }
 
 /// [`json_value_by_kind`] for the Maxwell path.
-pub(super) fn json_value_to_mysql_value_by_kind(
+pub(super) fn json_value_to_mysql_value_by_kind<C: crate::backend::MySqlTableNameCase>(
     value: &serde_json::Value,
     kind: DeclaredType,
-) -> Value<MySql> {
+) -> Value<MySql<C>> {
     json_value_by_kind(value, kind)
 }
 
@@ -351,7 +351,10 @@ mod tests {
             Value::Float(0.1)
         );
         assert_eq!(
-            json_value_to_mysql_value_by_kind(&serde_json::json!(0.1), single),
+            json_value_to_mysql_value_by_kind::<crate::backend::NamesStoredAsWritten>(
+                &serde_json::json!(0.1),
+                single
+            ),
             Value::Float(f64::from(0.1_f32)),
             "MySQL's FLOAT is float4 too, and Maxwell prints it the same way"
         );
@@ -607,7 +610,10 @@ mod tests {
                 Value::<Postgres>::Null
             );
             assert_eq!(
-                json_value_to_mysql_value_by_kind(&serde_json::json!(null), declared(kind)),
+                json_value_to_mysql_value_by_kind::<crate::backend::NamesStoredAsWritten>(
+                    &serde_json::json!(null),
+                    declared(kind)
+                ),
                 Value::<MySql>::Null
             );
         }
@@ -625,7 +631,10 @@ mod tests {
             Value::Int(250)
         );
         assert_eq!(
-            json_value_to_mysql_value_by_kind(&serde_json::json!(-7), declared(ScalarFamily::Int)),
+            json_value_to_mysql_value_by_kind::<crate::backend::NamesStoredAsWritten>(
+                &serde_json::json!(-7),
+                declared(ScalarFamily::Int)
+            ),
             Value::Int(-7)
         );
     }
@@ -662,7 +671,7 @@ mod tests {
             Value::Float(250.0)
         );
         assert_eq!(
-            json_value_to_mysql_value_by_kind(
+            json_value_to_mysql_value_by_kind::<crate::backend::NamesStoredAsWritten>(
                 &serde_json::json!("3.5"),
                 declared(ScalarFamily::Float)
             ),
@@ -681,7 +690,7 @@ mod tests {
         assert_eq!(d, BigDecimal::from_str(s).unwrap());
         // A bare JSON number also decodes through its lexical form.
         assert!(matches!(
-            json_value_to_mysql_value_by_kind(
+            json_value_to_mysql_value_by_kind::<crate::backend::NamesStoredAsWritten>(
                 &serde_json::json!(1.5),
                 declared(ScalarFamily::Decimal)
             ),
@@ -697,11 +706,17 @@ mod tests {
         );
         // MySQL tinyint(1) arrives as a bare 0 / 1 number.
         assert_eq!(
-            json_value_to_mysql_value_by_kind(&serde_json::json!(1), declared(ScalarFamily::Bool)),
+            json_value_to_mysql_value_by_kind::<crate::backend::NamesStoredAsWritten>(
+                &serde_json::json!(1),
+                declared(ScalarFamily::Bool)
+            ),
             Value::Bool(true)
         );
         assert_eq!(
-            json_value_to_mysql_value_by_kind(&serde_json::json!(0), declared(ScalarFamily::Bool)),
+            json_value_to_mysql_value_by_kind::<crate::backend::NamesStoredAsWritten>(
+                &serde_json::json!(0),
+                declared(ScalarFamily::Bool)
+            ),
             Value::Bool(false)
         );
         assert_eq!(
@@ -710,7 +725,10 @@ mod tests {
         );
         // 2 is neither true nor false.
         assert_eq!(
-            json_value_to_mysql_value_by_kind(&serde_json::json!(2), declared(ScalarFamily::Bool)),
+            json_value_to_mysql_value_by_kind::<crate::backend::NamesStoredAsWritten>(
+                &serde_json::json!(2),
+                declared(ScalarFamily::Bool)
+            ),
             Value::Missing
         );
     }
@@ -748,14 +766,14 @@ mod tests {
             Value::Bytes(alloc::vec![0x01, 0x02, 0xff])
         );
         assert_eq!(
-            json_value_to_mysql_value_by_kind(
+            json_value_to_mysql_value_by_kind::<crate::backend::NamesStoredAsWritten>(
                 &serde_json::json!("0102ff"),
                 declared(ScalarFamily::Bytes)
             ),
             Value::Missing
         );
         assert_eq!(
-            json_value_to_mysql_value_by_kind(
+            json_value_to_mysql_value_by_kind::<crate::backend::NamesStoredAsWritten>(
                 &serde_json::json!(r"\x00"),
                 declared(ScalarFamily::Bytes)
             ),
@@ -774,7 +792,10 @@ mod tests {
         assert_eq!(parsed.to_string(), u);
         // MySQL keeps the textual form verbatim.
         assert_eq!(
-            json_value_to_mysql_value_by_kind(&serde_json::json!(u), declared(ScalarFamily::Uuid)),
+            json_value_to_mysql_value_by_kind::<crate::backend::NamesStoredAsWritten>(
+                &serde_json::json!(u),
+                declared(ScalarFamily::Uuid)
+            ),
             Value::Uuid(u.to_string())
         );
         // Malformed uuid: Postgres -> Missing; MySQL takes the raw text.
@@ -786,7 +807,7 @@ mod tests {
             Value::Missing
         );
         assert_eq!(
-            json_value_to_mysql_value_by_kind(
+            json_value_to_mysql_value_by_kind::<crate::backend::NamesStoredAsWritten>(
                 &serde_json::json!("not-a-uuid"),
                 declared(ScalarFamily::Uuid)
             ),
@@ -873,7 +894,7 @@ mod tests {
         );
         // Float kind but a JSON object -> Missing.
         assert_eq!(
-            json_value_to_mysql_value_by_kind(
+            json_value_to_mysql_value_by_kind::<crate::backend::NamesStoredAsWritten>(
                 &serde_json::json!({"x": 1}),
                 declared(ScalarFamily::Float)
             ),

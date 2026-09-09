@@ -374,7 +374,7 @@ ALTER TABLE ledger ENABLE ROW LEVEL SECURITY;
     }
 
     fn docs_id(db: &ParserDB) -> TableId {
-        catalog_helpers::table_id(db, "docs").unwrap()
+        catalog_helpers::table_id::<crate::backend::Postgres, _>(db, "docs").unwrap()
     }
 
     /// A `docs` insert: id 4, the named owner and editor.
@@ -460,7 +460,8 @@ ALTER TABLE ledger ENABLE ROW LEVEL SECURITY;
     #[test]
     fn a_table_the_model_refuses_denies_every_watcher_without_asking() {
         let (db, relations) = translated(CLOSED);
-        let ledger = catalog_helpers::table_id(&db, "ledger").unwrap();
+        let ledger =
+            catalog_helpers::table_id::<crate::backend::Postgres, _>(&db, "ledger").unwrap();
         let event = insert(ledger, vec![Value::Int(4), Value::Int(7)]);
         let policy = RowPolicy::new(shared(db, &relations), Delegate::granting("user:alice"));
 
@@ -484,7 +485,8 @@ ALTER TABLE ledger ENABLE ROW LEVEL SECURITY;
     #[test]
     fn a_write_the_model_refuses_is_denied_without_asking() {
         let (db, relations) = translated(CLOSED);
-        let ledger = catalog_helpers::table_id(&db, "ledger").unwrap();
+        let ledger =
+            catalog_helpers::table_id::<crate::backend::Postgres, _>(&db, "ledger").unwrap();
         let event = insert(ledger, vec![Value::Int(4), Value::Int(7)]);
         let policy = RowPolicy::new(shared(db, &relations), Delegate::granting("user:alice"));
         let view = EventRow::current(&event, policy.catalog()).unwrap();
@@ -693,7 +695,8 @@ ALTER TABLE ledger ENABLE ROW LEVEL SECURITY;
              CREATE TABLE notes(id INTEGER PRIMARY KEY, body TEXT);",
         )
         .unwrap();
-        let notes = catalog_helpers::table_id(&catalog, "notes").unwrap();
+        let notes =
+            catalog_helpers::table_id::<crate::backend::Postgres, _>(&catalog, "notes").unwrap();
         let event = insert(notes, vec![Value::Int(1), text("hi")]);
         let policy = RowPolicy::new(
             shared(catalog, &relations),
@@ -1598,7 +1601,7 @@ CREATE POLICY notes_p ON notes USING (
     }
 
     fn notes_id(db: &ParserDB) -> TableId {
-        catalog_helpers::table_id(db, "notes").unwrap()
+        catalog_helpers::table_id::<crate::backend::Postgres, _>(db, "notes").unwrap()
     }
 
     /// A `notes` row: id 4, owned by `owner`.
@@ -1852,7 +1855,7 @@ CREATE POLICY notes_p ON notes USING (owner = current_setting('app.department', 
     #[test]
     fn a_table_restricting_nothing_grants_without_asking() {
         let (db, relations) = translated(TEAM);
-        let teams = catalog_helpers::table_id(&db, "teams").unwrap();
+        let teams = catalog_helpers::table_id::<crate::backend::Postgres, _>(&db, "teams").unwrap();
         let policy = RowPolicy::new(shared(db, &relations), Named::<Principal>::default());
         let event: TestEvent<_> =
             TestEvent::insert(teams, vec![Value::Int(1)]).with_pk_columns([0u16]);

@@ -135,7 +135,7 @@ impl PgSqliteEmuSource {
     ///     conn,
     ///     "CREATE TABLE orders (id INT PRIMARY KEY, amount INT);",
     /// )?;
-    /// assert!(catalog_helpers::table_id(source.pg_catalog(), "orders").is_some());
+    /// assert!(catalog_helpers::table_id::<subql::backend::Postgres, _>(source.pg_catalog(), "orders").is_some());
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
     pub fn new(mut connection: SqliteConnection, pg_ddl: &str) -> Result<Self, PgSqliteEmuError> {
@@ -352,7 +352,7 @@ impl PgSqliteEmuSource {
     /// let mut source = PgSqliteEmuSource::open_in_memory(
     ///     "CREATE TABLE items (id INT PRIMARY KEY);",
     /// )?;
-    /// let table_id = catalog_helpers::table_id(source.pg_catalog(), "items")
+    /// let table_id = catalog_helpers::table_id::<subql::backend::Postgres, _>(source.pg_catalog(), "items")
     ///     .expect("items table resolves");
     /// source.inject_truncate(table_id)?;
     /// let event = source.poll_next_event()?.expect("truncate emitted");
@@ -766,7 +766,9 @@ mod tests {
     #[test]
     fn truncate_injection_reaches_engine_dispatch() {
         let mut src = build_source();
-        let table_id = catalog_helpers::table_id(src.pg_catalog(), "orders").expect("orders id");
+        let table_id =
+            catalog_helpers::table_id::<crate::backend::Postgres, _>(src.pg_catalog(), "orders")
+                .expect("orders id");
         src.inject_truncate(table_id).expect("truncate");
         let ev = src.poll_next_event().unwrap().expect("truncate event");
         assert_eq!(ev.kind(), crate::EventKind::Truncate);

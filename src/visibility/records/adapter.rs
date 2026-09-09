@@ -299,7 +299,7 @@ CREATE POLICY docs_owner ON docs USING (owner = current_user);";
 
     fn event(row: Vec<Value<Postgres>>) -> TestEvent<Postgres> {
         let db = catalog();
-        let docs = catalog_helpers::table_id(&db, "docs").unwrap();
+        let docs = catalog_helpers::table_id::<crate::backend::Postgres, _>(&db, "docs").unwrap();
         TestEvent::insert(docs, row).with_pk_columns([0u16])
     }
 
@@ -688,7 +688,7 @@ CREATE POLICY docs_owner ON docs USING (owner = current_user);";
     #[test]
     fn the_previous_image_answers_about_the_old_owner() {
         let db = catalog();
-        let docs = catalog_helpers::table_id(&db, "docs").unwrap();
+        let docs = catalog_helpers::table_id::<crate::backend::Postgres, _>(&db, "docs").unwrap();
         let event = TestEvent::<Postgres>::update(
             docs,
             row_of(Value::String("alice".into())),

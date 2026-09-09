@@ -88,7 +88,7 @@ fn build_ddl(rls_flags: &[bool]) -> String {
 }
 
 fn table_id_of(catalog: &ParserDB, name: &str) -> TableId {
-    subql::catalog_helpers::table_id(catalog, name).unwrap()
+    subql::catalog_helpers::table_id::<subql::backend::Postgres, _>(catalog, name).unwrap()
 }
 
 proptest! {

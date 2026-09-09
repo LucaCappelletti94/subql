@@ -95,14 +95,59 @@ fn table_of<DB: DatabaseLike>(msg: &Message, db: &DB) -> Option<TableId> {
     resolve_table(&payload.database, &payload.table, db).ok()
 }
 
-wire_cdc_event!(Message, MySql, crate::NoCheckpoint);
+/// A parsed Maxwell message viewed as a subql event, carrying the server's
+/// `lower_case_table_names` on the type.
+///
+/// The wrapper exists because `maxwell_cdc::Message` is another crate's
+/// type, so it has no slot for the marker that says how this server
+/// compares a table name. Without one, every Maxwell stream would run the
+/// Unix default whatever its server was initialized with.
+///
+/// Construct it from a message with [`From`], and take the message back with
+/// [`MaxwellEvent::into_message`] when the patchset path wants it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MaxwellEvent<C = crate::backend::NamesStoredAsWritten> {
+    message: Message,
+    _table_name_case: core::marker::PhantomData<fn() -> C>,
+}
 
-impl WireEvent for Message {
-    type Backend = MySql;
+impl<C> MaxwellEvent<C> {
+    /// Views `message` as an event for a server whose case rule is `C`.
+    #[must_use]
+    pub const fn new(message: Message) -> Self {
+        Self {
+            message,
+            _table_name_case: core::marker::PhantomData,
+        }
+    }
+
+    /// The message this event views.
+    #[must_use]
+    pub const fn message(&self) -> &Message {
+        &self.message
+    }
+
+    /// Takes the message back out, for the patchset path that digests it.
+    #[must_use]
+    pub fn into_message(self) -> Message {
+        self.message
+    }
+}
+
+impl<C> From<Message> for MaxwellEvent<C> {
+    fn from(message: Message) -> Self {
+        Self::new(message)
+    }
+}
+
+wire_cdc_event!(<C: crate::backend::MySqlTableNameCase> MaxwellEvent<C>, MySql<C>, crate::NoCheckpoint);
+
+impl<C: crate::backend::MySqlTableNameCase> WireEvent for MaxwellEvent<C> {
+    type Backend = MySql<C>;
     type Checkpoint = crate::NoCheckpoint;
 
     fn wire_kind(&self) -> EventKind {
-        kind_of(self).expect(
+        kind_of(&self.message).expect(
             "CdcEvent::kind called on a Maxwell message with no row. Filter with parse_messages first",
         )
     }
@@ -110,7 +155,7 @@ impl WireEvent for Message {
     fn wire_table_id<DB: DatabaseLike>(&self, db: &DB) -> TableId {
         // Infallible in the trait, so an unresolved name yields the `u32`
         // sentinel, which the engine reports as an unknown table.
-        table_of(self, db).unwrap_or(TableId::MAX)
+        table_of(&self.message, db).unwrap_or(TableId::MAX)
     }
 
     fn wire_checkpoint(&self) -> Option<Self::Checkpoint> {
@@ -118,7 +163,7 @@ impl WireEvent for Message {
     }
 
     fn wire_changed_columns<DB: DatabaseLike>(&self, db: &DB, table_id: TableId) -> Vec<ColumnId> {
-        let Self::Update(payload) = self else {
+        let Message::Update(payload) = &self.message else {
             return Vec::new();
         };
         let Some(old) = payload.old.as_ref() else {
@@ -135,7 +180,7 @@ impl WireEvent for Message {
         table_id: TableId,
         row: RowKind,
         col: ColumnId,
-    ) -> Result<Value<MySql>, crate::ValueError> {
+    ) -> Result<Value<MySql<C>>, crate::ValueError> {
         if row == RowKind::Pk
             && !catalog_helpers::primary_key_columns(db, table_id)
                 .unwrap_or_default()
@@ -143,7 +188,7 @@ impl WireEvent for Message {
         {
             return Ok(Value::Missing);
         }
-        let Some(image) = image_for(self, row) else {
+        let Some(image) = image_for(&self.message, row) else {
             return Ok(Value::Missing);
         };
         let Some(name) = catalog_helpers::column_name(db, table_id, col) else {
@@ -152,7 +197,7 @@ impl WireEvent for Message {
         match image.get(name.as_str()) {
             None => Ok(Value::Missing),
             Some(value) if value.is_null() => Ok(Value::Null),
-            Some(value) => catalog_helpers::column_scalar_kind::<MySql, DB>(db, table_id, col)
+            Some(value) => catalog_helpers::column_scalar_kind::<MySql<C>, DB>(db, table_id, col)
                 .map_or(Ok(Value::Missing), |kind| {
                     crate::backend::decode_cell(col, kind, |builtin| {
                         json_value_to_mysql_value_by_kind(value, builtin)
@@ -168,7 +213,7 @@ impl WireEvent for Message {
         db: &DB,
         table_id: TableId,
         col: ColumnId,
-    ) -> Result<Value<MySql>, crate::ValueError> {
+    ) -> Result<Value<MySql<C>>, crate::ValueError> {
         match self.wire_kind() {
             EventKind::Insert => self.wire_value_at(db, table_id, RowKind::New, col),
             EventKind::Delete => self.wire_value_at(db, table_id, RowKind::Old, col),
@@ -196,10 +241,10 @@ mod tests {
         .expect("parse DDL")
     }
 
-    fn one(bytes: &[u8]) -> Message {
+    fn one(bytes: &[u8]) -> MaxwellEvent {
         let mut msgs = parse_messages(bytes).expect("parse succeeds");
         assert_eq!(msgs.len(), 1);
-        msgs.remove(0)
+        MaxwellEvent::new(msgs.remove(0))
     }
 
     #[test]

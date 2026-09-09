@@ -17,7 +17,8 @@ type Engine = SubscriptionEngine<TestEvent<Postgres>, DefaultIds, ParserDB>;
 /// A bare engine holding one uninstalled `MIN(price)` subscription.
 fn engine() -> (Engine, TableId, SubscriptionId) {
     let catalog = ParserDB::parse::<PostgreSqlDialect>(DDL).expect("parse DDL");
-    let table = catalog_helpers::table_id(&catalog, "orders").expect("orders resolves");
+    let table = catalog_helpers::table_id::<subql::backend::Postgres, _>(&catalog, "orders")
+        .expect("orders resolves");
     let mut engine = SubscriptionEngine::new(catalog, PostgreSqlDialect {});
     let registered = engine
         .register(SubscriptionRequest::new(

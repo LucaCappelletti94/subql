@@ -100,7 +100,8 @@ mod tests {
             "CREATE TABLE docs (id INT PRIMARY KEY, owner INT);",
         )
         .expect("catalog DDL parses");
-        let docs = catalog_helpers::table_id(&db, "docs").expect("docs is in the catalog");
+        let docs = catalog_helpers::table_id::<crate::backend::Postgres, _>(&db, "docs")
+            .expect("docs is in the catalog");
         (db, docs)
     }
 

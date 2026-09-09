@@ -24,7 +24,8 @@ fn pg_engine() -> (PgEngine, TableId) {
         "CREATE TABLE readings (id INT PRIMARY KEY, taken_at TIMESTAMPTZ, seen_on DATE);",
     )
     .expect("parse DDL");
-    let table_id = catalog_helpers::table_id(&db, "readings").expect("table readings exists");
+    let table_id = catalog_helpers::table_id::<subql::backend::Postgres, _>(&db, "readings")
+        .expect("table readings exists");
     (SubscriptionEngine::new(db, PostgreSqlDialect {}), table_id)
 }
 

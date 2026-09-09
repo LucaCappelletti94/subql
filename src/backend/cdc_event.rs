@@ -404,7 +404,8 @@ mod cell_presence_tests {
             "CREATE TABLE t (id INT PRIMARY KEY, absent TEXT, nulled TEXT);",
         )
         .expect("the DDL parses");
-        let table = crate::catalog_helpers::table_id(&db, "t").expect("t is cataloged");
+        let table = crate::catalog_helpers::table_id::<crate::backend::Postgres, _>(&db, "t")
+            .expect("t is cataloged");
         let event =
             TestEvent::<Postgres>::insert(table, vec![Value::Int(1), Value::Missing, Value::Null])
                 .with_pk_columns([0u16]);
@@ -470,7 +471,8 @@ mod cell_presence_tests {
 
         let db = ParserDB::parse::<PostgreSqlDialect>("CREATE TABLE t (id INT PRIMARY KEY);")
             .expect("the DDL parses");
-        let table = crate::catalog_helpers::table_id(&db, "t").expect("t is cataloged");
+        let table = crate::catalog_helpers::table_id::<crate::backend::Postgres, _>(&db, "t")
+            .expect("t is cataloged");
         assert_eq!(
             Corrupt(table).presence_at(&db, RowKind::New, 0),
             CellPresence::Undecodable
@@ -712,9 +714,11 @@ mod canonical_group_key_tests {
 
     #[test]
     fn mysql_binary_collations_apply_their_padding_rule() {
-        assert!(MySql::group_key_encoder(vec![column(ScalarFamily::String)]).is_none());
+        assert!(
+            <MySql as Backend>::group_key_encoder(vec![column(ScalarFamily::String)]).is_none()
+        );
 
-        let pad = MySql::group_key_encoder(vec![column_with_collation(
+        let pad = <MySql as Backend>::group_key_encoder(vec![column_with_collation(
             ScalarFamily::String,
             named_collation("utf8mb4_bin", None, Some(MySqlCollationPadding::PadSpace)),
         )])
@@ -724,7 +728,7 @@ mod canonical_group_key_tests {
             pad.encode(&[Value::String(String::from("value  "))])
         );
 
-        let no_pad = MySql::group_key_encoder(vec![column_with_collation(
+        let no_pad = <MySql as Backend>::group_key_encoder(vec![column_with_collation(
             ScalarFamily::String,
             named_collation("utf8mb4_0900_bin", None, Some(MySqlCollationPadding::NoPad)),
         )])
@@ -764,7 +768,7 @@ mod canonical_group_key_tests {
             named_collation("utf8mb4_robin", None, Some(MySqlCollationPadding::NoPad)),
         ] {
             assert!(
-                MySql::group_key_encoder(vec![column_with_collation(
+                <MySql as Backend>::group_key_encoder(vec![column_with_collation(
                     ScalarFamily::String,
                     collation.clone(),
                 )])
@@ -776,7 +780,8 @@ mod canonical_group_key_tests {
 
     #[test]
     fn mysql_decimal_keys_ignore_scale_spelling() {
-        let encoder = MySql::group_key_encoder(vec![column(ScalarFamily::Decimal)]).unwrap();
+        let encoder =
+            <MySql as Backend>::group_key_encoder(vec![column(ScalarFamily::Decimal)]).unwrap();
         assert_eq!(
             encoder.encode(&[Value::Decimal("1.0".parse().unwrap())]),
             encoder.encode(&[Value::Decimal("1.00".parse().unwrap())])

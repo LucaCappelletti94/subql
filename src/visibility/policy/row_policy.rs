@@ -61,7 +61,7 @@ use crate::TableId;
 ///      ALTER TABLE docs ENABLE ROW LEVEL SECURITY;
 ///      CREATE POLICY p ON docs FOR SELECT USING (owner_id = current_user);",
 /// )?;
-/// let docs = catalog_helpers::table_id(&db, "docs").expect("docs is in the catalog");
+/// let docs = catalog_helpers::table_id::<subql::backend::Postgres, _>(&db, "docs").expect("docs is in the catalog");
 ///
 /// // `can_select: owner`, and one row decides it.
 /// let translator = TranslatorBuilder::new()

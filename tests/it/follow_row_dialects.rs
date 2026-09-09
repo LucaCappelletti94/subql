@@ -23,7 +23,7 @@ const CONSUMER: u64 = 1;
 #[test]
 fn follow_row_matches_its_row_under_postgres() {
     let db = ParserDB::parse::<PostgreSqlDialect>(DDL).unwrap();
-    let users = catalog_helpers::table_id(&db, "users").unwrap();
+    let users = catalog_helpers::table_id::<Postgres, _>(&db, "users").unwrap();
     let mut engine =
         SubscriptionEngine::<TestEvent<Postgres>, DefaultIds, _>::new(db, PostgreSqlDialect {});
 
@@ -51,7 +51,7 @@ fn follow_row_matches_its_row_under_postgres() {
 #[test]
 fn follow_row_matches_its_row_under_mysql() {
     let db = ParserDB::parse::<MySqlDialect>(DDL).unwrap();
-    let users = catalog_helpers::table_id(&db, "users").unwrap();
+    let users = catalog_helpers::table_id::<Postgres, _>(&db, "users").unwrap();
     let mut engine =
         SubscriptionEngine::<TestEvent<MySql>, DefaultIds, _>::new(db, MySqlDialect {});
 
@@ -78,7 +78,7 @@ fn follow_row_matches_its_row_under_mysql() {
 #[test]
 fn follow_row_matches_its_row_under_sqlite() {
     let db = ParserDB::parse::<SQLiteDialect>(DDL).unwrap();
-    let users = catalog_helpers::table_id(&db, "users").unwrap();
+    let users = catalog_helpers::table_id::<Postgres, _>(&db, "users").unwrap();
     let mut engine =
         SubscriptionEngine::<TestEvent<SQLite>, DefaultIds, _>::new(db, SQLiteDialect {});
 
@@ -111,7 +111,7 @@ fn follow_row_matches_a_composite_key_under_mysql() {
         PRIMARY KEY (region_id, item_id));";
 
     let db = ParserDB::parse::<MySqlDialect>(COMPOSITE_DDL).unwrap();
-    let items = catalog_helpers::table_id(&db, "items").unwrap();
+    let items = catalog_helpers::table_id::<Postgres, _>(&db, "items").unwrap();
     let mut engine =
         SubscriptionEngine::<TestEvent<MySql>, DefaultIds, _>::new(db, MySqlDialect {});
 
@@ -166,7 +166,7 @@ fn follow_row_survives_a_quoted_key_column() {
     const QUOTED_DDL: &str = "CREATE TABLE users (\"a\"\"b\" INT PRIMARY KEY, name TEXT);";
 
     let db = ParserDB::parse::<PostgreSqlDialect>(QUOTED_DDL).unwrap();
-    let users = catalog_helpers::table_id(&db, "users").unwrap();
+    let users = catalog_helpers::table_id::<Postgres, _>(&db, "users").unwrap();
     let mut engine =
         SubscriptionEngine::<TestEvent<Postgres>, DefaultIds, _>::new(db, PostgreSqlDialect {});
 

@@ -80,7 +80,7 @@ proptest! {
             "CREATE TABLE orders (id INT PRIMARY KEY, region TEXT, amount INT);",
         )
         .expect("parse DDL");
-        let table = subql::catalog_helpers::table_id(&database, "orders").expect("orders");
+        let table = subql::catalog_helpers::table_id::<subql::backend::Postgres, _>(&database, "orders").expect("orders");
         let mut engine = SubscriptionEngine::<
             TestEvent<Postgres>,
             DefaultIds,
@@ -217,7 +217,7 @@ proptest! {
             "CREATE TABLE orders (id INT PRIMARY KEY, region TEXT, amount INT);",
         )
         .expect("parse DDL");
-        let table = subql::catalog_helpers::table_id(&database, "orders").expect("orders");
+        let table = subql::catalog_helpers::table_id::<subql::backend::Postgres, _>(&database, "orders").expect("orders");
         let mut engine = SubscriptionEngine::<
             TestEvent<Postgres>,
             DefaultIds,

@@ -35,7 +35,8 @@ fn catalog() -> ParserDB {
 }
 
 fn orders_id(database: &ParserDB) -> TableId {
-    subql::catalog_helpers::table_id(database, "orders").expect("orders table")
+    subql::catalog_helpers::table_id::<subql::backend::Postgres, _>(database, "orders")
+        .expect("orders table")
 }
 
 // orders columns: id=0, price=1, quantity=2, status=3.

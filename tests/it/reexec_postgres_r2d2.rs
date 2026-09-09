@@ -936,7 +936,8 @@ fn a_panic_during_a_read_leaves_no_transaction_behind() {
         fetches: parking_lot::Mutex::new(0),
     };
     let cat = catalog();
-    let table = subql::catalog_helpers::table_id(&cat, "orders").expect("orders");
+    let table = subql::catalog_helpers::table_id::<subql::backend::Postgres, _>(&cat, "orders")
+        .expect("orders");
     let inner =
         SubscriptionEngine::<subql::testing::TestEvent<Postgres>, DefaultIds, ParserDB>::new(
             cat,

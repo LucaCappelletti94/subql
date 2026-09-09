@@ -354,8 +354,8 @@ fn records_from_events(
     let RecordDerivation::FromRow { table, .. } = &description.derivation else {
         panic!("only a row-derived description reaches here");
     };
-    let table =
-        catalog_helpers::table_id(catalog, table.name()).expect("the table is in the catalog");
+    let table = catalog_helpers::table_id::<subql::backend::Postgres, _>(catalog, table.name())
+        .expect("the table is in the catalog");
 
     let mut out = BTreeSet::new();
     for event in events {

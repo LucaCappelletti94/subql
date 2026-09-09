@@ -41,7 +41,8 @@ const MYSQL_DDL: &str = "CREATE TABLE names (id INT PRIMARY KEY, name TEXT COLLA
 macro_rules! notifies {
     ($backend:ty, $dialect:ty, $ddl:expr, $predicate:expr, $name:expr) => {{
         let db = ParserDB::parse::<$dialect>($ddl).expect("DDL parses");
-        let table = catalog_helpers::table_id(&db, "names").expect("names is in the catalog");
+        let table = catalog_helpers::table_id::<subql::backend::Postgres, _>(&db, "names")
+            .expect("names is in the catalog");
         let mut engine: SubscriptionEngine<TestEvent<$backend>, DefaultIds, ParserDB> =
             SubscriptionEngine::new(db, <$dialect>::default());
         engine
@@ -178,7 +179,8 @@ fn sqlite_has_no_default_like_escape() {
 #[test]
 fn a_pattern_ending_with_the_escape_fails_the_subscription() {
     let db = ParserDB::parse::<PostgreSqlDialect>(DDL).expect("DDL parses");
-    let table = catalog_helpers::table_id(&db, "names").expect("names is in the catalog");
+    let table = catalog_helpers::table_id::<subql::backend::Postgres, _>(&db, "names")
+        .expect("names is in the catalog");
     let mut engine: SubscriptionEngine<TestEvent<Postgres>, DefaultIds, ParserDB> =
         SubscriptionEngine::new(db, PostgreSqlDialect {});
     let subscription = engine

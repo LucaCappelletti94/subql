@@ -360,7 +360,8 @@ impl AsyncConnector for AsyncAggregateRecording {
 
 fn registry() -> (Registry, TableId) {
     let catalog = ParserDB::parse::<PostgreSqlDialect>(DDL).expect("parse DDL");
-    let table = catalog_helpers::table_id(&catalog, "notes").expect("notes resolves");
+    let table = catalog_helpers::table_id::<subql::backend::Postgres, _>(&catalog, "notes")
+        .expect("notes resolves");
     (
         SubscriptionEngine::new(catalog, PostgreSqlDialect {}),
         table,

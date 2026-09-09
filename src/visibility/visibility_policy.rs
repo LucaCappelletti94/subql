@@ -99,7 +99,7 @@ use super::{RowView, RowWrite, Verdict};
 /// let db = ParserDB::parse::<PostgreSqlDialect>(
 ///     "CREATE TABLE docs (id INT PRIMARY KEY, owner INT);",
 /// )?;
-/// let docs = catalog_helpers::table_id(&db, "docs").expect("docs is in the catalog");
+/// let docs = catalog_helpers::table_id::<subql::backend::Postgres, _>(&db, "docs").expect("docs is in the catalog");
 ///
 /// // Row 4 is owned by watcher 7.
 /// let event =

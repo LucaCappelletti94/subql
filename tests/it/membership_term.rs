@@ -42,7 +42,8 @@ fn translator() -> Translator {
 
 fn engine() -> (Engine, TableId) {
     let db = ParserDB::parse::<PostgreSqlDialect>(DDL).expect("DDL parses");
-    let docs = catalog_helpers::table_id(&db, "docs").expect("docs is in the catalog");
+    let docs = catalog_helpers::table_id::<subql::backend::Postgres, _>(&db, "docs")
+        .expect("docs is in the catalog");
     let engine = SubscriptionEngine::new(db, PostgreSqlDialect {}).with_translator(translator());
     (engine, docs)
 }
@@ -579,8 +580,11 @@ mod changed_membership {
 
     /// The membership table, and a row of it: `(project_id, user_id)`.
     fn members_table(engine: &Engine) -> TableId {
-        catalog_helpers::table_id(engine.database(), "project_members")
-            .expect("project_members is in the catalog")
+        catalog_helpers::table_id::<subql::backend::Postgres, _>(
+            engine.database(),
+            "project_members",
+        )
+        .expect("project_members is in the catalog")
     }
 
     fn membership(project: i64, user: &str) -> Vec<Value<Postgres>> {
@@ -1147,7 +1151,8 @@ mod describe_terms {
          (SELECT project_id FROM project_members WHERE user_id = current_setting('app.user_id', true))";
 
         let db = ParserDB::parse::<PostgreSqlDialect>(CROSS_DDL).expect("DDL parses");
-        let reports = catalog_helpers::table_id(&db, "reports").expect("reports is in the catalog");
+        let reports = catalog_helpers::table_id::<subql::backend::Postgres, _>(&db, "reports")
+            .expect("reports is in the catalog");
         let mut engine: Engine =
             SubscriptionEngine::new(db, PostgreSqlDialect {}).with_translator(translator());
 

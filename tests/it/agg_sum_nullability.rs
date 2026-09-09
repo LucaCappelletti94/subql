@@ -40,7 +40,7 @@ type Engine = SubscriptionEngine<Event, DefaultIds, ParserDB>;
 /// component row `[sum, count]` the bootstrap projects.
 fn seeded(sum: Value<Postgres>, count: i64) -> (Engine, TableId, u64, AggValue) {
     let database = ParserDB::parse::<PostgreSqlDialect>(DDL).unwrap();
-    let orders = catalog_helpers::table_id(&database, "orders").unwrap();
+    let orders = catalog_helpers::table_id::<Postgres, _>(&database, "orders").unwrap();
     let mut engine: Engine = SubscriptionEngine::new(database, PostgreSqlDialect {});
     let subscription = engine
         .register(SubscriptionRequest::new(7, SUM))

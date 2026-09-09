@@ -216,7 +216,7 @@ where
     let mut tables = Vec::new();
     for name in &names {
         let table_name = crate::compiler::parser::SqlTableName::from_object_name(name)?;
-        let id = crate::table_resolution::resolve_table_reference(
+        let id = crate::table_resolution::resolve_table_reference::<B, DB>(
             table_name.qualified.as_deref(),
             &table_name.unqualified,
             database,
@@ -739,7 +739,7 @@ where
     let (table_name, _) =
         crate::compiler::sql_shape::extract_ungrouped_table_and_where(&statement)?;
     let name = crate::compiler::parser::SqlTableName::from_object_name(&table_name)?;
-    let table = crate::table_resolution::resolve_table_reference(
+    let table = crate::table_resolution::resolve_table_reference::<B, DB>(
         name.qualified.as_deref(),
         &name.unqualified,
         database,

@@ -76,8 +76,14 @@ pub trait WireEvent {
 /// Every wire format's impl is the same delegation, so it is spelled once
 /// here rather than four times over.
 macro_rules! wire_cdc_event {
-    ($wire:ty, $backend:ty, $checkpoint:ty) => {
-        impl $crate::backend::CdcEvent for $wire {
+    // The one body, taking zero or more type parameters. A wire type that
+    // carries parameters, such as the Maxwell event carrying its server's
+    // identifier-case marker, names them; the plain form below forwards with
+    // none, so the delegation exists once.
+    // A wire type that carries type parameters, such as the Maxwell event
+    // carrying its server's identifier-case marker.
+    (<$($param:ident: $bound:path),*> $wire:ty, $backend:ty, $checkpoint:ty) => {
+        impl<$($param: $bound),*> $crate::backend::CdcEvent for $wire {
             type Backend = $backend;
             type Checkpoint = $checkpoint;
 
@@ -167,6 +173,10 @@ macro_rules! wire_cdc_event {
             }
         }
     };
+    ($wire:ty, $backend:ty, $checkpoint:ty) => {
+        $crate::wal::wire_event::wire_cdc_event!(<> $wire, $backend, $checkpoint);
+    };
+
 }
 
 pub(crate) use wire_cdc_event;

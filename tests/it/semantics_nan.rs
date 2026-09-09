@@ -29,7 +29,8 @@ const SQLITE_DDL: &str = "CREATE TABLE readings (id INTEGER PRIMARY KEY, value R
 
 fn pg_engine() -> (PgEngine, TableId) {
     let db = ParserDB::parse::<PostgreSqlDialect>(PG_DDL).expect("DDL parses");
-    let table = catalog_helpers::table_id(&db, "readings").expect("readings is in the catalog");
+    let table = catalog_helpers::table_id::<subql::backend::Postgres, _>(&db, "readings")
+        .expect("readings is in the catalog");
     (SubscriptionEngine::new(db, PostgreSqlDialect {}), table)
 }
 
@@ -119,7 +120,8 @@ fn pg_nan_range_probe_agrees_with_the_comparator() {
 #[test]
 fn mysql_keeps_the_ieee_rule() {
     let db = ParserDB::parse::<MySqlDialect>(MYSQL_DDL).expect("DDL parses");
-    let table = catalog_helpers::table_id(&db, "readings").expect("readings is in the catalog");
+    let table = catalog_helpers::table_id::<subql::backend::Postgres, _>(&db, "readings")
+        .expect("readings is in the catalog");
     let mut engine: MySqlEngine = SubscriptionEngine::new(db, MySqlDialect {});
     engine
         .register(SubscriptionRequest::new(
@@ -143,7 +145,8 @@ fn mysql_keeps_the_ieee_rule() {
 #[test]
 fn sqlite_stores_a_nan_as_null_and_null_is_not_self_equal() {
     let db = ParserDB::parse::<SQLiteDialect>(SQLITE_DDL).expect("DDL parses");
-    let table = catalog_helpers::table_id(&db, "readings").expect("readings is in the catalog");
+    let table = catalog_helpers::table_id::<subql::backend::Postgres, _>(&db, "readings")
+        .expect("readings is in the catalog");
     let mut engine: SqliteEngine = SubscriptionEngine::new(db, SQLiteDialect {});
     engine
         .register(SubscriptionRequest::new(
@@ -166,7 +169,8 @@ fn sqlite_stores_a_nan_as_null_and_null_is_not_self_equal() {
 #[test]
 fn sqlite_keeps_the_ieee_rule() {
     let db = ParserDB::parse::<SQLiteDialect>(SQLITE_DDL).expect("DDL parses");
-    let table = catalog_helpers::table_id(&db, "readings").expect("readings is in the catalog");
+    let table = catalog_helpers::table_id::<subql::backend::Postgres, _>(&db, "readings")
+        .expect("readings is in the catalog");
     let mut engine: SqliteEngine = SubscriptionEngine::new(db, SQLiteDialect {});
     engine
         .register(SubscriptionRequest::new(

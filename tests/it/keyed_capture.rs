@@ -142,7 +142,8 @@ fn a_keyed_read_names_no_more_keys_per_statement_than_its_budget() {
     }
 
     let catalog = ParserDB::parse::<SQLiteDialect>(DDL).expect("catalog");
-    let table = subql::catalog_helpers::table_id(&catalog, "orders").expect("orders");
+    let table = subql::catalog_helpers::table_id::<subql::backend::Postgres, _>(&catalog, "orders")
+        .expect("orders");
     let inner = SubscriptionEngine::<TestEvent<SQLite>, DefaultIds, ParserDB>::new(
         catalog,
         SQLiteDialect {},
@@ -210,7 +211,8 @@ fn setup(rows: &[(i64, &str)]) -> (Engine, TableId) {
     }
 
     let catalog = ParserDB::parse::<SQLiteDialect>(DDL).expect("catalog");
-    let table = subql::catalog_helpers::table_id(&catalog, "orders").expect("orders");
+    let table = subql::catalog_helpers::table_id::<subql::backend::Postgres, _>(&catalog, "orders")
+        .expect("orders");
     let inner = SubscriptionEngine::<TestEvent<SQLite>, DefaultIds, ParserDB>::new(
         catalog,
         SQLiteDialect {},
@@ -353,7 +355,8 @@ fn several_changed_rows_are_answered_in_one_pass() {
 #[test]
 fn a_change_with_no_readable_key_transitions_to_whole_rows() {
     let catalog = ParserDB::parse::<SQLiteDialect>(DDL).expect("catalog");
-    let table = subql::catalog_helpers::table_id(&catalog, "orders").expect("orders");
+    let table = subql::catalog_helpers::table_id::<subql::backend::Postgres, _>(&catalog, "orders")
+        .expect("orders");
     let mut registry = SubscriptionEngine::<TestEvent<SQLite>, DefaultIds, ParserDB>::new(
         catalog,
         SQLiteDialect {},
@@ -561,7 +564,8 @@ fn a_failed_read_keeps_the_keys_it_was_going_to_ask_about() {
     }
 
     let catalog = ParserDB::parse::<SQLiteDialect>(DDL).expect("catalog");
-    let table = subql::catalog_helpers::table_id(&catalog, "orders").expect("orders");
+    let table = subql::catalog_helpers::table_id::<subql::backend::Postgres, _>(&catalog, "orders")
+        .expect("orders");
     let inner = SubscriptionEngine::<TestEvent<SQLite>, DefaultIds, ParserDB>::new(
         catalog,
         SQLiteDialect {},
@@ -677,7 +681,8 @@ fn a_failure_on_a_later_batch_gives_back_every_key() {
     }
 
     let catalog = ParserDB::parse::<SQLiteDialect>(DDL).expect("catalog");
-    let table = subql::catalog_helpers::table_id(&catalog, "orders").expect("orders");
+    let table = subql::catalog_helpers::table_id::<subql::backend::Postgres, _>(&catalog, "orders")
+        .expect("orders");
     let inner = SubscriptionEngine::<TestEvent<SQLite>, DefaultIds, ParserDB>::new(
         catalog,
         SQLiteDialect {},
@@ -760,7 +765,8 @@ fn a_compound_key_is_delivered_in_key_column_order() {
     }
 
     let catalog = ParserDB::parse::<SQLiteDialect>(COMPOUND_DDL).expect("catalog");
-    let table = subql::catalog_helpers::table_id(&catalog, "lines").expect("lines");
+    let table = subql::catalog_helpers::table_id::<subql::backend::Postgres, _>(&catalog, "lines")
+        .expect("lines");
     let inner = SubscriptionEngine::<TestEvent<SQLite>, DefaultIds, ParserDB>::new(
         catalog,
         SQLiteDialect {},
@@ -841,7 +847,8 @@ fn a_batch_spanning_several_pages_answers_every_key_once() {
     }
 
     let catalog = ParserDB::parse::<SQLiteDialect>(DDL).expect("catalog");
-    let table = subql::catalog_helpers::table_id(&catalog, "orders").expect("orders");
+    let table = subql::catalog_helpers::table_id::<subql::backend::Postgres, _>(&catalog, "orders")
+        .expect("orders");
     let inner = SubscriptionEngine::<TestEvent<SQLite>, DefaultIds, ParserDB>::new(
         catalog,
         SQLiteDialect {},

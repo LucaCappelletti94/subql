@@ -28,7 +28,8 @@ fn insert_round_trips_through_the_emulator() {
     assert_eq!(rows, 1);
 
     let expected_table_id =
-        catalog_helpers::table_id(source.pg_catalog(), "orders").expect("orders resolves");
+        catalog_helpers::table_id::<subql::backend::Postgres, _>(source.pg_catalog(), "orders")
+            .expect("orders resolves");
 
     let event = source
         .poll_next_event()

@@ -30,7 +30,8 @@ const DDL: &str = "CREATE TABLE docs (id INT PRIMARY KEY, doc JSONB)";
 
 fn engine() -> (Engine, TableId, ColumnId) {
     let db = ParserDB::parse::<PostgreSqlDialect>(DDL).expect("DDL parses");
-    let table = catalog_helpers::table_id(&db, "docs").expect("docs is in the catalog");
+    let table = catalog_helpers::table_id::<subql::backend::Postgres, _>(&db, "docs")
+        .expect("docs is in the catalog");
     let column = catalog_helpers::column_id(&db, table, "doc").expect("doc is in the catalog");
     (
         SubscriptionEngine::new(db, PostgreSqlDialect {}),

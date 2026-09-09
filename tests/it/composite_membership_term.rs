@@ -37,8 +37,10 @@ fn translator() -> Translator {
 
 fn engine() -> (Engine, TableId, TableId) {
     let db = ParserDB::parse::<PostgreSqlDialect>(DDL).expect("DDL parses");
-    let docs = catalog_helpers::table_id(&db, "docs").expect("docs is in the catalog");
-    let shares = catalog_helpers::table_id(&db, "shares").expect("shares is in the catalog");
+    let docs =
+        catalog_helpers::table_id::<Postgres, _>(&db, "docs").expect("docs is in the catalog");
+    let shares =
+        catalog_helpers::table_id::<Postgres, _>(&db, "shares").expect("shares is in the catalog");
     let engine = SubscriptionEngine::new(db, PostgreSqlDialect {}).with_translator(translator());
     (engine, docs, shares)
 }

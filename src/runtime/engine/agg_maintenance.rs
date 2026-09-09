@@ -227,7 +227,7 @@ where
     ///     "CREATE TABLE orders (id INT PRIMARY KEY, status TEXT);",
     /// )
     /// .expect("the DDL parses");
-    /// let orders_id = catalog_helpers::table_id(&database, "orders").expect("orders is cataloged");
+    /// let orders_id = catalog_helpers::table_id::<subql::backend::Postgres, _>(&database, "orders").expect("orders is cataloged");
     /// let mut engine: SubscriptionEngine<TestEvent<Postgres>, DefaultIds, ParserDB> =
     ///     SubscriptionEngine::new(database, PostgreSqlDialect {});
     ///

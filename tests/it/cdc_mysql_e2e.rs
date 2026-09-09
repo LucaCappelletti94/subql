@@ -9,28 +9,22 @@
 //!
 //! This is the MySQL/Maxwell half of `tests/it/cdc_cross_db.rs`, lifted and
 //! specialized: no PG, no cross-DB parity, just direct assertions on the
-//! Maxwell path. The Maxwell/MySQL container helpers are duplicated here rather
-//! than shared.
+//! Maxwell path.
 //!
 //! Requires Docker and `default-libmysqlclient-dev`. Run with:
 //! ```sh
 //! cargo test --test it cdc_mysql_e2e:: -- --ignored --nocapture
 //! ```
 
-use std::time::Duration;
-
 use diesel::prelude::*;
 use sqlparser::dialect::MySqlDialect;
-use testcontainers::core::{IntoContainerPort, Mount, WaitFor};
-use testcontainers::runners::SyncRunner;
-use testcontainers::{GenericImage, ImageExt};
 
+use crate::common::{
+    assert_docker_available, maxwell_collect, mysql_networked, mysql_port, mysql_url, start_maxwell,
+};
 use sql_traits::structs::ParserDB;
 use subql::backend::MySql;
-use subql::{parse_maxwell, DefaultIds, MaxwellMessage, SubscriptionEngine, SubscriptionRequest};
-
-const MAXWELL_IMAGE: &str = "zendesk/maxwell";
-const MAXWELL_TAG: &str = "v1.44.0";
+use subql::{parse_maxwell, DefaultIds, MaxwellEvent, SubscriptionEngine, SubscriptionRequest};
 
 /// Catalog for the `events` table. Parsed with `PostgreSqlDialect` (subql
 /// parses PG-flavored DDL regardless of the live backend). Maxwell sends
@@ -41,77 +35,6 @@ fn events_catalog() -> ParserDB {
         "CREATE TABLE events (id INT PRIMARY KEY, amount DOUBLE PRECISION, label TEXT);",
     )
     .expect("events DDL parses")
-}
-
-/// Start MySQL 8.0 with binlog enabled. `with_container_name` lets Maxwell
-/// reach it as `mysql_name` on the shared network. Waits for "port: 3306",
-/// which only appears in the final (real-server) ready message.
-fn start_mysql(network: &str, container_name: &str) -> testcontainers::Container<GenericImage> {
-    GenericImage::new("mysql", "8.0")
-        .with_wait_for(WaitFor::message_on_stderr("port: 3306"))
-        .with_exposed_port(3306.tcp())
-        .with_env_var("MYSQL_ROOT_PASSWORD", "subql_test")
-        .with_env_var("MYSQL_DATABASE", "testdb")
-        .with_cmd([
-            "--server-id=1",
-            "--log-bin=mysql-bin",
-            "--binlog-format=ROW",
-            "--binlog-row-image=FULL",
-        ])
-        .with_network(network)
-        .with_container_name(container_name)
-        .with_startup_timeout(Duration::from_secs(120))
-        .start()
-        .unwrap_or_else(|e| {
-            panic!("start mysql network={network} container_name={container_name}: {e}")
-        })
-}
-
-/// Start the Maxwell daemon reading from MySQL on the shared network, writing
-/// CDC rows to a bind-mounted JSONL file.
-fn start_maxwell(
-    network: &str,
-    mysql_name: &str,
-    output_dir: &str,
-) -> testcontainers::Container<GenericImage> {
-    let host_flag = format!("--host={mysql_name}");
-    GenericImage::new(MAXWELL_IMAGE, MAXWELL_TAG)
-        .with_wait_for(WaitFor::message_on_stderr("Binlog connected"))
-        .with_network(network)
-        .with_mount(Mount::bind_mount(output_dir, "/output"))
-        .with_cmd([
-            "bin/maxwell",
-            "--producer=file",
-            "--output_file=/output/maxwell.jsonl",
-            "--output_primary_key_columns=true",
-            &host_flag,
-            "--port=3306",
-            "--user=root",
-            "--password=subql_test",
-        ])
-        .with_startup_timeout(Duration::from_secs(90))
-        .start()
-        .unwrap_or_else(|e| {
-            panic!(
-                "start maxwell image={MAXWELL_IMAGE} tag={MAXWELL_TAG} network={network} \
-                 mysql_name={mysql_name}: {e}"
-            )
-        })
-}
-
-/// Fail fast with actionable diagnostics if Docker is unavailable.
-fn assert_docker_available() {
-    let output = std::process::Command::new("docker")
-        .args(["info", "--format", "{{.ServerVersion}}"])
-        .output()
-        .unwrap_or_else(|e| panic!("docker preflight: failed to execute `docker info`: {e}"));
-    assert!(
-        output.status.success(),
-        "docker preflight failed: `docker info` exited with status {}.\nstderr: {}\n\
-         Ensure the Docker daemon is running and this user can access the socket.",
-        output.status,
-        String::from_utf8_lossy(&output.stderr).trim()
-    );
 }
 
 fn setup_mysql(my: &mut MysqlConnection) {
@@ -143,43 +66,6 @@ fn apply_dml(my: &mut MysqlConnection) {
         .expect("delete 1");
 }
 
-/// Poll the bind-mounted Maxwell JSONL until at least `expected_count` rows for
-/// the `events` table are present. Returns them in file (commit) order.
-fn maxwell_read_changes(output_dir: &str, expected_count: usize) -> Vec<String> {
-    let jsonl_path = std::path::Path::new(output_dir).join("maxwell.jsonl");
-    let timeout = Duration::from_secs(30);
-    let poll_interval = Duration::from_millis(500);
-    let start = std::time::Instant::now();
-
-    loop {
-        assert!(
-            start.elapsed() <= timeout,
-            "Timed out waiting for Maxwell CDC messages at {}",
-            jsonl_path.display()
-        );
-
-        if jsonl_path.exists() {
-            let content = std::fs::read_to_string(&jsonl_path).unwrap_or_default();
-            let matching: Vec<String> = content
-                .lines()
-                .filter(|line| {
-                    line.contains("\"table\":\"events\"")
-                        && (line.contains("\"type\":\"insert\"")
-                            || line.contains("\"type\":\"update\"")
-                            || line.contains("\"type\":\"delete\""))
-                })
-                .map(String::from)
-                .collect();
-
-            if matching.len() >= expected_count {
-                return matching;
-            }
-        }
-
-        std::thread::sleep(poll_interval);
-    }
-}
-
 #[test]
 #[ignore = "requires Docker; run with: cargo test --test it cdc_mysql_e2e:: -- --ignored"]
 #[allow(clippy::print_stderr)]
@@ -204,21 +90,18 @@ fn mysql_maxwell_cdc_e2e() {
         .expect("tempdir path")
         .to_string();
 
-    let mysql_container = start_mysql(&network, &mysql_name);
+    let mysql_container = mysql_networked(&network, &mysql_name);
 
     let _maxwell_container = start_maxwell(&network, &mysql_name, &maxwell_path);
 
-    let my_port = mysql_container
-        .get_host_port_ipv4(3306.tcp())
-        .expect("mysql port");
-    let my_url = format!("mysql://root:subql_test@127.0.0.1:{my_port}/testdb");
+    let my_url = mysql_url(mysql_port(&mysql_container));
     let mut my = MysqlConnection::establish(&my_url).expect("MySQL connection");
 
     setup_mysql(&mut my);
 
     apply_dml(&mut my);
 
-    let messages = maxwell_read_changes(&maxwell_path, 4);
+    let messages = maxwell_collect(&maxwell_path, "events", 4);
     assert_eq!(
         messages.len(),
         4,
@@ -227,7 +110,7 @@ fn mysql_maxwell_cdc_e2e() {
     );
 
     let consumer: u64 = 1;
-    let mut engine: SubscriptionEngine<MaxwellMessage, DefaultIds, ParserDB> =
+    let mut engine: SubscriptionEngine<MaxwellEvent, DefaultIds, ParserDB> =
         SubscriptionEngine::new(events_catalog(), MySqlDialect {});
     engine
         .register(SubscriptionRequest::<DefaultIds, MySql>::new(
@@ -242,8 +125,11 @@ fn mysql_maxwell_cdc_e2e() {
     let mut deleted: Vec<Vec<u64>> = Vec::new();
 
     for (i, msg) in messages.iter().enumerate() {
-        let events = parse_maxwell(msg.as_bytes())
-            .unwrap_or_else(|e| panic!("Maxwell parse failed for message {i}: {e}"));
+        let events: Vec<MaxwellEvent> = parse_maxwell(msg.as_bytes())
+            .unwrap_or_else(|e| panic!("Maxwell parse failed for message {i}: {e}"))
+            .into_iter()
+            .map(MaxwellEvent::new)
+            .collect();
         for event in &events {
             let notifs = engine
                 .consumers(event)
