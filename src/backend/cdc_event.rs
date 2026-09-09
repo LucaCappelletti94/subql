@@ -735,6 +735,45 @@ mod canonical_group_key_tests {
         );
     }
 
+    /// A known padding rule does not make a collation binary.
+    ///
+    /// Only the binary family compares byte for byte, and MySQL reports
+    /// `PAD_ATTRIBUTE` for every collation it has, so a padding fact beside
+    /// a folding collation says how it pads and nothing about whether subql
+    /// can reproduce it.
+    #[test]
+    fn mysql_reads_only_the_binary_family_as_exact() {
+        for collation in [
+            named_collation(
+                "utf8mb4_general_ci",
+                None,
+                Some(MySqlCollationPadding::PadSpace),
+            ),
+            named_collation(
+                "utf8mb4_0900_ai_ci",
+                None,
+                Some(MySqlCollationPadding::NoPad),
+            ),
+            named_collation(
+                "utf8mb4_0900_as_cs",
+                None,
+                Some(MySqlCollationPadding::NoPad),
+            ),
+            // A name ending in the family's suffix only as part of a longer
+            // word is not the family either.
+            named_collation("utf8mb4_robin", None, Some(MySqlCollationPadding::NoPad)),
+        ] {
+            assert!(
+                MySql::group_key_encoder(vec![column_with_collation(
+                    ScalarFamily::String,
+                    collation.clone(),
+                )])
+                .is_none(),
+                "{collation:?} is not the binary family"
+            );
+        }
+    }
+
     #[test]
     fn mysql_decimal_keys_ignore_scale_spelling() {
         let encoder = MySql::group_key_encoder(vec![column(ScalarFamily::Decimal)]).unwrap();
