@@ -19,7 +19,7 @@ sql-traits = { git = "https://github.com/earth-metabolome-initiative/sql-traits"
 
 # PG dialect parser. The workspace [patch.crates-io] redirects this to the
 # visitor-wasm fork.
-sqlparser = { version = "0.62", default-features = false }
+sqlparser = { version = "0.63", default-features = false }
 
 # PG-DDL -> SQLite-DDL translator. Single PG DDL string per preset is fed
 # both into subql's ParserDB and into pg2sqlite::translate to produce the

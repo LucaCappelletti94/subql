@@ -88,7 +88,7 @@ required-features = ["testing"]
 # `visitor` provides the derived AST walk. The capture classifier needs every
 # table a statement reads, and a table it missed would be a table whose changes
 # never trigger the query, so totality by derivation beats a hand-rolled walk.
-sqlparser = { version = "0.62", default-features = false, features = ["visitor"] }
+sqlparser = { version = "0.63", default-features = false, features = ["visitor"] }
 
 # Generic SQL schema traits + canonical SchemaFingerprint (FINGERPRINT_SPEC).
 # `default-features = false` follows sql-traits' own gating. The `std`
