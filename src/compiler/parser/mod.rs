@@ -108,7 +108,8 @@ impl<B: Backend> Compiling<B> {
         table_id: TableId,
         database: &DB,
     ) -> Option<u16> {
-        let column = crate::compiler::literals::resolve_column_ref(expr, table_id, database)?;
+        let column =
+            crate::compiler::literals::resolve_column_ref::<B, DB>(expr, table_id, database)?;
         let facts = crate::catalog_helpers::column_comparison::<B, DB>(database, table_id, column)?;
         if let Some(slot) = self.comparisons.iter().position(|held| *held == facts) {
             return u16::try_from(slot).ok();
@@ -147,7 +148,7 @@ impl<B: Backend> Compiling<B> {
         let mut columns = alloc::vec::Vec::with_capacity(2);
         for side in [left, right] {
             let Some(column) =
-                crate::compiler::literals::resolve_column_ref(side, table_id, database)
+                crate::compiler::literals::resolve_column_ref::<B, DB>(side, table_id, database)
             else {
                 continue;
             };

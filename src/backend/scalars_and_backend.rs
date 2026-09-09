@@ -278,6 +278,20 @@ pub trait Backend: 'static {
     /// escape cannot have a dangling one, so the two facts belong together.
     const LIKE_ESCAPE: Option<crate::compiler::vm::refusal::LikeEscape>;
 
+    /// Whether the engine folds a delimited identifier's case.
+    ///
+    /// PostgreSQL keeps a delimited identifier exactly as written, so
+    /// `"Owner"` and `owner` are two columns and a filter naming one must
+    /// not reach the other. MySQL compares column names case-insensitively
+    /// whether or not they were written in backticks, and SQLite does the
+    /// same for quoted names, so there `"Owner"` names the column declared
+    /// `Owner`.
+    ///
+    /// Required rather than defaulted, because a wrong answer either
+    /// refuses a filter the engine accepts or reads a column the filter
+    /// did not name, and neither is a safe guess.
+    const DELIMITED_IDENTIFIERS_FOLD_CASE: bool;
+
     /// The width an arithmetic result is held at, given each operand's
     /// width, or `None` when the operation is not on floats.
     ///

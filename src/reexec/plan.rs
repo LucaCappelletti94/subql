@@ -614,7 +614,7 @@ where
     }
 
     let Some((kind, agg_column)) =
-        extract_scalar_aggregate(&parsed.statement, parsed.table_id, database)?
+        extract_scalar_aggregate::<B, DB>(&parsed.statement, parsed.table_id, database)?
     else {
         return Err(RegisterError::UnsupportedSql(
             "query is not a single-table scalar MIN/MAX; cannot re-execute".to_string(),

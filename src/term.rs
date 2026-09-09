@@ -225,14 +225,14 @@ impl TermDescription {
         let seed_sql = match &term.expr {
             Expr::InSubquery { subquery, .. } => subquery.to_string(),
             Expr::Exists { subquery, .. } => {
-                crate::compiler::sql_shape::exists_seed_select(subquery, table, database)
+                crate::compiler::sql_shape::exists_seed_select::<B, DB>(subquery, table, database)
                     .ok_or_else(|| {
-                        RegisterError::MembershipTermRefused(
-                            "this membership term's EXISTS lost its recognized shape, so SubQL \
+                    RegisterError::MembershipTermRefused(
+                        "this membership term's EXISTS lost its recognized shape, so SubQL \
                              cannot say which read seeds it"
-                                .into(),
-                        )
-                    })?
+                            .into(),
+                    )
+                })?
             }
             _ => {
                 return Err(RegisterError::MembershipTermRefused(

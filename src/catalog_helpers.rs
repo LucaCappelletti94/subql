@@ -127,22 +127,30 @@ pub fn column_id<DB: DatabaseLike>(
 /// would either lose the quoting, which silently reaches a differently
 /// spelled column, or need an allocation per lookup to put the quotes back.
 ///
+/// The quoting means what the engine says it means, through
+/// [`Backend::DELIMITED_IDENTIFIERS_FOLD_CASE`](crate::backend::Backend::DELIMITED_IDENTIFIERS_FOLD_CASE).
+/// PostgreSQL keeps a delimited identifier as written, so `"Owner"` and
+/// `owner` are two columns. MySQL and SQLite fold it, so a written
+/// `"Owner"` reaches a column declared `Owner`, and refusing there would
+/// refuse a filter the engine answers.
+///
 /// **Complexity**: O(n) per call where `n = table.number_of_columns()`, the
 /// same walk [`column_id`] performs.
 #[must_use]
-pub fn column_id_for_name<DB: DatabaseLike>(
+pub fn column_id_for_name<B: crate::backend::Backend, DB: DatabaseLike>(
     database: &DB,
     table_id: TableId,
     column_name: &str,
     column_name_is_quoted: bool,
 ) -> Option<ColumnId> {
     let table = database.table_by_id(table_id as usize)?;
+    let lookup_is_quoted = column_name_is_quoted && !B::DELIMITED_IDENTIFIERS_FOLD_CASE;
     let ordinal = table.columns(database).ok()?.position(|column| {
         identifiers_match(
             column.column_name(),
-            column.column_name_is_quoted(),
+            column.column_name_is_quoted() && !B::DELIMITED_IDENTIFIERS_FOLD_CASE,
             column_name,
-            column_name_is_quoted,
+            lookup_is_quoted,
         )
     })?;
     u16::try_from(ordinal).ok()

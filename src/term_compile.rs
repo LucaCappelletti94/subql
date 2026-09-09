@@ -55,7 +55,7 @@ pub fn plan_term<B: crate::backend::Backend, DB: DatabaseLike>(
         return caller_plan(term, table, database, &shapes);
     }
 
-    let movement = member_columns(term, table, &shapes, database)?;
+    let movement = member_columns::<B, DB>(term, table, &shapes, database)?;
 
     // Each value the term compares has to be the value the membership row keys
     // its object on at the same position, or the lookup stores under one key
@@ -182,7 +182,7 @@ fn caller_plan<DB: DatabaseLike>(
 /// each compared column meets, and the shape's key set is verified against
 /// them rather than trusted for its order, since `rls2fga` orders a composite
 /// key by the object it names rather than by the filter's text.
-fn member_columns<DB: DatabaseLike>(
+fn member_columns<B: crate::backend::Backend, DB: DatabaseLike>(
     term: &CompiledTerm,
     table: TableId,
     shapes: &TermShapes,
@@ -215,12 +215,12 @@ fn member_columns<DB: DatabaseLike>(
         })?;
 
     let movement = read_from_one_row(entry, database)?;
-    align_with_the_filter(term, table, movement, database)
+    align_with_the_filter::<B, DB>(term, table, movement, database)
 }
 
 /// Reorder the shape's membership keys into the filter's own pair order, or
 /// refuse when the two disagree about which columns key the relationship.
-fn align_with_the_filter<DB: DatabaseLike>(
+fn align_with_the_filter<B: crate::backend::Backend, DB: DatabaseLike>(
     term: &CompiledTerm,
     table: TableId,
     mut movement: TermMovement,
@@ -242,8 +242,9 @@ fn align_with_the_filter<DB: DatabaseLike>(
         // reordering.
         return Ok(movement);
     };
-    let parts = crate::compiler::sql_shape::membership_exists_parts(subquery, table, database)
-        .map_err(|_| refuse("was compiled from an EXISTS that lost its recognized shape"))?;
+    let parts =
+        crate::compiler::sql_shape::membership_exists_parts::<B, DB>(subquery, table, database)
+            .map_err(|_| refuse("was compiled from an EXISTS that lost its recognized shape"))?;
     if parts.member_table != movement.member_table {
         return Err(refuse(
             "reads a different table than the filter's own membership subquery",
