@@ -52,7 +52,6 @@ pub struct MysqlDatabase {
     port: u16,
     pub(super) name: String,
     run: String,
-    maxwell_count: AtomicU32,
 }
 
 /// Acquire the shared MySQL and create a fresh database on it.
@@ -71,12 +70,7 @@ pub fn mysql_database() -> MysqlDatabase {
     diesel::sql_query(format!("CREATE DATABASE {name}"))
         .execute(&mut admin)
         .expect("create test database");
-    MysqlDatabase {
-        port,
-        name,
-        run,
-        maxwell_count: AtomicU32::new(0),
-    }
+    MysqlDatabase { port, name, run }
 }
 
 impl MysqlDatabase {
@@ -117,8 +111,12 @@ pub fn start_maxwell(db: &MysqlDatabase, output_dir: &str) -> Container<GenericI
     // its own state schema. Other tests' databases are blacklisted, not just
     // excluded: Maxwell halts on DDL it cannot parse, whichever database it is
     // in, and a blacklist is the one filter that skips schema tracking.
-    let instance = db.maxwell_count.fetch_add(1, Ordering::Relaxed);
-    let replica_server_id = 2 + std::process::id() * 16 + instance;
+    static MAXWELL_COUNTER: AtomicU32 = AtomicU32::new(0);
+    // Unique across the server: the process is unique within a run and the
+    // counter within the process. Folded into u32 for MySQL, never 0 or 1.
+    let instance = MAXWELL_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let raw = u64::from(std::process::id()) * 1024 + u64::from(instance);
+    let replica_server_id = 2 + u32::try_from(raw % u64::from(u32::MAX - 2)).expect("folded");
     GenericImage::new(MAXWELL_IMAGE, MAXWELL_TAG)
         .with_wait_for(WaitFor::message_on_stderr("Binlog connected"))
         .with_network(network_name(&db.run))
