@@ -25,9 +25,9 @@ use subql::{parse_wal2json_v2, MessageV2};
 const SLOT: &str = "rt_slot";
 
 /// Drain every pending wal2json v2 change and parse it to row events.
-fn drain(pg: &mut PgConnection) -> Vec<MessageV2> {
+fn drain(pg: &mut PgConnection, slot: &str) -> Vec<MessageV2> {
     let mut events = Vec::new();
-    for line in &common::drain_slot(pg, SLOT) {
+    for line in &common::drain_slot(pg, slot) {
         events.extend(parse_wal2json_v2(line.as_bytes()).unwrap());
     }
     events
@@ -37,23 +37,23 @@ fn drain(pg: &mut PgConnection) -> Vec<MessageV2> {
 #[ignore = "requires Docker; run with --ignored"]
 fn round_trip_wal2json_dispatches_bool_uuid_domain_enum() {
     common::assert_docker_available();
-    let container = common::pg_with_wal2json();
-    let port = common::pg_port(&container);
-    let mut pg = common::pg_connect(port);
+    let db = common::pg_database();
+    let mut pg = db.connect();
+    let slot = db.slot(SLOT);
 
     common::dispatch::create_schema(&mut pg);
-    common::create_slot(&mut pg, SLOT);
+    common::create_slot(&mut pg, &slot);
     let catalog = common::dispatch::subql_catalog();
 
     // Seed phase: inserts.
     common::dispatch::seed_dml(&mut pg);
-    let seed_events = drain(&mut pg);
+    let seed_events = drain(&mut pg, &slot);
     assert!(!seed_events.is_empty(), "seed drain yielded no row events");
     let seed_builder = wal2json_patchset_builder(&catalog, &seed_events).unwrap();
 
     // Mutate phase: update and delete.
     common::dispatch::mutate_dml(&mut pg);
-    let mutate_events = drain(&mut pg);
+    let mutate_events = drain(&mut pg, &slot);
     assert!(!mutate_events.is_empty(), "mutate drain yielded no events");
     let mutate_builder = wal2json_patchset_builder(&catalog, &mutate_events).unwrap();
 

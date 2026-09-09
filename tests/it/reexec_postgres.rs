@@ -25,7 +25,7 @@
 
 use crate::common;
 
-use diesel::{sql_query, PgConnection, RunQueryDsl};
+use diesel::{sql_query, Connection, PgConnection, RunQueryDsl};
 use sql_traits::structs::ParserDB;
 use sqlparser::dialect::PostgreSqlDialect;
 use subql::backend::{Postgres, ScalarFamily, Value};
@@ -55,7 +55,7 @@ const PG_DDL: &str = "CREATE TABLE orders (
 /// slot. The slot starts empty (the seeds are inserted **before** creating
 /// the slot, so their WAL records never reach it). After this returns we
 /// can drive test-specific DML and observe it cleanly.
-fn setup_pg(conn: &mut PgConnection, seed: &[(i64, f64)]) {
+fn setup_pg(conn: &mut PgConnection, seed: &[(i64, f64)], slot: &str) {
     sql_query(PG_DDL).execute(conn).expect("CREATE TABLE");
     sql_query("ALTER TABLE orders REPLICA IDENTITY FULL")
         .execute(conn)
@@ -68,7 +68,7 @@ fn setup_pg(conn: &mut PgConnection, seed: &[(i64, f64)]) {
         .execute(conn)
         .expect("seed insert");
     }
-    common::create_slot(conn, SLOT);
+    common::create_slot(conn, slot);
 }
 
 /// One more row, for a commit that lands while a read is parked.
@@ -105,14 +105,12 @@ fn parse_message(msg: &str) -> Vec<MessageV2> {
 #[ignore = "requires Docker; run with --ignored"]
 fn scaffold_registers_both_subscription_kinds() {
     common::assert_docker_available();
-    let container = common::pg_with_wal2json();
-    let port = common::pg_port(&container);
-
-    let mut conn_setup = common::pg_connect(port);
-    let _conn_dml = common::pg_connect(port);
-    let conn_exec = common::pg_connect(port);
-
-    setup_pg(&mut conn_setup, &[(1, 5.0), (2, 9.0)]);
+    let db = common::pg_database();
+    let slot = db.slot(SLOT);
+    let mut conn_setup = db.connect();
+    let _conn_dml = db.connect();
+    let conn_exec = db.connect();
+    setup_pg(&mut conn_setup, &[(1, 5.0), (2, 9.0)], &slot);
 
     let mut engine = build_engine(catalog(), conn_exec);
 
@@ -186,14 +184,12 @@ fn scaffold_registers_both_subscription_kinds() {
 #[ignore = "requires Docker; run with --ignored"]
 fn engine_and_captured_paths_coexist_through_pg_connector() {
     common::assert_docker_available();
-    let container = common::pg_with_wal2json();
-    let port = common::pg_port(&container);
-
-    let mut conn_setup = common::pg_connect(port);
-    let mut conn_dml = common::pg_connect(port);
-    let conn_exec = common::pg_connect(port);
-
-    setup_pg(&mut conn_setup, &[(1, 5.0), (2, 9.0)]);
+    let db = common::pg_database();
+    let slot = db.slot(SLOT);
+    let mut conn_setup = db.connect();
+    let mut conn_dml = db.connect();
+    let conn_exec = db.connect();
+    setup_pg(&mut conn_setup, &[(1, 5.0), (2, 9.0)], &slot);
 
     let mut engine = build_engine(catalog(), conn_exec);
 
@@ -251,7 +247,7 @@ fn engine_and_captured_paths_coexist_through_pg_connector() {
         .expect("delete id=1");
 
     // Pull WAL output and feed it through the parser + engine.
-    let msgs = common::drain_slot(&mut conn_setup, SLOT);
+    let msgs = common::drain_slot(&mut conn_setup, &slot);
     assert!(
         !msgs.is_empty(),
         "expected at least one wal2json message after INSERT+DELETE"
@@ -323,14 +319,12 @@ fn engine_and_captured_paths_coexist_through_pg_connector() {
 #[ignore = "requires Docker; run with --ignored"]
 fn update_displacing_extreme_resolves_via_pg_connector() {
     common::assert_docker_available();
-    let container = common::pg_with_wal2json();
-    let port = common::pg_port(&container);
-
-    let mut conn_setup = common::pg_connect(port);
-    let mut conn_dml = common::pg_connect(port);
-    let conn_exec = common::pg_connect(port);
-
-    setup_pg(&mut conn_setup, &[(1, 5.0)]);
+    let db = common::pg_database();
+    let slot = db.slot(SLOT);
+    let mut conn_setup = db.connect();
+    let mut conn_dml = db.connect();
+    let conn_exec = db.connect();
+    setup_pg(&mut conn_setup, &[(1, 5.0)], &slot);
 
     let mut engine = build_engine(catalog(), conn_exec);
 
@@ -362,7 +356,7 @@ fn update_displacing_extreme_resolves_via_pg_connector() {
         .execute(&mut conn_dml)
         .expect("update id=1 price=20.0");
 
-    let msgs = common::drain_slot(&mut conn_setup, SLOT);
+    let msgs = common::drain_slot(&mut conn_setup, &slot);
     let mut events: Vec<MessageV2> = Vec::new();
     for msg in &msgs {
         events.extend(parse_message(msg));
@@ -389,13 +383,11 @@ fn update_displacing_extreme_resolves_via_pg_connector() {
 #[ignore = "requires Docker; run with --ignored"]
 fn snapshot_reads_value_and_lsn_from_pg() {
     common::assert_docker_available();
-    let container = common::pg_with_wal2json();
-    let port = common::pg_port(&container);
-
-    let mut conn_setup = common::pg_connect(port);
-    let conn_exec = common::pg_connect(port);
-
-    setup_pg(&mut conn_setup, &[(1, 5.0), (2, 9.0)]);
+    let db = common::pg_database();
+    let slot = db.slot(SLOT);
+    let mut conn_setup = db.connect();
+    let conn_exec = db.connect();
+    setup_pg(&mut conn_setup, &[(1, 5.0), (2, 9.0)], &slot);
 
     let mut engine = build_engine(catalog(), conn_exec);
 
@@ -440,10 +432,8 @@ fn snapshot_reads_value_and_lsn_from_pg() {
 #[ignore = "requires Docker; run with --ignored"]
 fn execute_scalar_row_decodes_integer_aggregate_seed() {
     common::assert_docker_available();
-    let container = common::pg_with_wal2json();
-    let port = common::pg_port(&container);
-
-    let mut setup = common::pg_connect(port);
+    let pg_db = common::pg_database();
+    let mut setup = pg_db.connect();
     sql_query("CREATE TABLE nums (id INT PRIMARY KEY, amount INT)")
         .execute(&mut setup)
         .expect("CREATE TABLE nums");
@@ -483,7 +473,7 @@ fn execute_scalar_row_decodes_integer_aggregate_seed() {
     // to the last digit. A sum of squares would be 56 and is what
     // SQLite's seed carries instead, since it has no variance function
     // at all.
-    let connector = PgDieselConnector::new(common::pg_connect(port));
+    let connector = PgDieselConnector::new(pg_db.connect());
     let (row, checkpoint) = connector
         .execute_scalar_row(&bundle.query.as_read_query(), &bundle.kinds, &())
         .expect("execute_scalar_row");
@@ -505,9 +495,8 @@ fn a_key_column_needing_quotes_is_still_readable() {
     use subql::testing::TestEvent;
 
     common::assert_docker_available();
-    let container = common::pg_with_wal2json();
-    let port = common::pg_port(&container);
-    let mut setup = common::pg_connect(port);
+    let db = common::pg_database();
+    let mut setup = db.connect();
     sql_query(r#"CREATE TABLE quoted ("OrderId" INT PRIMARY KEY, status TEXT)"#)
         .execute(&mut setup)
         .expect("create");
@@ -525,10 +514,8 @@ fn a_key_column_needing_quotes_is_still_readable() {
         cat,
         PostgreSqlDialect {},
     );
-    let mut engine = AutoResolvingEngine::new(
-        inner,
-        SyncMode(PgDieselConnector::new(common::pg_connect(port))),
-    );
+    let mut engine =
+        AutoResolvingEngine::new(inner, SyncMode(PgDieselConnector::new(db.connect())));
     engine
         .register(
             SubscriptionRequest::<DefaultIds, Postgres>::new(
@@ -574,14 +561,15 @@ fn a_key_column_needing_quotes_is_still_readable() {
 #[ignore = "requires Docker; run with --ignored"]
 fn every_read_reports_a_position_taken_before_its_snapshot() {
     common::assert_docker_available();
-    let container = common::pg_with_wal2json();
-    let port = common::pg_port(&container);
-    let mut conn = common::pg_connect(port);
-    setup_pg(&mut conn, &[(1, 5.0)]);
+    let db = common::pg_database();
+    let slot = db.slot(SLOT);
+    let mut conn = db.connect();
+    setup_pg(&mut conn, &[(1, 5.0)], &slot);
 
     let sql = format!("SELECT count(*)::bigint AS v FROM orders {}", common::PARK);
-    let ((value, position), after_commit) = common::park_a_read(port, &insert(2), move || {
-        PgDieselConnector::new(common::pg_connect(port))
+    let url = db.url();
+    let ((value, position), after_commit) = common::park_a_read(&db, &insert(2), move || {
+        PgDieselConnector::new(PgConnection::establish(&url).expect("pg connection"))
             .execute_scalar(
                 &subql::reexec::ReadQuery::without_binds(&sql),
                 ScalarFamily::Int,
@@ -600,8 +588,9 @@ fn every_read_reports_a_position_taken_before_its_snapshot() {
     );
 
     let sql = format!("SELECT id FROM orders {} ORDER BY id", common::PARK);
-    let (page, after_commit) = common::park_a_read(port, &insert(3), move || {
-        PgDieselConnector::new(common::pg_connect(port))
+    let url = db.url();
+    let (page, after_commit) = common::park_a_read(&db, &insert(3), move || {
+        PgDieselConnector::new(PgConnection::establish(&url).expect("pg connection"))
             .read_page(&subql::reexec::ReadQuery::without_binds(&sql), 1 << 20, &())
             .expect("page read")
     });
@@ -616,8 +605,9 @@ fn every_read_reports_a_position_taken_before_its_snapshot() {
     );
 
     let sql = format!("SELECT count(*)::bigint AS c0 FROM orders {}", common::PARK);
-    let ((values, position), after_commit) = common::park_a_read(port, &insert(4), move || {
-        PgDieselConnector::new(common::pg_connect(port))
+    let url = db.url();
+    let ((values, position), after_commit) = common::park_a_read(&db, &insert(4), move || {
+        PgDieselConnector::new(PgConnection::establish(&url).expect("pg connection"))
             .execute_scalar_row(
                 &subql::reexec::ReadQuery::without_binds(&sql),
                 &[ScalarFamily::Int],
@@ -653,13 +643,12 @@ impl SessionSetup for MarkerSetup {
 #[ignore = "requires Docker; run with --ignored"]
 fn session_setup_runs_inside_each_read_transaction_sync_pg() {
     common::assert_docker_available();
-    let container = common::pg_with_wal2json();
-    let port = common::pg_port(&container);
+    let db = common::pg_database();
 
     let read_marker = "SELECT current_setting('app.marker', true) AS v";
     let setup = MarkerSetup(vec!["SET LOCAL app.marker = 'seen'".to_string()]);
     let connector: PgDieselConnector<MarkerSetup> =
-        PgDieselConnector::with_session_setup(common::pg_connect(port));
+        PgDieselConnector::with_session_setup(db.connect());
 
     let (value, _) = connector
         .execute_scalar(
@@ -687,7 +676,7 @@ fn session_setup_runs_inside_each_read_transaction_sync_pg() {
         "read_page setup takes hold"
     );
 
-    let plain = PgDieselConnector::new(common::pg_connect(port));
+    let plain = PgDieselConnector::new(db.connect());
     let (value, _) = plain
         .execute_scalar(
             &subql::reexec::ReadQuery::without_binds(read_marker),
@@ -705,12 +694,12 @@ fn session_setup_runs_inside_each_read_transaction_sync_pg() {
 #[ignore = "requires Docker; run with --ignored"]
 fn each_read_runs_read_only_at_repeatable_read() {
     common::assert_docker_available();
-    let container = common::pg_with_wal2json();
-    let port = common::pg_port(&container);
-    let mut conn = common::pg_connect(port);
-    setup_pg(&mut conn, &[(1, 5.0)]);
+    let db = common::pg_database();
+    let slot = db.slot(SLOT);
+    let mut conn = db.connect();
+    setup_pg(&mut conn, &[(1, 5.0)], &slot);
 
-    let connector = PgDieselConnector::new(common::pg_connect(port));
+    let connector = PgDieselConnector::new(db.connect());
     let (isolation, _) = connector
         .execute_scalar(
             &subql::reexec::ReadQuery::without_binds(

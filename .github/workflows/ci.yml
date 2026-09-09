@@ -196,13 +196,10 @@ jobs:
         group:
           - name: mysql
             filter: test(~mysql)
-            threads: 1
           - name: openfga
             filter: test(~openfga)
-            threads: 8
           - name: postgres and the rest
             filter: not (test(~mysql) or test(~openfga))
-            threads: 8
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # The tests read the fixture Dockerfile from the working tree and link
@@ -214,9 +211,8 @@ jobs:
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: nextest-archive
-      # MySQL runs one thread because concurrent container startups time out.
-      # Other groups use eight.
-      - run: cargo nextest run --archive-file nextest.tar.zst --workspace-remap . --run-ignored ignored-only --no-fail-fast --test-threads ${{ matrix.group.threads }} -E '${{ matrix.group.filter }}'
+      # One shared server per engine per run, so every group runs eight threads.
+      - run: cargo nextest run --archive-file nextest.tar.zst --workspace-remap . --run-ignored ignored-only --no-fail-fast --test-threads 8 -E '${{ matrix.group.filter }}'
 
   docs:
     name: docs + doctests

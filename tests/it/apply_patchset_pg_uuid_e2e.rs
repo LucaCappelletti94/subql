@@ -50,10 +50,8 @@ struct ThingRow {
 #[allow(clippy::too_many_lines)]
 fn apply_patchset_uuid_roundtrip_blob_and_text_clients() {
     common::assert_docker_available();
-    let container = common::pg_with_wal2json();
-    let port = common::pg_port(&container);
-
-    let mut conn = common::pg_connect(port);
+    let db = common::pg_database();
+    let mut conn = db.connect();
     sql_query(PG_DDL).execute(&mut conn).expect("create table");
 
     let catalog = ParserDB::parse::<PostgreSqlDialect>(DDL).expect("parse subql DDL");

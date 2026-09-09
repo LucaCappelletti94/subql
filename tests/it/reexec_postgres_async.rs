@@ -24,7 +24,7 @@ use crate::common;
 
 use std::sync::Arc;
 
-use diesel::{sql_query, ExpressionMethods, PgConnection, QueryDsl, RunQueryDsl};
+use diesel::{sql_query, Connection, ExpressionMethods, PgConnection, QueryDsl, RunQueryDsl};
 use diesel_async::pooled_connection::bb8::Pool;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::AsyncPgConnection;
@@ -68,8 +68,9 @@ fn count(observer: &mut PgConnection, sql: &str) -> i64 {
 
 /// Backends parked inside a transaction, which is what a cancelled read leaves
 /// behind when its transaction is invisible to the pool.
-const IDLE_IN_TXN: &str = "SELECT count(*) AS n FROM pg_stat_activity \
-     WHERE state = 'idle in transaction' AND xact_start IS NOT NULL";
+const IDLE_IN_TXN: &str =
+    "SELECT count(*) AS n FROM pg_stat_activity WHERE datname = current_database() \
+     AND state = 'idle in transaction' AND xact_start IS NOT NULL";
 
 /// Poll a future exactly once with a waker that does nothing.
 ///
@@ -95,18 +96,17 @@ const PG_DDL: &str = "CREATE TABLE orders (
 type Engine =
     AutoResolvingEngine<MessageV2, DefaultIds, ParserDB, AsyncMode<PgAsyncDieselConnector>>;
 
-/// Build a `bb8` pool over `AsyncPgConnection` for the container at `port`.
-async fn pg_async_pool(port: u16) -> Pool<AsyncPgConnection> {
-    let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(common::pg_url(port));
+/// Build a `bb8` pool over `AsyncPgConnection` for the database at `url`.
+async fn pg_async_pool(url: &str) -> Pool<AsyncPgConnection> {
+    let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(url);
     Pool::builder()
         .build(manager)
         .await
         .expect("build async pg pool")
 }
 
-/// Same PG-side setup as the sync test: DDL, REPLICA IDENTITY FULL, seed
-/// rows, then create the slot (so the seed WAL records never reach it).
-fn setup_pg(conn: &mut PgConnection, seed: &[(i64, f64)]) {
+/// DDL, REPLICA IDENTITY FULL, seed rows, then the given replication slot.
+fn setup_pg(conn: &mut PgConnection, seed: &[(i64, f64)], slot: &str) {
     sql_query(PG_DDL).execute(conn).expect("CREATE TABLE");
     sql_query("ALTER TABLE orders REPLICA IDENTITY FULL")
         .execute(conn)
@@ -119,7 +119,7 @@ fn setup_pg(conn: &mut PgConnection, seed: &[(i64, f64)]) {
         .execute(conn)
         .expect("seed insert");
     }
-    common::create_slot(conn, SLOT);
+    common::create_slot(conn, slot);
 }
 
 /// One more row, for a commit that lands while a read is parked.
@@ -149,15 +149,15 @@ fn parse_message(msg: &str) -> Vec<MessageV2> {
 #[ignore = "requires Docker; run with --ignored"]
 fn engine_and_captured_paths_coexist_through_pg_async_connector() {
     common::assert_docker_available();
-    let container = common::pg_with_wal2json();
-    let port = common::pg_port(&container);
-
-    let mut conn_setup = common::pg_connect(port);
-    let mut conn_dml = common::pg_connect(port);
-    setup_pg(&mut conn_setup, &[(1, 5.0), (2, 9.0)]);
+    let db = common::pg_database();
+    let url = db.url();
+    let slot = db.slot(SLOT);
+    let mut conn_setup = db.connect();
+    let mut conn_dml = db.connect();
+    setup_pg(&mut conn_setup, &[(1, 5.0), (2, 9.0)], &slot);
 
     common::multi_thread_rt().block_on(async move {
-        let pool = pg_async_pool(port).await;
+        let pool = pg_async_pool(&url).await;
         let mut engine = build_engine(catalog(), pool);
 
         let engine_consumer: u64 = 1;
@@ -212,7 +212,7 @@ fn engine_and_captured_paths_coexist_through_pg_async_connector() {
             .execute(&mut conn_dml)
             .expect("delete id=1");
 
-        let msgs = common::drain_slot(&mut conn_setup, SLOT);
+        let msgs = common::drain_slot(&mut conn_setup, &slot);
         assert!(
             !msgs.is_empty(),
             "expected at least one wal2json message after INSERT+DELETE"
@@ -265,14 +265,14 @@ fn engine_and_captured_paths_coexist_through_pg_async_connector() {
 #[ignore = "requires Docker; run with --ignored"]
 fn snapshot_reads_value_and_lsn_from_pg_async() {
     common::assert_docker_available();
-    let container = common::pg_with_wal2json();
-    let port = common::pg_port(&container);
-
-    let mut conn_setup = common::pg_connect(port);
-    setup_pg(&mut conn_setup, &[(1, 5.0), (2, 9.0)]);
+    let db = common::pg_database();
+    let url = db.url();
+    let slot = db.slot(SLOT);
+    let mut conn_setup = db.connect();
+    setup_pg(&mut conn_setup, &[(1, 5.0), (2, 9.0)], &slot);
 
     common::multi_thread_rt().block_on(async move {
-        let pool = pg_async_pool(port).await;
+        let pool = pg_async_pool(&url).await;
         let mut engine = build_engine(catalog(), pool);
 
         let captured_qid = match engine
@@ -319,10 +319,10 @@ fn snapshot_reads_value_and_lsn_from_pg_async() {
 #[ignore = "requires Docker; run with --ignored"]
 fn execute_scalar_row_decodes_integer_aggregate_seed_async() {
     common::assert_docker_available();
-    let container = common::pg_with_wal2json();
-    let port = common::pg_port(&container);
+    let pg_db = common::pg_database();
+    let url = pg_db.url();
 
-    let mut setup = common::pg_connect(port);
+    let mut setup = pg_db.connect();
     sql_query("CREATE TABLE nums (id INT PRIMARY KEY, amount INT)")
         .execute(&mut setup)
         .expect("CREATE TABLE nums");
@@ -352,7 +352,7 @@ fn execute_scalar_row_decodes_integer_aggregate_seed_async() {
         .expect("aggregate carries a bootstrap");
 
     common::multi_thread_rt().block_on(async move {
-        let pool = pg_async_pool(port).await;
+        let pool = pg_async_pool(&url).await;
         let connector = PgAsyncDieselConnector::new(pool);
         let (row, checkpoint) = connector
             .execute_scalar_row(&bundle.query.as_read_query(), &bundle.kinds, &())
@@ -378,17 +378,17 @@ fn execute_scalar_row_decodes_integer_aggregate_seed_async() {
 #[ignore = "requires docker"]
 fn a_cancelled_read_does_not_hand_its_transaction_to_the_next_caller() {
     common::assert_docker_available();
-    let container = common::pg_with_wal2json();
-    let port = common::pg_port(&container);
-    let mut setup = common::pg_connect(port);
-    setup_pg(&mut setup, &[(1, 10.0), (2, 20.0), (3, 30.0)]);
+    let db = common::pg_database();
+    let url = db.url();
+    let slot = db.slot(SLOT);
+    let mut setup = db.connect();
+    setup_pg(&mut setup, &[(1, 10.0), (2, 20.0), (3, 30.0)], &slot);
 
-    let mut observer = common::pg_connect(port);
+    let mut observer = db.connect();
 
     common::multi_thread_rt().block_on(async move {
-        // One connection, so the next caller must reuse whatever the cancelled
-        // read left behind. That is the whole question.
-        let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(common::pg_url(port));
+        // the next caller must reuse whatever the cancelled read left behind
+        let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(&url);
         let pool: Pool<AsyncPgConnection> = Pool::builder()
             .max_size(1)
             .build(manager)
@@ -467,14 +467,15 @@ fn a_busy_cursor_and_a_broken_one_report_differently() {
     use subql::reexec::CursorError;
 
     common::assert_docker_available();
-    let container = common::pg_with_wal2json();
-    let port = common::pg_port(&container);
-    let mut setup = common::pg_connect(port);
-    setup_pg(&mut setup, &[(1, 10.0), (2, 20.0), (3, 30.0)]);
-    let mut observer = common::pg_connect(port);
+    let db = common::pg_database();
+    let url = db.url();
+    let slot = db.slot(SLOT);
+    let mut setup = db.connect();
+    setup_pg(&mut setup, &[(1, 10.0), (2, 20.0), (3, 30.0)], &slot);
+    let mut observer = db.connect();
 
     common::multi_thread_rt().block_on(async move {
-        let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(common::pg_url(port));
+        let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(&url);
         let pool: Pool<AsyncPgConnection> = Pool::builder()
             .max_size(2)
             .build(manager)
@@ -527,8 +528,8 @@ fn a_busy_cursor_and_a_broken_one_report_differently() {
             use diesel::RunQueryDsl as S;
             S::execute(
                 sql_query(
-                    "SELECT pg_terminate_backend(pid) FROM pg_stat_activity \
-                     WHERE state = 'idle in transaction' AND xact_start IS NOT NULL",
+                    "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = current_database() \
+                     AND state = 'idle in transaction' AND xact_start IS NOT NULL",
                 ),
                 &mut observer,
             )
@@ -564,14 +565,15 @@ fn a_busy_cursor_and_a_broken_one_report_differently() {
 #[ignore = "requires docker"]
 fn closing_a_cursor_during_a_read_does_not_orphan_it() {
     common::assert_docker_available();
-    let container = common::pg_with_wal2json();
-    let port = common::pg_port(&container);
-    let mut setup = common::pg_connect(port);
-    setup_pg(&mut setup, &[(1, 10.0), (2, 20.0), (3, 30.0)]);
-    let mut observer = common::pg_connect(port);
+    let db = common::pg_database();
+    let url = db.url();
+    let slot = db.slot(SLOT);
+    let mut setup = db.connect();
+    setup_pg(&mut setup, &[(1, 10.0), (2, 20.0), (3, 30.0)], &slot);
+    let mut observer = db.connect();
 
     common::multi_thread_rt().block_on(async move {
-        let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(common::pg_url(port));
+        let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(&url);
         let pool: Pool<AsyncPgConnection> = Pool::builder()
             .max_size(4)
             .build(manager)
@@ -630,13 +632,14 @@ fn a_cancelled_read_does_not_poison_its_cursor_id() {
     use subql::reexec::CursorError;
 
     common::assert_docker_available();
-    let container = common::pg_with_wal2json();
-    let port = common::pg_port(&container);
-    let mut setup = common::pg_connect(port);
-    setup_pg(&mut setup, &[(1, 10.0), (2, 20.0), (3, 30.0)]);
+    let db = common::pg_database();
+    let url = db.url();
+    let slot = db.slot(SLOT);
+    let mut setup = db.connect();
+    setup_pg(&mut setup, &[(1, 10.0), (2, 20.0), (3, 30.0)], &slot);
 
     common::multi_thread_rt().block_on(async move {
-        let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(common::pg_url(port));
+        let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(&url);
         let pool: Pool<AsyncPgConnection> = Pool::builder()
             .max_size(4)
             .build(manager)
@@ -688,14 +691,15 @@ fn a_cancelled_read_does_not_poison_its_cursor_id() {
 #[ignore = "requires Docker; run with --ignored"]
 fn the_keyed_tier_delivers_row_deltas_through_the_async_engine() {
     common::assert_docker_available();
-    let container = common::pg_with_wal2json();
-    let port = common::pg_port(&container);
-    let mut conn_setup = common::pg_connect(port);
-    let mut conn_dml = common::pg_connect(port);
-    setup_pg(&mut conn_setup, &[(1, 5.0), (2, 9.0)]);
+    let db = common::pg_database();
+    let url = db.url();
+    let slot = db.slot(SLOT);
+    let mut conn_setup = db.connect();
+    let mut conn_dml = db.connect();
+    setup_pg(&mut conn_setup, &[(1, 5.0), (2, 9.0)], &slot);
 
     common::multi_thread_rt().block_on(async move {
-        let pool = pg_async_pool(port).await;
+        let pool = pg_async_pool(&url).await;
         let mut engine = build_engine(catalog(), pool);
 
         // `lower(status)` is a function call the in-process language cannot
@@ -725,7 +729,7 @@ fn the_keyed_tier_delivers_row_deltas_through_the_async_engine() {
         sql_query("UPDATE orders SET price = 7.0 WHERE id = 1")
             .execute(&mut conn_dml)
             .expect("update");
-        let msgs = common::drain_slot(&mut conn_setup, SLOT);
+        let msgs = common::drain_slot(&mut conn_setup, &slot);
         let events: Vec<MessageV2> = msgs.iter().flat_map(|m| parse_message(m)).collect();
         assert!(!events.is_empty(), "the slot must carry both updates");
 
@@ -797,14 +801,15 @@ fn the_keyed_tier_delivers_row_deltas_through_the_async_engine() {
 #[ignore = "requires Docker; run with --ignored"]
 fn the_whole_reread_tier_delivers_pages_through_the_async_engine() {
     common::assert_docker_available();
-    let container = common::pg_with_wal2json();
-    let port = common::pg_port(&container);
-    let mut conn_setup = common::pg_connect(port);
-    let mut conn_dml = common::pg_connect(port);
-    setup_pg(&mut conn_setup, &[(1, 5.0), (2, 9.0), (3, 11.0)]);
+    let db = common::pg_database();
+    let url = db.url();
+    let slot = db.slot(SLOT);
+    let mut conn_setup = db.connect();
+    let mut conn_dml = db.connect();
+    setup_pg(&mut conn_setup, &[(1, 5.0), (2, 9.0), (3, 11.0)], &slot);
 
     common::multi_thread_rt().block_on(async move {
-        let pool = pg_async_pool(port).await;
+        let pool = pg_async_pool(&url).await;
         // One row per page, so the cursor has to page and `more` has to be
         // right, which one big page would never test.
         let mut engine = build_engine(catalog(), pool).with_max_page_bytes(1);
@@ -832,7 +837,7 @@ fn the_whole_reread_tier_delivers_pages_through_the_async_engine() {
         sql_query("INSERT INTO orders (id, price, quantity, status) VALUES (4, 1.0, 1, 'paid')")
             .execute(&mut conn_dml)
             .expect("insert");
-        let msgs = common::drain_slot(&mut conn_setup, SLOT);
+        let msgs = common::drain_slot(&mut conn_setup, &slot);
         let events: Vec<MessageV2> = msgs.iter().flat_map(|m| parse_message(m)).collect();
         assert!(!events.is_empty(), "the slot must carry the insert");
 
@@ -887,14 +892,15 @@ fn the_whole_reread_tier_delivers_pages_through_the_async_engine() {
 #[ignore = "requires Docker, run with --ignored"]
 fn the_async_batch_path_delivers_row_deltas_and_transitions_a_keyless_change() {
     common::assert_docker_available();
-    let container = common::pg_with_wal2json();
-    let port = common::pg_port(&container);
-    let mut conn_setup = common::pg_connect(port);
-    let mut conn_dml = common::pg_connect(port);
-    setup_pg(&mut conn_setup, &[(1, 5.0), (2, 9.0), (3, 11.0)]);
+    let db = common::pg_database();
+    let url = db.url();
+    let slot = db.slot(SLOT);
+    let mut conn_setup = db.connect();
+    let mut conn_dml = db.connect();
+    setup_pg(&mut conn_setup, &[(1, 5.0), (2, 9.0), (3, 11.0)], &slot);
 
     common::multi_thread_rt().block_on(async move {
-        let pool = pg_async_pool(port).await;
+        let pool = pg_async_pool(&url).await;
         let mut engine = build_engine(catalog(), pool);
         let subscription_id = match engine
             .register(
@@ -921,7 +927,7 @@ fn the_async_batch_path_delivers_row_deltas_and_transitions_a_keyless_change() {
         sql_query("UPDATE orders SET price = 6.0 WHERE id = 1")
             .execute(&mut conn_dml)
             .expect("update");
-        let msgs = common::drain_slot(&mut conn_setup, SLOT);
+        let msgs = common::drain_slot(&mut conn_setup, &slot);
         let events: Vec<MessageV2> = msgs.iter().flat_map(|m| parse_message(m)).collect();
         assert!(events.len() >= 3, "the slot must carry all three updates");
 
@@ -1009,20 +1015,21 @@ fn the_async_batch_path_delivers_row_deltas_and_transitions_a_keyless_change() {
 #[ignore = "requires Docker; run with --ignored"]
 fn a_captured_query_snapshots_its_rows_on_either_tier_async() {
     common::assert_docker_available();
-    let container = common::pg_with_wal2json();
-    let port = common::pg_port(&container);
-    let mut conn_setup = common::pg_connect(port);
+    let db = common::pg_database();
+    let url = db.url();
+    let slot = db.slot(SLOT);
+    let mut conn_setup = db.connect();
     let seed: Vec<(i64, f64)> = (1..=12_u32)
         .map(|id| (i64::from(id), f64::from(id)))
         .collect();
-    setup_pg(&mut conn_setup, &seed);
+    setup_pg(&mut conn_setup, &seed, &slot);
     // One row outside both filters, so a read that dropped the WHERE is caught.
     sql_query("UPDATE orders SET status = 'void' WHERE id = 7")
         .execute(&mut conn_setup)
         .expect("take one row out of the answer");
 
     common::multi_thread_rt().block_on(async move {
-        let pool = pg_async_pool(port).await;
+        let pool = pg_async_pool(&url).await;
         // Below one row's size, so the answer is only complete if the read
         // pages. One big page would pass with the paging deleted.
         let mut engine = build_engine(catalog(), pool).with_max_page_bytes(1);
@@ -1121,20 +1128,21 @@ fn register_captured(engine: &mut Engine, consumer: u64, sql: &str, keyed: bool)
 #[ignore = "requires Docker; run with --ignored"]
 fn every_read_reports_a_position_taken_before_its_snapshot() {
     common::assert_docker_available();
-    let container = common::pg_with_wal2json();
-    let port = common::pg_port(&container);
-    let mut conn = common::pg_connect(port);
-    setup_pg(&mut conn, &[(1, 5.0)]);
+    let db = common::pg_database();
+    let url = db.url();
+    let slot = db.slot(SLOT);
+    let mut conn = db.connect();
+    setup_pg(&mut conn, &[(1, 5.0)], &slot);
 
     let rt = common::multi_thread_rt();
     let connector = Arc::new(PgAsyncDieselConnector::new(
-        rt.block_on(pg_async_pool(port)),
+        rt.block_on(pg_async_pool(&url)),
     ));
 
     let held = Arc::clone(&connector);
     let on = rt.handle().clone();
     let sql = format!("SELECT count(*)::bigint AS v FROM orders {}", common::PARK);
-    let ((value, position), after_commit) = common::park_a_read(port, &insert(2), move || {
+    let ((value, position), after_commit) = common::park_a_read(&db, &insert(2), move || {
         on.block_on(async move {
             held.execute_scalar(
                 &subql::reexec::ReadQuery::without_binds(&sql),
@@ -1158,7 +1166,7 @@ fn every_read_reports_a_position_taken_before_its_snapshot() {
     let held = Arc::clone(&connector);
     let on = rt.handle().clone();
     let sql = format!("SELECT id FROM orders {} ORDER BY id", common::PARK);
-    let (page, after_commit) = common::park_a_read(port, &insert(3), move || {
+    let (page, after_commit) = common::park_a_read(&db, &insert(3), move || {
         on.block_on(async move {
             held.read_page(&subql::reexec::ReadQuery::without_binds(&sql), 1 << 20, &())
                 .await
@@ -1178,7 +1186,7 @@ fn every_read_reports_a_position_taken_before_its_snapshot() {
     let held = Arc::clone(&connector);
     let on = rt.handle().clone();
     let sql = format!("SELECT count(*)::bigint AS c0 FROM orders {}", common::PARK);
-    let ((values, position), after_commit) = common::park_a_read(port, &insert(4), move || {
+    let ((values, position), after_commit) = common::park_a_read(&db, &insert(4), move || {
         on.block_on(async move {
             held.execute_scalar_row(
                 &subql::reexec::ReadQuery::without_binds(&sql),
@@ -1205,18 +1213,19 @@ fn every_read_reports_a_position_taken_before_its_snapshot() {
 #[ignore = "requires Docker, run with --ignored"]
 fn grouped_min_snapshots_and_rereads_one_group_async() {
     common::assert_docker_available();
-    let container = common::pg_with_wal2json();
-    let port = common::pg_port(&container);
-    let mut conn_setup = common::pg_connect(port);
-    setup_pg(&mut conn_setup, &[(1, 5.0), (2, 9.0), (3, 11.0)]);
+    let db = common::pg_database();
+    let url = db.url();
+    let slot = db.slot(SLOT);
+    let mut conn_setup = db.connect();
+    setup_pg(&mut conn_setup, &[(1, 5.0), (2, 9.0), (3, 11.0)], &slot);
     diesel::update(grouped_schema::orders::table.find(3))
         .set(grouped_schema::orders::status.eq("void"))
         .execute(&mut conn_setup)
         .expect("seed second group");
-    let _ = common::drain_slot(&mut conn_setup, SLOT);
+    let _ = common::drain_slot(&mut conn_setup, &slot);
 
     common::multi_thread_rt().block_on(async move {
-        let pool = pg_async_pool(port).await;
+        let pool = pg_async_pool(&url).await;
         let mut engine = build_engine(catalog(), pool.clone());
         let subscription = match engine
             .register(
@@ -1262,8 +1271,8 @@ fn grouped_min_snapshots_and_rereads_one_group_async() {
         .expect("delete current minimum");
         drop(connection);
         let messages = tokio::task::spawn_blocking(move || {
-            let mut connection = common::pg_connect(port);
-            common::drain_slot(&mut connection, SLOT)
+            let mut connection = PgConnection::establish(&url).expect("PG connection");
+            common::drain_slot(&mut connection, &slot)
         })
         .await
         .expect("slot reader joins");
@@ -1289,10 +1298,11 @@ fn grouped_min_snapshots_and_rereads_one_group_async() {
 #[ignore = "requires Docker"]
 fn a_scalar_over_a_narrow_integer_column_decodes_async() {
     common::assert_docker_available();
-    let container = common::pg_with_wal2json();
-    let port = common::pg_port(&container);
-    let mut conn = common::pg_connect(port);
-    setup_pg(&mut conn, &[(1, 5.0)]);
+    let db = common::pg_database();
+    let url = db.url();
+    let slot = db.slot(SLOT);
+    let mut conn = db.connect();
+    setup_pg(&mut conn, &[(1, 5.0)], &slot);
     sql_query("CREATE TABLE probe (small INT, tiny SMALLINT)")
         .execute(&mut conn)
         .expect("probe table");
@@ -1301,7 +1311,7 @@ fn a_scalar_over_a_narrow_integer_column_decodes_async() {
         .expect("probe rows");
 
     let rt = common::multi_thread_rt();
-    let connector = PgAsyncDieselConnector::new(rt.block_on(pg_async_pool(port)));
+    let connector = PgAsyncDieselConnector::new(rt.block_on(pg_async_pool(&url)));
     let (value, _) = rt
         .block_on(connector.execute_scalar(
             &subql::reexec::ReadQuery::without_binds("SELECT MIN(quantity) FROM orders"),
@@ -1346,14 +1356,14 @@ impl SessionSetup for MarkerSetup {
 #[ignore = "requires Docker; run with --ignored"]
 fn session_setup_runs_inside_each_read_transaction_async_pg() {
     common::assert_docker_available();
-    let container = common::pg_with_wal2json();
-    let port = common::pg_port(&container);
+    let db = common::pg_database();
+    let url = db.url();
 
     common::multi_thread_rt().block_on(async move {
         let read_marker = "SELECT current_setting('app.marker', true) AS v";
         let setup = MarkerSetup(vec!["SET LOCAL app.marker = 'seen'".to_string()]);
         let connector: PgAsyncDieselConnector<MarkerSetup> =
-            PgAsyncDieselConnector::with_session_setup(pg_async_pool(port).await);
+            PgAsyncDieselConnector::with_session_setup(pg_async_pool(&url).await);
 
         let (value, _) = connector
             .execute_scalar(
@@ -1400,7 +1410,7 @@ fn session_setup_runs_inside_each_read_transaction_async_pg() {
         );
         connector.close_cursor(cursor).await.expect("close");
 
-        let plain = PgAsyncDieselConnector::new(pg_async_pool(port).await);
+        let plain = PgAsyncDieselConnector::new(pg_async_pool(&url).await);
         let (value, _) = plain
             .execute_scalar(
                 &subql::reexec::ReadQuery::without_binds(read_marker),
@@ -1416,13 +1426,14 @@ fn session_setup_runs_inside_each_read_transaction_async_pg() {
 #[test]
 #[ignore = "requires Docker"]
 fn async_page_reads_apply_typed_binds() {
-    let container = common::pg_with_wal2json();
-    let port = common::pg_port(&container);
-    let mut connection = common::pg_connect(port);
-    setup_pg(&mut connection, &[(7, 1.0)]);
+    let db = common::pg_database();
+    let url = db.url();
+    let slot = db.slot(SLOT);
+    let mut connection = db.connect();
+    setup_pg(&mut connection, &[(7, 1.0)], &slot);
     let runtime = common::multi_thread_rt();
     runtime.block_on(async {
-        let connector = PgAsyncDieselConnector::new(pg_async_pool(port).await);
+        let connector = PgAsyncDieselConnector::new(pg_async_pool(&url).await);
         let query = subql::reexec::ReadQuery::owned(
             "SELECT id, status FROM orders WHERE id = $1".to_string(),
             vec![Value::Int(7)],
@@ -1436,8 +1447,9 @@ fn async_page_reads_apply_typed_binds() {
 /// Backends parked inside a transaction, aborted or not. A failed cursor open
 /// aborts its transaction before rolling it back, and an aborted one is its
 /// own `pg_stat_activity` state, which [`IDLE_IN_TXN`] does not match.
-const IDLE_IN_ANY_TXN: &str = "SELECT count(*) AS n FROM pg_stat_activity \
-     WHERE state LIKE 'idle in transaction%' AND xact_start IS NOT NULL";
+const IDLE_IN_ANY_TXN: &str =
+    "SELECT count(*) AS n FROM pg_stat_activity WHERE datname = current_database() \
+     AND state LIKE 'idle in transaction%' AND xact_start IS NOT NULL";
 
 /// One `current_setting` of the transaction an async scalar read runs in.
 async fn setting(connector: &PgAsyncDieselConnector, name: &str) -> Value<Postgres> {
@@ -1483,16 +1495,17 @@ async fn cursor_settings(connector: &PgAsyncDieselConnector) -> Vec<Value<Postgr
 #[ignore = "requires Docker"]
 fn each_async_read_runs_read_only_at_repeatable_read() {
     common::assert_docker_available();
-    let container = common::pg_with_wal2json();
-    let port = common::pg_port(&container);
-    let mut conn = common::pg_connect(port);
-    setup_pg(&mut conn, &[(1, 5.0)]);
+    let db = common::pg_database();
+    let url = db.url();
+    let slot = db.slot(SLOT);
+    let mut conn = db.connect();
+    setup_pg(&mut conn, &[(1, 5.0)], &slot);
     sql_query("CREATE SEQUENCE probe_seq")
         .execute(&mut conn)
         .expect("create the sequence");
 
     common::multi_thread_rt().block_on(async {
-        let connector = PgAsyncDieselConnector::new(pg_async_pool(port).await);
+        let connector = PgAsyncDieselConnector::new(pg_async_pool(&url).await);
         assert_eq!(
             setting(&connector, "transaction_isolation").await,
             Value::String("repeatable read".into())
@@ -1562,18 +1575,19 @@ async fn page_of_ids(
 #[ignore = "requires Docker"]
 fn two_async_cursors_open_at_once_page_independently() {
     common::assert_docker_available();
-    let container = common::pg_with_wal2json();
-    let port = common::pg_port(&container);
-    let mut conn = common::pg_connect(port);
+    let db = common::pg_database();
+    let url = db.url();
+    let slot = db.slot(SLOT);
+    let mut conn = db.connect();
     // Enough rows that each cursor is paged many times, so every page but the
     // first has to resume a cursor the other one read from in between.
     let seed: Vec<(i64, f64)> = (1..=40_u32)
         .map(|id| (i64::from(id), f64::from(id)))
         .collect();
-    setup_pg(&mut conn, &seed);
+    setup_pg(&mut conn, &seed, &slot);
 
     common::multi_thread_rt().block_on(async {
-        let connector = PgAsyncDieselConnector::new(pg_async_pool(port).await);
+        let connector = PgAsyncDieselConnector::new(pg_async_pool(&url).await);
         let (ascending, descending) = open_ordered_cursors(&connector).await;
         assert_ne!(
             ascending, descending,
@@ -1658,15 +1672,16 @@ async fn drain_interleaved(
 #[ignore = "requires Docker"]
 fn an_async_cursor_that_fails_to_open_keeps_its_connection() {
     common::assert_docker_available();
-    let container = common::pg_with_wal2json();
-    let port = common::pg_port(&container);
-    let mut conn = common::pg_connect(port);
-    setup_pg(&mut conn, &[(1, 1.0)]);
-    let mut observer = common::pg_connect(port);
+    let db = common::pg_database();
+    let url = db.url();
+    let slot = db.slot(SLOT);
+    let mut conn = db.connect();
+    setup_pg(&mut conn, &[(1, 1.0)], &slot);
+    let mut observer = db.connect();
 
     common::multi_thread_rt().block_on(async {
         // One connection, so the pid names the same pool slot each time.
-        let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(common::pg_url(port));
+        let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(&url);
         let pool: Pool<AsyncPgConnection> = Pool::builder()
             .max_size(1)
             .build(manager)
@@ -1714,16 +1729,17 @@ fn an_async_cursor_that_fails_to_open_keeps_its_connection() {
 #[ignore = "requires Docker"]
 fn every_page_of_an_async_cursor_names_its_columns() {
     common::assert_docker_available();
-    let container = common::pg_with_wal2json();
-    let port = common::pg_port(&container);
-    let mut conn = common::pg_connect(port);
+    let db = common::pg_database();
+    let url = db.url();
+    let slot = db.slot(SLOT);
+    let mut conn = db.connect();
     let seed: Vec<(i64, f64)> = (1..=8_u32)
         .map(|id| (i64::from(id), f64::from(id)))
         .collect();
-    setup_pg(&mut conn, &seed);
+    setup_pg(&mut conn, &seed, &slot);
 
     common::multi_thread_rt().block_on(async {
-        let connector = PgAsyncDieselConnector::new(pg_async_pool(port).await);
+        let connector = PgAsyncDieselConnector::new(pg_async_pool(&url).await);
         let cursor = connector
             .open_cursor(
                 &subql::reexec::ReadQuery::without_binds(
@@ -1765,11 +1781,11 @@ fn a_seed_row_of_the_wrong_width_is_refused_async_pg() {
     use subql::reexec::ScalarRowError;
 
     common::assert_docker_available();
-    let container = common::pg_with_wal2json();
-    let port = common::pg_port(&container);
+    let db = common::pg_database();
+    let url = db.url();
 
     common::multi_thread_rt().block_on(async {
-        let connector = PgAsyncDieselConnector::new(pg_async_pool(port).await);
+        let connector = PgAsyncDieselConnector::new(pg_async_pool(&url).await);
         let refused = connector
             .execute_scalar_row(
                 &subql::reexec::ReadQuery::without_binds("SELECT 1, 2"),

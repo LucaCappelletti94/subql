@@ -50,17 +50,16 @@ fn drain_typed(msgs: &[String]) -> Vec<MessageV2> {
 #[ignore = "requires Docker; run with --ignored"]
 fn evict_oldest_drops_subscription_from_dispatch_path() {
     common::assert_docker_available();
-    let container = common::pg_with_wal2json();
-    let port = common::pg_port(&container);
+    let db = common::pg_database();
 
-    let mut setup = common::pg_connect(port);
-    let mut dml = common::pg_connect(port);
+    let mut setup = db.connect();
+    let mut dml = db.connect();
     sql_query(PG_DDL).execute(&mut setup).expect("create table");
     sql_query("ALTER TABLE orders REPLICA IDENTITY FULL")
         .execute(&mut setup)
         .expect("REPLICA IDENTITY FULL");
-    let slot = "subql_evict_oldest_slot";
-    common::create_slot(&mut setup, slot);
+    let slot = db.slot("subql_evict_oldest_slot");
+    common::create_slot(&mut setup, &slot);
 
     let catalog = ParserDB::parse::<PostgreSqlDialect>(DDL).expect("parse DDL");
     let _orders_id = catalog_helpers::table_id::<Postgres, _>(&catalog, "orders").unwrap();
@@ -107,7 +106,7 @@ fn evict_oldest_drops_subscription_from_dispatch_path() {
         .execute(&mut dml)
         .expect("insert id=3");
 
-    let msgs = common::drain_slot(&mut setup, slot);
+    let msgs = common::drain_slot(&mut setup, &slot);
     let events = drain_typed(&msgs);
 
     let mut matched_consumers: Vec<u64> = Vec::new();
@@ -130,7 +129,7 @@ fn evict_oldest_drops_subscription_from_dispatch_path() {
     );
 
     let _ = s_keep;
-    common::drop_slot(&mut setup, slot);
+    common::drop_slot(&mut setup, &slot);
 }
 
 /// `EvictLeastActive` end-to-end: real WAL events stamp activity through
@@ -140,17 +139,16 @@ fn evict_oldest_drops_subscription_from_dispatch_path() {
 #[ignore = "requires Docker; run with --ignored"]
 fn evict_least_active_uses_real_wal_dispatch_timestamps() {
     common::assert_docker_available();
-    let container = common::pg_with_wal2json();
-    let port = common::pg_port(&container);
+    let db = common::pg_database();
 
-    let mut setup = common::pg_connect(port);
-    let mut dml = common::pg_connect(port);
+    let mut setup = db.connect();
+    let mut dml = db.connect();
     sql_query(PG_DDL).execute(&mut setup).expect("create table");
     sql_query("ALTER TABLE orders REPLICA IDENTITY FULL")
         .execute(&mut setup)
         .expect("REPLICA IDENTITY FULL");
-    let slot = "subql_evict_least_active_slot";
-    common::create_slot(&mut setup, slot);
+    let slot = db.slot("subql_evict_least_active_slot");
+    common::create_slot(&mut setup, &slot);
 
     let clock = Arc::new(ManualClock::new(0));
     #[allow(clippy::clone_on_ref_ptr)] // explicit dyn-trait unsize coercion
@@ -180,7 +178,7 @@ fn evict_least_active_uses_real_wal_dispatch_timestamps() {
     sql_query("INSERT INTO orders VALUES (1, 5.0)")
         .execute(&mut dml)
         .expect("insert id=1");
-    let events = drain_typed(&common::drain_slot(&mut setup, slot));
+    let events = drain_typed(&common::drain_slot(&mut setup, &slot));
     for ev in &events {
         engine.consumers(ev).expect("dispatch id=1");
     }
@@ -190,7 +188,7 @@ fn evict_least_active_uses_real_wal_dispatch_timestamps() {
     sql_query("INSERT INTO orders VALUES (2, 9.0)")
         .execute(&mut dml)
         .expect("insert id=2");
-    let events = drain_typed(&common::drain_slot(&mut setup, slot));
+    let events = drain_typed(&common::drain_slot(&mut setup, &slot));
     for ev in &events {
         engine.consumers(ev).expect("dispatch id=2");
     }
@@ -217,7 +215,7 @@ fn evict_least_active_uses_real_wal_dispatch_timestamps() {
     sql_query("UPDATE orders SET price = 6.0 WHERE id = 1")
         .execute(&mut dml)
         .expect("update id=1");
-    let events = drain_typed(&common::drain_slot(&mut setup, slot));
+    let events = drain_typed(&common::drain_slot(&mut setup, &slot));
     let mut hits: Vec<u64> = Vec::new();
     for ev in &events {
         let notifs = engine.consumers(ev).expect("dispatch");
@@ -230,7 +228,7 @@ fn evict_least_active_uses_real_wal_dispatch_timestamps() {
     );
 
     let _ = s_b;
-    common::drop_slot(&mut setup, slot);
+    common::drop_slot(&mut setup, &slot);
 }
 
 /// `register_batch` with `EvictOldest` end-to-end: a batch that exceeds the
@@ -246,17 +244,16 @@ fn evict_least_active_uses_real_wal_dispatch_timestamps() {
 #[ignore = "requires Docker; run with --ignored"]
 fn register_batch_cap_eviction_round_trips_through_wal() {
     common::assert_docker_available();
-    let container = common::pg_with_wal2json();
-    let port = common::pg_port(&container);
+    let db = common::pg_database();
 
-    let mut setup = common::pg_connect(port);
-    let mut dml = common::pg_connect(port);
+    let mut setup = db.connect();
+    let mut dml = db.connect();
     sql_query(PG_DDL).execute(&mut setup).expect("create table");
     sql_query("ALTER TABLE orders REPLICA IDENTITY FULL")
         .execute(&mut setup)
         .expect("REPLICA IDENTITY FULL");
-    let slot = "subql_evict_batch_slot";
-    common::create_slot(&mut setup, slot);
+    let slot = db.slot("subql_evict_batch_slot");
+    common::create_slot(&mut setup, &slot);
 
     let mut engine: SubscriptionEngine<MessageV2, DefaultIds, ParserDB> = SubscriptionEngine::new(
         ParserDB::parse::<PostgreSqlDialect>(DDL).expect("parse DDL"),
@@ -306,7 +303,7 @@ fn register_batch_cap_eviction_round_trips_through_wal() {
             .execute(&mut dml)
             .unwrap_or_else(|e| panic!("insert id={id}: {e}"));
     }
-    let events = drain_typed(&common::drain_slot(&mut setup, slot));
+    let events = drain_typed(&common::drain_slot(&mut setup, &slot));
     let mut hits: Vec<u64> = Vec::new();
     for ev in &events {
         let notifs = engine.consumers(ev).expect("dispatch");
@@ -330,7 +327,7 @@ fn register_batch_cap_eviction_round_trips_through_wal() {
         "consumer 4 survived and should match id=4, got hits {hits:?}"
     );
 
-    common::drop_slot(&mut setup, slot);
+    common::drop_slot(&mut setup, &slot);
 }
 
 /// `EvictionPolicy::Reject` end-to-end: the over-cap registration fails
@@ -340,17 +337,16 @@ fn register_batch_cap_eviction_round_trips_through_wal() {
 #[ignore = "requires Docker; run with --ignored"]
 fn reject_keeps_existing_subscriptions_intact() {
     common::assert_docker_available();
-    let container = common::pg_with_wal2json();
-    let port = common::pg_port(&container);
+    let db = common::pg_database();
 
-    let mut setup = common::pg_connect(port);
-    let mut dml = common::pg_connect(port);
+    let mut setup = db.connect();
+    let mut dml = db.connect();
     sql_query(PG_DDL).execute(&mut setup).expect("create table");
     sql_query("ALTER TABLE orders REPLICA IDENTITY FULL")
         .execute(&mut setup)
         .expect("REPLICA IDENTITY FULL");
-    let slot = "subql_evict_reject_slot";
-    common::create_slot(&mut setup, slot);
+    let slot = db.slot("subql_evict_reject_slot");
+    common::create_slot(&mut setup, &slot);
 
     let mut engine: SubscriptionEngine<MessageV2, DefaultIds, ParserDB> = SubscriptionEngine::new(
         ParserDB::parse::<PostgreSqlDialect>(DDL).expect("parse DDL"),
@@ -375,7 +371,7 @@ fn reject_keeps_existing_subscriptions_intact() {
     sql_query("INSERT INTO orders VALUES (1, 5.0)")
         .execute(&mut dml)
         .expect("insert id=1");
-    let events = drain_typed(&common::drain_slot(&mut setup, slot));
+    let events = drain_typed(&common::drain_slot(&mut setup, &slot));
     let mut hits: Vec<u64> = Vec::new();
     for ev in &events {
         let notifs = engine.consumers(ev).expect("dispatch");
@@ -387,5 +383,5 @@ fn reject_keeps_existing_subscriptions_intact() {
         "the first subscriber must still receive matches"
     );
 
-    common::drop_slot(&mut setup, slot);
+    common::drop_slot(&mut setup, &slot);
 }

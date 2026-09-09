@@ -34,9 +34,8 @@ diesel::table! {
 #[ignore = "requires Docker"]
 fn register_follow_insert_decodes_minted_pk() {
     common::assert_docker_available();
-    let container = common::pg_with_wal2json();
-    let mut conn = common::pg_connect(common::pg_port(&container));
-
+    let db = common::pg_database();
+    let mut conn = db.connect();
     // A genuine auto-generated (SERIAL) primary key: the id is minted by the DB.
     diesel::sql_query("CREATE TABLE users (id SERIAL PRIMARY KEY, name TEXT)")
         .execute(&mut conn)

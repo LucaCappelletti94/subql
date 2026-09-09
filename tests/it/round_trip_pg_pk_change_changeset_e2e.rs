@@ -84,9 +84,8 @@ fn final_rows() -> Vec<Item> {
 #[ignore = "requires Docker; run with --ignored"]
 fn round_trip_pk_change_via_changeset() {
     common::assert_docker_available();
-    let container = common::pg_with_wal2json();
-    let port = common::pg_port(&container);
-    let mut pg = common::pg_connect(port);
+    let db = common::pg_database();
+    let mut pg = db.connect();
 
     // Server state: create and seed the Postgres table
     sql_query(PG_DDL).execute(&mut pg).unwrap();

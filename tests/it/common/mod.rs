@@ -1,21 +1,17 @@
-//! Shared helpers for integration tests that need a real Postgres with
-//! logical replication enabled.
+//! Shared helpers for the Docker-backed integration tests.
 //!
-//! Each test that wants them does `mod common;` at the top of its file. Cargo
-//! recompiles this module per integration-test crate. That's the price of
-//! integration-test isolation and is fine for a handful of helpers.
-//!
-//! Requires Docker. The `pg_with_wal2json` helper builds the custom
-//! `subql-test/postgres-wal2json:16` image from `tests/fixtures/Dockerfile.postgres`
-//! on first call (cached by Docker's layer cache for subsequent runs).
-#![allow(dead_code)] // a given test may use only a subset of these helpers
+//! One server per engine per nextest run, looked up by name and label from
+//! every test process, and one database per test on it. Requires Docker. The
+//! Postgres image `subql-test/postgres-wal2json:16` is built from
+//! `tests/fixtures/Dockerfile.postgres` on first use.
 
-use std::time::Duration;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use diesel::{Connection, PgConnection, RunQueryDsl};
+use diesel::prelude::*;
 use testcontainers::core::{IntoContainerPort, Mount, WaitFor};
 use testcontainers::runners::SyncRunner;
-use testcontainers::{Container, GenericImage, ImageExt};
+use testcontainers::{Container, ContainerRequest, GenericImage, ImageExt, ReuseDirective};
 
 // Shared round-trip dispatch machinery, only for test crates that enable
 // the full apply stack. Empty (undeclared) for every other test.
@@ -28,14 +24,37 @@ pub mod dispatch;
 
 const PG_IMAGE: &str = "subql-test/postgres-wal2json";
 const PG_TAG: &str = "16";
+const MAXWELL_IMAGE: &str = "zendesk/maxwell";
+const MAXWELL_TAG: &str = "v1.44.0";
+const PASSWORD: &str = "subql_test";
+const ENGINE_LABEL: &str = "subql.test.engine";
+const RUN_LABEL: &str = "subql.test.run";
+/// Shared servers from other runs older than this are removed on acquisition.
+const STALE_AFTER: Duration = Duration::from_secs(30 * 60);
 
-/// Build the custom Postgres image with wal2json. Returns immediately if the
-/// image is already present in the local Docker cache.
-fn ensure_image() {
-    let output = std::process::Command::new("docker")
-        .args(["images", "-q", &format!("{PG_IMAGE}:{PG_TAG}")])
+/// The nextest run this process belongs to, or the process itself under
+/// `cargo test`, which runs every test in one process anyway.
+fn run_id() -> String {
+    std::env::var("NEXTEST_RUN_ID").unwrap_or_else(|_| std::process::id().to_string())
+}
+
+fn network_name(run: &str) -> String {
+    format!("subql-net-{run}")
+}
+
+fn mysql_host(run: &str) -> String {
+    format!("subql-mysql-{run}")
+}
+
+fn docker(args: &[&str]) -> std::process::Output {
+    std::process::Command::new("docker")
+        .args(args)
         .output()
-        .expect("docker images");
+        .unwrap_or_else(|e| panic!("docker {}: {e}", args.join(" ")))
+}
+
+fn ensure_image() {
+    let output = docker(&["images", "-q", &format!("{PG_IMAGE}:{PG_TAG}")]);
     if !output.stdout.is_empty() {
         return;
     }
@@ -43,17 +62,14 @@ fn ensure_image() {
         env!("CARGO_MANIFEST_DIR"),
         "/tests/fixtures/Dockerfile.postgres"
     );
-    let build_out = std::process::Command::new("docker")
-        .args([
-            "build",
-            "-t",
-            &format!("{PG_IMAGE}:{PG_TAG}"),
-            "-f",
-            dockerfile,
-            ".",
-        ])
-        .output()
-        .expect("docker build");
+    let build_out = docker(&[
+        "build",
+        "-t",
+        &format!("{PG_IMAGE}:{PG_TAG}"),
+        "-f",
+        dockerfile,
+        ".",
+    ]);
     assert!(
         build_out.status.success(),
         "Failed to build postgres-wal2json image: {}",
@@ -64,10 +80,7 @@ fn ensure_image() {
 /// Preflight Docker. Panics with an actionable message if the daemon is
 /// unreachable.
 pub fn assert_docker_available() {
-    let output = std::process::Command::new("docker")
-        .args(["info", "--format", "{{.ServerVersion}}"])
-        .output()
-        .unwrap_or_else(|e| panic!("docker preflight: `docker info` failed to execute: {e}"));
+    let output = docker(&["info", "--format", "{{.ServerVersion}}"]);
     assert!(
         output.status.success(),
         "docker preflight failed: `docker info` exited with status {}.\n\
@@ -82,6 +95,12 @@ pub fn assert_docker_available() {
 /// test boundary so blocking testcontainers setup runs before `block_on`,
 /// then used to drive the async apply and re-exec paths. Multi-thread so
 /// the connectors' `Send` futures are exercised across worker threads.
+#[cfg(any(
+    feature = "apply-patchset-postgres-async",
+    feature = "apply-patchset-mysql-async",
+    feature = "executor-diesel-async-postgres",
+    feature = "executor-diesel-async-mysql",
+))]
 pub fn multi_thread_rt() -> tokio::runtime::Runtime {
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -89,15 +108,112 @@ pub fn multi_thread_rt() -> tokio::runtime::Runtime {
         .expect("build multi-thread tokio runtime")
 }
 
-/// Spin up a Postgres 16 container with the wal2json output plugin and
-/// `wal_level=logical`, waiting until the server is accepting connections.
+fn unix_now() -> i64 {
+    i64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock after the epoch")
+            .as_secs(),
+    )
+    .expect("seconds fit i64")
+}
+
+/// Remove our shared servers left behind by runs older than [`STALE_AFTER`],
+/// and their networks. Nothing else can: testcontainers-rs has no reaper and
+/// a reused container is never stopped on drop.
+fn reap_stale() {
+    let listing = docker(&[
+        "ps",
+        "-a",
+        "--filter",
+        &format!("label={ENGINE_LABEL}"),
+        "--format",
+        &format!("{{{{.ID}}}}\t{{{{.Label \"{RUN_LABEL}\"}}}}"),
+    ]);
+    let mine = run_id();
+    let now = unix_now();
+    for line in String::from_utf8_lossy(&listing.stdout).lines() {
+        let Some((id, run)) = line.split_once('\t') else {
+            continue;
+        };
+        if run == mine {
+            continue;
+        }
+        let created = docker(&["inspect", "--format", "{{.Created}}", id]);
+        let created = String::from_utf8_lossy(&created.stdout);
+        let Ok(created) = chrono::DateTime::parse_from_rfc3339(created.trim()) else {
+            continue;
+        };
+        if now - created.timestamp() < i64::try_from(STALE_AFTER.as_secs()).expect("fits") {
+            continue;
+        }
+        docker(&["rm", "-f", id]);
+        docker(&["network", "rm", &network_name(run)]);
+    }
+}
+
+/// Look up or start this run's shared `engine` server and wait until `ready`
+/// accepts its mapped host port.
 ///
-/// `output_plugin_libraries` is what admits an output plugin at all. PostgreSQL
-/// 16.15 made it an allow-list, so without it a wal2json slot is refused with
-/// "library wal2json may not be used as an output plugin" however correctly the
-/// plugin is installed. The list is set rather than added to, so the two entries
-/// it ships with have to be repeated or the built-in `pgoutput` stops loading too.
-pub fn pg_with_wal2json() -> Container<GenericImage> {
+/// Test processes race on the first acquisition: both miss the lookup, one
+/// creation loses on the name and retries into a hit. The reuse path skips the
+/// image's `WaitFor`, so readiness is always probed here.
+fn shared_server(
+    engine: &str,
+    request: impl Fn() -> ContainerRequest<GenericImage>,
+    container_port: u16,
+    ready: impl Fn(u16) -> bool,
+    timeout: Duration,
+) -> u16 {
+    reap_stale();
+    let run = run_id();
+    let name = format!("subql-{engine}-{run}");
+    let deadline = Instant::now() + timeout;
+    let container = loop {
+        let attempt = request()
+            .with_container_name(&name)
+            .with_label(ENGINE_LABEL, engine)
+            .with_label(RUN_LABEL, &run)
+            .with_reuse(ReuseDirective::Always)
+            .with_startup_timeout(timeout)
+            .start();
+        match attempt {
+            Ok(container) => break container,
+            Err(err) => {
+                assert!(
+                    Instant::now() < deadline,
+                    "start shared {engine} server {name}: {err}"
+                );
+                std::thread::sleep(Duration::from_millis(500));
+            }
+        }
+    };
+    let port = container
+        .get_host_port_ipv4(container_port.tcp())
+        .expect("mapped port");
+    while !ready(port) {
+        assert!(
+            Instant::now() < deadline,
+            "shared {engine} server {name} never became ready on port {port}"
+        );
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    port
+}
+
+static DB_COUNTER: AtomicU32 = AtomicU32::new(0);
+
+fn fresh_db_name() -> String {
+    format!(
+        "t{}_{}",
+        std::process::id(),
+        DB_COUNTER.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
+// Postgres
+
+fn pg_request() -> ContainerRequest<GenericImage> {
     ensure_image();
     GenericImage::new(PG_IMAGE, PG_TAG)
         .with_wait_for(WaitFor::message_on_stderr("ready to accept connections"))
@@ -106,88 +222,120 @@ pub fn pg_with_wal2json() -> Container<GenericImage> {
         // fsync hit RAM, which is what a throwaway test server wants.
         .with_mount(Mount::tmpfs_mount("/var/lib/postgresql/data"))
         .with_env_var("POSTGRES_USER", "subql_test")
-        .with_env_var("POSTGRES_PASSWORD", "subql_test")
-        .with_env_var("POSTGRES_DB", "testdb")
+        .with_env_var("POSTGRES_PASSWORD", PASSWORD)
+        .with_env_var("POSTGRES_DB", "postgres")
         .with_cmd([
             "postgres",
             "-c",
             "wal_level=logical",
             "-c",
-            "max_wal_senders=4",
+            "max_wal_senders=128",
             "-c",
-            "max_replication_slots=4",
+            "max_replication_slots=128",
             "-c",
+            "max_connections=400",
+            "-c",
+            // PostgreSQL 16.15 made this an allow-list that replaces rather
+            // than extends, so the two shipped plugins are repeated.
             "output_plugin_libraries=pgoutput,test_decoding,wal2json",
         ])
-        // 180s: a full-width parallel sweep starts a dozen containers at
-        // once, and a cold Postgres under that contention can miss a 60s
-        // ceiling while being perfectly healthy.
-        .with_startup_timeout(Duration::from_secs(180))
-        .start()
-        .expect("start postgres")
 }
 
-/// Same as [`pg_with_wal2json`] but with a short `wal_sender_timeout`
-/// so the server tears down the replication connection if the client
-/// doesn't send a `StandbyStatusUpdate` within the given window.
-/// Used to prove the periodic-pump path keeps the source alive across
-/// idle periods.
-pub fn pg_with_wal2json_impatient(wal_sender_timeout: Duration) -> Container<GenericImage> {
-    ensure_image();
-    let timeout_arg = format!("wal_sender_timeout={}ms", wal_sender_timeout.as_millis());
-    GenericImage::new(PG_IMAGE, PG_TAG)
-        .with_wait_for(WaitFor::message_on_stderr("ready to accept connections"))
-        .with_exposed_port(5432.tcp())
-        .with_mount(Mount::tmpfs_mount("/var/lib/postgresql/data"))
-        .with_env_var("POSTGRES_USER", "subql_test")
-        .with_env_var("POSTGRES_PASSWORD", "subql_test")
-        .with_env_var("POSTGRES_DB", "testdb")
-        .with_cmd([
-            "postgres",
-            "-c",
-            "wal_level=logical",
-            "-c",
-            "max_wal_senders=4",
-            "-c",
-            "max_replication_slots=4",
-            "-c",
-            "output_plugin_libraries=pgoutput,test_decoding,wal2json",
-            "-c",
-            &timeout_arg,
-        ])
-        .with_startup_timeout(Duration::from_secs(180))
-        .start()
-        .expect("start postgres")
+fn pg_url_for(port: u16, database: &str) -> String {
+    format!("postgres://subql_test:{PASSWORD}@127.0.0.1:{port}/{database}")
 }
 
-/// Build the libpq URL for a Postgres container at the given mapped port.
-pub fn pg_url(port: u16) -> String {
-    format!("postgres://subql_test:subql_test@127.0.0.1:{port}/testdb")
+fn pg_admin(port: u16) -> ConnectionResult<PgConnection> {
+    PgConnection::establish(&pg_url_for(port, "postgres"))
 }
 
-/// Build the libpq URL for a Postgres container. Alias for
-/// [`pg_url`] kept around so the pg_streaming e2e is explicit about
-/// the connection being used for replication. `PgStreamingCdcSource`
-/// flips on logical-replication mode programmatically, so no extra
-/// query param is needed in the URL.
-pub fn pg_replication_url(port: u16) -> String {
-    pg_url(port)
+/// One database on this run's shared Postgres, dropped with its slots when
+/// the handle drops. Declare it before anything that connects to it.
+pub struct PgDatabase {
+    port: u16,
+    name: String,
 }
 
-/// Establish a diesel [`PgConnection`] against the container at `port`.
-pub fn pg_connect(port: u16) -> PgConnection {
-    PgConnection::establish(&pg_url(port)).expect("PG connection")
+/// Acquire the shared Postgres and create a fresh database on it.
+pub fn pg_database() -> PgDatabase {
+    let port = shared_server(
+        "pg",
+        pg_request,
+        5432,
+        |port| pg_admin(port).is_ok(),
+        Duration::from_secs(180),
+    );
+    let name = fresh_db_name();
+    let mut admin = pg_admin(port).expect("PG admin connection");
+    // DDL, which the query DSL does not express.
+    diesel::sql_query(format!("CREATE DATABASE {name}"))
+        .execute(&mut admin)
+        .expect("create test database");
+    PgDatabase { port, name }
 }
 
-/// Mapped host port for a started Postgres container.
-pub fn pg_port(c: &Container<GenericImage>) -> u16 {
-    c.get_host_port_ipv4(5432.tcp()).expect("pg port")
+impl PgDatabase {
+    /// libpq URL of this database.
+    pub fn url(&self) -> String {
+        pg_url_for(self.port, &self.name)
+    }
+
+    /// Establish a diesel [`PgConnection`] to this database.
+    pub fn connect(&self) -> PgConnection {
+        PgConnection::establish(&self.url()).expect("PG connection")
+    }
+
+    /// A replication slot name for this database. Slot names are cluster
+    /// wide, so `base` is prefixed with the database name.
+    pub fn slot(&self, base: &str) -> String {
+        format!("{}_{base}", self.name)
+    }
+
+    /// Set a configuration parameter for new sessions on this database.
+    #[cfg(feature = "pg-streaming")]
+    pub fn set(&self, parameter: &str, value: &str) {
+        let mut admin = pg_admin(self.port).expect("PG admin connection");
+        // DDL, which the query DSL does not express.
+        diesel::sql_query(format!(
+            "ALTER DATABASE {} SET {parameter} = '{value}'",
+            self.name
+        ))
+        .execute(&mut admin)
+        .expect("alter database");
+    }
 }
 
-/// Create a logical replication slot driven by `wal2json`. Idempotent only
-/// within a fresh container. Calling twice with the same name on the same
-/// instance errors.
+diesel::table! {
+    pg_catalog.pg_replication_slots (slot_name) {
+        slot_name -> Text,
+        database -> Nullable<Text>,
+    }
+}
+
+impl Drop for PgDatabase {
+    fn drop(&mut self) {
+        let Ok(mut admin) = pg_admin(self.port) else {
+            return;
+        };
+        // A database cannot be dropped while a logical slot is bound to it.
+        let slots: Vec<String> = pg_replication_slots::table
+            .filter(pg_replication_slots::database.eq(&self.name))
+            .select(pg_replication_slots::slot_name)
+            .load(&mut admin)
+            .unwrap_or_default();
+        for slot in slots {
+            let _ = try_drop_slot(&mut admin, &slot);
+        }
+        // DDL, which the query DSL does not express.
+        let _ = diesel::sql_query(format!("DROP DATABASE {} WITH (FORCE)", self.name))
+            .execute(&mut admin);
+    }
+}
+
+/// Create a logical replication slot driven by `wal2json`. Name it through
+/// [`PgDatabase::slot`].
 pub fn create_slot(conn: &mut PgConnection, name: &str) {
+    // Replication administration, which the query DSL does not express.
     diesel::sql_query(format!(
         "SELECT pg_create_logical_replication_slot('{name}', 'wal2json')"
     ))
@@ -200,39 +348,39 @@ pub fn create_slot(conn: &mut PgConnection, name: &str) {
 /// A streaming source releases its slot when its replication connection
 /// closes, and the server notices that shortly after the client task ends, so
 /// an immediate drop races the release and fails with `is active for PID`.
-/// Raw SQL because `pg_drop_replication_slot` is a Postgres administrative
-/// function with no typed diesel representation.
-pub fn drop_slot(conn: &mut PgConnection, name: &str) {
-    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+fn try_drop_slot(conn: &mut PgConnection, name: &str) -> QueryResult<()> {
+    let deadline = Instant::now() + Duration::from_secs(15);
     loop {
+        // Replication administration, which the query DSL does not express.
         match diesel::sql_query("SELECT pg_drop_replication_slot($1)")
             .bind::<diesel::sql_types::Text, _>(name)
             .execute(conn)
         {
-            Ok(_) => return,
-            Err(err) => {
-                let racing_walsender = err.to_string().contains("is active");
-                assert!(
-                    racing_walsender && std::time::Instant::now() < deadline,
-                    "drop replication slot {name}: {err}"
-                );
+            Ok(_) => return Ok(()),
+            Err(err) if err.to_string().contains("is active") && Instant::now() < deadline => {
                 std::thread::sleep(Duration::from_millis(100));
             }
+            Err(err) => return Err(err),
         }
     }
 }
 
+/// Drop a replication slot, waiting out a walsender that still holds it.
+pub fn drop_slot(conn: &mut PgConnection, name: &str) {
+    try_drop_slot(conn, name).unwrap_or_else(|err| panic!("drop replication slot {name}: {err}"));
+}
+
 /// Drain every queued WAL change from the named slot as wal2json v2 JSON
-/// strings. Returns `Vec<String>` in commit order. Empty if there is nothing
-/// pending. The format options match what subql's `parse_wal2json_v2` expects:
-/// `format-version=2`, `include-pk=true`, and `include-lsn=true` so each
-/// change carries the LSN that `MessageV2` surfaces as its checkpoint.
+/// strings, in commit order. The options match what `parse_wal2json_v2`
+/// expects: `format-version=2`, `include-pk=true`, and `include-lsn=true` so
+/// each change carries the LSN that `MessageV2` surfaces as its checkpoint.
 pub fn drain_slot(conn: &mut PgConnection, name: &str) -> Vec<String> {
     #[derive(diesel::QueryableByName)]
     struct Row {
         #[diesel(sql_type = diesel::sql_types::Text)]
         data: String,
     }
+    // Set-returning replication function, which the query DSL does not express.
     let rows: Vec<Row> = diesel::sql_query(format!(
         "SELECT data FROM pg_logical_slot_get_changes(\
             '{name}', NULL, NULL, \
@@ -248,7 +396,9 @@ pub fn drain_slot(conn: &mut PgConnection, name: &str) -> Vec<String> {
 
 /// Create a Postgres `PUBLICATION` over a single table. Required before
 /// a pgoutput logical replication slot can stream from that table.
+#[cfg(any(feature = "pg-streaming", feature = "pgoutput-emit"))]
 pub fn create_publication(conn: &mut PgConnection, publication: &str, table: &str) {
+    // DDL, which the query DSL does not express.
     diesel::sql_query(format!(
         "CREATE PUBLICATION {publication} FOR TABLE {table}"
     ))
@@ -258,7 +408,9 @@ pub fn create_publication(conn: &mut PgConnection, publication: &str, table: &st
 
 /// Create a logical replication slot driven by the built-in `pgoutput`
 /// plugin. Pair with [`create_publication`] before draining.
+#[cfg(any(feature = "pg-streaming", feature = "pgoutput-emit"))]
 pub fn create_pgoutput_slot(conn: &mut PgConnection, name: &str) {
+    // Replication administration, which the query DSL does not express.
     diesel::sql_query(format!(
         "SELECT pg_create_logical_replication_slot('{name}', 'pgoutput')"
     ))
@@ -266,156 +418,224 @@ pub fn create_pgoutput_slot(conn: &mut PgConnection, name: &str) {
     .expect("create pgoutput slot");
 }
 
-pub use mysql_maxwell_helpers::{
-    maxwell_collect, mysql_networked, mysql_port, mysql_url, start_maxwell,
-};
-// Consumed only by feature-gated modules in `tests/it/main.rs`.
+// MySQL
+
+fn mysql_request(run: &str) -> ContainerRequest<GenericImage> {
+    // MySQL 8.0 prints "ready for connections" twice during startup, for the
+    // bootstrap temp server and the real one. "port: 3306" is only in the
+    // final message.
+    GenericImage::new("mysql", "8.0")
+        .with_wait_for(WaitFor::message_on_stderr("port: 3306"))
+        .with_exposed_port(3306.tcp())
+        // In-memory datadir, as for Postgres above. InnoDB initialization is
+        // the bulk of a cold MySQL boot and it is all writes.
+        .with_mount(Mount::tmpfs_mount("/var/lib/mysql"))
+        .with_env_var("MYSQL_ROOT_PASSWORD", PASSWORD)
+        .with_cmd([
+            "--server-id=1",
+            "--log-bin=mysql-bin",
+            "--binlog-format=ROW",
+            "--binlog-row-image=FULL",
+            "--max-connections=400",
+        ])
+        .with_network(network_name(run))
+}
+
+fn mysql_url_for(port: u16, database: &str) -> String {
+    format!("mysql://root:{PASSWORD}@127.0.0.1:{port}/{database}")
+}
+
+fn mysql_admin(port: u16) -> ConnectionResult<MysqlConnection> {
+    MysqlConnection::establish(&mysql_url_for(port, "mysql"))
+}
+
+/// One database on this run's shared MySQL, dropped when the handle drops.
+/// Declare it before anything that connects to it.
+pub struct MysqlDatabase {
+    port: u16,
+    name: String,
+    run: String,
+    maxwell_count: AtomicU32,
+}
+
+/// Acquire the shared MySQL and create a fresh database on it.
+pub fn mysql_database() -> MysqlDatabase {
+    let run = run_id();
+    let port = shared_server(
+        "mysql",
+        || mysql_request(&run),
+        3306,
+        |port| mysql_admin(port).is_ok(),
+        Duration::from_secs(120),
+    );
+    let name = fresh_db_name();
+    let mut admin = mysql_admin(port).expect("MySQL admin connection");
+    // DDL, which the query DSL does not express.
+    diesel::sql_query(format!("CREATE DATABASE {name}"))
+        .execute(&mut admin)
+        .expect("create test database");
+    MysqlDatabase {
+        port,
+        name,
+        run,
+        maxwell_count: AtomicU32::new(0),
+    }
+}
+
+impl MysqlDatabase {
+    /// diesel URL of this database.
+    pub fn url(&self) -> String {
+        mysql_url_for(self.port, &self.name)
+    }
+
+    /// Establish a diesel [`MysqlConnection`] to this database.
+    pub fn connect(&self) -> MysqlConnection {
+        MysqlConnection::establish(&self.url()).expect("MySQL connection")
+    }
+
+    fn maxwell_schema(&self) -> String {
+        format!("maxwell_{}", self.name)
+    }
+}
+
+impl Drop for MysqlDatabase {
+    fn drop(&mut self) {
+        let Ok(mut admin) = mysql_admin(self.port) else {
+            return;
+        };
+        for database in [self.name.clone(), self.maxwell_schema()] {
+            // DDL, which the query DSL does not express.
+            let _ = diesel::sql_query(format!("DROP DATABASE IF EXISTS {database}"))
+                .execute(&mut admin);
+        }
+    }
+}
+
+/// Start a Maxwell daemon replicating `db` alone from the shared MySQL and
+/// writing CDC as JSONL into `output_dir` (bind-mounted at `/output`).
+/// `output_dir` must be world-writable so the in-container Maxwell process
+/// can write it.
+pub fn start_maxwell(db: &MysqlDatabase, output_dir: &str) -> Container<GenericImage> {
+    // Every Maxwell on the shared server is its own replication client with
+    // its own state schema. Other tests' databases are blacklisted, not just
+    // excluded: Maxwell halts on DDL it cannot parse, whichever database it is
+    // in, and a blacklist is the one filter that skips schema tracking.
+    let instance = db.maxwell_count.fetch_add(1, Ordering::Relaxed);
+    let replica_server_id = 2 + std::process::id() * 16 + instance;
+    GenericImage::new(MAXWELL_IMAGE, MAXWELL_TAG)
+        .with_wait_for(WaitFor::message_on_stderr("Binlog connected"))
+        .with_network(network_name(&db.run))
+        .with_mount(Mount::bind_mount(output_dir, "/output"))
+        .with_cmd([
+            "bin/maxwell".to_string(),
+            "--producer=file".to_string(),
+            "--output_file=/output/maxwell.jsonl".to_string(),
+            "--output_primary_key_columns=true".to_string(),
+            format!("--host={}", mysql_host(&db.run)),
+            "--port=3306".to_string(),
+            "--user=root".to_string(),
+            format!("--password={PASSWORD}"),
+            format!("--client_id={}_{instance}", db.name),
+            format!("--replica_server_id={replica_server_id}"),
+            format!("--schema_database={}", db.maxwell_schema()),
+            format!(
+                "--filter=blacklist: /^(?!({0}|{1})$).*/.*, exclude: *.*, include: {0}.*",
+                db.name,
+                db.maxwell_schema()
+            ),
+        ])
+        .with_startup_timeout(Duration::from_secs(90))
+        .start()
+        .unwrap_or_else(|e| panic!("start maxwell for {}: {e}", db.name))
+}
+
+/// Poll the Maxwell JSONL output for row-change lines on `db`.`table` until
+/// at least `expected` have arrived, returning them in file (commit) order.
+/// Panics after a fixed timeout.
+pub fn maxwell_collect(
+    output_dir: &str,
+    db: &MysqlDatabase,
+    table: &str,
+    expected: usize,
+) -> Vec<String> {
+    let path = std::path::Path::new(output_dir).join("maxwell.jsonl");
+    let database_tag = format!("\"database\":\"{}\"", db.name);
+    let table_tag = format!("\"table\":\"{table}\"");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if path.exists() {
+            let content = std::fs::read_to_string(&path).unwrap_or_default();
+            let matching: Vec<String> = content
+                .lines()
+                .filter(|line| {
+                    line.contains(&database_tag)
+                        && line.contains(&table_tag)
+                        && (line.contains("\"type\":\"insert\"")
+                            || line.contains("\"type\":\"update\"")
+                            || line.contains("\"type\":\"delete\""))
+                })
+                .map(String::from)
+                .collect();
+            if matching.len() >= expected {
+                return matching;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for {expected} Maxwell rows on {table} at {}",
+            path.display()
+        );
+        std::thread::sleep(Duration::from_millis(500));
+    }
+}
+
+// OpenFGA
+
+/// Mapped gRPC port of this run's shared OpenFGA. Blocking: call it from
+/// `spawn_blocking` inside an async test.
+#[cfg(all(feature = "visibility-openfga", feature = "testing"))]
+pub fn openfga_port() -> u16 {
+    shared_server(
+        "openfga",
+        || {
+            // The image does not declare its gRPC port. The log line precedes
+            // the listener, so callers still wait for a call to succeed.
+            GenericImage::new("openfga/openfga", "v1.8.13")
+                .with_wait_for(WaitFor::message_on_stdout("starting openfga service"))
+                .with_exposed_port(8081.tcp())
+                .with_cmd(["run"])
+        },
+        8081,
+        |port| std::net::TcpStream::connect(("127.0.0.1", port)).is_ok(),
+        Duration::from_secs(60),
+    )
+}
+
+// Parked reads, for the re-execution connector tests.
+
 #[cfg(any(
     feature = "executor-diesel-postgres",
     feature = "executor-diesel-async-postgres",
     feature = "executor-diesel-postgres-r2d2",
     feature = "executor-diesel-mysql",
     feature = "executor-diesel-async-mysql",
-    feature = "diesel-typed-mysql",
-    feature = "apply-patchset-mysql",
-    feature = "apply-patchset-mysql-async",
 ))]
-pub use mysql_maxwell_helpers::{mysql_8, mysql_connect, park_a_mysql_read, park_a_read, PARK};
+pub use parked_reads::*;
 
-mod mysql_maxwell_helpers {
-    use super::pg_connect;
-    use diesel::{Connection, MysqlConnection, PgConnection, RunQueryDsl};
-    use std::time::Duration;
-    use testcontainers::core::{IntoContainerPort, Mount, WaitFor};
-    use testcontainers::runners::SyncRunner;
-    use testcontainers::{Container, ContainerRequest, GenericImage, ImageExt};
+#[cfg(any(
+    feature = "executor-diesel-postgres",
+    feature = "executor-diesel-async-postgres",
+    feature = "executor-diesel-postgres-r2d2",
+    feature = "executor-diesel-mysql",
+    feature = "executor-diesel-async-mysql",
+))]
+mod parked_reads {
+    use super::{MysqlDatabase, PgDatabase};
+    use diesel::prelude::*;
+    use std::time::{Duration, Instant};
 
-    /// Base MySQL 8.0 container request with binary logging enabled (ROW
-    /// format, FULL row images) and port 3306 exposed for host connections.
-    /// Binary logging is required both for Maxwell replication and for the
-    /// binlog coordinate `SHOW MASTER STATUS` reports.
-    ///
-    /// MySQL 8.0 prints "ready for connections" twice during startup (once for
-    /// the bootstrap temp server, once for the real one). We wait for the
-    /// "port: 3306" line, which only appears in the final ready message.
-    fn mysql_request() -> ContainerRequest<GenericImage> {
-        GenericImage::new("mysql", "8.0")
-            .with_wait_for(WaitFor::message_on_stderr("port: 3306"))
-            .with_exposed_port(3306.tcp())
-            // In-memory datadir, as for Postgres above. InnoDB initialization is
-            // the bulk of a cold MySQL boot and it is all writes.
-            .with_mount(Mount::tmpfs_mount("/var/lib/mysql"))
-            .with_env_var("MYSQL_ROOT_PASSWORD", "subql_test")
-            .with_env_var("MYSQL_DATABASE", "testdb")
-            .with_cmd([
-                "--server-id=1",
-                "--log-bin=mysql-bin",
-                "--binlog-format=ROW",
-                "--binlog-row-image=FULL",
-            ])
-            .with_startup_timeout(Duration::from_secs(120))
-    }
-
-    /// Spin up a standalone MySQL 8.0 container. See [`mysql_request`] for the
-    /// binary-logging setup.
-    pub fn mysql_8() -> Container<GenericImage> {
-        mysql_request().start().expect("start mysql")
-    }
-
-    /// Spin up a MySQL 8.0 container attached to `network` under
-    /// `container_name`, so a sibling container (Maxwell) can reach it by
-    /// name. The mapped 3306 port is still exposed for host connections.
-    pub fn mysql_networked(network: &str, container_name: &str) -> Container<GenericImage> {
-        mysql_request()
-            .with_network(network)
-            .with_container_name(container_name)
-            .start()
-            .unwrap_or_else(|e| {
-                panic!("start networked mysql network={network} name={container_name}: {e}")
-            })
-    }
-
-    /// Build the diesel URL for a MySQL container at the given mapped port.
-    pub fn mysql_url(port: u16) -> String {
-        format!("mysql://root:subql_test@127.0.0.1:{port}/testdb")
-    }
-
-    /// Establish a diesel [`MysqlConnection`] against the container at `port`.
-    pub fn mysql_connect(port: u16) -> MysqlConnection {
-        MysqlConnection::establish(&mysql_url(port)).expect("MySQL connection")
-    }
-
-    /// Mapped host port for a started MySQL container.
-    pub fn mysql_port(c: &Container<GenericImage>) -> u16 {
-        c.get_host_port_ipv4(3306.tcp()).expect("mysql port")
-    }
-
-    const MAXWELL_IMAGE: &str = "zendesk/maxwell";
-    const MAXWELL_TAG: &str = "v1.44.0";
-
-    /// Start a Maxwell daemon on `network`, replicating from the MySQL
-    /// container named `mysql_name` and writing CDC as JSONL into `output_dir`
-    /// (bind-mounted at `/output`). `output_dir` must be world-writable so the
-    /// in-container Maxwell process can write it.
-    pub fn start_maxwell(
-        network: &str,
-        mysql_name: &str,
-        output_dir: &str,
-    ) -> Container<GenericImage> {
-        let host_flag = format!("--host={mysql_name}");
-        GenericImage::new(MAXWELL_IMAGE, MAXWELL_TAG)
-            .with_wait_for(WaitFor::message_on_stderr("Binlog connected"))
-            .with_network(network)
-            .with_mount(Mount::bind_mount(output_dir, "/output"))
-            .with_cmd([
-                "bin/maxwell",
-                "--producer=file",
-                "--output_file=/output/maxwell.jsonl",
-                "--output_primary_key_columns=true",
-                &host_flag,
-                "--port=3306",
-                "--user=root",
-                "--password=subql_test",
-            ])
-            .with_startup_timeout(Duration::from_secs(90))
-            .start()
-            .unwrap_or_else(|e| panic!("start maxwell network={network} mysql={mysql_name}: {e}"))
-    }
-
-    /// Poll the Maxwell JSONL output for row-change lines on `table` until at
-    /// least `expected` have arrived, returning them in file (commit) order.
-    /// Panics after a fixed timeout.
-    pub fn maxwell_collect(output_dir: &str, table: &str, expected: usize) -> Vec<String> {
-        let path = std::path::Path::new(output_dir).join("maxwell.jsonl");
-        let table_tag = format!("\"table\":\"{table}\"");
-        let deadline = std::time::Instant::now() + Duration::from_secs(30);
-        loop {
-            if path.exists() {
-                let content = std::fs::read_to_string(&path).unwrap_or_default();
-                let matching: Vec<String> = content
-                    .lines()
-                    .filter(|line| {
-                        line.contains(&table_tag)
-                            && (line.contains("\"type\":\"insert\"")
-                                || line.contains("\"type\":\"update\"")
-                                || line.contains("\"type\":\"delete\""))
-                    })
-                    .map(String::from)
-                    .collect();
-                if matching.len() >= expected {
-                    return matching;
-                }
-            }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "timed out waiting for {expected} Maxwell rows on {table} at {}",
-                path.display()
-            );
-            std::thread::sleep(Duration::from_millis(500));
-        }
-    }
-
-    /// Advisory-lock key the parked-read helper gates on.
+    /// Advisory-lock key the parked-read helper gates on. Advisory locks are
+    /// scoped to the database, so the constant is safe on a shared server.
     const PARK_KEY: i64 = 4242;
 
     /// Cross join that parks a read until [`park_a_read`] releases its gate.
@@ -433,26 +653,44 @@ mod mysql_maxwell_helpers {
             #[diesel(sql_type = diesel::sql_types::Text)]
             v: String,
         }
+        // Administrative function, which the query DSL does not express.
         let rows: Vec<Row> = diesel::sql_query("SELECT pg_current_wal_lsn()::text AS v")
             .load(conn)
             .expect("read the current WAL position");
         subql::PgLsn::parse(&rows[0].v).expect("parse the current WAL position")
     }
 
-    /// Backends blocked on an advisory lock, which is what a parked read looks
-    /// like from another connection.
-    fn parked_count(conn: &mut PgConnection) -> i64 {
-        #[derive(diesel::QueryableByName)]
-        struct Row {
-            #[diesel(sql_type = diesel::sql_types::BigInt)]
-            n: i64,
+    diesel::table! {
+        pg_catalog.pg_locks (pid) {
+            pid -> Nullable<Integer>,
+            locktype -> Text,
+            database -> Nullable<Oid>,
+            granted -> Bool,
         }
-        let rows: Vec<Row> = diesel::sql_query(
-            "SELECT count(*) AS n FROM pg_locks WHERE locktype = 'advisory' AND NOT granted",
-        )
-        .load(conn)
-        .expect("read pg_locks");
-        rows[0].n
+    }
+
+    diesel::table! {
+        pg_catalog.pg_database (oid) {
+            oid -> Oid,
+            datname -> Text,
+        }
+    }
+
+    /// Backends of `database` blocked on an advisory lock, which is what a
+    /// parked read looks like from another connection.
+    fn parked_count(conn: &mut PgConnection, database: &str) -> i64 {
+        let oid: u32 = pg_database::table
+            .filter(pg_database::datname.eq(database))
+            .select(pg_database::oid)
+            .first(conn)
+            .expect("resolve the database oid");
+        pg_locks::table
+            .filter(pg_locks::locktype.eq("advisory"))
+            .filter(pg_locks::granted.eq(false))
+            .filter(pg_locks::database.eq(oid))
+            .count()
+            .get_result(conn)
+            .expect("read pg_locks")
     }
 
     /// Run `read` on another thread, commit `dml` while it is parked, and report
@@ -462,22 +700,23 @@ mod mysql_maxwell_helpers {
     /// until the commit is done. A position taken before the snapshot therefore
     /// sits behind the returned one, and a position taken after sits at or ahead
     /// of it, so the two orderings are told apart from outside the call.
-    pub fn park_a_read<T, F>(port: u16, dml: &str, read: F) -> (T, subql::PgLsn)
+    pub fn park_a_read<T, F>(db: &PgDatabase, dml: &str, read: F) -> (T, subql::PgLsn)
     where
         F: FnOnce() -> T + Send + 'static,
         T: Send + 'static,
     {
-        let mut gate = pg_connect(port);
-        let mut observer = pg_connect(port);
+        let mut gate = db.connect();
+        let mut observer = db.connect();
+        // Advisory lock function, which the query DSL does not express.
         diesel::sql_query(format!("SELECT pg_advisory_lock({PARK_KEY})"))
             .execute(&mut gate)
             .expect("take the gate");
 
         let reader = std::thread::spawn(read);
-        let deadline = std::time::Instant::now() + Duration::from_secs(30);
-        while parked_count(&mut observer) == 0 {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while parked_count(&mut observer, &db.name) == 0 {
             assert!(
-                std::time::Instant::now() < deadline,
+                Instant::now() < deadline,
                 "the read never parked on the gate, so its snapshot was never pinned"
             );
             std::thread::sleep(Duration::from_millis(25));
@@ -503,6 +742,8 @@ mod mysql_maxwell_helpers {
             #[diesel(sql_type = diesel::sql_types::Unsigned<diesel::sql_types::BigInt>)]
             pos: u64,
         }
+        // JSON extraction from a performance schema table, which the query DSL
+        // does not express.
         let rows: Vec<Row> = diesel::sql_query(
             "SELECT JSON_UNQUOTE(JSON_EXTRACT(LOCAL, '$.binary_log_file')) AS file, \
          CAST(JSON_EXTRACT(LOCAL, '$.binary_log_position') AS UNSIGNED) AS pos \
@@ -527,7 +768,7 @@ mod mysql_maxwell_helpers {
     /// `lock` must be unique per call: the parked read acquires it and its
     /// session keeps it, so a reused name would park the next read on itself.
     pub fn park_a_mysql_read<T, F>(
-        port: u16,
+        db: &MysqlDatabase,
         lock: &str,
         dml: &str,
         read: F,
@@ -536,17 +777,20 @@ mod mysql_maxwell_helpers {
         F: FnOnce() -> T + Send + 'static,
         T: Send + 'static,
     {
-        let mut gate = mysql_connect(port);
-        let mut observer = mysql_connect(port);
+        // User locks are server wide, so the name carries the database.
+        let lock = format!("{}_{lock}", db.name);
+        let mut gate = db.connect();
+        let mut observer = db.connect();
+        // User lock function, which the query DSL does not express.
         diesel::sql_query(format!("SELECT GET_LOCK('{lock}', 60) AS n"))
             .execute(&mut gate)
             .expect("take the gate");
 
         let reader = std::thread::spawn(read);
-        let deadline = std::time::Instant::now() + Duration::from_secs(30);
-        while mysql_parked_count(&mut observer) == 0 {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while mysql_parked_count(&mut observer, &db.name) == 0 {
             assert!(
-                std::time::Instant::now() < deadline,
+                Instant::now() < deadline,
                 "the read never parked on the gate, so its snapshot was never pinned"
             );
             std::thread::sleep(Duration::from_millis(25));
@@ -563,18 +807,21 @@ mod mysql_maxwell_helpers {
         (reader.join().expect("parked read"), after_commit)
     }
 
-    /// Sessions blocked on a user-level lock.
-    fn mysql_parked_count(conn: &mut MysqlConnection) -> i64 {
-        #[derive(diesel::QueryableByName)]
-        struct Row {
-            #[diesel(sql_type = diesel::sql_types::BigInt)]
-            n: i64,
+    diesel::table! {
+        information_schema.processlist (id) {
+            id -> Unsigned<BigInt>,
+            db -> Nullable<Text>,
+            state -> Nullable<Text>,
         }
-        let rows: Vec<Row> = diesel::sql_query(
-            "SELECT count(*) AS n FROM information_schema.processlist WHERE state = 'User lock'",
-        )
-        .load(conn)
-        .expect("read processlist");
-        rows[0].n
+    }
+
+    /// Sessions of `database` blocked on a user-level lock.
+    fn mysql_parked_count(conn: &mut MysqlConnection, database: &str) -> i64 {
+        processlist::table
+            .filter(processlist::state.eq("User lock"))
+            .filter(processlist::db.eq(database))
+            .count()
+            .get_result(conn)
+            .expect("read processlist")
     }
 }

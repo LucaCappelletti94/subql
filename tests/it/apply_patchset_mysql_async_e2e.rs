@@ -48,18 +48,16 @@ struct ThingRow {
 #[ignore = "requires Docker; run with --ignored"]
 fn apply_patchset_async_bool_roundtrip_insert_update_delete_mysql() {
     common::assert_docker_available();
-    let container = common::mysql_8();
-    let port = common::mysql_port(&container);
-
+    let db = common::mysql_database();
     common::multi_thread_rt().block_on(async move {
         // Sync connection for DDL and result verification.
-        let mut verify = common::mysql_connect(port);
+        let mut verify = db.connect();
         sql_query(MYSQL_DDL)
             .execute(&mut verify)
             .expect("create table");
 
         // Async connection that drives the apply path under test.
-        let mut conn = AsyncMysqlConnection::establish(&common::mysql_url(port))
+        let mut conn = AsyncMysqlConnection::establish(&db.url())
             .await
             .expect("async mysql connect");
 

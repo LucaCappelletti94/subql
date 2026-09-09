@@ -481,10 +481,9 @@ mod tests {
     #[test]
     #[ignore = "requires Docker; run with --ignored"]
     fn the_postgres_sweep_agrees_and_says_how_often() {
-        let container = crate::common::pg_with_wal2json();
-        let port = crate::common::pg_port(&container);
+        let db = crate::common::pg_database();
         let mut oracle = crate::differential::oracle::PgOracle {
-            connection: crate::common::pg_connect(port),
+            connection: db.connect(),
         };
         let found = sweep(&mut oracle, Engine::Postgres, rows_per_form(), REGRESSIONS);
         assert!(
@@ -514,10 +513,9 @@ mod tests {
     #[test]
     #[ignore = "requires Docker; run with --ignored"]
     fn the_mysql_sweep_agrees_and_says_how_often() {
-        let container = crate::common::mysql_8();
-        let port = crate::common::mysql_port(&container);
+        let db = crate::common::mysql_database();
         let mut oracle = crate::differential::oracle::MySqlOracle {
-            connection: crate::common::mysql_connect(port),
+            connection: db.connect(),
         };
         let found = sweep(&mut oracle, Engine::MySql, rows_per_form(), REGRESSIONS);
         assert!(

@@ -307,8 +307,8 @@ fn records_from_sql(conn: &mut PgConnection, sql: &str, conditional: bool) -> BT
         .collect()
 }
 
-fn drain(conn: &mut PgConnection) -> Vec<MessageV2> {
-    common::drain_slot(conn, SLOT)
+fn drain(conn: &mut PgConnection, slot: &str) -> Vec<MessageV2> {
+    common::drain_slot(conn, slot)
         .iter()
         .flat_map(|line| parse_wal2json_v2(line.as_bytes()).unwrap())
         .collect()
@@ -402,15 +402,16 @@ fn shapes(catalog: &ParserDB) -> Vec<(String, bool, RecordDescription)> {
 #[ignore = "requires Docker"]
 fn every_record_a_row_implies_matches_the_query_that_loads_it() {
     common::assert_docker_available();
-    let container = common::pg_with_wal2json();
-    let mut pg = common::pg_connect(common::pg_port(&container));
+    let db = common::pg_database();
+    let slot = db.slot(SLOT);
+    let mut pg = db.connect();
 
     create_schema(&mut pg);
-    common::create_slot(&mut pg, SLOT);
+    common::create_slot(&mut pg, &slot);
     seed(&mut pg);
 
     let catalog = ParserDB::parse::<PostgreSqlDialect>(SCHEMA).unwrap();
-    let events = drain(&mut pg);
+    let events = drain(&mut pg, &slot);
     assert!(!events.is_empty(), "the slot carried no row events");
 
     let shapes = shapes(&catalog);
@@ -433,13 +434,14 @@ fn every_record_a_row_implies_matches_the_query_that_loads_it() {
 #[ignore = "requires Docker"]
 fn the_difference_a_change_reports_matches_what_the_loader_would_reload() {
     common::assert_docker_available();
-    let container = common::pg_with_wal2json();
-    let mut pg = common::pg_connect(common::pg_port(&container));
+    let db = common::pg_database();
+    let slot = db.slot(SLOT);
+    let mut pg = db.connect();
 
     create_schema(&mut pg);
-    common::create_slot(&mut pg, SLOT);
+    common::create_slot(&mut pg, &slot);
     seed(&mut pg);
-    drain(&mut pg);
+    drain(&mut pg, &slot);
 
     let catalog = ParserDB::parse::<PostgreSqlDialect>(SCHEMA).unwrap();
     let shapes = shapes(&catalog);
@@ -466,7 +468,7 @@ fn the_difference_a_change_reports_matches_what_the_loader_would_reload() {
         .execute(&mut pg)
         .unwrap();
 
-    let events = drain(&mut pg);
+    let events = drain(&mut pg, &slot);
     assert_eq!(events.len(), 4, "one event per statement");
 
     let after: BTreeSet<Fact> = shapes
@@ -627,13 +629,14 @@ fn compound_replay_relations(catalog: &ParserDB) -> Vec<RelationShapes> {
 #[ignore = "requires Docker"]
 fn a_replayed_compound_key_query_selects_only_the_row_that_changed() {
     common::assert_docker_available();
-    let container = common::pg_with_wal2json();
-    let mut pg = common::pg_connect(common::pg_port(&container));
+    let db = common::pg_database();
+    let slot = db.slot(SLOT);
+    let mut pg = db.connect();
 
     for statement in GRANTS_SCHEMA.split(';').filter(|s| !s.trim().is_empty()) {
         ddl(&mut pg, statement);
     }
-    common::create_slot(&mut pg, SLOT);
+    common::create_slot(&mut pg, &slot);
     diesel::insert_into(meters::table)
         .values(vec![
             (
@@ -655,7 +658,7 @@ fn a_replayed_compound_key_query_selects_only_the_row_that_changed() {
     )
     .execute(&mut pg)
     .unwrap();
-    drain(&mut pg);
+    drain(&mut pg, &slot);
 
     sql_query(
         "INSERT INTO meter_members (tenant_id, meter_id, user_id, expires_at) VALUES \
@@ -664,7 +667,7 @@ fn a_replayed_compound_key_query_selects_only_the_row_that_changed() {
     .execute(&mut pg)
     .unwrap();
 
-    let events = drain(&mut pg);
+    let events = drain(&mut pg, &slot);
     assert_eq!(events.len(), 1, "one event for one statement");
     let catalog = ParserDB::parse::<PostgreSqlDialect>(GRANTS_SCHEMA).unwrap();
 

@@ -493,10 +493,6 @@ fn finish_loop(
 fn round_trip_maxwell_dispatches_bool_uuid_enum() {
     common::assert_docker_available();
 
-    let pid = std::process::id();
-    let network = format!("subql-rt-mx-{pid}");
-    let mysql_name = format!("subql-rt-mysql-{pid}");
-
     // Maxwell bind-mounts this dir; it must be world-writable so the
     // in-container process can write into it.
     let maxwell_dir = tempfile::tempdir().unwrap();
@@ -507,11 +503,10 @@ fn round_trip_maxwell_dispatches_bool_uuid_enum() {
     }
     let out = maxwell_dir.path().to_str().unwrap().to_owned();
 
-    let mysql = common::mysql_networked(&network, &mysql_name);
-    let _maxwell = common::start_maxwell(&network, &mysql_name, &out);
+    let db = common::mysql_database();
+    let _maxwell = common::start_maxwell(&db, &out);
 
-    let port = common::mysql_port(&mysql);
-    let mut my = common::mysql_connect(port);
+    let mut my = db.connect();
     sql_query("SET time_zone = '+00:00'")
         .execute(&mut my)
         .unwrap();
@@ -522,14 +517,14 @@ fn round_trip_maxwell_dispatches_bool_uuid_enum() {
 
     // Seed phase: three inserts.
     seed_dml(&mut my);
-    let seed_lines = common::maxwell_collect(&out, "orders", 3);
+    let seed_lines = common::maxwell_collect(&out, &db, "orders", 3);
     let seed_events = parse_lines(&seed_lines[..3]);
     let seed_builder = maxwell_patchset_builder(&catalog, &seed_events).unwrap();
     assert!(!seed_events.is_empty(), "seed drain yielded no events");
 
     // Mutate phase: one update and one delete on top of the seeded rows.
     mutate_dml(&mut my);
-    let all_lines = common::maxwell_collect(&out, "orders", 5);
+    let all_lines = common::maxwell_collect(&out, &db, "orders", 5);
     let mutate_events = parse_lines(&all_lines[3..]);
     let mutate_builder = maxwell_patchset_builder(&catalog, &mutate_events).unwrap();
     assert!(!mutate_events.is_empty(), "mutate drain yielded no events");

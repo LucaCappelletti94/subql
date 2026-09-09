@@ -464,32 +464,27 @@ fn unchanged_toast_does_not_drop_a_subscription() {
     use subql::{CdcSource, PgStreamingCdcSource, PgStreamingConfig};
 
     common::assert_docker_available();
-    let container = common::pg_with_wal2json();
-    let port = common::pg_port(&container);
-
-    let mut setup = common::pg_connect(port);
-    let mut dml = common::pg_connect(port);
+    let db = common::pg_database();
+    let mut setup = db.connect();
+    let mut dml = db.connect();
     sql_query("CREATE TABLE docs (id INT PRIMARY KEY, body TEXT, tag TEXT)")
         .execute(&mut setup)
         .expect("create table");
-    // The strongest identity the server offers, so the omission below is
-    // not an identity gap.
+    // REPLICA IDENTITY FULL is the strongest setting; omission below is not an identity gap.
     sql_query("ALTER TABLE docs REPLICA IDENTITY FULL")
         .execute(&mut setup)
         .expect("REPLICA IDENTITY FULL");
-    // Stored out of line, and stored uncompressed so the value really goes
-    // to the TOAST table rather than being compressed inline.
+    // EXTERNAL storage bypasses compression so the value goes to TOAST rather than inline.
     sql_query("ALTER TABLE docs ALTER COLUMN body SET STORAGE EXTERNAL")
         .execute(&mut setup)
         .expect("external storage");
 
     let publication = "subql_toast_pub";
     common::create_publication(&mut setup, publication, "docs");
-    let slot = "subql_toast_slot";
-    common::create_pgoutput_slot(&mut setup, slot);
+    let slot = db.slot("subql_toast_slot");
+    common::create_pgoutput_slot(&mut setup, &slot);
 
-    // Past the roughly two-kilobyte threshold, so the value is stored out
-    // of line, while still short enough to spell in a predicate.
+    // Past the ~2 KiB TOAST threshold so the value is stored out of line.
     let body = "x".repeat(3_000);
     sql_query("INSERT INTO docs VALUES (1, repeat('x', 3000), 'before')")
         .execute(&mut dml)
@@ -499,7 +494,7 @@ fn unchanged_toast_does_not_drop_a_subscription() {
     let table = catalog_helpers::table_id::<subql::backend::Postgres, _>(&catalog, "docs")
         .expect("docs is cataloged");
     let column = catalog_helpers::column_id(&catalog, table, "body").expect("body is cataloged");
-    let config = PgStreamingConfig::new(common::pg_replication_url(port), slot, publication);
+    let config = PgStreamingConfig::new(db.url(), &slot, publication);
 
     let mut engine: SubscriptionEngine<_, DefaultIds, ParserDB> = SubscriptionEngine::new(
         ParserDB::parse::<PostgreSqlDialect>(DDL).unwrap(),
@@ -508,8 +503,7 @@ fn unchanged_toast_does_not_drop_a_subscription() {
     let registered = engine
         .register(SubscriptionRequest::new(
             1u64,
-            // Matches the stored row, so before this phase the omission
-            // was a silent no-match on a row the database returns.
+            // Matches the stored row, so before this fix the omission was a silent no-match.
             format!("SELECT * FROM docs WHERE body = '{body}'"),
         ))
         .expect("the predicate registers in process");
@@ -527,8 +521,7 @@ fn unchanged_toast_does_not_drop_a_subscription() {
                 .await
                 .expect("connect to the slot");
 
-            // Touches `tag` only, so `body` is unchanged and PostgreSQL
-            // omits it from the update message.
+            // UPDATE touches tag only so body is unchanged and PostgreSQL omits it.
             sql_query("UPDATE docs SET tag = 'after' WHERE id = 1")
                 .execute(&mut dml)
                 .expect("update the unrelated column");

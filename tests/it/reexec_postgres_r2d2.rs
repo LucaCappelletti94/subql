@@ -74,8 +74,9 @@ fn backend_pid(conn: &mut PgConnection) -> i64 {
 
 /// Backends parked inside a transaction, which is what a stranded cursor looks
 /// like from outside.
-const IDLE_IN_TXN: &str = "SELECT count(*) AS n FROM pg_stat_activity \
-     WHERE state = 'idle in transaction' AND xact_start IS NOT NULL";
+const IDLE_IN_TXN: &str =
+    "SELECT count(*) AS n FROM pg_stat_activity WHERE datname = current_database() \
+     AND state = 'idle in transaction' AND xact_start IS NOT NULL";
 
 /// The connector's own cursors open in the asking session. A cursor declared
 /// without `WITH HOLD` lives inside its transaction, so this is zero once the
@@ -97,7 +98,7 @@ const PG_DDL: &str = "CREATE TABLE orders (
     status TEXT
 )";
 
-fn setup_pg(conn: &mut PgConnection, seed: &[(i64, f64)]) {
+fn setup_pg(conn: &mut PgConnection, seed: &[(i64, f64)], slot: &str) {
     sql_query(PG_DDL).execute(conn).expect("CREATE TABLE");
     sql_query("ALTER TABLE orders REPLICA IDENTITY FULL")
         .execute(conn)
@@ -110,7 +111,7 @@ fn setup_pg(conn: &mut PgConnection, seed: &[(i64, f64)]) {
         .execute(conn)
         .expect("seed insert");
     }
-    common::create_slot(conn, SLOT);
+    common::create_slot(conn, slot);
 }
 
 /// One more row, for a commit that lands while a read is parked.
@@ -122,8 +123,7 @@ fn catalog() -> ParserDB {
     ParserDB::parse::<PostgreSqlDialect>(DDL).expect("parse DDL")
 }
 
-fn build_pool(port: u16) -> r2d2::Pool<ConnectionManager<PgConnection>> {
-    let url = common::pg_url(port);
+fn build_pool(url: &str) -> r2d2::Pool<ConnectionManager<PgConnection>> {
     let manager = ConnectionManager::<PgConnection>::new(url);
     r2d2::Pool::builder()
         .max_size(4)
@@ -152,14 +152,13 @@ fn parse_message(msg: &str) -> Vec<MessageV2> {
 #[ignore = "requires Docker; run with --ignored"]
 fn r2d2_pool_drives_snapshot_and_reexec() {
     common::assert_docker_available();
-    let container = common::pg_with_wal2json();
-    let port = common::pg_port(&container);
+    let db = common::pg_database();
+    let slot = db.slot(SLOT);
+    let mut conn_setup = db.connect();
+    let mut conn_dml = db.connect();
+    setup_pg(&mut conn_setup, &[(1, 5.0), (2, 9.0)], &slot);
 
-    let mut conn_setup = common::pg_connect(port);
-    let mut conn_dml = common::pg_connect(port);
-    setup_pg(&mut conn_setup, &[(1, 5.0), (2, 9.0)]);
-
-    let pool = build_pool(port);
+    let pool = build_pool(&db.url());
     let mut engine = build_engine(catalog(), pool);
 
     let captured_qid = match engine
@@ -199,7 +198,7 @@ fn r2d2_pool_drives_snapshot_and_reexec() {
         .execute(&mut conn_dml)
         .expect("delete id=1");
 
-    let msgs = common::drain_slot(&mut conn_setup, SLOT);
+    let msgs = common::drain_slot(&mut conn_setup, &slot);
     let mut events: Vec<MessageV2> = Vec::new();
     for msg in &msgs {
         events.extend(parse_message(msg));
@@ -239,16 +238,16 @@ fn a_cursor_pages_one_snapshot_of_a_keyless_result() {
     use subql::reexec::{Connector, CursorError, CursorId};
 
     common::assert_docker_available();
-    let container = common::pg_with_wal2json();
-    let port = common::pg_port(&container);
+    let db = common::pg_database();
+    let slot = db.slot(SLOT);
 
-    let mut conn_setup = common::pg_connect(port);
+    let mut conn_setup = db.connect();
     let seed: Vec<(i64, f64)> = (1..=40_u32)
         .map(|id| (i64::from(id), f64::from(id)))
         .collect();
-    setup_pg(&mut conn_setup, &seed);
+    setup_pg(&mut conn_setup, &seed, &slot);
 
-    let connector = PgR2D2DieselConnector::new(build_pool(port));
+    let connector = PgR2D2DieselConnector::new(build_pool(&db.url()));
     // DISTINCT has no key to resume from, which is what cursors exist for.
     let cursor = connector
         .open_cursor(
@@ -261,7 +260,7 @@ fn a_cursor_pages_one_snapshot_of_a_keyless_result() {
         .expect("open cursor");
 
     // A write committed after the cursor opened must not appear in its pages.
-    let mut conn_dml = common::pg_connect(port);
+    let mut conn_dml = db.connect();
     sql_query("INSERT INTO orders (id, price, quantity, status) VALUES (999, 1.0, 1, 'late')")
         .execute(&mut conn_dml)
         .expect("concurrent insert");
@@ -311,23 +310,16 @@ fn a_cursor_pages_one_snapshot_of_a_keyless_result() {
 #[ignore = "requires Docker; run with --ignored"]
 fn a_captured_query_delivers_its_rows_again_when_the_table_changes() {
     common::assert_docker_available();
-    let container = common::pg_with_wal2json();
-    let port = common::pg_port(&container);
-
-    let mut conn_setup = common::pg_connect(port);
-    let mut conn_dml = common::pg_connect(port);
-    // Enough rows that the answer cannot fit one page, so the test exercises
-    // paging rather than trivially passing on a single page.
+    let db = common::pg_database();
+    let slot = db.slot(SLOT);
+    let mut conn_setup = db.connect();
+    let mut conn_dml = db.connect();
     let seed: Vec<(i64, f64)> = (1..=40_u32)
         .map(|id| (i64::from(id), f64::from(id)))
         .collect();
-    setup_pg(&mut conn_setup, &seed);
+    setup_pg(&mut conn_setup, &seed, &slot);
 
-    // `lower(status)` is a function call the in-process predicate language
-    // cannot evaluate, so the engine refuses and the wrapper captures. DISTINCT
-    // is keyless, so the capture cannot resume by changed key and lands on the
-    // whole re-read tier.
-    let mut engine = build_engine(catalog(), build_pool(port)).with_max_page_bytes(64);
+    let mut engine = build_engine(catalog(), build_pool(&db.url())).with_max_page_bytes(64);
     let registered = engine
         .register(
             SubscriptionRequest::<DefaultIds, Postgres>::new(
@@ -351,7 +343,7 @@ fn a_captured_query_delivers_its_rows_again_when_the_table_changes() {
     sql_query("INSERT INTO orders (id, price, quantity, status) VALUES (41, 1.0, 1, 'paid')")
         .execute(&mut conn_dml)
         .expect("insert");
-    let msgs = common::drain_slot(&mut conn_setup, SLOT);
+    let msgs = common::drain_slot(&mut conn_setup, &slot);
     let mut events: Vec<MessageV2> = Vec::new();
     for msg in &msgs {
         events.extend(parse_message(msg));
@@ -413,17 +405,15 @@ fn a_captured_query_snapshots_its_answer_at_registration() {
     use subql::reexec::SnapshotResult;
 
     common::assert_docker_available();
-    let container = common::pg_with_wal2json();
-    let port = common::pg_port(&container);
-
-    let mut conn_setup = common::pg_connect(port);
+    let db = common::pg_database();
+    let slot = db.slot(SLOT);
+    let mut conn_setup = db.connect();
     let seed: Vec<(i64, f64)> = (1..=30_u32)
         .map(|id| (i64::from(id), f64::from(id)))
         .collect();
-    setup_pg(&mut conn_setup, &seed);
+    setup_pg(&mut conn_setup, &seed, &slot);
 
-    // DISTINCT is keyless, so the capture lands on the whole re-read tier.
-    let mut engine = build_engine(catalog(), build_pool(port)).with_max_page_bytes(64);
+    let mut engine = build_engine(catalog(), build_pool(&db.url())).with_max_page_bytes(64);
     let subscription_id = match engine
         .register(
             SubscriptionRequest::<DefaultIds, Postgres>::new(
@@ -479,12 +469,11 @@ fn a_captured_query_snapshots_its_answer_at_registration() {
 #[ignore = "requires Docker; run with --ignored"]
 fn a_joined_capture_is_triggered_by_either_table() {
     common::assert_docker_available();
-    let container = common::pg_with_wal2json();
-    let port = common::pg_port(&container);
-
-    let mut conn_setup = common::pg_connect(port);
-    let mut conn_dml = common::pg_connect(port);
-    setup_pg(&mut conn_setup, &[(1, 5.0), (2, 9.0)]);
+    let db = common::pg_database();
+    let slot = db.slot(SLOT);
+    let mut conn_setup = db.connect();
+    let mut conn_dml = db.connect();
+    setup_pg(&mut conn_setup, &[(1, 5.0), (2, 9.0)], &slot);
     sql_query("CREATE TABLE couriers (status TEXT PRIMARY KEY, name TEXT)")
         .execute(&mut conn_setup)
         .expect("create couriers");
@@ -500,7 +489,7 @@ fn a_joined_capture_is_triggered_by_either_table() {
          CREATE TABLE couriers (status TEXT PRIMARY KEY, name TEXT);",
     )
     .expect("parse joined DDL");
-    let mut engine = build_engine(joined_catalog, build_pool(port));
+    let mut engine = build_engine(joined_catalog, build_pool(&db.url()));
 
     let tables = match engine
         .register(
@@ -522,7 +511,7 @@ fn a_joined_capture_is_triggered_by_either_table() {
     assert_eq!(tables.len(), 2, "both sides of the join trigger it");
 
     // Drain the slot so only the changes below are read.
-    let _ = common::drain_slot(&mut conn_setup, SLOT);
+    let _ = common::drain_slot(&mut conn_setup, &slot);
 
     for (label, dml) in [
         (
@@ -532,7 +521,7 @@ fn a_joined_capture_is_triggered_by_either_table() {
         ("right side", "INSERT INTO couriers VALUES ('late', 'bo')"),
     ] {
         sql_query(dml).execute(&mut conn_dml).expect(label);
-        let msgs = common::drain_slot(&mut conn_setup, SLOT);
+        let msgs = common::drain_slot(&mut conn_setup, &slot);
         let mut delivered = 0;
         for msg in &msgs {
             for event in parse_message(msg) {
@@ -576,12 +565,11 @@ fn the_wal_position_is_not_bound_to_the_transaction_snapshot() {
     }
 
     common::assert_docker_available();
-    let container = common::pg_with_wal2json();
-    let port = common::pg_port(&container);
-    let mut reader = common::pg_connect(port);
-    let mut writer = common::pg_connect(port);
-
-    setup_pg(&mut reader, &[(1, 5.0)]);
+    let db = common::pg_database();
+    let slot = db.slot(SLOT);
+    let mut reader = db.connect();
+    let mut writer = db.connect();
+    setup_pg(&mut reader, &[(1, 5.0)], &slot);
 
     sql_query("BEGIN").execute(&mut reader).expect("begin");
     sql_query("SET TRANSACTION READ ONLY, ISOLATION LEVEL REPEATABLE READ")
@@ -633,15 +621,15 @@ fn the_wal_position_is_not_bound_to_the_transaction_snapshot() {
 #[ignore = "requires Docker; run with --ignored"]
 fn every_read_reports_a_position_taken_before_its_snapshot() {
     common::assert_docker_available();
-    let container = common::pg_with_wal2json();
-    let port = common::pg_port(&container);
-    let mut conn = common::pg_connect(port);
-    setup_pg(&mut conn, &[(1, 5.0)]);
-    let connector = Arc::new(PgR2D2DieselConnector::new(build_pool(port)));
+    let db = common::pg_database();
+    let slot = db.slot(SLOT);
+    let mut conn = db.connect();
+    setup_pg(&mut conn, &[(1, 5.0)], &slot);
+    let connector = Arc::new(PgR2D2DieselConnector::new(build_pool(&db.url())));
 
     let held = Arc::clone(&connector);
     let sql = format!("SELECT count(*)::bigint AS v FROM orders {}", common::PARK);
-    let ((value, position), after_commit) = common::park_a_read(port, &insert(2), move || {
+    let ((value, position), after_commit) = common::park_a_read(&db, &insert(2), move || {
         held.execute_scalar(
             &subql::reexec::ReadQuery::without_binds(&sql),
             ScalarFamily::Int,
@@ -661,7 +649,7 @@ fn every_read_reports_a_position_taken_before_its_snapshot() {
 
     let held = Arc::clone(&connector);
     let sql = format!("SELECT id FROM orders {} ORDER BY id", common::PARK);
-    let (page, after_commit) = common::park_a_read(port, &insert(3), move || {
+    let (page, after_commit) = common::park_a_read(&db, &insert(3), move || {
         held.read_page(&subql::reexec::ReadQuery::without_binds(&sql), 1 << 20, &())
             .expect("page read")
     });
@@ -677,7 +665,7 @@ fn every_read_reports_a_position_taken_before_its_snapshot() {
 
     let held = Arc::clone(&connector);
     let sql = format!("SELECT count(*)::bigint AS c0 FROM orders {}", common::PARK);
-    let ((values, position), after_commit) = common::park_a_read(port, &insert(4), move || {
+    let ((values, position), after_commit) = common::park_a_read(&db, &insert(4), move || {
         held.execute_scalar_row(
             &subql::reexec::ReadQuery::without_binds(&sql),
             &[ScalarFamily::Int],
@@ -708,21 +696,17 @@ fn every_read_reports_a_position_taken_before_its_snapshot() {
 #[ignore = "requires Docker; run with --ignored"]
 fn an_abandoned_cursor_ends_its_transaction_and_keeps_its_connection() {
     common::assert_docker_available();
-    let container = common::pg_with_wal2json();
-    let port = common::pg_port(&container);
-    let mut conn = common::pg_connect(port);
-    setup_pg(&mut conn, &[(1, 10.0), (2, 20.0), (3, 30.0)]);
+    let db = common::pg_database();
+    let slot = db.slot(SLOT);
+    let mut conn = db.connect();
+    setup_pg(&mut conn, &[(1, 10.0), (2, 20.0), (3, 30.0)], &slot);
 
-    // Observed from a separate connection, never through the pool under test:
-    // that pool's own query reads as `active`, not `idle in transaction`.
-    let mut observer = common::pg_connect(port);
+    let mut observer = db.connect();
 
-    // One connection, so an abandoned cursor cannot hide behind a spare.
-    let url = common::pg_url(port);
     let pool = r2d2::Pool::builder()
         .max_size(1)
         .connection_timeout(Duration::from_secs(10))
-        .build(ConnectionManager::<PgConnection>::new(url))
+        .build(ConnectionManager::<PgConnection>::new(db.url()))
         .expect("build pool");
 
     // The pool holds exactly one connection, so this is the process the cursor
@@ -793,13 +777,13 @@ fn a_cursor_whose_read_failed_reports_as_unknown() {
     use subql::reexec::CursorError;
 
     common::assert_docker_available();
-    let container = common::pg_with_wal2json();
-    let port = common::pg_port(&container);
-    let mut conn = common::pg_connect(port);
-    setup_pg(&mut conn, &[(1, 10.0), (2, 20.0), (3, 30.0)]);
-    let mut observer = common::pg_connect(port);
+    let db = common::pg_database();
+    let slot = db.slot(SLOT);
+    let mut conn = db.connect();
+    setup_pg(&mut conn, &[(1, 10.0), (2, 20.0), (3, 30.0)], &slot);
+    let mut observer = db.connect();
 
-    let connector = PgR2D2DieselConnector::new(build_pool(port));
+    let connector = PgR2D2DieselConnector::new(build_pool(&db.url()));
     let cursor = connector
         .open_cursor(
             &subql::reexec::ReadQuery::without_binds("SELECT id, price FROM orders ORDER BY id"),
@@ -816,8 +800,8 @@ fn a_cursor_whose_read_failed_reports_as_unknown() {
         }
     }
     sql_query(
-        "SELECT pg_terminate_backend(pid) FROM pg_stat_activity \
-         WHERE state = 'idle in transaction' AND xact_start IS NOT NULL",
+        "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = current_database() \
+         AND state = 'idle in transaction' AND xact_start IS NOT NULL",
     )
     .execute(&mut observer)
     .expect("terminate the cursor's backend");
@@ -925,14 +909,14 @@ impl Connector for PanicMidRead {
 #[ignore = "requires Docker; run with --ignored"]
 fn a_panic_during_a_read_leaves_no_transaction_behind() {
     common::assert_docker_available();
-    let container = common::pg_with_wal2json();
-    let port = common::pg_port(&container);
-    let mut conn = common::pg_connect(port);
-    setup_pg(&mut conn, &[(1, 10.0), (2, 20.0), (3, 30.0)]);
-    let mut observer = common::pg_connect(port);
+    let db = common::pg_database();
+    let slot = db.slot(SLOT);
+    let mut conn = db.connect();
+    setup_pg(&mut conn, &[(1, 10.0), (2, 20.0), (3, 30.0)], &slot);
+    let mut observer = db.connect();
 
     let connector = PanicMidRead {
-        inner: PgR2D2DieselConnector::new(build_pool(port)),
+        inner: PgR2D2DieselConnector::new(build_pool(&db.url())),
         fetches: parking_lot::Mutex::new(0),
     };
     let cat = catalog();
@@ -995,23 +979,18 @@ fn a_panic_during_a_read_leaves_no_transaction_behind() {
 #[ignore = "requires Docker; run with --ignored"]
 fn a_keyed_capture_snapshots_its_rows() {
     common::assert_docker_available();
-    let container = common::pg_with_wal2json();
-    let port = common::pg_port(&container);
-
-    let mut conn_setup = common::pg_connect(port);
+    let db = common::pg_database();
+    let slot = db.slot(SLOT);
+    let mut conn_setup = db.connect();
     let seed: Vec<(i64, f64)> = (1..=12_u32)
         .map(|id| (i64::from(id), f64::from(id)))
         .collect();
-    setup_pg(&mut conn_setup, &seed);
-    // One row outside the filter, so a snapshot that ignored the WHERE would
-    // deliver it and be caught.
+    setup_pg(&mut conn_setup, &seed, &slot);
     sql_query("UPDATE orders SET status = 'void' WHERE id = 7")
         .execute(&mut conn_setup)
         .expect("take one row out of the answer");
 
-    // A page budget below one row's size, so the answer only arrives complete
-    // if the read pages. A single-page read would pass with the paging deleted.
-    let mut engine = build_engine(catalog(), build_pool(port)).with_max_page_bytes(1);
+    let mut engine = build_engine(catalog(), build_pool(&db.url())).with_max_page_bytes(1);
     let subscription_id = match engine
         .register(
             SubscriptionRequest::<DefaultIds, Postgres>::new(
@@ -1069,12 +1048,12 @@ fn a_keyed_capture_snapshots_its_rows() {
 #[ignore = "requires Docker, run with --ignored"]
 fn a_keyless_change_transitions_and_runs_the_sync_replacement_read() {
     common::assert_docker_available();
-    let container = common::pg_with_wal2json();
-    let port = common::pg_port(&container);
-    let mut conn_setup = common::pg_connect(port);
-    setup_pg(&mut conn_setup, &[(1, 5.0), (2, 9.0)]);
+    let db = common::pg_database();
+    let slot = db.slot(SLOT);
+    let mut conn_setup = db.connect();
+    setup_pg(&mut conn_setup, &[(1, 5.0), (2, 9.0)], &slot);
 
-    let mut engine = build_engine(catalog(), build_pool(port));
+    let mut engine = build_engine(catalog(), build_pool(&db.url()));
     let subscription_id = match engine
         .register(
             SubscriptionRequest::<DefaultIds, Postgres>::new(
@@ -1134,10 +1113,10 @@ fn a_keyless_change_transitions_and_runs_the_sync_replacement_read() {
 #[ignore = "requires Docker, run with --ignored"]
 fn grouped_min_snapshots_and_rereads_one_group_sync() {
     common::assert_docker_available();
-    let container = common::pg_with_wal2json();
-    let port = common::pg_port(&container);
-    let mut conn = common::pg_connect(port);
-    setup_pg(&mut conn, &[(1, 5.0), (2, 9.0), (3, 11.0)]);
+    let db = common::pg_database();
+    let slot = db.slot(SLOT);
+    let mut conn = db.connect();
+    setup_pg(&mut conn, &[(1, 5.0), (2, 9.0), (3, 11.0)], &slot);
     // Diesel has no DDL query builder.
     sql_query(r"ALTER TABLE orders ADD COLUMN bucket BYTEA NOT NULL DEFAULT '\x01'")
         .execute(&mut conn)
@@ -1146,7 +1125,7 @@ fn grouped_min_snapshots_and_rereads_one_group_sync() {
         .set(grouped_schema::orders::bucket.eq(vec![2u8]))
         .execute(&mut conn)
         .expect("seed second group");
-    let _ = common::drain_slot(&mut conn, SLOT);
+    let _ = common::drain_slot(&mut conn, &slot);
 
     let grouped_catalog = ParserDB::parse::<PostgreSqlDialect>(
         "CREATE TABLE orders (
@@ -1158,7 +1137,7 @@ fn grouped_min_snapshots_and_rereads_one_group_sync() {
         );",
     )
     .expect("parse grouped catalog");
-    let mut engine = build_engine(grouped_catalog, build_pool(port));
+    let mut engine = build_engine(grouped_catalog, build_pool(&db.url()));
     let subscription = match engine
         .register(
             SubscriptionRequest::<DefaultIds, Postgres>::new(
@@ -1196,7 +1175,7 @@ fn grouped_min_snapshots_and_rereads_one_group_sync() {
     diesel::delete(grouped_schema::orders::table.find(1))
         .execute(&mut conn)
         .expect("delete current minimum");
-    let events: Vec<_> = common::drain_slot(&mut conn, SLOT)
+    let events: Vec<_> = common::drain_slot(&mut conn, &slot)
         .iter()
         .flat_map(|message| parse_message(message))
         .collect();
@@ -1221,10 +1200,10 @@ fn grouped_min_snapshots_and_rereads_one_group_sync() {
 #[ignore = "requires Docker"]
 fn a_scalar_over_a_narrow_integer_column_decodes() {
     common::assert_docker_available();
-    let container = common::pg_with_wal2json();
-    let port = common::pg_port(&container);
-    let mut conn = common::pg_connect(port);
-    setup_pg(&mut conn, &[(1, 5.0), (2, 9.0)]);
+    let db = common::pg_database();
+    let slot = db.slot(SLOT);
+    let mut conn = db.connect();
+    setup_pg(&mut conn, &[(1, 5.0), (2, 9.0)], &slot);
     sql_query("CREATE TABLE probe (small INT, tiny SMALLINT)")
         .execute(&mut conn)
         .expect("probe table");
@@ -1232,7 +1211,7 @@ fn a_scalar_over_a_narrow_integer_column_decodes() {
         .execute(&mut conn)
         .expect("probe rows");
 
-    let connector = PgR2D2DieselConnector::new(build_pool(port));
+    let connector = PgR2D2DieselConnector::new(build_pool(&db.url()));
     let (value, _) = connector
         .execute_scalar(
             &subql::reexec::ReadQuery::without_binds("SELECT MIN(quantity) FROM orders"),
@@ -1277,15 +1256,15 @@ impl SessionSetup for MarkerSetup {
 #[ignore = "requires Docker; run with --ignored"]
 fn session_setup_runs_inside_each_read_transaction() {
     common::assert_docker_available();
-    let container = common::pg_with_wal2json();
-    let port = common::pg_port(&container);
-    let mut conn = common::pg_connect(port);
-    setup_pg(&mut conn, &[(1, 5.0)]);
+    let db = common::pg_database();
+    let slot = db.slot(SLOT);
+    let mut conn = db.connect();
+    setup_pg(&mut conn, &[(1, 5.0)], &slot);
 
     let read_marker = "SELECT current_setting('app.marker', true) AS v";
     let setup = MarkerSetup(vec!["SET LOCAL app.marker = 'seen'".to_string()]);
     let connector: PgR2D2DieselConnector<MarkerSetup> =
-        PgR2D2DieselConnector::with_session_setup(build_pool(port));
+        PgR2D2DieselConnector::with_session_setup(build_pool(&db.url()));
 
     let (value, _) = connector
         .execute_scalar(
@@ -1330,7 +1309,7 @@ fn session_setup_runs_inside_each_read_transaction() {
     connector.close_cursor(cursor).expect("close");
 
     // No setup: the marker is never set, so current_setting is NULL.
-    let plain = PgR2D2DieselConnector::new(build_pool(port));
+    let plain = PgR2D2DieselConnector::new(build_pool(&db.url()));
     let (value, _) = plain
         .execute_scalar(
             &subql::reexec::ReadQuery::without_binds(read_marker),
@@ -1344,13 +1323,15 @@ fn session_setup_runs_inside_each_read_transaction() {
 /// Backends parked inside a transaction, aborted or not. A failed cursor open
 /// aborts its transaction before it is rolled back, and an aborted one is a
 /// distinct `pg_stat_activity` state, so the plain probe above would miss it.
-const IDLE_IN_ANY_TXN: &str = "SELECT count(*) AS n FROM pg_stat_activity \
-     WHERE state LIKE 'idle in transaction%' AND xact_start IS NOT NULL";
+const IDLE_IN_ANY_TXN: &str =
+    "SELECT count(*) AS n FROM pg_stat_activity WHERE datname = current_database() \
+     AND state LIKE 'idle in transaction%' AND xact_start IS NOT NULL";
 
 /// A backend running a cursor `FETCH` right now, which is what a reader
 /// holding the cursor looks like from another connection.
-const FETCH_RUNNING: &str = "SELECT count(*) AS n FROM pg_stat_activity \
-     WHERE state = 'active' AND query LIKE 'FETCH FORWARD%'";
+const FETCH_RUNNING: &str =
+    "SELECT count(*) AS n FROM pg_stat_activity WHERE datname = current_database() \
+     AND state = 'active' AND query LIKE 'FETCH FORWARD%'";
 
 /// A cursor's held transaction is the same read snapshot every other read
 /// gets: repeatable read, and read only. The cursor's own SQL is what
@@ -1359,12 +1340,12 @@ const FETCH_RUNNING: &str = "SELECT count(*) AS n FROM pg_stat_activity \
 #[ignore = "requires Docker; run with --ignored"]
 fn a_cursor_holds_a_read_only_repeatable_read_snapshot() {
     common::assert_docker_available();
-    let container = common::pg_with_wal2json();
-    let port = common::pg_port(&container);
-    let mut conn = common::pg_connect(port);
-    setup_pg(&mut conn, &[(1, 5.0)]);
+    let db = common::pg_database();
+    let slot = db.slot(SLOT);
+    let mut conn = db.connect();
+    setup_pg(&mut conn, &[(1, 5.0)], &slot);
 
-    let connector = PgR2D2DieselConnector::new(build_pool(port));
+    let connector = PgR2D2DieselConnector::new(build_pool(&db.url()));
     let cursor = connector
         .open_cursor(
             &subql::reexec::ReadQuery::without_binds(
@@ -1433,17 +1414,15 @@ fn page_of_ids(
 #[ignore = "requires Docker; run with --ignored"]
 fn two_cursors_open_at_once_page_independently() {
     common::assert_docker_available();
-    let container = common::pg_with_wal2json();
-    let port = common::pg_port(&container);
-    let mut conn = common::pg_connect(port);
-    // Enough rows that each cursor is paged many times, so every page but the
-    // first has to resume a cursor the other one read from in between.
+    let db = common::pg_database();
+    let slot = db.slot(SLOT);
+    let mut conn = db.connect();
     let seed: Vec<(i64, f64)> = (1..=40_u32)
         .map(|id| (i64::from(id), f64::from(id)))
         .collect();
-    setup_pg(&mut conn, &seed);
+    setup_pg(&mut conn, &seed, &slot);
 
-    let connector = PgR2D2DieselConnector::new(build_pool(port));
+    let connector = PgR2D2DieselConnector::new(build_pool(&db.url()));
     let (ascending, descending) = open_ordered_cursors(&connector);
     assert_ne!(
         ascending, descending,
@@ -1546,18 +1525,18 @@ fn a_second_reader_of_one_cursor_is_told_it_is_busy() {
     use subql::reexec::CursorError;
 
     common::assert_docker_available();
-    let container = common::pg_with_wal2json();
-    let port = common::pg_port(&container);
-    let mut conn = common::pg_connect(port);
-    setup_pg(&mut conn, &[(1, 1.0), (2, 2.0), (3, 3.0)]);
+    let db = common::pg_database();
+    let slot = db.slot(SLOT);
+    let mut conn = db.connect();
+    setup_pg(&mut conn, &[(1, 1.0), (2, 2.0), (3, 3.0)], &slot);
 
-    let connector = Arc::new(PgR2D2DieselConnector::new(build_pool(port)));
+    let connector = Arc::new(PgR2D2DieselConnector::new(build_pool(&db.url())));
     let cursor = open_slow_cursor(&connector);
     let reader = {
         let connector = Arc::clone(&connector);
         std::thread::spawn(move || connector.fetch_cursor(cursor, 1 << 20))
     };
-    let mut observer = common::pg_connect(port);
+    let mut observer = db.connect();
     wait_for_a_running_fetch(&mut observer);
 
     let contended = connector.fetch_cursor(cursor, 1 << 20);
@@ -1581,13 +1560,13 @@ fn a_second_reader_of_one_cursor_is_told_it_is_busy() {
 #[ignore = "requires Docker; run with --ignored"]
 fn a_cursor_is_served_while_another_is_mid_fetch() {
     common::assert_docker_available();
-    let container = common::pg_with_wal2json();
-    let port = common::pg_port(&container);
-    let mut conn = common::pg_connect(port);
-    setup_pg(&mut conn, &[(1, 1.0), (2, 2.0), (3, 3.0)]);
+    let db = common::pg_database();
+    let slot = db.slot(SLOT);
+    let mut conn = db.connect();
+    setup_pg(&mut conn, &[(1, 1.0), (2, 2.0), (3, 3.0)], &slot);
 
-    let connector = Arc::new(PgR2D2DieselConnector::new(build_pool(port)));
-    let slow = open_slow_cursor(&connector);
+    let connector = Arc::new(PgR2D2DieselConnector::new(build_pool(&db.url())));
+    let held = open_slow_cursor(&connector);
     let quick = connector
         .open_cursor(
             &subql::reexec::ReadQuery::without_binds("SELECT id FROM orders ORDER BY id"),
@@ -1597,9 +1576,9 @@ fn a_cursor_is_served_while_another_is_mid_fetch() {
 
     let reader = {
         let connector = Arc::clone(&connector);
-        std::thread::spawn(move || connector.fetch_cursor(slow, 1 << 20))
+        std::thread::spawn(move || connector.fetch_cursor(held, 1 << 20))
     };
-    let mut observer = common::pg_connect(port);
+    let mut observer = db.connect();
     wait_for_a_running_fetch(&mut observer);
 
     let page = connector
@@ -1615,7 +1594,7 @@ fn a_cursor_is_served_while_another_is_mid_fetch() {
         .join()
         .expect("the reading thread finishes")
         .expect("the slow read succeeds");
-    connector.close_cursor(slow).expect("close the slow cursor");
+    connector.close_cursor(held).expect("close the slow cursor");
     connector
         .close_cursor(quick)
         .expect("close the quick cursor");
@@ -1628,14 +1607,13 @@ fn a_cursor_is_served_while_another_is_mid_fetch() {
 #[ignore = "requires Docker; run with --ignored"]
 fn a_cursor_that_fails_to_open_keeps_its_connection_and_leaves_no_transaction() {
     common::assert_docker_available();
-    let container = common::pg_with_wal2json();
-    let port = common::pg_port(&container);
-    let mut conn = common::pg_connect(port);
-    setup_pg(&mut conn, &[(1, 1.0)]);
-    let mut observer = common::pg_connect(port);
+    let db = common::pg_database();
+    let slot = db.slot(SLOT);
+    let mut conn = db.connect();
+    setup_pg(&mut conn, &[(1, 1.0)], &slot);
+    let mut observer = db.connect();
 
-    // One connection, so the pid before and after names the same slot.
-    let manager = ConnectionManager::<PgConnection>::new(common::pg_url(port));
+    let manager = ConnectionManager::<PgConnection>::new(db.url());
     let pool = r2d2::Pool::builder()
         .max_size(1)
         .connection_timeout(Duration::from_secs(10))
@@ -1674,15 +1652,15 @@ fn a_cursor_that_fails_to_open_keeps_its_connection_and_leaves_no_transaction() 
 #[ignore = "requires Docker; run with --ignored"]
 fn every_page_of_a_cursor_names_its_columns() {
     common::assert_docker_available();
-    let container = common::pg_with_wal2json();
-    let port = common::pg_port(&container);
-    let mut conn = common::pg_connect(port);
+    let db = common::pg_database();
+    let slot = db.slot(SLOT);
+    let mut conn = db.connect();
     let seed: Vec<(i64, f64)> = (1..=8_u32)
         .map(|id| (i64::from(id), f64::from(id)))
         .collect();
-    setup_pg(&mut conn, &seed);
+    setup_pg(&mut conn, &seed, &slot);
 
-    let connector = PgR2D2DieselConnector::new(build_pool(port));
+    let connector = PgR2D2DieselConnector::new(build_pool(&db.url()));
     let cursor = connector
         .open_cursor(
             &subql::reexec::ReadQuery::without_binds("SELECT id, status FROM orders ORDER BY id"),

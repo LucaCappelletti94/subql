@@ -45,10 +45,9 @@ struct ThingRow {
 #[ignore = "requires Docker; run with --ignored"]
 fn apply_patchset_bool_roundtrip_insert_update_delete_mysql() {
     common::assert_docker_available();
-    let container = common::mysql_8();
-    let port = common::mysql_port(&container);
+    let db = common::mysql_database();
 
-    let mut conn = common::mysql_connect(port);
+    let mut conn = db.connect();
     sql_query(MYSQL_DDL)
         .execute(&mut conn)
         .expect("create table");
@@ -170,10 +169,9 @@ struct NullableThingRow {
 #[ignore = "requires Docker; run with --ignored"]
 fn apply_patchset_boolean_column_takes_any_nonzero_integer_and_null_mysql() {
     common::assert_docker_available();
-    let container = common::mysql_8();
-    let port = common::mysql_port(&container);
+    let db = common::mysql_database();
 
-    let mut conn = common::mysql_connect(port);
+    let mut conn = db.connect();
     sql_query(MYSQL_DDL)
         .execute(&mut conn)
         .expect("create table");

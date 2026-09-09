@@ -158,11 +158,9 @@ where
 #[allow(clippy::too_many_lines)]
 fn push_and_poll_observe_identical_event_streams() {
     common::assert_docker_available();
-    let container = common::pg_with_wal2json();
-    let port = common::pg_port(&container);
-
-    let mut setup = common::pg_connect(port);
-    let mut dml = common::pg_connect(port);
+    let db = common::pg_database();
+    let mut setup = db.connect();
+    let mut dml = db.connect();
     sql_query(PG_DDL).execute(&mut setup).expect("create table");
     sql_query("ALTER TABLE orders REPLICA IDENTITY FULL")
         .execute(&mut setup)
@@ -170,21 +168,20 @@ fn push_and_poll_observe_identical_event_streams() {
 
     let publication = "subql_equiv_pub";
     common::create_publication(&mut setup, publication, "orders");
-    let push_slot = "subql_equiv_push";
-    let poll_slot = "subql_equiv_poll";
-    common::create_pgoutput_slot(&mut setup, push_slot);
-    common::create_pgoutput_slot(&mut setup, poll_slot);
+    let push_slot = db.slot("subql_equiv_push");
+    let poll_slot = db.slot("subql_equiv_poll");
+    common::create_pgoutput_slot(&mut setup, &push_slot);
+    common::create_pgoutput_slot(&mut setup, &poll_slot);
 
     let catalog = ParserDB::parse::<PostgreSqlDialect>(DDL).expect("parse DDL");
-    let push_config =
-        PgStreamingConfig::new(common::pg_replication_url(port), push_slot, publication);
-    let poll_config = PollingPgCdcConfig::new(common::pg_url(port), poll_slot, publication)
+    let push_config = PgStreamingConfig::new(db.url(), &push_slot, publication);
+    let poll_config = PollingPgCdcConfig::new(db.url(), &poll_slot, publication)
         .poll_interval(Duration::from_millis(50));
 
-    const N_INSERTS: i32 = 5;
-    const N_UPDATES: i32 = 3;
-    const N_DELETES: i32 = 2;
-    const N_TOTAL: usize = (N_INSERTS + N_UPDATES + N_DELETES) as usize;
+    const N_INSERTS: usize = 5;
+    const N_UPDATES: usize = 3;
+    const N_DELETES: usize = 2;
+    const N_TOTAL: usize = N_INSERTS + N_UPDATES + N_DELETES;
 
     current_thread_rt().block_on(async move {
         let mut push_source = PgStreamingCdcSource::connect(push_config, catalog)
@@ -240,22 +237,21 @@ fn push_and_poll_observe_identical_event_streams() {
 
         let kinds: Vec<EventKind> = push_canon.iter().map(|e| e.kind).collect();
         assert_eq!(
-            &kinds[..N_INSERTS as usize],
-            &vec![EventKind::Insert; N_INSERTS as usize][..],
+            &kinds[..N_INSERTS],
+            &vec![EventKind::Insert; N_INSERTS][..],
             "first {N_INSERTS} events must be INSERTs"
         );
         assert_eq!(
-            &kinds[N_INSERTS as usize..(N_INSERTS + N_UPDATES) as usize],
-            &vec![EventKind::Update; N_UPDATES as usize][..],
+            &kinds[N_INSERTS..(N_INSERTS + N_UPDATES)],
+            &vec![EventKind::Update; N_UPDATES][..],
             "next {N_UPDATES} events must be UPDATEs"
         );
         assert_eq!(
-            &kinds[(N_INSERTS + N_UPDATES) as usize..],
-            &vec![EventKind::Delete; N_DELETES as usize][..],
+            &kinds[(N_INSERTS + N_UPDATES)..],
+            &vec![EventKind::Delete; N_DELETES][..],
             "final {N_DELETES} events must be DELETEs"
         );
 
-        // First INSERT was id=1, price=10.0.
         let first = &push_events[0];
         assert_eq!(first.kind(), EventKind::Insert);
         assert!(matches!(
@@ -270,7 +266,6 @@ fn push_and_poll_observe_identical_event_streams() {
         println!("push and poll observed identical {N_TOTAL} events (canonical equality)");
     });
 
-    for slot in [push_slot, poll_slot] {
-        common::drop_slot(&mut setup, slot);
-    }
+    common::drop_slot(&mut setup, &push_slot);
+    common::drop_slot(&mut setup, &poll_slot);
 }
