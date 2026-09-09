@@ -258,10 +258,10 @@ impl HavingFunction {
 /// The column name a bare identifier or a two-part `table.column` spells.
 /// `None` for wildcards, longer qualifications, and expressions, which
 /// keeps the two-part assumption in one place.
-fn ident_name(expr: &Expr) -> Option<&str> {
+fn ident_name(expr: &Expr) -> Option<&Ident> {
     match expr {
-        Expr::Identifier(ident) => Some(&ident.value),
-        Expr::CompoundIdentifier(parts) if parts.len() == 2 => Some(&parts[1].value),
+        Expr::Identifier(ident) => Some(ident),
+        Expr::CompoundIdentifier(parts) if parts.len() == 2 => Some(&parts[1]),
         _ => None,
     }
 }
@@ -329,13 +329,11 @@ impl AggHaving {
 /// Extract a plain column name from a function argument, if it is a bare
 /// identifier or a two-part `table.column` compound identifier.
 /// Returns `None` for wildcards, expressions, or anything else.
-fn extract_column_arg(arg: &FunctionArg) -> Option<String> {
+fn extract_column_arg(arg: &FunctionArg) -> Option<&Ident> {
     match arg {
-        FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::Identifier(ident))) => {
-            Some(ident.value.clone())
-        }
+        FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::Identifier(ident))) => Some(ident),
         FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::CompoundIdentifier(parts))) => {
-            parts.last().map(|p| p.value.clone())
+            parts.last()
         }
         _ => None,
     }
@@ -348,7 +346,7 @@ fn extract_column_arg(arg: &FunctionArg) -> Option<String> {
 /// check on top (see [`resolve_numeric_agg_column`]).
 ///
 /// `display` is the upper-cased function name used in error messages.
-pub(crate) fn resolve_single_column_arg<DB: DatabaseLike>(
+pub(crate) fn resolve_single_column_arg<B: crate::backend::Backend, DB: DatabaseLike>(
     display: &str,
     f: &sqlparser::ast::Function,
     table_id: crate::TableId,
@@ -390,12 +388,12 @@ pub(crate) fn resolve_single_column_arg<DB: DatabaseLike>(
                     "{display} argument must be a plain column name, not an expression"
                 ))
             })?;
-            catalog_helpers::column_id(database, table_id, &col_name).ok_or(
+            written_column::<B, DB>(database, table_id, col_name).ok_or_else(|| {
                 RegisterError::UnknownColumn {
                     table_id,
-                    column: col_name,
-                },
-            )
+                    column: col_name.value.clone(),
+                }
+            })
         }
         _ => Err(RegisterError::UnsupportedSql(format!(
             "{display} requires a column argument"
@@ -408,14 +406,14 @@ pub(crate) fn resolve_single_column_arg<DB: DatabaseLike>(
 /// and `STDDEV` aliases). Layers a numeric-type constraint on top of
 /// [`resolve_single_column_arg`]: rejects `Bool`/`String` columns when the
 /// catalog exposes type information.
-fn resolve_numeric_agg_column<DB: DatabaseLike>(
+fn resolve_numeric_agg_column<B: crate::backend::Backend, DB: DatabaseLike>(
     func: &str,
     f: &sqlparser::ast::Function,
     table_id: crate::TableId,
     database: &DB,
 ) -> Result<crate::ColumnId, RegisterError> {
     let display = func.to_uppercase();
-    let column = resolve_single_column_arg(&display, f, table_id, database)?;
+    let column = resolve_single_column_arg::<B, DB>(&display, f, table_id, database)?;
 
     if let Some(kind) = catalog_helpers::column_scalar_family(database, table_id, column) {
         match kind {
@@ -466,7 +464,7 @@ fn resolve_numeric_agg_column<DB: DatabaseLike>(
 /// projection is equivalent to `SELECT *` for subql (which delivers full row
 /// images). Returns false for partial lists, duplicates, aliases, expressions,
 /// wildcards, or when the catalog cannot report the table's arity.
-fn is_complete_column_list<DB: DatabaseLike>(
+fn is_complete_column_list<B: crate::backend::Backend, DB: DatabaseLike>(
     items: &[SelectItem],
     table_id: crate::TableId,
     database: &DB,
@@ -485,7 +483,7 @@ fn is_complete_column_list<DB: DatabaseLike>(
         let Some(name) = ident_name(expr) else {
             return false;
         };
-        let Some(col) = catalog_helpers::column_id(database, table_id, name) else {
+        let Some(col) = written_column::<B, DB>(database, table_id, name) else {
             return false;
         };
         if seen.contains(&col) {
@@ -510,7 +508,7 @@ pub(super) fn extract_projection<B: crate::backend::Backend, DB: DatabaseLike>(
     // before anything else so no ungrouped path can accept one by accident: a
     // wildcard projection alongside a `GROUP BY` used to look like a plain row
     // subscription, which is the silent drop this whole surface exists to stop.
-    if let Some(groups) = group_columns(select, table_id, database)? {
+    if let Some(groups) = group_columns::<B, DB>(select, table_id, database)? {
         return grouped_projection::<B, DB>(select, &groups, table_id, database);
     }
 
@@ -536,7 +534,7 @@ pub(super) fn extract_projection<B: crate::backend::Backend, DB: DatabaseLike>(
     // `SELECT *`: subql delivers full row images regardless of the projection,
     // and diesel renders row queries as an explicit all-columns list. Partial
     // lists, aliases, or expressions fall through to the aggregate checks below.
-    if is_complete_column_list(items, table_id, database) {
+    if is_complete_column_list::<B, DB>(items, table_id, database) {
         return Ok(QueryProjection::Rows);
     }
 
@@ -557,7 +555,7 @@ pub(super) fn extract_projection<B: crate::backend::Backend, DB: DatabaseLike>(
             }
             SelectItem::Wildcard(_) => unreachable!("handled above"),
         };
-        aggregate_from_expr(expr, table_id, database).map(QueryProjection::Aggregate)
+        aggregate_from_expr::<B, DB>(expr, table_id, database).map(QueryProjection::Aggregate)
     } else {
         Err(RegisterError::UnsupportedSql(
             UNSUPPORTED_PROJECTION.to_string(),
@@ -569,7 +567,7 @@ pub(super) fn extract_projection<B: crate::backend::Backend, DB: DatabaseLike>(
 ///
 /// Shared by the plain and grouped paths so the two cannot drift on which
 /// aggregates are served or on how their arguments are read.
-fn aggregate_from_expr<DB: DatabaseLike>(
+fn aggregate_from_expr<B: crate::backend::Backend, DB: DatabaseLike>(
     expr: &Expr,
     table_id: crate::TableId,
     database: &DB,
@@ -627,12 +625,13 @@ fn aggregate_from_expr<DB: DatabaseLike>(
                                 .to_string(),
                         )
                     })?;
-                    let column = catalog_helpers::column_id(database, table_id, &col_name).ok_or(
-                        RegisterError::UnknownColumn {
-                            table_id,
-                            column: col_name,
-                        },
-                    )?;
+                    let column =
+                        written_column::<B, DB>(database, table_id, col_name).ok_or_else(|| {
+                            RegisterError::UnknownColumn {
+                                table_id,
+                                column: col_name.value.clone(),
+                            }
+                        })?;
                     Ok(AggSpec::CountColumn { column })
                 }
                 _ => Err(RegisterError::UnsupportedSql(
@@ -644,7 +643,7 @@ fn aggregate_from_expr<DB: DatabaseLike>(
             func @ ("sum" | "avg" | "var_pop" | "var_samp" | "variance" | "stddev_pop"
             | "stddev_samp" | "stddev"),
         ) => {
-            let column = resolve_numeric_agg_column(func, f, table_id, database)?;
+            let column = resolve_numeric_agg_column::<B, DB>(func, f, table_id, database)?;
             Ok(match func {
                 "sum" => AggSpec::Sum { column },
                 "avg" => AggSpec::Avg { column },
@@ -671,7 +670,7 @@ fn aggregate_from_expr<DB: DatabaseLike>(
 /// anything other than bare columns of this table: the fold works by letting a
 /// changed row name its own group, and it can only do that when the group is
 /// read from the row rather than computed from it.
-pub(crate) fn group_columns<DB: DatabaseLike>(
+pub(crate) fn group_columns<B: crate::backend::Backend, DB: DatabaseLike>(
     select: &Select,
     table_id: crate::TableId,
     database: &DB,
@@ -693,10 +692,10 @@ pub(crate) fn group_columns<DB: DatabaseLike>(
                     .to_string(),
             ));
         };
-        let column = catalog_helpers::column_id(database, table_id, name).ok_or_else(|| {
+        let column = written_column::<B, DB>(database, table_id, name).ok_or_else(|| {
             RegisterError::UnknownColumn {
                 table_id,
-                column: name.to_string(),
+                column: name.value.clone(),
             }
         })?;
         if columns.contains(&column) {
@@ -763,10 +762,10 @@ fn grouped_projection<B: crate::backend::Backend, DB: DatabaseLike>(
                     ));
                 };
                 let column =
-                    catalog_helpers::column_id(database, table_id, name).ok_or_else(|| {
+                    written_column::<B, DB>(database, table_id, name).ok_or_else(|| {
                         RegisterError::UnknownColumn {
                             table_id,
-                            column: name.to_string(),
+                            column: name.value.clone(),
                         }
                     })?;
                 if !groups.contains(&column) {
@@ -785,7 +784,7 @@ fn grouped_projection<B: crate::backend::Backend, DB: DatabaseLike>(
                             .to_string(),
                     ));
                 }
-                agg = Some(aggregate_from_expr(expr, table_id, database)?);
+                agg = Some(aggregate_from_expr::<B, DB>(expr, table_id, database)?);
             }
             _ => {
                 return Err(RegisterError::UnsupportedSql(
@@ -816,7 +815,7 @@ fn grouped_projection<B: crate::backend::Backend, DB: DatabaseLike>(
     let having = select
         .having
         .as_ref()
-        .map(|expr| having_from_expr(expr, &agg, table_id, database))
+        .map(|expr| having_from_expr::<B, DB>(expr, &agg, table_id, database))
         .transpose()?;
     Ok(QueryProjection::GroupedAggregate {
         groups: groups.to_vec(),
@@ -837,7 +836,7 @@ fn having_literal_text(expr: &Expr) -> Option<String> {
 /// Parse the one `HAVING` comparison a grouped fold can check in process:
 /// `COUNT(*)` or a family function over the projected column, against a
 /// numeric constant, either operand order.
-fn having_from_expr<DB: DatabaseLike>(
+fn having_from_expr<B: crate::backend::Backend, DB: DatabaseLike>(
     having: &Expr,
     projected: &AggSpec,
     table_id: crate::TableId,
@@ -868,7 +867,7 @@ fn having_from_expr<DB: DatabaseLike>(
             "HAVING threshold {threshold} is not a numeric constant"
         )));
     }
-    let compared = aggregate_from_expr(subject_expr, table_id, database)?;
+    let compared = aggregate_from_expr::<B, DB>(subject_expr, table_id, database)?;
     let subject = match &compared {
         AggSpec::CountStar => HavingSubject::RowCount,
         spec => {
@@ -963,7 +962,7 @@ fn extreme_literal(expr: &Expr) -> Option<sqlparser::ast::Value> {
 /// Parse the one `HAVING` comparison a grouped extreme can check in
 /// process: the projected extreme or `COUNT(*)` against a constant, either
 /// operand order. `None` sends the statement to the capture tier.
-fn extreme_having<DB: DatabaseLike>(
+fn extreme_having<B: crate::backend::Backend, DB: DatabaseLike>(
     having: &Expr,
     kind: ScalarAggKind,
     extreme_column: crate::ColumnId,
@@ -1011,7 +1010,8 @@ fn extreme_having<DB: DatabaseLike>(
                 ScalarAggKind::Min => "MIN",
                 ScalarAggKind::Max => "MAX",
             };
-            let column = resolve_single_column_arg(display, function, table_id, database).ok()?;
+            let column =
+                resolve_single_column_arg::<B, DB>(display, function, table_id, database).ok()?;
             if column != extreme_column {
                 return None;
             }
@@ -1041,7 +1041,7 @@ pub(crate) fn extract_grouped_extreme<B: crate::backend::Backend, DB: DatabaseLi
     let Some(select) = select_of(stmt) else {
         return Ok(None);
     };
-    let Some(groups) = group_columns(select, table_id, database)? else {
+    let Some(groups) = group_columns::<B, DB>(select, table_id, database)? else {
         return Ok(None);
     };
     let Some(columns) = groups
@@ -1069,10 +1069,10 @@ pub(crate) fn extract_grouped_extreme<B: crate::backend::Backend, DB: DatabaseLi
                 let Some(name) = ident_name(expr) else {
                     return Ok(None);
                 };
-                let Some(column) = catalog_helpers::column_id(database, table_id, name) else {
+                let Some(column) = written_column::<B, DB>(database, table_id, name) else {
                     return Err(RegisterError::UnknownColumn {
                         table_id,
-                        column: name.to_string(),
+                        column: name.value.clone(),
                     });
                 };
                 if !groups.contains(&column) {
@@ -1099,7 +1099,8 @@ pub(crate) fn extract_grouped_extreme<B: crate::backend::Backend, DB: DatabaseLi
                     ScalarAggKind::Min => "MIN",
                     ScalarAggKind::Max => "MAX",
                 };
-                let column = resolve_single_column_arg(display, function, table_id, database)?;
+                let column =
+                    resolve_single_column_arg::<B, DB>(display, function, table_id, database)?;
                 extreme = Some((kind, column));
             }
             _ => return Ok(None),
@@ -1116,7 +1117,7 @@ pub(crate) fn extract_grouped_extreme<B: crate::backend::Backend, DB: DatabaseLi
     };
     let having = match &select.having {
         None => None,
-        Some(expr) => match extreme_having(expr, kind, column, table_id, database) {
+        Some(expr) => match extreme_having::<B, DB>(expr, kind, column, table_id, database) {
             Some(having) => Some(having),
             // Outside the fast path: the capture tier answers instead.
             None => return Ok(None),
@@ -1144,7 +1145,7 @@ pub(crate) fn extract_grouped_extreme<B: crate::backend::Backend, DB: DatabaseLi
 ///
 /// Unlike [`extract_projection`], the column type is not constrained: `MIN`
 /// and `MAX` are well-defined on any orderable type.
-pub(crate) fn extract_scalar_aggregate<DB: DatabaseLike>(
+pub(crate) fn extract_scalar_aggregate<B: crate::backend::Backend, DB: DatabaseLike>(
     stmt: &Statement,
     table_id: crate::TableId,
     database: &DB,
@@ -1196,7 +1197,7 @@ pub(crate) fn extract_scalar_aggregate<DB: DatabaseLike>(
         ScalarAggKind::Min => "MIN",
         ScalarAggKind::Max => "MAX",
     };
-    let column = resolve_single_column_arg(display, f, table_id, database)?;
+    let column = resolve_single_column_arg::<B, DB>(display, f, table_id, database)?;
     Ok(Some((kind, column)))
 }
 
@@ -2114,12 +2115,12 @@ const fn qualified_parts(expr: &Expr) -> Option<(Option<&Ident>, &Ident)> {
 }
 
 /// The column a written reference names, quoting kept.
-fn written_column<DB: DatabaseLike>(
+fn written_column<B: crate::backend::Backend, DB: DatabaseLike>(
     database: &DB,
     table_id: crate::TableId,
     column: &Ident,
 ) -> Option<crate::ColumnId> {
-    catalog_helpers::column_id_for_name(
+    catalog_helpers::column_id_for_name::<B, DB>(
         database,
         table_id,
         &column.value,
@@ -2164,7 +2165,7 @@ fn written_name_part(ident: &Ident) -> TargetName<'_> {
     reason = "one pass classifies every conjunct against resolvers that close over the \
               subquery's alias, and splitting it would hand the closures around"
 )]
-pub(crate) fn membership_exists_parts<'a, DB: DatabaseLike>(
+pub(crate) fn membership_exists_parts<'a, B: crate::backend::Backend, DB: DatabaseLike>(
     query: &'a Query,
     table_id: crate::TableId,
     database: &DB,
@@ -2219,7 +2220,7 @@ pub(crate) fn membership_exists_parts<'a, DB: DatabaseLike>(
         if qualifier.is_some_and(|qualifier| !is_member_qualifier(qualifier)) {
             return None;
         }
-        written_column(database, member_table, column)
+        written_column::<B, DB>(database, member_table, column)
     };
     let subscribed_column = |expr: &Expr| -> Option<crate::ColumnId> {
         let (qualifier, column) = qualified_parts(expr)?;
@@ -2230,7 +2231,7 @@ pub(crate) fn membership_exists_parts<'a, DB: DatabaseLike>(
         {
             return None;
         }
-        written_column(database, table_id, column)
+        written_column::<B, DB>(database, table_id, column)
     };
     // Both builds resolve the membership column to classify the pair. Only
     // the `membership-term` half stores it.
@@ -2315,12 +2316,12 @@ pub(crate) fn membership_exists_parts<'a, DB: DatabaseLike>(
 }
 
 /// The compared columns of a bounded membership `EXISTS`, in written order.
-pub(super) fn check_membership_exists_bound<DB: DatabaseLike>(
+pub(super) fn check_membership_exists_bound<B: crate::backend::Backend, DB: DatabaseLike>(
     query: &Query,
     table_id: crate::TableId,
     database: &DB,
 ) -> Result<Vec<crate::ColumnId>, RegisterError> {
-    Ok(membership_exists_parts(query, table_id, database)?
+    Ok(membership_exists_parts::<B, DB>(query, table_id, database)?
         .pairs
         .into_iter()
         .map(|pair| pair.outer)
@@ -2332,12 +2333,12 @@ pub(super) fn check_membership_exists_bound<DB: DatabaseLike>(
 ///
 /// `None` when `query` is not the recognized form, which `resolve` reports as
 /// a shape that lost its seed read.
-pub(crate) fn exists_seed_select<DB: DatabaseLike>(
+pub(crate) fn exists_seed_select<B: crate::backend::Backend, DB: DatabaseLike>(
     query: &Query,
     table_id: crate::TableId,
     database: &DB,
 ) -> Option<String> {
-    let parts = membership_exists_parts(query, table_id, database).ok()?;
+    let parts = membership_exists_parts::<B, DB>(query, table_id, database).ok()?;
     let mut projection = String::new();
     for (position, pair) in parts.pairs.iter().enumerate() {
         if position > 0 {
@@ -2587,7 +2588,7 @@ mod membership_naming_tests {
                  AND s.viewer = current_setting('app.user_id', true))"#,
         );
 
-        let parts = membership_exists_parts(&subquery, docs, &db)
+        let parts = membership_exists_parts::<crate::backend::Postgres, _>(&subquery, docs, &db)
             .expect("the catalog knows a table named `my.shares`");
         assert_eq!(parts.pairs.len(), 1);
     }
@@ -2603,7 +2604,7 @@ mod membership_naming_tests {
                  AND s.viewer = current_setting('app.user_id', true))"#,
         );
 
-        let parts = membership_exists_parts(&subquery, docs, &db)
+        let parts = membership_exists_parts::<crate::backend::Postgres, _>(&subquery, docs, &db)
             .expect("the catalog knows `app.\"Shares\"`");
         assert_eq!(parts.pairs.len(), 1);
     }
@@ -2624,7 +2625,9 @@ mod membership_naming_tests {
                  AND s.viewer = current_setting('app.user_id', true))"#,
         );
 
-        let Err(error) = membership_exists_parts(&subquery, docs, &db) else {
+        let Err(error) =
+            membership_exists_parts::<crate::backend::Postgres, _>(&subquery, docs, &db)
+        else {
             panic!("a database-qualified name names nothing this catalog holds");
         };
         assert!(
@@ -2646,7 +2649,7 @@ mod membership_naming_tests {
                  AND "Shares".viewer = current_setting('app.user_id', true))"#,
         );
 
-        let parts = membership_exists_parts(&subquery, docs, &db)
+        let parts = membership_exists_parts::<crate::backend::Postgres, _>(&subquery, docs, &db)
             .expect("the qualifier names the membership table");
         assert_eq!(parts.pairs.len(), 1);
     }
@@ -2668,7 +2671,7 @@ mod membership_naming_tests {
                  AND s.viewer = current_setting('app.user_id', true))"#,
         );
 
-        let parts = membership_exists_parts(&subquery, shares, &db)
+        let parts = membership_exists_parts::<crate::backend::Postgres, _>(&subquery, shares, &db)
             .expect("the alias names the membership side, the written name the subscribed one");
         assert_eq!(parts.pairs.len(), 1);
     }
@@ -2694,8 +2697,9 @@ mod membership_naming_tests {
                      AND s.viewer = current_setting('app.user_id', true))"#
             ));
 
-            let parts = membership_exists_parts(&subquery, docs, &db)
-                .expect("the subscribed column is named as written");
+            let parts =
+                membership_exists_parts::<crate::backend::Postgres, _>(&subquery, docs, &db)
+                    .expect("the subscribed column is named as written");
             let [pair] = parts.pairs.as_slice() else {
                 panic!("one pair");
             };
@@ -2718,11 +2722,179 @@ mod membership_naming_tests {
                  AND s.viewer = current_setting('app.user_id', true))"#,
         );
 
-        let parts = membership_exists_parts(&subquery, docs, &db)
+        let parts = membership_exists_parts::<crate::backend::Postgres, _>(&subquery, docs, &db)
             .expect("the membership column is named as written");
         let [pair] = parts.pairs.as_slice() else {
             panic!("one pair");
         };
         assert_eq!(pair.inner, dotted);
+    }
+}
+
+/// How the filter path reads a written column name.
+///
+/// Every one of these surfaces takes a column name off a parsed statement,
+/// where the text and the quoting arrive separately, and a table declaring
+/// `"Owner"` beside `owner` is what tells them apart: PostgreSQL folds the
+/// unquoted spelling and keeps the quoted one, so the two are two columns.
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod written_column_tests {
+    use crate::{catalog_helpers, RegisterError};
+    use sql_traits::structs::ParserDB;
+    use sqlparser::dialect::PostgreSqlDialect;
+    const DDL: &str = r#"CREATE TABLE docs (
+            id INT PRIMARY KEY,
+            "Owner" INT,
+            owner INT,
+            "Amount" TEXT,
+            amount INT
+        );"#;
+    /// The ordinals of the quoted column and of the folded one beside it.
+    fn columns(db: &ParserDB) -> (crate::TableId, crate::ColumnId, crate::ColumnId) {
+        let docs = catalog_helpers::table_id(db, "docs").unwrap();
+        let quoted = catalog_helpers::column_id(db, docs, r#""Owner""#).unwrap();
+        let folded = catalog_helpers::column_id(db, docs, "owner").unwrap();
+        assert_ne!(quoted, folded);
+        (docs, quoted, folded)
+    }
+
+    fn expr_of(sql: &str) -> sqlparser::ast::Expr {
+        let statements = sqlparser::parser::Parser::parse_sql(&PostgreSqlDialect {}, sql).unwrap();
+        let [sqlparser::ast::Statement::Query(query)] = statements.as_slice() else {
+            panic!("one query");
+        };
+        let sqlparser::ast::SetExpr::Select(select) = query.body.as_ref() else {
+            panic!("a select");
+        };
+        let sqlparser::ast::Expr::BinaryOp { left, .. } =
+            select.selection.as_ref().expect("a WHERE")
+        else {
+            panic!("one comparison");
+        };
+        left.as_ref().clone()
+    }
+
+    /// The `WHERE` path, which the parser and the prefilter share.
+    #[test]
+    fn a_where_clause_reads_the_column_it_wrote() {
+        let db = ParserDB::parse::<PostgreSqlDialect>(DDL).unwrap();
+        let (docs, quoted, folded) = columns(&db);
+
+        for (sql, expected) in [
+            (r#"SELECT * FROM docs WHERE "Owner" = 1"#, quoted),
+            ("SELECT * FROM docs WHERE owner = 1", folded),
+            (r#"SELECT * FROM docs WHERE docs."Owner" = 1"#, quoted),
+            ("SELECT * FROM docs WHERE docs.owner = 1", folded),
+        ] {
+            let expr = expr_of(sql);
+            assert_eq!(
+                crate::compiler::literals::resolve_column_ref::<crate::backend::Postgres, _>(
+                    &expr, docs, &db
+                ),
+                Some(expected),
+                "{sql}"
+            );
+        }
+    }
+    /// A statement of `sql`, for the shape readers that take one.
+    fn statement_of(sql: &str) -> sqlparser::ast::Statement {
+        let statements = sqlparser::parser::Parser::parse_sql(&PostgreSqlDialect {}, sql).unwrap();
+        let [statement] = statements.as_slice() else {
+            panic!("one statement");
+        };
+        statement.clone()
+    }
+
+    /// MySQL and SQLite fold a delimited identifier, PostgreSQL does not.
+    ///
+    /// Measured on the engines' own rules: MySQL compares a column name
+    /// case-insensitively whether or not backticks were written, SQLite does
+    /// the same for a quoted name, and PostgreSQL keeps the spelling. So the
+    /// same written `"Owner"` must reach a column declared `Owner` on the
+    /// first two and refuse on the third, where `owner` is its own column.
+    #[test]
+    fn the_engine_decides_what_a_delimited_name_matches() {
+        let folded_ddl = "CREATE TABLE docs (id INT PRIMARY KEY, Owner INT);";
+
+        let lite = ParserDB::parse::<sqlparser::dialect::SQLiteDialect>(folded_ddl).unwrap();
+        let lite_docs = catalog_helpers::table_id(&lite, "docs").unwrap();
+        let expr = expr_of(r#"SELECT * FROM docs WHERE "Owner" = 1"#);
+        assert_eq!(
+            crate::compiler::literals::resolve_column_ref::<crate::backend::SQLite, _>(
+                &expr, lite_docs, &lite
+            ),
+            Some(1),
+            "SQLite folds a quoted name"
+        );
+
+        let my = ParserDB::parse::<sqlparser::dialect::MySqlDialect>(folded_ddl).unwrap();
+        let my_docs = catalog_helpers::table_id(&my, "docs").unwrap();
+        assert_eq!(
+            crate::compiler::literals::resolve_column_ref::<crate::backend::MySql, _>(
+                &expr, my_docs, &my
+            ),
+            Some(1),
+            "MySQL folds a delimited name"
+        );
+
+        // PostgreSQL keeps it, so the quoted spelling names the quoted
+        // column and nothing else: here the table declares only `owner`.
+        let pg = ParserDB::parse::<PostgreSqlDialect>(
+            "CREATE TABLE docs (id INT PRIMARY KEY, owner INT);",
+        )
+        .unwrap();
+        let pg_docs = catalog_helpers::table_id(&pg, "docs").unwrap();
+        assert_eq!(
+            crate::compiler::literals::resolve_column_ref::<crate::backend::Postgres, _>(
+                &expr, pg_docs, &pg
+            ),
+            None,
+            "PostgreSQL keeps a delimited name as written"
+        );
+    }
+
+    /// Projection and `GROUP BY` read their own spellings, so a mismatch
+    /// between them is a mismatch rather than two names folded into one.
+    #[test]
+    fn a_grouped_projection_reads_both_spellings() {
+        let db = ParserDB::parse::<PostgreSqlDialect>(DDL).unwrap();
+        let (docs, _, _) = columns(&db);
+
+        let matching = statement_of(r#"SELECT "Owner", COUNT(*) FROM docs GROUP BY "Owner""#);
+        super::extract_projection::<crate::backend::Postgres, _>(&matching, docs, &db)
+            .expect("the projected column is the grouped one");
+
+        let crossed = statement_of(r#"SELECT "Owner", COUNT(*) FROM docs GROUP BY owner"#);
+        let Err(error) =
+            super::extract_projection::<crate::backend::Postgres, _>(&crossed, docs, &db)
+        else {
+            panic!("`\"Owner\"` and `owner` are two columns, so the projection is not grouped");
+        };
+        assert!(
+            matches!(&error, RegisterError::UnsupportedSql(message)
+                if message.contains("projected but not grouped by")),
+            "{error:?}"
+        );
+    }
+
+    /// An aggregate reads its argument's own spelling, which decides
+    /// whether the column it names can be summed at all.
+    #[test]
+    fn an_aggregate_argument_reads_the_column_it_wrote() {
+        let db = ParserDB::parse::<PostgreSqlDialect>(DDL).unwrap();
+        let (docs, _, _) = columns(&db);
+
+        let numeric = statement_of("SELECT SUM(amount) FROM docs");
+        super::extract_projection::<crate::backend::Postgres, _>(&numeric, docs, &db)
+            .expect("`amount` is an integer column");
+
+        // `"Amount"` is the TEXT column beside it, and a text column is not
+        // summable, so folding the quoting away would accept this.
+        let textual = statement_of(r#"SELECT SUM("Amount") FROM docs"#);
+        assert!(
+            super::extract_projection::<crate::backend::Postgres, _>(&textual, docs, &db).is_err(),
+            "a TEXT column cannot be summed"
+        );
     }
 }

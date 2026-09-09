@@ -232,7 +232,7 @@ fn analyze_expr<B: SqlLiteralParse, DB: DatabaseLike>(
             low,
             high,
             negated: between_negated,
-        } => analyze_between(
+        } => analyze_between::<B, DB>(
             expr,
             low,
             high,
@@ -241,8 +241,10 @@ fn analyze_expr<B: SqlLiteralParse, DB: DatabaseLike>(
             database,
         ),
 
-        Expr::IsNull(expr) => analyze_null_check(expr, true ^ negated, table_id, database),
-        Expr::IsNotNull(expr) => analyze_null_check(expr, false ^ negated, table_id, database),
+        Expr::IsNull(expr) => analyze_null_check::<B, DB>(expr, true ^ negated, table_id, database),
+        Expr::IsNotNull(expr) => {
+            analyze_null_check::<B, DB>(expr, false ^ negated, table_id, database)
+        }
 
         Expr::Value(val) => match &val.value {
             SqlValue::Boolean(b) => Analysis::constant(*b ^ negated),
@@ -253,13 +255,13 @@ fn analyze_expr<B: SqlLiteralParse, DB: DatabaseLike>(
     }
 }
 
-fn analyze_null_check<DB: DatabaseLike>(
+fn analyze_null_check<B: crate::backend::Backend, DB: DatabaseLike>(
     expr: &Expr,
     is_null: bool,
     table_id: TableId,
     database: &DB,
 ) -> Analysis {
-    resolve_column(expr, table_id, database).map_or_else(Analysis::unknown, |column_id| {
+    resolve_column::<B, DB>(expr, table_id, database).map_or_else(Analysis::unknown, |column_id| {
         Analysis::indexed_atom(PlannerAtom::Null { column_id, is_null })
     })
 }
@@ -275,7 +277,7 @@ fn analyze_in_list<B: SqlLiteralParse, DB: DatabaseLike>(
         return Analysis::unknown();
     }
 
-    let Some(column_id) = resolve_column(expr, table_id, database) else {
+    let Some(column_id) = resolve_column::<B, DB>(expr, table_id, database) else {
         return Analysis::unknown();
     };
 
@@ -329,7 +331,7 @@ fn analyze_in_list<B: SqlLiteralParse, DB: DatabaseLike>(
     }
 }
 
-fn analyze_between<DB: DatabaseLike>(
+fn analyze_between<B: crate::backend::Backend, DB: DatabaseLike>(
     expr: &Expr,
     low: &Expr,
     high: &Expr,
@@ -337,7 +339,7 @@ fn analyze_between<DB: DatabaseLike>(
     table_id: TableId,
     database: &DB,
 ) -> Analysis {
-    let Some(column_id) = resolve_column(expr, table_id, database) else {
+    let Some(column_id) = resolve_column::<B, DB>(expr, table_id, database) else {
         return Analysis::unknown();
     };
 
@@ -371,7 +373,7 @@ fn analyze_between<DB: DatabaseLike>(
 
 /// Split a comparison into the column it names, the literal it compares
 /// against, and the operator oriented so the column reads on the left.
-fn column_and_literal<'e, DB: DatabaseLike>(
+fn column_and_literal<'e, B: crate::backend::Backend, DB: DatabaseLike>(
     left: &'e Expr,
     op: BinaryOperator,
     right: &'e Expr,
@@ -379,12 +381,12 @@ fn column_and_literal<'e, DB: DatabaseLike>(
     database: &DB,
 ) -> Option<(ColumnId, &'e Expr, BinaryOperator)> {
     if is_literal(right) {
-        if let Some(column_id) = resolve_column(left, table_id, database) {
+        if let Some(column_id) = resolve_column::<B, DB>(left, table_id, database) {
             return Some((column_id, right, op));
         }
     }
     if is_literal(left) {
-        if let Some(column_id) = resolve_column(right, table_id, database) {
+        if let Some(column_id) = resolve_column::<B, DB>(right, table_id, database) {
             return Some((column_id, left, flip_comparison(op)));
         }
     }
@@ -400,7 +402,7 @@ fn analyze_comparison<B: SqlLiteralParse, DB: DatabaseLike>(
     negated: bool,
 ) -> Analysis {
     let Some((column_id, literal, normalized_op)) =
-        column_and_literal(left, op, right, table_id, database)
+        column_and_literal::<B, DB>(left, op, right, table_id, database)
     else {
         return Analysis::unknown();
     };
@@ -477,12 +479,12 @@ fn flip_comparison(op: BinaryOperator) -> BinaryOperator {
     }
 }
 
-fn resolve_column<DB: DatabaseLike>(
+fn resolve_column<B: crate::backend::Backend, DB: DatabaseLike>(
     expr: &Expr,
     table_id: TableId,
     database: &DB,
 ) -> Option<ColumnId> {
-    super::literals::resolve_column_ref(expr, table_id, database)
+    super::literals::resolve_column_ref::<B, DB>(expr, table_id, database)
 }
 
 /// The index key for the literal in `expr` as compared against `column_id`,

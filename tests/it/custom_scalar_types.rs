@@ -106,6 +106,10 @@ impl CustomScalars for MyScalars {
 struct Custom;
 
 impl Backend for Custom {
+    /// The embedder's own engine here is PostgreSQL's, whose delimited
+    /// identifiers keep their case.
+    const DELIMITED_IDENTIFIERS_FOLD_CASE: bool = false;
+
     /// This backend speaks the PostgreSQL dialect, so it takes
     /// PostgreSQL's `LIKE` escape rule with it.
     const LIKE_ESCAPE: Option<LikeEscape> = Some(LikeEscape {

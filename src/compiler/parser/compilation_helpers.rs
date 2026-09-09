@@ -25,7 +25,7 @@ fn column_scalar_of<B: Backend, DB: DatabaseLike>(
     table_id: TableId,
     database: &DB,
 ) -> Option<ValueKindOf<B>> {
-    let col = resolve_column_ref(expr, table_id, database)?;
+    let col = resolve_column_ref::<B, DB>(expr, table_id, database)?;
     crate::catalog_helpers::column_scalar_kind::<B, DB>(database, table_id, col)
         .map(|kind| kind.value_kind())
 }
@@ -249,7 +249,7 @@ fn float_result_width<B: Backend, DB: DatabaseLike>(
     database: &DB,
     depth: usize,
 ) -> FloatResult {
-    if let Some(column) = resolve_column_ref(expr, table_id, database) {
+    if let Some(column) = resolve_column_ref::<B, DB>(expr, table_id, database) {
         return crate::catalog_helpers::column_comparison::<B, DB>(database, table_id, column)
             .and_then(|facts| facts.kind.declared_type())
             .and_then(crate::backend::DeclaredType::float_width);
@@ -372,12 +372,15 @@ where
                     // Whether the call names the caller is registration's
                     // question, since answering it needs `rls2fga`.
                     if sql_shape::is_caller_comparison(expr) {
-                        let tested = if resolve_column_ref(left, table_id, database).is_some() {
-                            left
-                        } else {
-                            right
-                        };
-                        if let Some(column) = resolve_column_ref(tested, table_id, database) {
+                        let tested =
+                            if resolve_column_ref::<B, DB>(left, table_id, database).is_some() {
+                                left
+                            } else {
+                                right
+                            };
+                        if let Some(column) =
+                            resolve_column_ref::<B, DB>(tested, table_id, database)
+                        {
                             let slot = out.term_slot(expr, alloc::vec![column])?;
                             out.push(Instruction::TermTruth(slot));
                             return Ok(());
@@ -518,17 +521,18 @@ where
         }
 
         col_expr @ (Expr::Identifier(_) | Expr::CompoundIdentifier(_)) => {
-            let col_id = resolve_column_ref(col_expr, table_id, database).ok_or_else(|| {
-                let col_name = match col_expr {
-                    Expr::Identifier(ident) => ident.value.clone(),
-                    Expr::CompoundIdentifier(parts) => parts[1].value.clone(),
-                    _ => unreachable!(),
-                };
-                RegisterError::UnknownColumn {
-                    table_id,
-                    column: col_name,
-                }
-            })?;
+            let col_id =
+                resolve_column_ref::<B, DB>(col_expr, table_id, database).ok_or_else(|| {
+                    let col_name = match col_expr {
+                        Expr::Identifier(ident) => ident.value.clone(),
+                        Expr::CompoundIdentifier(parts) => parts[1].value.clone(),
+                        _ => unreachable!(),
+                    };
+                    RegisterError::UnknownColumn {
+                        table_id,
+                        column: col_name,
+                    }
+                })?;
             // Reject a column whose declared type the runtime decoder cannot
             // resolve against the catalog (an unsupported SQL type).
             crate::catalog_helpers::column_scalar_kind::<B, DB>(database, table_id, col_id)
@@ -617,7 +621,7 @@ where
                 ));
             }
 
-            let Some(column) = resolve_column_ref(tested, table_id, database) else {
+            let Some(column) = resolve_column_ref::<B, DB>(tested, table_id, database) else {
                 return Err(RegisterError::UnsupportedSql(
                     "A membership subquery must test a column of the subscribed table. SubQL \
                      reads that column off each changed row to decide which subscribers the row \
@@ -640,7 +644,8 @@ where
             if *negated {
                 return Err(negated_term_refusal());
             }
-            let columns = sql_shape::check_membership_exists_bound(subquery, table_id, database)?;
+            let columns =
+                sql_shape::check_membership_exists_bound::<B, DB>(subquery, table_id, database)?;
             let slot = out.term_slot(expr, columns)?;
             out.push(Instruction::TermTruth(slot));
         }

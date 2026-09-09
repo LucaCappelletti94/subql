@@ -192,6 +192,10 @@ impl<V: postgres_jsonb_canonical::PgVersion + 'static> Backend for Postgres<V> {
             dangling: crate::compiler::vm::refusal::DanglingEscape::Fails,
         });
 
+    /// PostgreSQL keeps a delimited identifier exactly as written, which is
+    /// what makes `"Owner"` and `owner` two columns.
+    const DELIMITED_IDENTIFIERS_FOLD_CASE: bool = false;
+
     /// Measured on 16.11. Equality under a deterministic collation is byte
     /// equality, including for the database default, since `CREATE
     /// DATABASE` cannot select a nondeterministic collation. Ordering is
@@ -405,6 +409,10 @@ impl Backend for MySql {
             character: '\\',
             dangling: crate::compiler::vm::refusal::DanglingEscape::NoMatch,
         });
+
+    /// MySQL compares a column name case-insensitively whether or not it
+    /// was written in backticks.
+    const DELIMITED_IDENTIFIERS_FOLD_CASE: bool = true;
 
     /// Measured: MySQL answers `NULL` with warning 1365, even with
     /// `ERROR_FOR_DIVISION_BY_ZERO` in `sql_mode`, which raises on writes.
@@ -759,6 +767,9 @@ impl Backend for SQLite {
     /// SQLite gives `LIKE` no default escape: a backslash in a pattern
     /// matches a backslash, so no pattern can end with one dangling.
     const LIKE_ESCAPE: Option<crate::compiler::vm::refusal::LikeEscape> = None;
+
+    /// SQLite compares a column name case-insensitively, quoted or not.
+    const DELIMITED_IDENTIFIERS_FOLD_CASE: bool = true;
 
     fn compare_cross_kind_numeric(
         left: &Value<Self>,
