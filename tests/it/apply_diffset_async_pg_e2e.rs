@@ -22,7 +22,7 @@
 
 use crate::common;
 
-use diesel::{sql_query, QueryableByName, RunQueryDsl};
+use diesel::{sql_query, Connection, PgConnection, QueryableByName, RunQueryDsl};
 use diesel_async::{AsyncConnection, AsyncPgConnection};
 use sql_traits::structs::ParserDB;
 use sqlite_diff_rs::{
@@ -68,15 +68,15 @@ fn engine() -> SubscriptionEngine<ChangeEvent, DefaultIds, ParserDB> {
 #[ignore = "requires Docker; run with --ignored"]
 fn diffset_bytes_async_applies_patchset_bytes() {
     common::assert_docker_available();
-    let container = common::pg_with_wal2json();
-    let port = common::pg_port(&container);
+    let db = common::pg_database();
+    let url = db.url();
 
     common::multi_thread_rt().block_on(async move {
-        let mut verify = common::pg_connect(port);
+        let mut verify = PgConnection::establish(&url).expect("PG connection");
         sql_query(PG_DDL)
             .execute(&mut verify)
             .expect("create table");
-        let mut conn = AsyncPgConnection::establish(&common::pg_url(port))
+        let mut conn = AsyncPgConnection::establish(&url)
             .await
             .expect("async pg connect");
 
@@ -84,7 +84,6 @@ fn diffset_bytes_async_applies_patchset_bytes() {
         let adapter = PgAdapter::new(engine.database()).expect("the catalog indexes");
         let table = items_table();
 
-        // Two inserts, serialized to SQLite session patchset bytes in memory.
         let insert_bytes = PatchSet::<SimpleTable, String, Vec<u8>>::new()
             .insert(
                 Insert::from(table.clone())
@@ -127,7 +126,6 @@ fn diffset_bytes_async_applies_patchset_bytes() {
             ]
         );
 
-        // A non-key update, also carried as patchset bytes.
         let update_bytes = PatchSet::<SimpleTable, String, Vec<u8>>::new()
             .update(
                 Update::<_, PatchsetFormat, String, Vec<u8>>::from(table)
@@ -164,18 +162,18 @@ fn diffset_bytes_async_applies_patchset_bytes() {
 #[ignore = "requires Docker; run with --ignored"]
 fn apply_changeset_async_relocates_primary_key() {
     common::assert_docker_available();
-    let container = common::pg_with_wal2json();
-    let port = common::pg_port(&container);
+    let db = common::pg_database();
+    let url = db.url();
 
     common::multi_thread_rt().block_on(async move {
-        let mut verify = common::pg_connect(port);
+        let mut verify = PgConnection::establish(&url).expect("PG connection");
         sql_query(PG_DDL)
             .execute(&mut verify)
             .expect("create table");
         sql_query("INSERT INTO items (id, label, qty) VALUES (1, 'a', 10), (2, 'b', 200)")
             .execute(&mut verify)
             .expect("seed");
-        let mut conn = AsyncPgConnection::establish(&common::pg_url(port))
+        let mut conn = AsyncPgConnection::establish(&url)
             .await
             .expect("async pg connect");
 
@@ -203,7 +201,6 @@ fn apply_changeset_async_relocates_primary_key() {
                     label: "a".into(),
                     qty: 10
                 },
-                // id relocated 2 -> 20, relabelled, qty preserved.
                 Item {
                     id: 20,
                     label: "moved".into(),
@@ -221,18 +218,18 @@ fn apply_changeset_async_relocates_primary_key() {
 #[ignore = "requires Docker; run with --ignored"]
 fn diffset_bytes_async_applies_changeset_bytes_pk_change() {
     common::assert_docker_available();
-    let container = common::pg_with_wal2json();
-    let port = common::pg_port(&container);
+    let db = common::pg_database();
+    let url = db.url();
 
     common::multi_thread_rt().block_on(async move {
-        let mut verify = common::pg_connect(port);
+        let mut verify = PgConnection::establish(&url).expect("PG connection");
         sql_query(PG_DDL)
             .execute(&mut verify)
             .expect("create table");
         sql_query("INSERT INTO items (id, label, qty) VALUES (2, 'b', 200)")
             .execute(&mut verify)
             .expect("seed");
-        let mut conn = AsyncPgConnection::establish(&common::pg_url(port))
+        let mut conn = AsyncPgConnection::establish(&url)
             .await
             .expect("async pg connect");
 

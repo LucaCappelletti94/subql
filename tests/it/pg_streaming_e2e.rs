@@ -49,21 +49,19 @@ fn current_thread_rt() -> tokio::runtime::Runtime {
 #[ignore = "requires Docker; run with --ignored"]
 fn connect_against_real_pg() {
     common::assert_docker_available();
-    let container = common::pg_with_wal2json();
-    let port = common::pg_port(&container);
-
-    let mut setup = common::pg_connect(port);
+    let db = common::pg_database();
+    let mut setup = db.connect();
     sql_query(PG_DDL).execute(&mut setup).expect("create table");
     sql_query("ALTER TABLE orders REPLICA IDENTITY FULL")
         .execute(&mut setup)
         .expect("REPLICA IDENTITY FULL");
-    let slot = "subql_pg_streaming_connect";
+    let slot = db.slot("subql_pg_streaming_connect");
     let publication = "subql_pg_streaming_connect_pub";
     common::create_publication(&mut setup, publication, "orders");
-    common::create_pgoutput_slot(&mut setup, slot);
+    common::create_pgoutput_slot(&mut setup, &slot);
 
     let catalog = ParserDB::parse::<PostgreSqlDialect>(DDL).expect("parse DDL");
-    let config = PgStreamingConfig::new(common::pg_replication_url(port), slot, publication)
+    let config = PgStreamingConfig::new(db.url(), &slot, publication)
         .status_interval(Duration::from_secs(10))
         .buffer_capacity(1024);
 
@@ -73,7 +71,7 @@ fn connect_against_real_pg() {
             .expect("connect succeeds against live PG with valid slot");
     });
 
-    common::drop_slot(&mut setup, slot);
+    common::drop_slot(&mut setup, &slot);
 }
 
 /// Query the slot's `confirmed_flush_lsn` via a side connection and
@@ -84,6 +82,7 @@ fn confirmed_flush_lsn(conn: &mut diesel::PgConnection, slot: &str) -> Option<Pg
         #[diesel(sql_type = diesel::sql_types::Text)]
         confirmed_flush_lsn: String,
     }
+    // pg_lsn has no Diesel type mapping; the ::text cast requires raw SQL
     let rows: Vec<Row> = diesel::sql_query(format!(
         "SELECT confirmed_flush_lsn::text AS confirmed_flush_lsn \
          FROM pg_replication_slots WHERE slot_name = '{slot}'"
@@ -111,36 +110,32 @@ fn confirmed_flush_lsn(conn: &mut diesel::PgConnection, slot: &str) -> Option<Pg
 #[ignore = "requires Docker; run with --ignored"]
 fn next_event_delivers_an_insert_without_waiting_for_a_tick() {
     common::assert_docker_available();
-    let container = common::pg_with_wal2json();
-    let port = common::pg_port(&container);
-
-    let mut setup = common::pg_connect(port);
-    let mut dml = common::pg_connect(port);
+    let db = common::pg_database();
+    let mut setup = db.connect();
+    let mut dml = db.connect();
     sql_query(PG_DDL).execute(&mut setup).expect("create table");
     sql_query("ALTER TABLE orders REPLICA IDENTITY FULL")
         .execute(&mut setup)
         .expect("REPLICA IDENTITY FULL");
-    let slot = "subql_pg_streaming_next_event";
+    let slot = db.slot("subql_pg_streaming_next_event");
     let publication = "subql_pg_streaming_next_event_pub";
     common::create_publication(&mut setup, publication, "orders");
-    common::create_pgoutput_slot(&mut setup, slot);
+    common::create_pgoutput_slot(&mut setup, &slot);
 
-    // Far above the ceiling below, so an event arriving on the tick cannot be
-    // mistaken for one arriving on the wire.
+    // Status interval far above the ceiling so a tick-driven event cannot pass the latency test.
     const STATUS_INTERVAL: Duration = Duration::from_secs(30);
     const CEILING: Duration = Duration::from_secs(5);
 
     let catalog = ParserDB::parse::<PostgreSqlDialect>(DDL).expect("parse DDL");
-    let config = PgStreamingConfig::new(common::pg_replication_url(port), slot, publication)
-        .status_interval(STATUS_INTERVAL);
+    let config =
+        PgStreamingConfig::new(db.url(), &slot, publication).status_interval(STATUS_INTERVAL);
 
     current_thread_rt().block_on(async move {
         let mut source = PgStreamingCdcSource::connect(config, catalog)
             .await
             .expect("connect");
 
-        // Drive the INSERT BEFORE we start polling, so the COMMIT timestamp
-        // is captured strictly before next_event() begins waiting.
+        // Commit before any next_event() poll so the timestamp precedes the wait.
         let commit_at = Instant::now();
         sql_query("INSERT INTO orders VALUES (1, 5.0)")
             .execute(&mut dml)
@@ -151,9 +146,7 @@ fn next_event_delivers_an_insert_without_waiting_for_a_tick() {
             .expect("the event must arrive on the wire, not on the status interval")
             .expect("next_event must not error")
             .expect("source must not have shut down");
-        // Reported, never asserted. The timeout above is the whole ceiling,
-        // and this number includes the blocking INSERT and whatever the
-        // runner was doing, so an assertion on it would measure them.
+        // Reported only; wall-clock includes the blocking INSERT and runner scheduling.
         let observed_latency = commit_at.elapsed();
 
         assert_eq!(
@@ -170,7 +163,7 @@ fn next_event_delivers_an_insert_without_waiting_for_a_tick() {
         );
     });
 
-    common::drop_slot(&mut setup, slot);
+    common::drop_slot(&mut setup, &slot);
 }
 
 /// Explicit `ack(upto)` advances the slot's
@@ -182,37 +175,35 @@ fn next_event_delivers_an_insert_without_waiting_for_a_tick() {
 #[ignore = "requires Docker; run with --ignored"]
 fn ack_advances_confirmed_flush_lsn() {
     common::assert_docker_available();
-    let container = common::pg_with_wal2json();
-    let port = common::pg_port(&container);
-
-    let mut setup = common::pg_connect(port);
-    let mut dml = common::pg_connect(port);
-    let mut probe = common::pg_connect(port);
+    let db = common::pg_database();
+    let mut setup = db.connect();
+    let mut dml = db.connect();
+    let mut probe = db.connect();
     sql_query(PG_DDL).execute(&mut setup).expect("create table");
     sql_query("ALTER TABLE orders REPLICA IDENTITY FULL")
         .execute(&mut setup)
         .expect("REPLICA IDENTITY FULL");
-    let slot = "subql_pg_streaming_ack";
+    let slot = db.slot("subql_pg_streaming_ack");
     let publication = "subql_pg_streaming_ack_pub";
     common::create_publication(&mut setup, publication, "orders");
-    common::create_pgoutput_slot(&mut setup, slot);
+    common::create_pgoutput_slot(&mut setup, &slot);
 
     let catalog = ParserDB::parse::<PostgreSqlDialect>(DDL).expect("parse DDL");
-    let config = PgStreamingConfig::new(common::pg_replication_url(port), slot, publication);
+    let config = PgStreamingConfig::new(db.url(), &slot, publication);
+    // slot also needed inside the async block for the confirmed_flush_lsn probe
+    let slot_inner = slot.clone();
 
     current_thread_rt().block_on(async move {
         let mut source = PgStreamingCdcSource::connect(config, catalog)
             .await
             .expect("connect");
 
-        // Drive a small batch of events. Each carries its own LSN.
         for id in 1..=3 {
             sql_query(format!("INSERT INTO orders VALUES ({id}, {id}.0)"))
                 .execute(&mut dml)
                 .unwrap_or_else(|e| panic!("insert id={id}: {e}"));
         }
 
-        // Drain three events, capture the final LSN.
         let mut last_lsn = PgLsn(0);
         for _ in 0..3 {
             let ev = tokio::time::timeout(ARRIVAL, source.next_event())
@@ -228,19 +219,13 @@ fn ack_advances_confirmed_flush_lsn() {
             "events must carry a non-zero LSN; got {last_lsn:?}"
         );
 
-        // Acknowledge up to the last seen LSN. The inner task should
-        // emit a StandbyStatusUpdate immediately; PG should advance
-        // `confirmed_flush_lsn` to at most this value within a short
-        // window.
         source.ack(last_lsn).await.expect("ack");
 
-        // Poll the slot's confirmed_flush_lsn until it advances to at least
-        // `last_lsn`. A no-op `ack` never advances it, so the loop's deadline
-        // is liveness rather than a latency claim.
+        // Loop is a liveness check; a no-op ack would never advance the LSN.
         let deadline = Instant::now() + ARRIVAL;
         let mut advanced = None;
         while Instant::now() < deadline {
-            if let Some(observed) = confirmed_flush_lsn(&mut probe, slot) {
+            if let Some(observed) = confirmed_flush_lsn(&mut probe, &slot_inner) {
                 if observed >= last_lsn {
                     advanced = Some(observed);
                     break;
@@ -255,16 +240,14 @@ fn ack_advances_confirmed_flush_lsn() {
                  ack() must surface a StandbyStatusUpdate to the server"
             )
         });
-        println!(
-            "ack({}/{}) -> confirmed_flush_lsn {}/{}",
-            (last_lsn.0 >> 32) as u32,
-            (last_lsn.0 & 0xFFFF_FFFF) as u32,
-            (observed.0 >> 32) as u32,
-            (observed.0 & 0xFFFF_FFFF) as u32,
-        );
+        let lsn_hi = u32::try_from(last_lsn.0 >> 32).expect("high 32 bits fit u32");
+        let lsn_lo = u32::try_from(last_lsn.0 & 0xFFFF_FFFF).expect("low 32 bits fit u32");
+        let obs_hi = u32::try_from(observed.0 >> 32).expect("high 32 bits fit u32");
+        let obs_lo = u32::try_from(observed.0 & 0xFFFF_FFFF).expect("low 32 bits fit u32");
+        println!("ack({lsn_hi}/{lsn_lo}) -> confirmed_flush_lsn {obs_hi}/{obs_lo}");
     });
 
-    common::drop_slot(&mut setup, slot);
+    common::drop_slot(&mut setup, &slot);
 }
 
 /// The periodic status-update pump bumps the observability counter while the
@@ -277,21 +260,19 @@ fn ack_advances_confirmed_flush_lsn() {
 #[ignore = "requires Docker; run with --ignored"]
 fn pump_increments_status_update_counter_during_idle() {
     common::assert_docker_available();
-    let container = common::pg_with_wal2json();
-    let port = common::pg_port(&container);
-
-    let mut setup = common::pg_connect(port);
+    let db = common::pg_database();
+    let mut setup = db.connect();
     sql_query(PG_DDL).execute(&mut setup).expect("create table");
     sql_query("ALTER TABLE orders REPLICA IDENTITY FULL")
         .execute(&mut setup)
         .expect("REPLICA IDENTITY FULL");
-    let slot = "subql_pg_streaming_pump_counter";
+    let slot = db.slot("subql_pg_streaming_pump_counter");
     let publication = "subql_pg_streaming_pump_counter_pub";
     common::create_publication(&mut setup, publication, "orders");
-    common::create_pgoutput_slot(&mut setup, slot);
+    common::create_pgoutput_slot(&mut setup, &slot);
 
     let catalog = ParserDB::parse::<PostgreSqlDialect>(DDL).expect("parse DDL");
-    let config = PgStreamingConfig::new(common::pg_replication_url(port), slot, publication)
+    let config = PgStreamingConfig::new(db.url(), &slot, publication)
         .status_interval(Duration::from_millis(100));
 
     current_thread_rt().block_on(async move {
@@ -305,9 +286,7 @@ fn pump_increments_status_update_counter_during_idle() {
             "counter should start at 0 after connect"
         );
 
-        // Three ticks, which at a hundred-millisecond interval an idle source
-        // reaches in under a second. A pump that never fires never gets
-        // there, however long this waits.
+        // A pump that never fires never reaches 3, however long this waits.
         let deadline = Instant::now() + ARRIVAL;
         let mut observed = 0;
         while Instant::now() < deadline {
@@ -324,7 +303,7 @@ fn pump_increments_status_update_counter_during_idle() {
         println!("status_updates_sent while idle: {observed}");
     });
 
-    common::drop_slot(&mut setup, slot);
+    common::drop_slot(&mut setup, &slot);
 }
 
 /// Idle through an impatient server's `wal_sender_timeout`
@@ -338,22 +317,21 @@ fn pump_increments_status_update_counter_during_idle() {
 #[ignore = "requires Docker; run with --ignored"]
 fn connection_survives_wal_sender_timeout() {
     common::assert_docker_available();
-    let container = common::pg_with_wal2json_impatient(Duration::from_secs(3));
-    let port = common::pg_port(&container);
-
-    let mut setup = common::pg_connect(port);
-    let mut dml = common::pg_connect(port);
+    let db = common::pg_database();
+    db.set("wal_sender_timeout", "3s");
+    let mut setup = db.connect();
+    let mut dml = db.connect();
     sql_query(PG_DDL).execute(&mut setup).expect("create table");
     sql_query("ALTER TABLE orders REPLICA IDENTITY FULL")
         .execute(&mut setup)
         .expect("REPLICA IDENTITY FULL");
-    let slot = "subql_pg_streaming_survive";
+    let slot = db.slot("subql_pg_streaming_survive");
     let publication = "subql_pg_streaming_survive_pub";
     common::create_publication(&mut setup, publication, "orders");
-    common::create_pgoutput_slot(&mut setup, slot);
+    common::create_pgoutput_slot(&mut setup, &slot);
 
     let catalog = ParserDB::parse::<PostgreSqlDialect>(DDL).expect("parse DDL");
-    let config = PgStreamingConfig::new(common::pg_replication_url(port), slot, publication)
+    let config = PgStreamingConfig::new(db.url(), &slot, publication)
         .status_interval(Duration::from_millis(500));
 
     current_thread_rt().block_on(async move {
@@ -361,23 +339,11 @@ fn connection_survives_wal_sender_timeout() {
             .await
             .expect("connect");
 
-        // Idle for 5s, longer than the 3s wal_sender_timeout. The
-        // server tears down replication connections that go silent
-        // for that long. The periodic pump should keep us alive.
         tokio::time::sleep(Duration::from_secs(5)).await;
 
-        // The delivery below is the whole claim, so nothing is asserted about
-        // the counter. It cannot carry one: `status_updates_sent` counts
-        // periodic ticks, explicit acks and replies to the server's own
-        // keepalive requests alike, so a positive count would not prove the
-        // periodic arm fired. Measured, by stretching the pump's interval to
-        // an hour: the connection survives on the keepalive replies alone.
-        // What the periodic arm does on its own is
-        // `pump_increments_status_update_counter_during_idle`.
+        // status_updates_sent counts pumps, acks, and keepalive replies alike; delivery is the claim.
         let pumped = source.status_updates_sent();
 
-        // Drive an INSERT now. The connection must still be alive to
-        // deliver it.
         sql_query("INSERT INTO orders VALUES (1, 5.0)")
             .execute(&mut dml)
             .expect("insert after idle");
@@ -394,7 +360,7 @@ fn connection_survives_wal_sender_timeout() {
         );
     });
 
-    common::drop_slot(&mut setup, slot);
+    common::drop_slot(&mut setup, &slot);
 }
 
 /// Bounded back-pressure. With `buffer_capacity = 4` and 100
@@ -405,24 +371,21 @@ fn connection_survives_wal_sender_timeout() {
 #[ignore = "requires Docker; run with --ignored"]
 fn back_pressure_under_slow_consumer_preserves_order_and_count() {
     common::assert_docker_available();
-    let container = common::pg_with_wal2json();
-    let port = common::pg_port(&container);
-
-    let mut setup = common::pg_connect(port);
-    let mut dml = common::pg_connect(port);
+    let db = common::pg_database();
+    let mut setup = db.connect();
+    let mut dml = db.connect();
     sql_query(PG_DDL).execute(&mut setup).expect("create table");
     sql_query("ALTER TABLE orders REPLICA IDENTITY FULL")
         .execute(&mut setup)
         .expect("REPLICA IDENTITY FULL");
-    let slot = "subql_pg_streaming_backpressure";
+    let slot = db.slot("subql_pg_streaming_backpressure");
     let publication = "subql_pg_streaming_backpressure_pub";
     common::create_publication(&mut setup, publication, "orders");
-    common::create_pgoutput_slot(&mut setup, slot);
+    common::create_pgoutput_slot(&mut setup, &slot);
 
     let catalog = ParserDB::parse::<PostgreSqlDialect>(DDL).expect("parse DDL");
     // Tiny buffer forces back-pressure: 100 inserts >> 4-slot channel.
-    let config = PgStreamingConfig::new(common::pg_replication_url(port), slot, publication)
-        .buffer_capacity(4);
+    let config = PgStreamingConfig::new(db.url(), &slot, publication).buffer_capacity(4);
 
     const N: i32 = 100;
 
@@ -431,25 +394,18 @@ fn back_pressure_under_slow_consumer_preserves_order_and_count() {
             .await
             .expect("connect");
 
-        // Burst 100 inserts before draining anything. By the time we
-        // first await `next_event`, the source's inner task will have
-        // begun reading them from CopyBoth and pushing to the bounded
-        // mpsc; with capacity 4, it will hit `send().await` and yield
-        // back to the consumer for cooperation.
+        // Insert before draining so the source hits back-pressure before the consumer polls.
         for id in 1..=N {
             sql_query(format!("INSERT INTO orders VALUES ({id}, {id}.0)"))
                 .execute(&mut dml)
                 .unwrap_or_else(|e| panic!("insert id={id}: {e}"));
         }
 
-        // Let the task fill its buffer + start back-pressuring.
         tokio::time::sleep(Duration::from_millis(50)).await;
 
-        // Drain all N events. If the inner task drops events under
-        // back-pressure, fewer than N arrive. If ordering is broken,
-        // the observed ids won't be 1..=N.
         let schema = ParserDB::parse::<PostgreSqlDialect>(DDL).expect("parse DDL");
-        let mut observed_ids = Vec::with_capacity(N as usize);
+        let n = usize::try_from(N).expect("N fits usize");
+        let mut observed_ids = Vec::with_capacity(n);
         for _ in 0..N {
             let ev = tokio::time::timeout(ARRIVAL, source.next_event())
                 .await
@@ -469,7 +425,7 @@ fn back_pressure_under_slow_consumer_preserves_order_and_count() {
 
         assert_eq!(
             observed_ids.len(),
-            N as usize,
+            n,
             "must receive all {N} events; got {}",
             observed_ids.len()
         );
@@ -481,7 +437,7 @@ fn back_pressure_under_slow_consumer_preserves_order_and_count() {
         println!("back-pressure: drained {N} events through a 4-slot buffer in commit order");
     });
 
-    common::drop_slot(&mut setup, slot);
+    common::drop_slot(&mut setup, &slot);
 }
 
 /// Dropping the source cleanly shuts down the inner task.
@@ -493,21 +449,19 @@ fn back_pressure_under_slow_consumer_preserves_order_and_count() {
 #[ignore = "requires Docker; run with --ignored"]
 fn drop_source_shuts_down_inner_task() {
     common::assert_docker_available();
-    let container = common::pg_with_wal2json();
-    let port = common::pg_port(&container);
-
-    let mut setup = common::pg_connect(port);
+    let db = common::pg_database();
+    let mut setup = db.connect();
     sql_query(PG_DDL).execute(&mut setup).expect("create table");
     sql_query("ALTER TABLE orders REPLICA IDENTITY FULL")
         .execute(&mut setup)
         .expect("REPLICA IDENTITY FULL");
-    let slot = "subql_pg_streaming_shutdown";
+    let slot = db.slot("subql_pg_streaming_shutdown");
     let publication = "subql_pg_streaming_shutdown_pub";
     common::create_publication(&mut setup, publication, "orders");
-    common::create_pgoutput_slot(&mut setup, slot);
+    common::create_pgoutput_slot(&mut setup, &slot);
 
     let catalog = ParserDB::parse::<PostgreSqlDialect>(DDL).expect("parse DDL");
-    let config = PgStreamingConfig::new(common::pg_replication_url(port), slot, publication)
+    let config = PgStreamingConfig::new(db.url(), &slot, publication)
         .status_interval(Duration::from_millis(100));
 
     current_thread_rt().block_on(async move {
@@ -515,25 +469,19 @@ fn drop_source_shuts_down_inner_task() {
             .await
             .expect("connect");
 
-        // Clone the task-exited handle BEFORE dropping the source so
-        // we can observe shutdown from outside its lifetime.
+        // Clone before drop so we can observe shutdown after the source is gone.
         let task_exited = source.task_exited_handle();
 
-        // Confirm the inner task is actually running first. Give it
-        // a couple of pump cadences.
         tokio::time::sleep(Duration::from_millis(250)).await;
         assert!(
             !task_exited.load(std::sync::atomic::Ordering::Relaxed),
             "inner task must still be running before drop"
         );
 
-        // Drop the source. The cooperative shutdown signal fires; the
-        // inner task's select! polls the shutdown arm first (biased)
-        // and breaks out of the loop. The drop guard sets the flag.
+        // Shutdown is cooperative; the biased select! polls the cancel arm before the WAL read.
         drop(source);
 
-        // Poll until task_exited flips. A leaked task never flips it, so the
-        // deadline is liveness rather than a claim about how fast drop is.
+        // Loop is a liveness check; a leaked task never flips the flag.
         let deadline = Instant::now() + ARRIVAL;
         let mut observed_exit = false;
         while Instant::now() < deadline {
@@ -550,7 +498,7 @@ fn drop_source_shuts_down_inner_task() {
         println!("inner task exited cleanly after source drop");
     });
 
-    common::drop_slot(&mut setup, slot);
+    common::drop_slot(&mut setup, &slot);
 }
 
 /// `events_received` counter is incremented as the inner task
@@ -561,22 +509,20 @@ fn drop_source_shuts_down_inner_task() {
 #[ignore = "requires Docker; run with --ignored"]
 fn events_received_counter_tracks_pushed_events() {
     common::assert_docker_available();
-    let container = common::pg_with_wal2json();
-    let port = common::pg_port(&container);
-
-    let mut setup = common::pg_connect(port);
-    let mut dml = common::pg_connect(port);
+    let db = common::pg_database();
+    let mut setup = db.connect();
+    let mut dml = db.connect();
     sql_query(PG_DDL).execute(&mut setup).expect("create table");
     sql_query("ALTER TABLE orders REPLICA IDENTITY FULL")
         .execute(&mut setup)
         .expect("REPLICA IDENTITY FULL");
-    let slot = "subql_pg_streaming_events_counter";
+    let slot = db.slot("subql_pg_streaming_events_counter");
     let publication = "subql_pg_streaming_events_counter_pub";
     common::create_publication(&mut setup, publication, "orders");
-    common::create_pgoutput_slot(&mut setup, slot);
+    common::create_pgoutput_slot(&mut setup, &slot);
 
     let catalog = ParserDB::parse::<PostgreSqlDialect>(DDL).expect("parse DDL");
-    let config = PgStreamingConfig::new(common::pg_replication_url(port), slot, publication);
+    let config = PgStreamingConfig::new(db.url(), &slot, publication);
 
     current_thread_rt().block_on(async move {
         let mut source = PgStreamingCdcSource::connect(config, catalog)
@@ -595,7 +541,6 @@ fn events_received_counter_tracks_pushed_events() {
                 .execute(&mut dml)
                 .unwrap_or_else(|e| panic!("insert id={id}: {e}"));
         }
-        // Drain all events so we're sure the inner task has pushed them.
         for _ in 0..N {
             let ev = tokio::time::timeout(ARRIVAL, source.next_event())
                 .await
@@ -614,5 +559,5 @@ fn events_received_counter_tracks_pushed_events() {
         println!("events_received after {N} inserts: {observed}");
     });
 
-    common::drop_slot(&mut setup, slot);
+    common::drop_slot(&mut setup, &slot);
 }

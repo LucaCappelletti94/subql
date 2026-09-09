@@ -198,9 +198,8 @@ fn pg_rows() -> [NewPgGroup; 12] {
 fn postgres_keys_match_group_by_equality() {
     use schema::pg_groups::dsl as groups;
 
-    let container = common::pg_with_wal2json();
-    let port = common::pg_port(&container);
-    let mut connection = common::pg_connect(port);
+    let db = common::pg_database();
+    let mut connection = db.connect();
     connection
         .batch_execute(
             "CREATE COLLATION ci (provider = icu, locale = 'und-u-ks-level2', deterministic = false);
@@ -298,7 +297,7 @@ fn postgres_keys_match_group_by_equality() {
         jsonb_encoder.encode(&[Value::Jsonb(rows[11].jsonb_value.clone())])
     );
 
-    let connector = PgDieselConnector::new(common::pg_connect(port));
+    let connector = PgDieselConnector::new(db.connect());
     let query = ReadQuery::owned(
         String::from("SELECT id FROM pg_groups WHERE jsonb_value = $1 ORDER BY id"),
         vec![Value::Jsonb(rows[0].jsonb_value.clone())],
@@ -324,9 +323,8 @@ struct NewMysqlGroup {
 fn mysql_keys_match_binary_collations_and_decimal_equality() {
     use schema::mysql_groups::dsl as groups;
 
-    let container = common::mysql_8();
-    let port = common::mysql_port(&container);
-    let mut connection = common::mysql_connect(port);
+    let db = common::mysql_database();
+    let mut connection = db.connect();
     connection
         .batch_execute(
             "CREATE TABLE mysql_groups (
@@ -410,7 +408,7 @@ fn mysql_keys_match_binary_collations_and_decimal_equality() {
     )])
     .is_none());
 
-    let connector = MysqlDieselConnector::new(common::mysql_connect(port));
+    let connector = MysqlDieselConnector::new(db.connect());
     let query = ReadQuery::owned(
         String::from("SELECT id FROM mysql_groups WHERE decimal_value = ? ORDER BY id"),
         vec![Value::Decimal(BigDecimal::from_str("1.00").unwrap())],

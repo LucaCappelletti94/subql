@@ -29,24 +29,21 @@ fn current_thread_rt() -> tokio::runtime::Runtime {
 #[ignore = "requires Docker; run with --ignored"]
 fn polling_source_drains_insert_and_updates_counters() {
     common::assert_docker_available();
-    let container = common::pg_with_wal2json();
-    let port = common::pg_port(&container);
-
-    let mut setup = common::pg_connect(port);
-    let mut dml = common::pg_connect(port);
+    let db = common::pg_database();
+    let mut setup = db.connect();
+    let mut dml = db.connect();
     sql_query(PG_DDL).execute(&mut setup).expect("create table");
     sql_query("ALTER TABLE orders REPLICA IDENTITY FULL")
         .execute(&mut setup)
         .expect("REPLICA IDENTITY FULL");
-    let slot = "subql_polling_smoke";
+    let slot = db.slot("subql_polling_smoke");
     let publication = "subql_polling_smoke_pub";
     common::create_publication(&mut setup, publication, "orders");
-    common::create_pgoutput_slot(&mut setup, slot);
+    common::create_pgoutput_slot(&mut setup, &slot);
 
     let catalog = ParserDB::parse::<PostgreSqlDialect>(DDL).expect("parse DDL");
-    // The polling source uses the regular SQL URL, NOT the replication
-    // one. Replication mode is push-source-only.
-    let config = PollingPgCdcConfig::new(common::pg_url(port), slot, publication)
+    // Polling uses the regular SQL URL; replication mode is push-source only.
+    let config = PollingPgCdcConfig::new(db.url(), &slot, publication)
         .poll_interval(Duration::from_millis(50));
 
     current_thread_rt().block_on(async move {
@@ -69,9 +66,6 @@ fn polling_source_drains_insert_and_updates_counters() {
             .expect("source closed");
         assert_eq!(event.kind(), EventKind::Insert);
 
-        // After at least one drain that produced an event, counters
-        // must reflect it. Polls may include extra empty drains from
-        // before the INSERT landed; that is part of the polling cost.
         assert!(source.events_received() >= 1);
         assert!(source.polls_issued() >= 1);
         let avg_batch = source.average_drain_batch_size();
@@ -89,5 +83,5 @@ fn polling_source_drains_insert_and_updates_counters() {
         );
     });
 
-    common::drop_slot(&mut setup, slot);
+    common::drop_slot(&mut setup, &slot);
 }

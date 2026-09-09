@@ -22,6 +22,7 @@ use crate::common;
 use diesel::{sql_query, MysqlConnection, RunQueryDsl};
 use sql_traits::structs::ParserDB;
 use sqlparser::dialect::MySqlDialect;
+use std::sync::Arc;
 use subql::backend::{MySql, ScalarFamily, Value};
 use subql::reexec::{
     AutoResolvingEngine, Connector, MysqlDieselConnector, SessionSetup, SnapshotResult, SyncMode,
@@ -90,11 +91,9 @@ fn orders_row(id: i64, price: f64) -> Vec<Value<MySql>> {
 #[ignore = "requires Docker; run with --ignored"]
 fn scaffold_registers_both_and_executes_scalar() {
     common::assert_docker_available();
-    let container = common::mysql_8();
-    let port = common::mysql_port(&container);
-
-    let mut conn_setup = common::mysql_connect(port);
-    let conn_exec = common::mysql_connect(port);
+    let db = common::mysql_database();
+    let mut conn_setup = db.connect();
+    let conn_exec = db.connect();
 
     setup_mysql(&mut conn_setup, &[(1, 5.0), (2, 9.0)]);
 
@@ -157,11 +156,9 @@ fn scaffold_registers_both_and_executes_scalar() {
 #[ignore = "requires Docker; run with --ignored"]
 fn snapshot_reads_value_and_binlog_pos_from_mysql() {
     common::assert_docker_available();
-    let container = common::mysql_8();
-    let port = common::mysql_port(&container);
-
-    let mut conn_setup = common::mysql_connect(port);
-    let conn_exec = common::mysql_connect(port);
+    let db = common::mysql_database();
+    let mut conn_setup = db.connect();
+    let conn_exec = db.connect();
 
     setup_mysql(&mut conn_setup, &[(1, 5.0), (2, 9.0)]);
 
@@ -203,13 +200,10 @@ fn snapshot_reads_value_and_binlog_pos_from_mysql() {
 #[ignore = "requires Docker; run with --ignored"]
 fn delete_displacing_extreme_resolves_via_mysql_connector() {
     common::assert_docker_available();
-    let container = common::mysql_8();
-    let port = common::mysql_port(&container);
-
-    let mut conn_setup = common::mysql_connect(port);
-    let mut conn_dml = common::mysql_connect(port);
-    let conn_exec = common::mysql_connect(port);
-
+    let db = common::mysql_database();
+    let mut conn_setup = db.connect();
+    let mut conn_dml = db.connect();
+    let conn_exec = db.connect();
     setup_mysql(&mut conn_setup, &[(1, 5.0), (2, 9.0)]);
 
     let cat = catalog();
@@ -277,10 +271,8 @@ fn delete_displacing_extreme_resolves_via_mysql_connector() {
 #[ignore = "requires Docker; run with --ignored"]
 fn execute_scalar_row_decodes_integer_aggregate_seed() {
     common::assert_docker_available();
-    let container = common::mysql_8();
-    let port = common::mysql_port(&container);
-
-    let mut setup = common::mysql_connect(port);
+    let mysql_db = common::mysql_database();
+    let mut setup = mysql_db.connect();
     sql_query("CREATE TABLE nums (id INT PRIMARY KEY, amount INT)")
         .execute(&mut setup)
         .expect("CREATE TABLE nums");
@@ -321,7 +313,7 @@ fn execute_scalar_row_decodes_integer_aggregate_seed() {
     // to the last digit. A sum of squares would be 56 and is what
     // SQLite's seed carries instead, since it has no variance function
     // at all.
-    let connector = MysqlDieselConnector::new(common::mysql_connect(port));
+    let connector = MysqlDieselConnector::new(mysql_db.connect());
     let (row, _checkpoint) = connector
         .execute_scalar_row(&bundle.query.as_read_query(), &bundle.kinds, &())
         .expect("execute_scalar_row");
@@ -351,19 +343,19 @@ fn execute_scalar_row_decodes_integer_aggregate_seed() {
 #[ignore = "requires Docker; run with --ignored"]
 fn every_read_reports_a_position_taken_before_its_snapshot() {
     common::assert_docker_available();
-    let container = common::mysql_8();
-    let port = common::mysql_port(&container);
-    let mut conn = common::mysql_connect(port);
+    let db = Arc::new(common::mysql_database());
+    let mut conn = db.connect();
     setup_mysql(&mut conn, &[(1, 5.0)]);
 
     // Each lock name carries a column, so MySQL cannot fold the condition to a
     // constant and take the lock before its read view exists. The gate holds
     // the name the lowest id builds, which a clustered-index scan reaches
     // first.
-    let sql = "SELECT count(*) AS v FROM orders WHERE GET_LOCK(CONCAT('park_scalar_', id), 60) = 1";
+    let sql = "SELECT count(*) AS v FROM orders WHERE GET_LOCK(CONCAT(DATABASE(), '_park_scalar_', id), 60) = 1";
+    let db2 = Arc::clone(&db);
     let ((value, position), after_commit) =
-        common::park_a_mysql_read(port, "park_scalar_1", &insert(2), move || {
-            MysqlDieselConnector::new(common::mysql_connect(port))
+        common::park_a_mysql_read(&db, "park_scalar_1", &insert(2), move || {
+            MysqlDieselConnector::new(db2.connect())
                 .execute_scalar(
                     &subql::reexec::ReadQuery::without_binds(sql),
                     ScalarFamily::Int,
@@ -381,10 +373,11 @@ fn every_read_reports_a_position_taken_before_its_snapshot() {
         "the scalar read's position must sit behind the commit at {after_commit:?}"
     );
 
-    let sql = "SELECT id FROM orders WHERE GET_LOCK(CONCAT('park_page_', id), 60) = 1 ORDER BY id";
+    let sql = "SELECT id FROM orders WHERE GET_LOCK(CONCAT(DATABASE(), '_park_page_', id), 60) = 1 ORDER BY id";
+    let db2 = Arc::clone(&db);
     let (page, after_commit) =
-        common::park_a_mysql_read(port, "park_page_1", &insert(3), move || {
-            MysqlDieselConnector::new(common::mysql_connect(port))
+        common::park_a_mysql_read(&db, "park_page_1", &insert(3), move || {
+            MysqlDieselConnector::new(db2.connect())
                 .read_page(&subql::reexec::ReadQuery::without_binds(sql), 1 << 20, &())
                 .expect("page read")
         });
@@ -400,10 +393,11 @@ fn every_read_reports_a_position_taken_before_its_snapshot() {
         "the page read's position must sit behind the commit at {after_commit:?}"
     );
 
-    let sql = "SELECT count(*) AS c0 FROM orders WHERE GET_LOCK(CONCAT('park_seed_', id), 60) = 1";
+    let sql = "SELECT count(*) AS c0 FROM orders WHERE GET_LOCK(CONCAT(DATABASE(), '_park_seed_', id), 60) = 1";
+    let db2 = Arc::clone(&db);
     let ((values, position), after_commit) =
-        common::park_a_mysql_read(port, "park_seed_1", &insert(4), move || {
-            MysqlDieselConnector::new(common::mysql_connect(port))
+        common::park_a_mysql_read(&db, "park_seed_1", &insert(4), move || {
+            MysqlDieselConnector::new(db2.connect())
                 .execute_scalar_row(
                     &subql::reexec::ReadQuery::without_binds(sql),
                     &[ScalarFamily::Int],
@@ -439,13 +433,11 @@ impl SessionSetup for MarkerSetup {
 #[ignore = "requires Docker; run with --ignored"]
 fn session_setup_runs_on_each_read_sync_mysql() {
     common::assert_docker_available();
-    let container = common::mysql_8();
-    let port = common::mysql_port(&container);
-
+    let db = common::mysql_database();
     let read_marker = "SELECT @@max_sort_length";
     let setup = MarkerSetup(vec!["SET SESSION max_sort_length = 1234".to_string()]);
     let connector: MysqlDieselConnector<MarkerSetup> =
-        MysqlDieselConnector::with_session_setup(common::mysql_connect(port));
+        MysqlDieselConnector::with_session_setup(db.connect());
 
     let (value, _) = connector
         .execute_scalar(
@@ -473,7 +465,7 @@ fn session_setup_runs_on_each_read_sync_mysql() {
         "read_page ran the setup first"
     );
 
-    let plain = MysqlDieselConnector::new(common::mysql_connect(port));
+    let plain = MysqlDieselConnector::new(db.connect());
     let (value, _) = plain
         .execute_scalar(
             &subql::reexec::ReadQuery::without_binds(read_marker),

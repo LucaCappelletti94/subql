@@ -42,10 +42,8 @@ struct ThingRow {
 #[ignore = "requires Docker; run with --ignored"]
 fn apply_patchset_bool_roundtrip_insert_update_delete() {
     common::assert_docker_available();
-    let container = common::pg_with_wal2json();
-    let port = common::pg_port(&container);
-
-    let mut conn = common::pg_connect(port);
+    let db = common::pg_database();
+    let mut conn = db.connect();
     sql_query(PG_DDL).execute(&mut conn).expect("create table");
 
     // subql catalog mirrors the PG DDL so the adapter can resolve

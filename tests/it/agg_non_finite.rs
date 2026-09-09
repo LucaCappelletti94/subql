@@ -231,9 +231,8 @@ fn sqlite_folds_infinity() {
 fn mysql_refuses_a_non_finite_double() {
     use diesel::connection::SimpleConnection as _;
 
-    let container = crate::common::mysql_8();
-    let port = crate::common::mysql_port(&container);
-    let mut connection = crate::common::mysql_connect(port);
+    let db = crate::common::mysql_database();
+    let mut connection = db.connect();
     connection
         .batch_execute("CREATE TABLE non_finite (f DOUBLE)")
         .expect("the table is created");

@@ -41,9 +41,6 @@ use subql::visibility::shapes::Shapes;
 use subql::visibility::store::{Enumeration, Replay, Replayer, Requery};
 use subql::visibility::{EventRow, Verdict, VisibilityPolicy};
 use subql::{catalog_helpers, ParserDB};
-use testcontainers::core::{IntoContainerPort, WaitFor};
-use testcontainers::runners::AsyncRunner;
-use testcontainers::{ContainerAsync, GenericImage, ImageExt};
 
 /// Everything a policy over one schema needs, from one translation.
 ///
@@ -130,34 +127,16 @@ CREATE POLICY p ON docs FOR SELECT USING (
           WHERE team_members.team_id = docs.team_id AND team_members.user_id = current_user));
 ";
 
-/// Pinned rather than `latest`, and handed over only once the gRPC surface has
-/// answered a call.
+/// A client on this run's shared OpenFGA whose first call has already come
+/// back.
 ///
-/// The line the service logs first is not readiness: it precedes binding the
-/// gRPC listener, and a published port with nothing behind it yet resets the
-/// connection rather than refusing it, so a client built on that line can fail
-/// its first call. A call that succeeded is the only condition worth waiting on.
-///
-/// Started through the async runner, not the blocking one: the blocking runner
-/// parks the thread it is called on, and this test is already being driven by a
-/// runtime, so parking it deadlocks rather than waits.
-async fn openfga() -> (ContainerAsync<GenericImage>, OpenFgaServiceClient<Channel>) {
-    let container = GenericImage::new("openfga/openfga", "v1.8.13")
-        .with_wait_for(WaitFor::message_on_stdout("starting openfga service"))
-        // The gRPC port, which the image does not declare, so it has to be
-        // mapped explicitly before it can be reached.
-        .with_exposed_port(8081.tcp())
-        .with_cmd(["run"])
-        .with_startup_timeout(Duration::from_secs(60))
-        .start()
+/// The shared-server acquisition is blocking and this test is driven by a
+/// runtime, so it runs on the blocking pool rather than parking the runtime.
+async fn openfga() -> OpenFgaServiceClient<Channel> {
+    let port = tokio::task::spawn_blocking(crate::common::openfga_port)
         .await
-        .expect("start openfga");
-    let port = container
-        .get_host_port_ipv4(8081.tcp())
-        .await
-        .expect("grpc port");
-    let client = serving_client(port).await;
-    (container, client)
+        .expect("acquire the shared openfga");
+    serving_client(port).await
 }
 
 /// A client whose first call has already come back, or a panic carrying the
@@ -182,7 +161,7 @@ async fn serving_client(port: u16) -> OpenFgaServiceClient<Channel> {
 #[tokio::test(flavor = "current_thread")]
 #[ignore = "requires docker"]
 async fn a_question_the_row_does_not_settle_is_answered_by_the_service() {
-    let (_container, mut client) = openfga().await;
+    let mut client = openfga().await;
 
     // What rls2fga makes of the schema: the model, the descriptions subql reads,
     // and which relations answer which statement. All from one translation, so
@@ -280,7 +259,7 @@ async fn a_question_the_row_does_not_settle_is_answered_by_the_service() {
 #[tokio::test(flavor = "current_thread")]
 #[ignore = "requires docker"]
 async fn a_batch_over_the_cap_is_split_and_stays_positional() {
-    let (_container, mut client) = openfga().await;
+    let mut client = openfga().await;
 
     let wired = wiring(SCHEMA);
     let docs = catalog_helpers::table_id::<subql::backend::Postgres, _>(&wired.db, "docs")
@@ -383,7 +362,7 @@ ALTER TABLE docs ENABLE ROW LEVEL SECURITY;
 CREATE POLICY p ON docs FOR SELECT USING (owner_id = current_user);
 ";
 
-    let (_container, mut client) = openfga().await;
+    let mut client = openfga().await;
 
     let wired = wiring(OWNED);
     let docs = catalog_helpers::table_id::<subql::backend::Postgres, _>(&wired.db, "docs")
@@ -488,7 +467,7 @@ CREATE POLICY p ON docs FOR SELECT USING (
             AND team_members.expires_at > now()));
 ";
 
-    let (_container, mut client) = openfga().await;
+    let mut client = openfga().await;
 
     let wired = wiring(EXPIRING);
     let members =
@@ -676,7 +655,7 @@ fn plain_membership(object: &str, subject: &str) -> Record {
 #[tokio::test(flavor = "current_thread")]
 #[ignore = "requires docker"]
 async fn a_group_keeps_every_members_facts_in_one_reconcile() {
-    let (_container, mut client) = openfga().await;
+    let mut client = openfga().await;
 
     let wired = wiring(SHARED_REGION);
     let model = wired.model.clone();
@@ -792,7 +771,7 @@ async fn a_group_keeps_every_members_facts_in_one_reconcile() {
 #[tokio::test(flavor = "current_thread")]
 #[ignore = "requires docker"]
 async fn two_members_contradicting_one_fact_are_refused_before_any_write() {
-    let (_container, mut client) = openfga().await;
+    let mut client = openfga().await;
 
     let wired = wiring(SHARED_REGION);
     let model = wired.model.clone();
@@ -875,7 +854,7 @@ async fn two_members_contradicting_one_fact_are_refused_before_any_write() {
 #[tokio::test(flavor = "current_thread")]
 #[ignore = "requires docker"]
 async fn a_reconcile_removes_a_fact_for_an_object_the_event_never_named() {
-    let (_container, mut client) = openfga().await;
+    let mut client = openfga().await;
 
     let wired = wiring(WHOLE_SHAPE);
     let share_table =
@@ -1054,7 +1033,7 @@ CREATE POLICY notes_p ON notes FOR ALL USING (
   OR owner = ANY(string_to_array(current_setting('app.subjects', true), ',')));
 ";
 
-    let (_container, mut client) = openfga().await;
+    let mut client = openfga().await;
 
     let wired = wiring(HELD_KEYS);
     let notes = catalog_helpers::table_id::<subql::backend::Postgres, _>(&wired.db, "notes")

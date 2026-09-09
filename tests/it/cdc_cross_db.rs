@@ -75,7 +75,7 @@ mod dml_setup {
     use super::NewReading;
     use diesel::prelude::*;
 
-    pub(super) fn setup_postgres(pg: &mut PgConnection) {
+    pub(super) fn setup_postgres(pg: &mut PgConnection, slot: &str) {
         diesel::sql_query(
             "CREATE TABLE IF NOT EXISTS readings (
             sensor_id INT PRIMARY KEY,
@@ -91,9 +91,7 @@ mod dml_setup {
             .execute(pg)
             .expect("PG REPLICA IDENTITY FULL");
 
-        diesel::sql_query("SELECT pg_create_logical_replication_slot('subql_test', 'wal2json')")
-            .execute(pg)
-            .expect("PG create replication slot");
+        crate::common::create_slot(pg, slot);
     }
 
     pub(super) fn setup_mysql(my: &mut MysqlConnection) {
@@ -164,38 +162,15 @@ mod dml_setup {
             .execute(my)
             .expect("MySQL delete");
     }
-
-    // CDC capture: PostgreSQL via pg_logical_slot_get_changes
-
-    pub(super) fn pg_read_changes(pg: &mut PgConnection) -> Vec<String> {
-        #[derive(diesel::QueryableByName)]
-        struct WalChange {
-            #[diesel(sql_type = diesel::sql_types::Text)]
-            data: String,
-        }
-
-        let changes: Vec<WalChange> = diesel::sql_query(
-            "SELECT data FROM pg_logical_slot_get_changes(\
-            'subql_test', NULL, NULL, \
-            'format-version', '2', \
-            'include-pk', 'true'\
-        )",
-        )
-        .load(pg)
-        .expect("pg_logical_slot_get_changes");
-
-        changes.into_iter().map(|c| c.data).collect()
-    }
 }
 
 mod engine_setup {
-    use super::dml_setup::{apply_dml, pg_read_changes, setup_mysql, setup_postgres};
+    use super::dml_setup::{apply_dml, setup_mysql, setup_postgres};
     use super::iot_catalog;
     use crate::common::{
-        assert_docker_available, maxwell_collect, mysql_networked, mysql_port, mysql_url, pg_port,
-        pg_url, pg_with_wal2json, start_maxwell,
+        assert_docker_available, drain_slot, maxwell_collect, mysql_database, pg_database,
+        start_maxwell,
     };
-    use diesel::prelude::*;
     use sql_traits::structs::ParserDB;
     use sqlparser::dialect::{MySqlDialect, PostgreSqlDialect};
     use std::collections::BTreeSet;
@@ -286,11 +261,6 @@ mod engine_setup {
     fn cross_db_cdc_parity() {
         assert_docker_available();
 
-        // Unique names to avoid collisions with parallel test runs
-        let pid = std::process::id();
-        let network = format!("subql-test-{pid}");
-        let mysql_name = format!("subql-mysql-{pid}");
-
         // Maxwell output directory (bind-mounted into the container).
         // Must be world-writable so the Maxwell process inside the container can write.
         let maxwell_dir = tempfile::tempdir().expect("create maxwell tempdir");
@@ -305,27 +275,25 @@ mod engine_setup {
             .expect("tempdir path")
             .to_string();
 
-        let pg_container = pg_with_wal2json();
-        let mysql_container = mysql_networked(&network, &mysql_name);
+        let pg_db = pg_database();
+        let my_db = mysql_database();
 
-        let _maxwell_container = start_maxwell(&network, &mysql_name, &maxwell_path);
+        let _maxwell_container = start_maxwell(&my_db, &maxwell_path);
 
-        let pg_url = pg_url(pg_port(&pg_container));
-        let my_url = mysql_url(mysql_port(&mysql_container));
-
-        let mut pg = PgConnection::establish(&pg_url).expect("PG connection");
-        let mut my = MysqlConnection::establish(&my_url).expect("MySQL connection");
+        let mut pg = pg_db.connect();
+        let mut my = my_db.connect();
 
         // DDL setup
-        setup_postgres(&mut pg);
+        let slot = pg_db.slot("subql_test");
+        setup_postgres(&mut pg, &slot);
         setup_mysql(&mut my);
 
         // Apply DML to both databases
         apply_dml(&mut pg, &mut my);
 
         // Capture CDC events
-        let pg_messages = pg_read_changes(&mut pg);
-        let mx_messages = maxwell_collect(&maxwell_path, "readings", 4);
+        let pg_messages = drain_slot(&mut pg, &slot);
+        let mx_messages = maxwell_collect(&maxwell_path, &my_db, "readings", 4);
 
         // Set up engines, one per CDC source
         let mut pg_engine = setup_pg_engine(iot_catalog());

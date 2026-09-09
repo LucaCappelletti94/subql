@@ -99,9 +99,9 @@ fn final_rows() -> Vec<Item> {
 }
 
 /// Drain every pending wal2json v2 change and parse it to row events.
-fn drain(pg: &mut PgConnection) -> Vec<MessageV2> {
+fn drain(pg: &mut PgConnection, slot: &str) -> Vec<MessageV2> {
     let mut events = Vec::new();
-    for line in &common::drain_slot(pg, SLOT) {
+    for line in &common::drain_slot(pg, slot) {
         events.extend(parse_wal2json_v2(line.as_bytes()).unwrap());
     }
     events
@@ -111,15 +111,15 @@ fn drain(pg: &mut PgConnection) -> Vec<MessageV2> {
 #[ignore = "requires Docker; run with --ignored"]
 fn changeset_emit_propagates_pk_change_to_replica() {
     common::assert_docker_available();
-    let container = common::pg_with_wal2json();
-    let port = common::pg_port(&container);
-    let mut pg = common::pg_connect(port);
+    let db = common::pg_database();
+    let mut pg = db.connect();
+    let slot = db.slot(SLOT);
 
     sql_query(PG_DDL).execute(&mut pg).unwrap();
     sql_query("ALTER TABLE items REPLICA IDENTITY FULL")
         .execute(&mut pg)
         .unwrap();
-    common::create_slot(&mut pg, SLOT);
+    common::create_slot(&mut pg, &slot);
     let catalog = ParserDB::parse::<PostgreSqlDialect>(SUBQL_PG_DDL).unwrap();
 
     // Replica engine and adapter over the SQLite catalog.
@@ -140,7 +140,7 @@ fn changeset_emit_propagates_pk_change_to_replica() {
         .execute(&mut pg)
         .unwrap();
     }
-    let seed_events = drain(&mut pg);
+    let seed_events = drain(&mut pg, &slot);
     assert!(!seed_events.is_empty(), "seed drain yielded no row events");
     let seed_changeset = wal2json_changeset_builder(&catalog, &seed_events).unwrap();
     sqlite_engine
@@ -163,7 +163,7 @@ fn changeset_emit_propagates_pk_change_to_replica() {
     sql_query("DELETE FROM items WHERE id = 3")
         .execute(&mut pg)
         .unwrap();
-    let mutate_events = drain(&mut pg);
+    let mutate_events = drain(&mut pg, &slot);
     assert!(!mutate_events.is_empty(), "mutate drain yielded no events");
     let mutate_changeset = wal2json_changeset_builder(&catalog, &mutate_events).unwrap();
     sqlite_engine

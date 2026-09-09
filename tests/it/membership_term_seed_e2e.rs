@@ -219,8 +219,8 @@ fn delivers(values: &[i64], project: i64) -> bool {
 #[ignore = "requires Docker"]
 fn the_described_seed_read_runs_and_admits_a_parent_with_no_rows_yet() {
     common::assert_docker_available();
-    let container = common::pg_with_wal2json();
-    let mut pg = common::pg_connect(common::pg_port(&container));
+    let db = common::pg_database();
+    let mut pg = db.connect();
 
     create_schema(&mut pg);
     seed_data(&mut pg);

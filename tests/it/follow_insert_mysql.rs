@@ -35,8 +35,8 @@ diesel::table! {
 #[ignore = "requires Docker"]
 fn follow_inserted_row_via_execute_returning_id() {
     common::assert_docker_available();
-    let container = common::mysql_8();
-    let mut conn = common::mysql_connect(common::mysql_port(&container));
+    let db = common::mysql_database();
+    let mut conn = db.connect();
 
     // A genuine auto-generated primary key: the id is minted by the DB.
     diesel::sql_query("CREATE TABLE users (id INT AUTO_INCREMENT PRIMARY KEY, name TEXT)")

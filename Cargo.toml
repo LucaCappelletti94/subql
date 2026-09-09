@@ -295,7 +295,7 @@ arbitrary = { version = "1", features = ["derive"] }
 # seeds a `UUID` primary key through the typed DSL and must not depend on
 # an apply feature to get the column type.
 diesel = { version = "2", features = ["postgres", "mysql", "sqlite", "numeric", "chrono", "serde_json", "uuid"] }
-testcontainers = { version = "0.27", features = ["blocking"] }
+testcontainers = { version = "0.27", features = ["blocking", "reusable-containers"] }
 
 # Constructing the `UUID` keys that parity test seeds. Already in the
 # graph as a library dependency, but an integration test sees only the

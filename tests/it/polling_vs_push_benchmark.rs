@@ -243,17 +243,15 @@ async fn spawn_poll(
 #[ignore = "requires Docker; run with --ignored. Benchmark, not unit test."]
 fn polling_vs_push_latency_comparison() {
     common::assert_docker_available();
-    let container = common::pg_with_wal2json();
-    let port = common::pg_port(&container);
-
-    let mut setup = common::pg_connect(port);
-    let mut dml = common::pg_connect(port);
+    let db = common::pg_database();
+    let mut setup = db.connect();
+    let mut dml = db.connect();
     sql_query(PG_DDL).execute(&mut setup).expect("create table");
     sql_query("ALTER TABLE orders REPLICA IDENTITY FULL")
         .execute(&mut setup)
         .expect("REPLICA IDENTITY FULL");
 
-    // Separate slot per measurement so the runs do not interfere.
+    // One slot per measurement so the runs do not interfere.
     fn setup_slot(setup: &mut diesel::PgConnection, slot: &str) -> String {
         let pub_name = format!("{slot}_pub");
         common::create_publication(setup, &pub_name, "orders");
@@ -261,12 +259,17 @@ fn polling_vs_push_latency_comparison() {
         pub_name
     }
 
-    let push_pub = setup_slot(&mut setup, "bench_push");
-    let poll10_pub = setup_slot(&mut setup, "bench_poll_10");
-    let poll100_pub = setup_slot(&mut setup, "bench_poll_100");
-    let poll1000_pub = setup_slot(&mut setup, "bench_poll_1000");
+    let bench_push = db.slot("bench_push");
+    let bench_poll_10 = db.slot("bench_poll_10");
+    let bench_poll_100 = db.slot("bench_poll_100");
+    let bench_poll_1000 = db.slot("bench_poll_1000");
 
-    let pg_url = common::pg_replication_url(port);
+    let push_pub = setup_slot(&mut setup, &bench_push);
+    let poll10_pub = setup_slot(&mut setup, &bench_poll_10);
+    let poll100_pub = setup_slot(&mut setup, &bench_poll_100);
+    let poll1000_pub = setup_slot(&mut setup, &bench_poll_1000);
+
+    let pg_url = db.url();
 
     let rt = current_thread_rt();
     let (push_stats, poll_10, poll_100, poll_1000) = rt.block_on(async {
@@ -275,13 +278,11 @@ fn polling_vs_push_latency_comparison() {
         let (rx, task) = spawn_push(
             ParserDB::parse::<PostgreSqlDialect>(DDL).expect("parse DDL"),
             pg_url.clone(),
-            "bench_push".to_string(),
+            bench_push.clone(),
             push_pub,
         )
         .await;
-        // Give the spawned source time to actually start streaming
-        // before we drive inserts. Otherwise the first few inserts
-        // commit before START_REPLICATION even completes.
+        // Wait for the source to start streaming before driving inserts.
         tokio::time::sleep(Duration::from_millis(500)).await;
         let commit_times = drive_inserts(&mut dml, 1_000, gap).await;
         let deadline = Instant::now() + Duration::from_secs(10);
@@ -298,7 +299,7 @@ fn polling_vs_push_latency_comparison() {
         let (rx, task) = spawn_poll(
             ParserDB::parse::<PostgreSqlDialect>(DDL).expect("parse DDL"),
             pg_url.clone(),
-            "bench_poll_10".to_string(),
+            bench_poll_10.clone(),
             poll10_pub,
             interval,
         )
@@ -319,7 +320,7 @@ fn polling_vs_push_latency_comparison() {
         let (rx, task) = spawn_poll(
             ParserDB::parse::<PostgreSqlDialect>(DDL).expect("parse DDL"),
             pg_url.clone(),
-            "bench_poll_100".to_string(),
+            bench_poll_100.clone(),
             poll100_pub,
             interval,
         )
@@ -340,7 +341,7 @@ fn polling_vs_push_latency_comparison() {
         let (rx, task) = spawn_poll(
             ParserDB::parse::<PostgreSqlDialect>(DDL).expect("parse DDL"),
             pg_url.clone(),
-            "bench_poll_1000".to_string(),
+            bench_poll_1000.clone(),
             poll1000_pub,
             interval,
         )
@@ -372,9 +373,6 @@ fn polling_vs_push_latency_comparison() {
     println!("long-running consumer).");
     println!();
 
-    // Sanity assertions: push must beat polling at every interval (in
-    // median). If the inequality holds, the polling-interval-floor
-    // effect is real and the architecture choice is justified.
     let median = |stats: &LatencyStats| -> Duration {
         let mut s = stats.samples.clone();
         s.sort();
@@ -393,20 +391,15 @@ fn polling_vs_push_latency_comparison() {
         push_median < poll_1000_median,
         "push median ({push_median:?}) must beat poll@1000ms median ({poll_1000_median:?})"
     );
-    // Poll @ 10ms is roughly as fast as push (~5-15ms either way). Just
-    // sanity-check the test ran by asserting both finished with samples.
+    // Poll @ 10ms is roughly as fast as push; just verify the run produced samples.
     assert!(
         !poll_10.samples.is_empty(),
         "poll @ 10ms must produce samples"
     );
     let _ = poll_10_median;
 
-    for slot in [
-        "bench_push",
-        "bench_poll_10",
-        "bench_poll_100",
-        "bench_poll_1000",
-    ] {
-        common::drop_slot(&mut setup, slot);
-    }
+    common::drop_slot(&mut setup, &bench_push);
+    common::drop_slot(&mut setup, &bench_poll_10);
+    common::drop_slot(&mut setup, &bench_poll_100);
+    common::drop_slot(&mut setup, &bench_poll_1000);
 }

@@ -46,8 +46,8 @@ fn ddl(conn: &mut PgConnection, statement: &str) {
 #[test]
 #[ignore = "requires Docker"]
 fn the_audit_names_every_table_that_omits_the_previous_row() {
-    let container = common::pg_with_wal2json();
-    let mut conn = common::pg_connect(common::pg_port(&container));
+    let db = common::pg_database();
+    let mut conn = db.connect();
 
     // A fresh database has no user tables, so nothing to report. This is
     // the assertion that catches a query matching the system catalogs.

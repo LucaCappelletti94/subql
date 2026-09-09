@@ -1012,10 +1012,9 @@ mod tests {
     #[test]
     #[ignore = "requires Docker; run with --ignored"]
     fn the_generated_schema_creates_on_postgres() {
-        let container = crate::common::pg_with_wal2json();
-        let port = crate::common::pg_port(&container);
+        let db = crate::common::pg_database();
         let mut oracle = crate::differential::oracle::PgOracle {
-            connection: crate::common::pg_connect(port),
+            connection: db.connect(),
         };
         assert_schema_creates(&mut oracle, Engine::Postgres);
     }
@@ -1033,10 +1032,9 @@ mod tests {
     #[test]
     #[ignore = "requires Docker; run with --ignored"]
     fn the_generated_schema_creates_on_mysql() {
-        let container = crate::common::mysql_8();
-        let port = crate::common::mysql_port(&container);
+        let db = crate::common::mysql_database();
         let mut oracle = crate::differential::oracle::MySqlOracle {
-            connection: crate::common::mysql_connect(port),
+            connection: db.connect(),
         };
         assert_schema_creates(&mut oracle, Engine::MySql);
     }
@@ -1089,10 +1087,9 @@ mod tests {
     #[test]
     #[ignore = "requires Docker; run with --ignored"]
     fn generated_rows_are_readable_by_postgres() {
-        let container = crate::common::pg_with_wal2json();
-        let port = crate::common::pg_port(&container);
+        let db = crate::common::pg_database();
         let mut oracle = crate::differential::oracle::PgOracle {
-            connection: crate::common::pg_connect(port),
+            connection: db.connect(),
         };
         assert_rows_are_readable(&mut oracle, Engine::Postgres);
     }
@@ -1110,10 +1107,9 @@ mod tests {
     #[test]
     #[ignore = "requires Docker; run with --ignored"]
     fn generated_rows_are_readable_by_mysql() {
-        let container = crate::common::mysql_8();
-        let port = crate::common::mysql_port(&container);
+        let db = crate::common::mysql_database();
         let mut oracle = crate::differential::oracle::MySqlOracle {
-            connection: crate::common::mysql_connect(port),
+            connection: db.connect(),
         };
         assert_rows_are_readable(&mut oracle, Engine::MySql);
     }

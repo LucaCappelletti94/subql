@@ -51,10 +51,8 @@ struct RichRow {
 #[ignore = "requires Docker; run with --ignored"]
 fn apply_patchset_binds_every_rich_scalar_natively() {
     common::assert_docker_available();
-    let container = common::pg_with_wal2json();
-    let port = common::pg_port(&container);
-
-    let mut conn = common::pg_connect(port);
+    let db = common::pg_database();
+    let mut conn = db.connect();
     sql_query(PG_DDL).execute(&mut conn).expect("create table");
     // A session zone away from UTC, so a `timestamp` column bound as
     // `timestamptz` would land shifted rather than verbatim.

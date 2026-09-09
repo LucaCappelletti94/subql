@@ -363,10 +363,9 @@ mod tests {
     #[test]
     #[ignore = "requires Docker; run with --ignored"]
     fn pg_oracle_answers_the_tri_state() {
-        let container = crate::common::pg_with_wal2json();
-        let port = crate::common::pg_port(&container);
+        let db = crate::common::pg_database();
         let mut oracle = PgOracle {
-            connection: crate::common::pg_connect(port),
+            connection: db.connect(),
         };
         assert_tri_state(&mut oracle, PG_DDL);
     }
@@ -384,10 +383,9 @@ mod tests {
     #[test]
     #[ignore = "requires Docker; run with --ignored"]
     fn mysql_oracle_answers_the_tri_state() {
-        let container = crate::common::mysql_8();
-        let port = crate::common::mysql_port(&container);
+        let db = crate::common::mysql_database();
         let mut oracle = MySqlOracle {
-            connection: crate::common::mysql_connect(port),
+            connection: db.connect(),
         };
         assert_tri_state(&mut oracle, MYSQL_DDL);
     }
@@ -431,10 +429,9 @@ mod tests {
     #[test]
     #[ignore = "requires Docker; run with --ignored"]
     fn pg_oracle_reports_a_raise_rather_than_unknown() {
-        let container = crate::common::pg_with_wal2json();
-        let port = crate::common::pg_port(&container);
+        let db = crate::common::pg_database();
         let mut oracle = PgOracle {
-            connection: crate::common::pg_connect(port),
+            connection: db.connect(),
         };
         let verdict = oracle.answer_case(
             &[PG_DDL],

@@ -37,9 +37,9 @@ struct BinaryChange {
 /// Drain every pending pgoutput binary message and decode it to a
 /// `ChangeEvent`. The decoder is shared across phases so its relation
 /// cache survives between drains.
-fn drain(pg: &mut PgConnection, decoder: &mut PgOutputDecoder) -> Vec<ChangeEvent> {
+fn drain(pg: &mut PgConnection, slot: &str, decoder: &mut PgOutputDecoder) -> Vec<ChangeEvent> {
     let changes: Vec<BinaryChange> = sql_query(format!(
-        "SELECT data FROM pg_logical_slot_get_binary_changes('{SLOT}', NULL, NULL, 'proto_version', '1', 'publication_names', '{PUBLICATION}')"
+        "SELECT data FROM pg_logical_slot_get_binary_changes('{slot}', NULL, NULL, 'proto_version', '1', 'publication_names', '{PUBLICATION}')"
     ))
     .load(pg)
     .unwrap();
@@ -56,25 +56,25 @@ fn drain(pg: &mut PgConnection, decoder: &mut PgOutputDecoder) -> Vec<ChangeEven
 #[ignore = "requires Docker; run with --ignored"]
 fn round_trip_pgoutput_dispatches_bool_uuid_domain_enum() {
     common::assert_docker_available();
-    let container = common::pg_with_wal2json();
-    let port = common::pg_port(&container);
-    let mut pg = common::pg_connect(port);
+    let db = common::pg_database();
+    let mut pg = db.connect();
+    let slot = db.slot(SLOT);
 
     common::dispatch::create_schema(&mut pg);
     common::create_publication(&mut pg, PUBLICATION, "orders");
-    common::create_pgoutput_slot(&mut pg, SLOT);
+    common::create_pgoutput_slot(&mut pg, &slot);
     let catalog = common::dispatch::subql_catalog();
     let mut decoder = PgOutputDecoder::with_protocol_version(1);
 
     // Seed phase: inserts.
     common::dispatch::seed_dml(&mut pg);
-    let seed_events = drain(&mut pg, &mut decoder);
+    let seed_events = drain(&mut pg, &slot, &mut decoder);
     assert!(!seed_events.is_empty(), "seed drain yielded no events");
     let seed_builder = pgoutput_patchset_builder(&catalog, &seed_events).unwrap();
 
     // Mutate phase: update and delete.
     common::dispatch::mutate_dml(&mut pg);
-    let mutate_events = drain(&mut pg, &mut decoder);
+    let mutate_events = drain(&mut pg, &slot, &mut decoder);
     assert!(!mutate_events.is_empty(), "mutate drain yielded no events");
     let mutate_builder = pgoutput_patchset_builder(&catalog, &mutate_events).unwrap();
 

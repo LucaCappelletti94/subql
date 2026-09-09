@@ -19,17 +19,15 @@
 use diesel::prelude::*;
 use sqlparser::dialect::MySqlDialect;
 
-use crate::common::{
-    assert_docker_available, maxwell_collect, mysql_networked, mysql_port, mysql_url, start_maxwell,
-};
+use crate::common::{assert_docker_available, maxwell_collect, mysql_database, start_maxwell};
 use sql_traits::structs::ParserDB;
 use subql::backend::MySql;
 use subql::{parse_maxwell, DefaultIds, MaxwellEvent, SubscriptionEngine, SubscriptionRequest};
 
 /// Catalog for the `events` table. Parsed with `PostgreSqlDialect` (subql
-/// parses PG-flavored DDL regardless of the live backend). Maxwell sends
-/// `schema="testdb"`; with no `testdb.events` in the catalog, table resolution
-/// falls back to the unqualified lookup that hits this bare table.
+/// parses PG-flavored DDL regardless of the live backend). Maxwell qualifies
+/// the table with the test database, which the catalog does not know, so
+/// table resolution falls back to the unqualified lookup that hits this bare table.
 fn events_catalog() -> ParserDB {
     ParserDB::parse::<MySqlDialect>(
         "CREATE TABLE events (id INT PRIMARY KEY, amount DOUBLE PRECISION, label TEXT);",
@@ -72,10 +70,6 @@ fn apply_dml(my: &mut MysqlConnection) {
 fn mysql_maxwell_cdc_e2e() {
     assert_docker_available();
 
-    let pid = std::process::id();
-    let network = format!("subql-mysql-e2e-{pid}");
-    let mysql_name = format!("subql-mysql-e2e-{pid}");
-
     // Maxwell output dir (bind-mounted). World-writable so the in-container
     // Maxwell process can write to it.
     let maxwell_dir = tempfile::tempdir().expect("create maxwell tempdir");
@@ -90,18 +84,15 @@ fn mysql_maxwell_cdc_e2e() {
         .expect("tempdir path")
         .to_string();
 
-    let mysql_container = mysql_networked(&network, &mysql_name);
-
-    let _maxwell_container = start_maxwell(&network, &mysql_name, &maxwell_path);
-
-    let my_url = mysql_url(mysql_port(&mysql_container));
-    let mut my = MysqlConnection::establish(&my_url).expect("MySQL connection");
+    let db = mysql_database();
+    let _maxwell_container = start_maxwell(&db, &maxwell_path);
+    let mut my = db.connect();
 
     setup_mysql(&mut my);
 
     apply_dml(&mut my);
 
-    let messages = maxwell_collect(&maxwell_path, "events", 4);
+    let messages = maxwell_collect(&maxwell_path, &db, "events", 4);
     assert_eq!(
         messages.len(),
         4,
