@@ -529,7 +529,7 @@ fn text_grouping_is_served_on_postgres_and_refused_on_mysql() {
 #[test]
 fn arithmetic_over_columns_types_the_paired_literal() {
     let db = ParserDB::parse::<PostgreSqlDialect>(DDL).unwrap();
-    let table = subql::catalog_helpers::table_id(&db, "t").unwrap();
+    let table = subql::catalog_helpers::table_id::<subql::backend::Postgres, _>(&db, "t").unwrap();
     let mut engine: Engine = SubscriptionEngine::new(db, PostgreSqlDialect {});
     let registered = engine
         .register(SubscriptionRequest::new(

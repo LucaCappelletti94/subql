@@ -188,7 +188,8 @@ async fn a_question_the_row_does_not_settle_is_answered_by_the_service() {
     // and which relations answer which statement. All from one translation, so
     // they cannot disagree.
     let wired = wiring(SCHEMA);
-    let docs = catalog_helpers::table_id(&wired.db, "docs").expect("docs is in the catalog");
+    let docs = catalog_helpers::table_id::<subql::backend::Postgres, _>(&wired.db, "docs")
+        .expect("docs is in the catalog");
     let model = wired.model.clone();
 
     let store = client
@@ -282,7 +283,8 @@ async fn a_batch_over_the_cap_is_split_and_stays_positional() {
     let (_container, mut client) = openfga().await;
 
     let wired = wiring(SCHEMA);
-    let docs = catalog_helpers::table_id(&wired.db, "docs").expect("docs is in the catalog");
+    let docs = catalog_helpers::table_id::<subql::backend::Postgres, _>(&wired.db, "docs")
+        .expect("docs is in the catalog");
     let model = wired.model.clone();
 
     let store = client
@@ -384,7 +386,8 @@ CREATE POLICY p ON docs FOR SELECT USING (owner_id = current_user);
     let (_container, mut client) = openfga().await;
 
     let wired = wiring(OWNED);
-    let docs = catalog_helpers::table_id(&wired.db, "docs").expect("docs is in the catalog");
+    let docs = catalog_helpers::table_id::<subql::backend::Postgres, _>(&wired.db, "docs")
+        .expect("docs is in the catalog");
     let model = wired.model.clone();
 
     let store = client
@@ -489,7 +492,8 @@ CREATE POLICY p ON docs FOR SELECT USING (
 
     let wired = wiring(EXPIRING);
     let members =
-        catalog_helpers::table_id(&wired.db, "team_members").expect("members is in the catalog");
+        catalog_helpers::table_id::<subql::backend::Postgres, _>(&wired.db, "team_members")
+            .expect("members is in the catalog");
     let model = wired.model.clone();
 
     let store = client
@@ -875,7 +879,8 @@ async fn a_reconcile_removes_a_fact_for_an_object_the_event_never_named() {
 
     let wired = wiring(WHOLE_SHAPE);
     let share_table =
-        catalog_helpers::table_id(&wired.db, "paper_shares").expect("shares are in the catalog");
+        catalog_helpers::table_id::<subql::backend::Postgres, _>(&wired.db, "paper_shares")
+            .expect("shares are in the catalog");
     let model = wired.model.clone();
     let store = client
         .create_store(CreateStoreRequest {
@@ -1052,7 +1057,8 @@ CREATE POLICY notes_p ON notes FOR ALL USING (
     let (_container, mut client) = openfga().await;
 
     let wired = wiring(HELD_KEYS);
-    let notes = catalog_helpers::table_id(&wired.db, "notes").expect("notes is in the catalog");
+    let notes = catalog_helpers::table_id::<subql::backend::Postgres, _>(&wired.db, "notes")
+        .expect("notes is in the catalog");
     let model = wired.model.clone();
 
     let store = client

@@ -40,7 +40,8 @@ type Engine = SubscriptionEngine<TestEvent<Postgres>, DefaultIds, ParserDB>;
 
 fn engine() -> (Engine, subql::TableId) {
     let db = ParserDB::parse::<PostgreSqlDialect>(DDL).expect("DDL parses");
-    let table = catalog_helpers::table_id(&db, "docs").expect("docs is in the catalog");
+    let table = catalog_helpers::table_id::<subql::backend::Postgres, _>(&db, "docs")
+        .expect("docs is in the catalog");
     (SubscriptionEngine::new(db, PostgreSqlDialect {}), table)
 }
 
@@ -364,7 +365,8 @@ fn an_absent_membership_term_column_is_reported() {
           WHERE user_id = current_setting('app.user_id', true))";
 
     let db = ParserDB::parse::<PostgreSqlDialect>(DDL_TERM).expect("DDL parses");
-    let notes = catalog_helpers::table_id(&db, "notes").expect("notes is in the catalog");
+    let notes = catalog_helpers::table_id::<subql::backend::Postgres, _>(&db, "notes")
+        .expect("notes is in the catalog");
     let project_id =
         catalog_helpers::column_id(&db, notes, "project_id").expect("project_id resolves");
     let mut engine: Engine = SubscriptionEngine::new(db, PostgreSqlDialect {}).with_translator(
@@ -494,7 +496,8 @@ fn unchanged_toast_does_not_drop_a_subscription() {
         .expect("insert the toasted row");
 
     let catalog = ParserDB::parse::<PostgreSqlDialect>(DDL).expect("DDL parses");
-    let table = catalog_helpers::table_id(&catalog, "docs").expect("docs is cataloged");
+    let table = catalog_helpers::table_id::<subql::backend::Postgres, _>(&catalog, "docs")
+        .expect("docs is cataloged");
     let column = catalog_helpers::column_id(&catalog, table, "body").expect("body is cataloged");
     let config = PgStreamingConfig::new(common::pg_replication_url(port), slot, publication);
 

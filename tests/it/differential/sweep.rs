@@ -95,7 +95,8 @@ impl Case {
         let Ok(database) = ParserDB::parse::<<O::Backend as Backend>::Dialect>(&catalog_ddl) else {
             return SubqlAnswer::Unparsed;
         };
-        let Some(table) = catalog_helpers::table_id(&database, "t") else {
+        let Some(table) = catalog_helpers::table_id::<subql::backend::Postgres, _>(&database, "t")
+        else {
             return SubqlAnswer::Unparsed;
         };
         let arity = catalog_helpers::table_arity(&database, table).unwrap_or(0);

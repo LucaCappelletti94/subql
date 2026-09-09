@@ -1556,18 +1556,20 @@ pub(super) fn encode_postgres_component<V: postgres_jsonb_canonical::PgVersion +
     }
 }
 
-pub(super) fn encode_mysql_component(
-    column: &ColumnComparisonOf<MySql>,
-    value: &Value<MySql>,
+pub(super) fn encode_mysql_component<C: super::shipped::MySqlTableNameCase>(
+    column: &ColumnComparisonOf<MySql<C>>,
+    value: &Value<MySql<C>>,
     output: &mut alloc::vec::Vec<u8>,
 ) -> bool {
     match (column.kind.family(), value) {
         (Some(ScalarFamily::Float), Value::Float(value)) => {
             append_tagged(output, 3, &canonical_f64(*value))
         }
-        (Some(ScalarFamily::String), Value::String(value)) => single_column_rule::<MySql>(column)
-            .is_some_and(|rule| append_text(output, 4, value, rule)),
-        (Some(ScalarFamily::Uuid), Value::Uuid(value)) => single_column_rule::<MySql>(column)
+        (Some(ScalarFamily::String), Value::String(value)) => {
+            single_column_rule::<MySql<C>>(column)
+                .is_some_and(|rule| append_text(output, 4, value, rule))
+        }
+        (Some(ScalarFamily::Uuid), Value::Uuid(value)) => single_column_rule::<MySql<C>>(column)
             .is_some_and(|rule| append_text(output, 6, value, rule)),
         (Some(ScalarFamily::Decimal), Value::Decimal(value)) => {
             append_tagged(output, 11, &value.normalized())

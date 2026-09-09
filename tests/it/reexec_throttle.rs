@@ -138,7 +138,8 @@ fn catalog() -> ParserDB {
 }
 
 fn orders_id(database: &ParserDB) -> TableId {
-    catalog_helpers::table_id(database, "orders").expect("orders table")
+    catalog_helpers::table_id::<subql::backend::Postgres, _>(database, "orders")
+        .expect("orders table")
 }
 
 fn row(id: i64, price: f64, quantity: i64) -> Vec<Value<Postgres>> {

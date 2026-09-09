@@ -96,8 +96,9 @@ mod tests {
         use sql_traits::prelude::DatabaseLike;
 
         let catalog = fuzz_catalog();
-        let tid = crate::catalog_helpers::table_id(&catalog, "orders")
-            .expect("orders must be resolvable in fuzz fixture");
+        let tid =
+            crate::catalog_helpers::table_id::<crate::backend::Postgres, _>(&catalog, "orders")
+                .expect("orders must be resolvable in fuzz fixture");
         assert!(catalog.number_of_tables() > 0);
         let arity = crate::catalog_helpers::table_arity(&catalog, tid)
             .expect("orders arity should be known");

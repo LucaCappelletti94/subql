@@ -26,12 +26,14 @@ use crate::types::{ColumnId, TableId};
 
 /// Resolve a table name, written as SQL, to subql's compact [`TableId`].
 ///
-/// The text is read by [`TargetName::parse`], so quoting decides case
-/// sensitivity, a dot separates the qualifier only outside quotes, and a
-/// doubled quote stands for one. Resolution is the catalog's own
-/// [`DatabaseLike::resolve_target_table`]: an unqualified name resolves
-/// through the search path, and a table stored without a schema resides
-/// in the default schema.
+/// The text is read by [`TargetName::parse`], so a dot separates the
+/// qualifier only outside quotes and a doubled quote stands for one.
+/// Resolution is the catalog's own [`DatabaseLike::resolve_target_table`]:
+/// an unqualified name resolves through the search path, and a table stored
+/// without a schema resides in the default schema.
+///
+/// What the quoting means is the engine's, through
+/// [`Backend::TABLE_NAMES_FOLD_CASE`](crate::backend::Backend::TABLE_NAMES_FOLD_CASE).
 ///
 /// Returns `None` when the text is not one valid identifier or a
 /// qualified pair, when the catalog holds no such table, when the name is
@@ -39,8 +41,11 @@ use crate::types::{ColumnId, TableId};
 /// `u32::MAX`. The cases are indistinguishable to callers, whose question
 /// is "which compact id, if any".
 #[must_use]
-pub fn table_id<DB: DatabaseLike>(database: &DB, table_name: &str) -> Option<TableId> {
-    table_id_for_name(database, TargetName::parse(table_name).ok()?)
+pub fn table_id<B: crate::backend::Backend, DB: DatabaseLike>(
+    database: &DB,
+    table_name: &str,
+) -> Option<TableId> {
+    table_id_for_name::<B, DB>(database, TargetName::parse(table_name).ok()?)
 }
 
 /// Resolve a name whose parts a caller already holds, quoting included.
@@ -50,14 +55,45 @@ pub fn table_id<DB: DatabaseLike>(database: &DB, table_name: &str) -> Option<Tab
 /// quoting arrive separately and rendering them back to text only to read
 /// them again would lose the quoting or invent a qualifier out of a dot
 /// inside a name.
+///
+/// On an engine that folds a table name's case, the quoting is dropped
+/// before resolution, so a written `"Docs"` reaches the table declared
+/// `Docs`. A table the catalog itself stores under a quoted spelling is
+/// still matched as PostgreSQL matches it, because the stored side belongs
+/// to `sql-traits` and its resolution has no folding mode: recorded in
+/// `upstream/sql-traits-case-insensitive-relation-lookup.md`.
 #[must_use]
-pub fn table_id_for_name<DB: DatabaseLike>(
+pub fn table_id_for_name<B: crate::backend::Backend, DB: DatabaseLike>(
     database: &DB,
     target: TargetName<'_>,
 ) -> Option<TableId> {
-    let table = database.resolve_target_table(target).ok()??;
-    let id = database.table_id(table)?;
+    let folded = if B::TABLE_NAMES_FOLD_CASE {
+        unquoted_name(&target)
+    } else {
+        None
+    };
+    let resolved = folded.map_or_else(
+        || database.resolve_target_table(target),
+        |folded| database.resolve_target_table(folded),
+    );
+    let id = database.table_id(resolved.ok()??)?;
     u32::try_from(id).ok()
+}
+
+/// The same name with its quoting dropped, or `None` when nothing was
+/// quoted and the name already reads the way a folding engine reads it.
+///
+/// Owned, because the parts are lent by `target` and the name outlives it.
+/// The allocation is paid only by a quoted name on a folding engine.
+fn unquoted_name(target: &TargetName<'_>) -> Option<TargetName<'static>> {
+    if !target.name_is_quoted() && !target.schema_is_quoted() {
+        return None;
+    }
+    let unquoted = TargetName::new(target.name(), false);
+    Some(match target.schema() {
+        Some(schema) => unquoted.with_schema(schema, false).into_owned(),
+        None => unquoted.into_owned(),
+    })
 }
 
 /// Resolve a table from separate schema and relation names.
@@ -318,7 +354,12 @@ pub struct ResolvedTable {
 /// let db = ParserDB::parse::<PostgreSqlDialect>(
 ///     "CREATE TABLE orders (id INT PRIMARY KEY, amount INT, status TEXT);",
 /// )?;
-/// let t = catalog_helpers::resolve_table(&db, "orders", &["id", "amount", "status"])?.unwrap();
+/// let t = catalog_helpers::resolve_table::<subql::backend::Postgres, _, _>(
+///     &db,
+///     "orders",
+///     &["id", "amount", "status"],
+/// )?
+/// .unwrap();
 /// assert_eq!(t.column_ids, vec![0, 1, 2]);
 /// assert_eq!(t.primary_key, vec![0]);
 /// # Ok::<(), Box<dyn std::error::Error>>(())
@@ -327,12 +368,12 @@ pub struct ResolvedTable {
 /// # Errors
 /// [`CatalogError`](crate::CatalogError) when the catalog fails to answer a
 /// lookup about a table it does contain.
-pub fn resolve_table<DB: DatabaseLike, S: AsRef<str>>(
+pub fn resolve_table<B: crate::backend::Backend, DB: DatabaseLike, S: AsRef<str>>(
     database: &DB,
     table_name: &str,
     columns: &[S],
 ) -> Result<Option<ResolvedTable>, crate::CatalogError> {
-    let Some(table_id) = table_id(database, table_name) else {
+    let Some(table_id) = table_id::<B, DB>(database, table_name) else {
         return Ok(None);
     };
     let mut column_ids = Vec::with_capacity(columns.len());
@@ -533,17 +574,86 @@ mod tests {
         .expect("DDL parses")
     }
 
+    /// What a quoted table name matches is the engine's rule, not one rule.
+    ///
+    /// Measured against the engines' own documentation. PostgreSQL keeps a
+    /// delimited relation name exactly as written, so `"Docs"` is not the
+    /// table declared `Docs`, which it folded to `docs` on creation. SQLite
+    /// folds a table name for ASCII whatever the quoting, with no setting
+    /// that changes it. MySQL answers whichever way its server was
+    /// initialized, which `lower_case_table_names` records and the marker
+    /// type carries: `0` on Unix compares case-sensitively, `1` and `2`
+    /// compare case-insensitively.
+    #[test]
+    fn a_quoted_table_name_follows_the_engine() {
+        use crate::backend::{MySql, NamesFoldedAtLookup, NamesStoredAsWritten, SQLite};
+
+        let ddl = "CREATE TABLE Docs (id INT PRIMARY KEY);";
+        let pg = ParserDB::parse::<sqlparser::dialect::PostgreSqlDialect>(ddl).unwrap();
+        let lite = ParserDB::parse::<sqlparser::dialect::SQLiteDialect>(ddl).unwrap();
+        let my = ParserDB::parse::<sqlparser::dialect::MySqlDialect>(ddl).unwrap();
+
+        // Every engine reaches the table by the spelling it was declared
+        // with, and by the folded one.
+        assert_eq!(table_id::<Postgres, _>(&pg, "Docs"), Some(0));
+        assert_eq!(table_id::<Postgres, _>(&pg, "docs"), Some(0));
+        assert_eq!(table_id::<SQLite, _>(&lite, "Docs"), Some(0));
+        assert_eq!(table_id::<MySql, _>(&my, "Docs"), Some(0));
+
+        // The quoted spelling is where they part.
+        assert_eq!(
+            table_id::<Postgres, _>(&pg, r#""Docs""#),
+            None,
+            "PostgreSQL folded the declaration, so the quoted name is another table"
+        );
+        assert_eq!(
+            table_id::<SQLite, _>(&lite, r#""Docs""#),
+            Some(0),
+            "SQLite folds a table name quoted or not"
+        );
+        assert_eq!(
+            table_id::<MySql<NamesStoredAsWritten>, _>(&my, r#""Docs""#),
+            None,
+            "lower_case_table_names = 0 compares case-sensitively"
+        );
+        assert_eq!(
+            table_id::<MySql<NamesFoldedAtLookup>, _>(&my, r#""Docs""#),
+            Some(0),
+            "lower_case_table_names = 2 folds at lookup"
+        );
+
+        // The qualifier folds with the name, since the same setting governs
+        // database names: "How table and database names are stored on disk
+        // and used in MySQL is affected by the lower_case_table_names
+        // system variable."
+        let qualified = ParserDB::parse::<sqlparser::dialect::MySqlDialect>(
+            "CREATE SCHEMA App; CREATE TABLE App.Docs (id INT PRIMARY KEY);",
+        )
+        .unwrap();
+        assert_eq!(
+            table_id::<MySql<NamesFoldedAtLookup>, _>(&qualified, r#""App"."Docs""#),
+            Some(0),
+            "a quoted qualifier folds where the engine folds names"
+        );
+        assert_eq!(
+            table_id::<MySql<NamesStoredAsWritten>, _>(&qualified, r#""App"."Docs""#),
+            None,
+            "and stays exact where it does not"
+        );
+    }
+
     #[test]
     fn table_id_resolves_known_table() {
         let db = make_db();
-        let tid = table_id(&db, "orders").expect("orders table exists");
+        let tid =
+            table_id::<crate::backend::Postgres, _>(&db, "orders").expect("orders table exists");
         assert_eq!(table_arity(&db, tid), Ok(3));
     }
 
     #[test]
     fn table_id_none_for_unknown_table() {
         let db = make_db();
-        assert!(table_id(&db, "no_such_table").is_none());
+        assert!(table_id::<crate::backend::Postgres, _>(&db, "no_such_table").is_none());
     }
 
     /// The review's reproduction, kept permanently: a quoted, case-sensitive
@@ -555,7 +665,10 @@ mod tests {
             r#"CREATE SCHEMA "App"; CREATE TABLE "App"."Items" (id INT PRIMARY KEY);"#,
         )
         .unwrap();
-        assert_eq!(table_id(&db, r#""App"."Items""#), Some(0));
+        assert_eq!(
+            table_id::<crate::backend::Postgres, _>(&db, r#""App"."Items""#),
+            Some(0)
+        );
     }
 
     /// A dot inside a quoted identifier belongs to the identifier, never a
@@ -566,7 +679,10 @@ mod tests {
             r#"CREATE TABLE "my.table" (id INT PRIMARY KEY);"#,
         )
         .unwrap();
-        assert_eq!(table_id(&db, r#""my.table""#), Some(0));
+        assert_eq!(
+            table_id::<crate::backend::Postgres, _>(&db, r#""my.table""#),
+            Some(0)
+        );
     }
 
     /// A doubled quote inside a quoted identifier stands for one quote.
@@ -576,7 +692,10 @@ mod tests {
             r#"CREATE TABLE "we""ird" (id INT PRIMARY KEY);"#,
         )
         .unwrap();
-        assert_eq!(table_id(&db, r#""we""ird""#), Some(0));
+        assert_eq!(
+            table_id::<crate::backend::Postgres, _>(&db, r#""we""ird""#),
+            Some(0)
+        );
     }
 
     /// An unqualified name resolves through the search path, exactly as the
@@ -587,7 +706,10 @@ mod tests {
             "CREATE SCHEMA app; SET search_path TO app; CREATE TABLE app.docs (id INT PRIMARY KEY);",
         )
         .unwrap();
-        assert_eq!(table_id(&db, "docs"), Some(0));
+        assert_eq!(
+            table_id::<crate::backend::Postgres, _>(&db, "docs"),
+            Some(0)
+        );
     }
 
     /// A bare spelling and its default-schema qualified spelling reach the
@@ -595,8 +717,14 @@ mod tests {
     #[test]
     fn table_id_resolves_bare_and_qualified_spellings() {
         let db = make_db();
-        assert_eq!(table_id(&db, "orders"), Some(0));
-        assert_eq!(table_id(&db, "public.orders"), Some(0));
+        assert_eq!(
+            table_id::<crate::backend::Postgres, _>(&db, "orders"),
+            Some(0)
+        );
+        assert_eq!(
+            table_id::<crate::backend::Postgres, _>(&db, "public.orders"),
+            Some(0)
+        );
     }
 
     /// Text that does not spell one identifier, or a qualifier and a name,
@@ -642,7 +770,7 @@ mod tests {
             "we\"ird",
         ] {
             assert_eq!(
-                table_id(&db, text),
+                table_id::<crate::backend::Postgres, _>(&db, text),
                 None,
                 "`{text}` does not name one table"
             );
@@ -652,9 +780,12 @@ mod tests {
         // catalog missing them. The ids are not asserted by number: the
         // catalog orders its tables by name, not by the order the DDL
         // declared them.
-        let dotted = table_id(&db, r#""a.b.c""#).expect("the quoted dotted name resolves");
-        let quoted = table_id(&db, r#""we""ird""#).expect("the doubled quote resolves");
-        let plain = table_id(&db, "orders").expect("the bare name resolves");
+        let dotted = table_id::<crate::backend::Postgres, _>(&db, r#""a.b.c""#)
+            .expect("the quoted dotted name resolves");
+        let quoted = table_id::<crate::backend::Postgres, _>(&db, r#""we""ird""#)
+            .expect("the doubled quote resolves");
+        let plain =
+            table_id::<crate::backend::Postgres, _>(&db, "orders").expect("the bare name resolves");
         assert_ne!(dotted, quoted);
         assert_ne!(dotted, plain);
         assert_ne!(quoted, plain);
@@ -670,10 +801,22 @@ mod tests {
         .unwrap();
         // The stored name is quoted and mixed case, so only that spelling
         // reaches it.
-        assert_eq!(table_id(&db, r#"app."Items""#), Some(0));
-        assert_eq!(table_id(&db, r#""app"."Items""#), Some(0));
-        assert_eq!(table_id(&db, r#"app."items""#), None);
-        assert_eq!(table_id(&db, "app.Items"), None);
+        assert_eq!(
+            table_id::<crate::backend::Postgres, _>(&db, r#"app."Items""#),
+            Some(0)
+        );
+        assert_eq!(
+            table_id::<crate::backend::Postgres, _>(&db, r#""app"."Items""#),
+            Some(0)
+        );
+        assert_eq!(
+            table_id::<crate::backend::Postgres, _>(&db, r#"app."items""#),
+            None
+        );
+        assert_eq!(
+            table_id::<crate::backend::Postgres, _>(&db, "app.Items"),
+            None
+        );
     }
 
     /// Whitespace around a written name, which SQL's tokenizer skips.
@@ -683,9 +826,18 @@ mod tests {
     #[test]
     fn table_id_reads_a_padded_name() {
         let db = make_db();
-        assert_eq!(table_id(&db, " orders"), Some(0));
-        assert_eq!(table_id(&db, "orders "), Some(0));
-        assert_eq!(table_id(&db, "public . orders"), Some(0));
+        assert_eq!(
+            table_id::<crate::backend::Postgres, _>(&db, " orders"),
+            Some(0)
+        );
+        assert_eq!(
+            table_id::<crate::backend::Postgres, _>(&db, "orders "),
+            Some(0)
+        );
+        assert_eq!(
+            table_id::<crate::backend::Postgres, _>(&db, "public . orders"),
+            Some(0)
+        );
     }
 
     #[test]
@@ -707,7 +859,7 @@ mod tests {
     #[test]
     fn column_id_resolves_each_column_to_its_ordinal() {
         let db = make_db();
-        let tid = table_id(&db, "orders").unwrap();
+        let tid = table_id::<crate::backend::Postgres, _>(&db, "orders").unwrap();
         assert_eq!(column_id(&db, tid, "id"), Some(0));
         assert_eq!(column_id(&db, tid, "amount"), Some(1));
         assert_eq!(column_id(&db, tid, "status"), Some(2));
@@ -716,7 +868,7 @@ mod tests {
     #[test]
     fn column_name_resolves_the_requested_ordinal() {
         let db = make_db();
-        let table = table_id(&db, "orders").expect("orders exists");
+        let table = table_id::<crate::backend::Postgres, _>(&db, "orders").expect("orders exists");
 
         assert_eq!(column_name(&db, table, 1).as_deref(), Some("amount"));
         assert_eq!(column_name(&db, table, 3), None);
@@ -725,21 +877,21 @@ mod tests {
     #[test]
     fn column_id_is_case_insensitive_for_unquoted_lookup() {
         let db = make_db();
-        let tid = table_id(&db, "orders").unwrap();
+        let tid = table_id::<crate::backend::Postgres, _>(&db, "orders").unwrap();
         assert_eq!(column_id(&db, tid, "AMOUNT"), Some(1));
     }
 
     #[test]
     fn column_id_none_for_unknown_column() {
         let db = make_db();
-        let tid = table_id(&db, "orders").unwrap();
+        let tid = table_id::<crate::backend::Postgres, _>(&db, "orders").unwrap();
         assert!(column_id(&db, tid, "nope").is_none());
     }
 
     #[test]
     fn primary_key_columns_returns_pk_ordinals() {
         let db = make_db();
-        let tid = table_id(&db, "orders").unwrap();
+        let tid = table_id::<crate::backend::Postgres, _>(&db, "orders").unwrap();
         assert_eq!(primary_key_columns(&db, tid), Ok(vec![0]));
     }
 
@@ -747,7 +899,7 @@ mod tests {
     fn primary_key_columns_empty_when_no_pk() {
         let db = ParserDB::parse::<GenericDialect>("CREATE TABLE t (a INT, b TEXT);")
             .expect("DDL parses");
-        let tid = table_id(&db, "t").unwrap();
+        let tid = table_id::<crate::backend::Postgres, _>(&db, "t").unwrap();
         assert_eq!(primary_key_columns(&db, tid), Ok(vec![]));
     }
 
@@ -762,7 +914,7 @@ mod tests {
             r#"CREATE TABLE mixed (id INT, "ID" INT, amount INT);"#,
         )
         .expect("DDL parses");
-        let tid = table_id(&db, "mixed").expect("mixed exists");
+        let tid = table_id::<crate::backend::Postgres, _>(&db, "mixed").expect("mixed exists");
 
         assert_eq!(column_id(&db, tid, "id"), Some(0));
         assert_eq!(column_id(&db, tid, "\"id\""), Some(0));
@@ -787,7 +939,7 @@ mod tests {
             "CREATE TABLE lots (id INT, amount INT, status TEXT, PRIMARY KEY (status, id));",
         )
         .expect("DDL parses");
-        let tid = table_id(&db, "lots").expect("lots exists");
+        let tid = table_id::<crate::backend::Postgres, _>(&db, "lots").expect("lots exists");
 
         assert_eq!(primary_key_columns(&db, tid), Ok(alloc::vec![2, 0]));
     }
@@ -819,8 +971,8 @@ mod tests {
     fn schema_fingerprint_round_trips_for_same_schema() {
         let db_a = make_db();
         let db_b = make_db();
-        let tid_a = table_id(&db_a, "orders").unwrap();
-        let tid_b = table_id(&db_b, "orders").unwrap();
+        let tid_a = table_id::<crate::backend::Postgres, _>(&db_a, "orders").unwrap();
+        let tid_b = table_id::<crate::backend::Postgres, _>(&db_b, "orders").unwrap();
         let fp_a = schema_fingerprint(&db_a, tid_a).unwrap().unwrap();
         let fp_b = schema_fingerprint(&db_b, tid_b).unwrap().unwrap();
         assert_eq!(fp_a, fp_b);
@@ -833,8 +985,8 @@ mod tests {
             "CREATE TABLE orders (id INT PRIMARY KEY, total INT, status TEXT);",
         )
         .unwrap();
-        let tid_a = table_id(&db_a, "orders").unwrap();
-        let tid_b = table_id(&db_b, "orders").unwrap();
+        let tid_a = table_id::<crate::backend::Postgres, _>(&db_a, "orders").unwrap();
+        let tid_b = table_id::<crate::backend::Postgres, _>(&db_b, "orders").unwrap();
         let fp_a = schema_fingerprint(&db_a, tid_a).unwrap().unwrap();
         let fp_b = schema_fingerprint(&db_b, tid_b).unwrap().unwrap();
         assert_ne!(fp_a, fp_b);
@@ -854,7 +1006,7 @@ mod tests {
             "CREATE TABLE e (id INT PRIMARY KEY, ts TIMESTAMP, tstz TIMESTAMPTZ, d DATE, t TIME);",
         )
         .unwrap();
-        let tid = table_id(&pg, "e").unwrap();
+        let tid = table_id::<crate::backend::Postgres, _>(&pg, "e").unwrap();
         assert_eq!(
             column_scalar_kind::<Postgres, _>(&pg, tid, 1),
             Some(ScalarFamily::Timestamp.into())
@@ -879,7 +1031,7 @@ mod tests {
             "CREATE TABLE e (id INT PRIMARY KEY, dt DATETIME, ts TIMESTAMP, d DATE, t TIME, big BIGINT UNSIGNED);",
         )
         .unwrap();
-        let tid = table_id(&my, "e").unwrap();
+        let tid = table_id::<crate::backend::Postgres, _>(&my, "e").unwrap();
         assert_eq!(
             column_scalar_kind::<Postgres, _>(&my, tid, 1),
             Some(ScalarFamily::Timestamp.into())
@@ -911,7 +1063,7 @@ mod tests {
              CREATE TABLE labels (name TEXT COLLATE ci);",
         )
         .unwrap();
-        let table = table_id(&db, "labels").unwrap();
+        let table = table_id::<crate::backend::Postgres, _>(&db, "labels").unwrap();
 
         let column: ColumnComparisonOf<Postgres> =
             column_comparison::<Postgres, _>(&db, table, 0).unwrap();
@@ -932,7 +1084,7 @@ mod tests {
             "CREATE TABLE labels (name TEXT);",
         )
         .unwrap();
-        let table = table_id(&default_db, "labels").unwrap();
+        let table = table_id::<crate::backend::Postgres, _>(&default_db, "labels").unwrap();
         let column: ColumnComparisonOf<crate::backend::SQLite> =
             column_comparison::<crate::backend::SQLite, _>(&default_db, table, 0).unwrap();
         assert_eq!(column.collation, ColumnCollation::DatabaseDefault);
@@ -941,7 +1093,7 @@ mod tests {
             "CREATE TABLE labels (name TEXT CHARACTER SET utf8mb4);",
         )
         .unwrap();
-        let table = table_id(&unknown_db, "labels").unwrap();
+        let table = table_id::<crate::backend::Postgres, _>(&unknown_db, "labels").unwrap();
         let column: ColumnComparisonOf<crate::backend::MySql> =
             column_comparison::<crate::backend::MySql, _>(&unknown_db, table, 0).unwrap();
         assert_eq!(column.collation, ColumnCollation::Unknown);

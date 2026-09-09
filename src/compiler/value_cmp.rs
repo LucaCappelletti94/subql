@@ -334,7 +334,8 @@ mod comparison_descriptor_tests {
 
     fn comparison(ddl: &str, column: &str) -> ColumnComparisonOf<Postgres> {
         let db = ParserDB::parse::<PostgreSqlDialect>(ddl).expect("the DDL parses");
-        let table = crate::catalog_helpers::table_id(&db, "t").expect("t is cataloged");
+        let table = crate::catalog_helpers::table_id::<crate::backend::Postgres, _>(&db, "t")
+            .expect("t is cataloged");
         let column_id = crate::catalog_helpers::column_id(&db, table, column).expect("the column");
         crate::catalog_helpers::column_comparison::<Postgres, _>(&db, table, column_id)
             .expect("the column classifies")

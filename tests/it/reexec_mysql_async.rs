@@ -169,7 +169,9 @@ fn delete_displacing_extreme_resolves_via_mysql_async_connector() {
     setup_mysql(&mut conn_setup, &[(1, 5.0), (2, 9.0)]);
 
     let cat = catalog();
-    let table_id: TableId = catalog_helpers::table_id(&cat, "orders").expect("resolve orders");
+    let table_id: TableId =
+        catalog_helpers::table_id::<subql::backend::Postgres, _>(&cat, "orders")
+            .expect("resolve orders");
 
     common::multi_thread_rt().block_on(async move {
         let pool = mysql_async_pool(port).await;

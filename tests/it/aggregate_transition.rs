@@ -23,7 +23,8 @@ type Engine = SubscriptionEngine<Event, DefaultIds, ParserDB>;
 
 fn engine(group_limit: usize) -> (Engine, TableId) {
     let catalog = ParserDB::parse::<PostgreSqlDialect>(DDL).expect("parse DDL");
-    let table = catalog_helpers::table_id(&catalog, "orders").expect("orders resolves");
+    let table =
+        catalog_helpers::table_id::<Postgres, _>(&catalog, "orders").expect("orders resolves");
     (
         SubscriptionEngine::new(catalog, PostgreSqlDialect {})
             .with_max_groups_per_aggregate(group_limit),

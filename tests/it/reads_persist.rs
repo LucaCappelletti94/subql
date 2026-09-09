@@ -426,7 +426,8 @@ fn a_restored_answer_asks_before_it_answers() {
         .find(|r| matches!(r.tier, Tier::Scalar { .. }))
         .expect("the extreme came back");
 
-    let table = catalog_helpers::table_id(&catalog(DDL), "orders").expect("orders resolves");
+    let table = catalog_helpers::table_id::<subql::backend::Postgres, _>(&catalog(DDL), "orders")
+        .expect("orders resolves");
     let event = TestEvent::<Postgres>::insert(
         table,
         vec![
@@ -466,7 +467,9 @@ fn an_answer_whose_table_moved_is_dropped_and_named() {
     );
     assert_eq!(engine.reread_count(), 0, "and neither is live");
 
-    let table = catalog_helpers::table_id(&catalog(WIDER_DDL), "orders").expect("orders resolves");
+    let table =
+        catalog_helpers::table_id::<subql::backend::Postgres, _>(&catalog(WIDER_DDL), "orders")
+            .expect("orders resolves");
     let mut dropped: Vec<u64> = report.dropped.iter().map(|d| d.subscription_id).collect();
     dropped.sort_unstable();
     assert_eq!(dropped, vec![1, 2]);
@@ -546,7 +549,8 @@ fn grouped_read_restores_registration_binds() {
         },
     )
     .expect("seed installs");
-    let orders = catalog_helpers::table_id(&catalog(DDL), "orders").expect("orders resolves");
+    let orders = catalog_helpers::table_id::<subql::backend::Postgres, _>(&catalog(DDL), "orders")
+        .expect("orders resolves");
     let event = TestEvent::<Postgres>::delete(
         orders,
         vec![

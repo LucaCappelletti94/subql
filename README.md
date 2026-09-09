@@ -26,7 +26,7 @@ use subql::{
 let catalog = ParserDB::parse::<PostgreSqlDialect>(
     "CREATE TABLE orders (id INT PRIMARY KEY, amount INT, status TEXT);",
 )?;
-let orders_id = catalog_helpers::table_id(&catalog, "orders").unwrap();
+let orders_id = catalog_helpers::table_id::<Postgres, _>(&catalog, "orders").unwrap();
 let mut engine: SubscriptionEngine<TestEvent<Postgres>, DefaultIds, ParserDB> =
     SubscriptionEngine::new(catalog, PostgreSqlDialect {});
 
@@ -68,7 +68,8 @@ let catalog = ParserDB::parse::<PostgreSqlDialect>(
     "CREATE TABLE orders (id INT PRIMARY KEY, amount INT, status TEXT);",
 )
 .expect("the DDL parses");
-let orders_id = catalog_helpers::table_id(&catalog, "orders").expect("orders is cataloged");
+let orders_id =
+    catalog_helpers::table_id::<Postgres, _>(&catalog, "orders").expect("orders is cataloged");
 let mut engine: SubscriptionEngine<TestEvent<Postgres>, DefaultIds, ParserDB> =
     SubscriptionEngine::new(catalog, PostgreSqlDialect {});
 

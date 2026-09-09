@@ -196,6 +196,9 @@ impl<V: postgres_jsonb_canonical::PgVersion + 'static> Backend for Postgres<V> {
     /// what makes `"Owner"` and `owner` two columns.
     const DELIMITED_IDENTIFIERS_FOLD_CASE: bool = false;
 
+    /// The same rule reaches relations: `"Docs"` and `docs` are two tables.
+    const TABLE_NAMES_FOLD_CASE: bool = false;
+
     /// Measured on 16.11. Equality under a deterministic collation is byte
     /// equality, including for the database default, since `CREATE
     /// DATABASE` cannot select a nondeterministic collation. Ordering is
@@ -362,11 +365,68 @@ impl<V: postgres_jsonb_canonical::PgVersion + 'static> Backend for Postgres<V> {
     type JsonbVersion = V;
 }
 
-/// MySQL backend marker.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
-pub struct MySql;
+/// How a MySQL server compares a table or database name, which is its
+/// `lower_case_table_names` setting.
+///
+/// The setting is fixed when the server is initialized and cannot be
+/// changed afterwards, and its default differs per platform: `0` on Unix,
+/// `1` on Windows, `2` on macOS. So it is not a property of MySQL that a
+/// library can know, and it rides on the marker type the embedder names.
+/// Read it from a server with `SELECT @@lower_case_table_names`.
+///
+/// Column names are not governed by it: they are case-insensitive on every
+/// platform, which is what
+/// [`Backend::DELIMITED_IDENTIFIERS_FOLD_CASE`](super::Backend::DELIMITED_IDENTIFIERS_FOLD_CASE)
+/// answers.
+pub trait MySqlTableNameCase: 'static {
+    /// The value `SELECT @@lower_case_table_names` answers.
+    const LOWER_CASE_TABLE_NAMES: u8;
 
-impl Backend for MySql {
+    /// Whether a table name comparison ignores case, which values `1` and
+    /// `2` do and value `0` does not.
+    const FOLDS_CASE: bool;
+}
+
+/// `lower_case_table_names = 0`, the Unix default: a name is stored as
+/// written and compared case-sensitively.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct NamesStoredAsWritten;
+
+impl MySqlTableNameCase for NamesStoredAsWritten {
+    const LOWER_CASE_TABLE_NAMES: u8 = 0;
+    const FOLDS_CASE: bool = false;
+}
+
+/// `lower_case_table_names = 1`, the Windows default: a name is lowercased
+/// on storage and compared case-insensitively.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct NamesStoredLowercased;
+
+impl MySqlTableNameCase for NamesStoredLowercased {
+    const LOWER_CASE_TABLE_NAMES: u8 = 1;
+    const FOLDS_CASE: bool = true;
+}
+
+/// `lower_case_table_names = 2`, the macOS default: a name is stored as
+/// written and lowercased at lookup, so comparison ignores case.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct NamesFoldedAtLookup;
+
+impl MySqlTableNameCase for NamesFoldedAtLookup {
+    const LOWER_CASE_TABLE_NAMES: u8 = 2;
+    const FOLDS_CASE: bool = true;
+}
+
+/// MySQL backend marker, parameterised by the server's
+/// `lower_case_table_names`.
+///
+/// The default is the Unix default, `0`, which compares table names
+/// case-sensitively. Name another, as `MySql<NamesStoredLowercased>`, for a
+/// server initialized the way Windows and macOS initialize theirs.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct MySql<C = NamesStoredAsWritten>(core::marker::PhantomData<C>);
+
+impl<C: MySqlTableNameCase> Backend for MySql<C> {
     fn hold_float_at_single(value: f64) -> f64 {
         super::scalar_value::at_float4(value)
     }
@@ -413,6 +473,10 @@ impl Backend for MySql {
     /// MySQL compares a column name case-insensitively whether or not it
     /// was written in backticks.
     const DELIMITED_IDENTIFIERS_FOLD_CASE: bool = true;
+
+    /// Table names follow the server's own `lower_case_table_names`, which
+    /// the marker carries because no platform-independent answer exists.
+    const TABLE_NAMES_FOLD_CASE: bool = C::FOLDS_CASE;
 
     /// Measured: MySQL answers `NULL` with warning 1365, even with
     /// `ERROR_FOR_DIVISION_BY_ZERO` in `sql_mode`, which raises on writes.
@@ -770,6 +834,10 @@ impl Backend for SQLite {
 
     /// SQLite compares a column name case-insensitively, quoted or not.
     const DELIMITED_IDENTIFIERS_FOLD_CASE: bool = true;
+
+    /// And a table name the same way: every schema lookup goes through the
+    /// ASCII-folding comparison, with no setting that changes it.
+    const TABLE_NAMES_FOLD_CASE: bool = true;
 
     fn compare_cross_kind_numeric(
         left: &Value<Self>,

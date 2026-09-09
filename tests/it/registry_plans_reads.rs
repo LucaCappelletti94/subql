@@ -15,7 +15,8 @@ type Engine = SubscriptionEngine<TestEvent<Postgres>, DefaultIds, ParserDB>;
 
 fn engine() -> (Engine, TableId) {
     let catalog = ParserDB::parse::<PostgreSqlDialect>(DDL).expect("parse DDL");
-    let table = catalog_helpers::table_id(&catalog, "orders").expect("orders resolves");
+    let table = catalog_helpers::table_id::<subql::backend::Postgres, _>(&catalog, "orders")
+        .expect("orders resolves");
     (
         SubscriptionEngine::new(catalog, PostgreSqlDialect {}),
         table,

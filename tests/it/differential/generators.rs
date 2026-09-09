@@ -884,7 +884,8 @@ mod tests {
         // Phase C5 turned on.
         let database = ParserDB::parse::<sqlparser::dialect::PostgreSqlDialect>(&ddl)
             .expect("the generated DDL parses");
-        let table = subql::catalog_helpers::table_id(&database, "t").expect("t is cataloged");
+        let table = subql::catalog_helpers::table_id::<Postgres, _>(&database, "t")
+            .expect("t is cataloged");
         let padded = subql::catalog_helpers::column_id(&database, table, "padded_bytes")
             .expect("the padded column is cataloged");
         let comparison =

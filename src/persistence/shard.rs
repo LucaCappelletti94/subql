@@ -482,7 +482,8 @@ mod tests {
 
     /// Resolve the single test-fixture table id from a [`ParserDB`].
     fn fixture_table_id(db: &sql_traits::structs::ParserDB) -> TableId {
-        catalog_helpers::table_id(db, "orders").expect("fixture table 'orders' exists")
+        catalog_helpers::table_id::<crate::backend::Postgres, _>(db, "orders")
+            .expect("fixture table 'orders' exists")
     }
 
     /// Serialize a shard, decode+mutate its header, and re-encode the tampered

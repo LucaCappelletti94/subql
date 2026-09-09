@@ -213,7 +213,9 @@ fn delete_displacing_extreme_resolves_via_mysql_connector() {
     setup_mysql(&mut conn_setup, &[(1, 5.0), (2, 9.0)]);
 
     let cat = catalog();
-    let table_id: TableId = catalog_helpers::table_id(&cat, "orders").expect("resolve orders");
+    let table_id: TableId =
+        catalog_helpers::table_id::<subql::backend::Postgres, _>(&cat, "orders")
+            .expect("resolve orders");
 
     let mut engine = build_engine(cat, conn_exec);
 

@@ -52,7 +52,7 @@ static UNRESTRICTED: ActionAnswer = ActionAnswer::Unrestricted;
 ///      ALTER TABLE docs ENABLE ROW LEVEL SECURITY;
 ///      CREATE POLICY p ON docs FOR SELECT USING (owner_id = current_user);",
 /// )?;
-/// let docs = catalog_helpers::table_id(&db, "docs").expect("docs is in the catalog");
+/// let docs = catalog_helpers::table_id::<subql::backend::Postgres, _>(&db, "docs").expect("docs is in the catalog");
 ///
 /// let translator = TranslatorBuilder::new()
 ///     .with_min_confidence(ConfidenceLevel::B)
@@ -275,7 +275,7 @@ impl<DB: DatabaseLike> Shapes<DB> {
     ///     "CREATE TABLE orders (id INT PRIMARY KEY, quantity BIGINT NOT NULL);",
     /// )
     /// .expect("the schema parses");
-    /// let orders = catalog_helpers::table_id(&db, "orders").expect("orders is in the catalog");
+    /// let orders = catalog_helpers::table_id::<subql::backend::Postgres, _>(&db, "orders").expect("orders is in the catalog");
     ///
     /// let translator = TranslatorBuilder::new()
     ///     .with_min_confidence(ConfidenceLevel::B)
@@ -1099,7 +1099,7 @@ mod tests {
     }
 
     fn table(shapes: &Shapes<ParserDB>, name: &str) -> TableId {
-        catalog_helpers::table_id(shapes.catalog(), name).unwrap()
+        catalog_helpers::table_id::<crate::backend::Postgres, _>(shapes.catalog(), name).unwrap()
     }
 
     /// The reported case, and the one the action report cannot carry: `orders`

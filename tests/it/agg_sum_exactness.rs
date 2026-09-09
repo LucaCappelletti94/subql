@@ -169,7 +169,7 @@ where
     D: sqlparser::dialect::Dialect + Default,
 {
     let database = ParserDB::parse::<D>(ddl).unwrap();
-    let table = catalog_helpers::table_id(&database, "t").unwrap();
+    let table = catalog_helpers::table_id::<Postgres, _>(&database, "t").unwrap();
     let mut engine: SubscriptionEngine<TestEvent<B, PgLsn>, DefaultIds, ParserDB> =
         SubscriptionEngine::new(database, dialect);
     let subscription = engine

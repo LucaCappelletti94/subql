@@ -173,7 +173,8 @@ pub(super) fn engine_with_values(
 ) {
     let database = catalog();
     let orders_id =
-        crate::catalog_helpers::table_id(&database, "orders").expect("orders table exists");
+        crate::catalog_helpers::table_id::<crate::backend::Postgres, _>(&database, "orders")
+            .expect("orders table exists");
     let inner = SubscriptionEngine::<TestEvent<Postgres>, DefaultIds, ParserDB>::new(
         database,
         PostgreSqlDialect {},

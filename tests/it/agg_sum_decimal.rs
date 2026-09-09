@@ -47,7 +47,7 @@ type Engine = SubscriptionEngine<Event, DefaultIds, ParserDB>;
 /// empty so that every number the test sees came from a fold.
 fn served(sql: &str, components: Vec<Value<Postgres>>) -> (Engine, TableId) {
     let database = ParserDB::parse::<PostgreSqlDialect>(DDL).unwrap();
-    let table = catalog_helpers::table_id(&database, "t").unwrap();
+    let table = catalog_helpers::table_id::<Postgres, _>(&database, "t").unwrap();
     let mut engine: Engine = SubscriptionEngine::new(database, PostgreSqlDialect {});
     let registered = engine
         .register(SubscriptionRequest::new(7, sql))

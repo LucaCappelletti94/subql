@@ -318,7 +318,7 @@ pub enum EvictionPolicy {
     /// let database = ParserDB::parse::<PostgreSqlDialect>(
     ///     "CREATE TABLE orders (id INT PRIMARY KEY, amount INT);",
     /// )?;
-    /// let orders_id = catalog_helpers::table_id(&database, "orders").unwrap();
+    /// let orders_id = catalog_helpers::table_id::<subql::backend::Postgres, _>(&database, "orders").unwrap();
     /// let clock = Arc::new(ManualClock::new(0));
     /// let handle: ClockHandle = clock.clone();
     ///
@@ -384,7 +384,7 @@ pub enum EvictionPolicy {
     /// let database = ParserDB::parse::<PostgreSqlDialect>(
     ///     "CREATE TABLE orders (id INT PRIMARY KEY, amount INT);",
     /// )?;
-    /// let orders_id = catalog_helpers::table_id(&database, "orders").unwrap();
+    /// let orders_id = catalog_helpers::table_id::<subql::backend::Postgres, _>(&database, "orders").unwrap();
     ///
     /// let mut engine: SubscriptionEngine<TestEvent<Postgres>, DefaultIds, ParserDB> =
     ///     SubscriptionEngine::new(database, PostgreSqlDialect {})

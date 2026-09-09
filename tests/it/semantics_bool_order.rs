@@ -29,7 +29,8 @@ const SQLITE_DDL: &str = "CREATE TABLE flags (id INTEGER PRIMARY KEY, flag BOOLE
 /// `flag` cell is `cell`.
 fn pg_notifies(predicate: &str, cell: Value<Postgres>) -> bool {
     let db = ParserDB::parse::<PostgreSqlDialect>(PG_DDL).expect("DDL parses");
-    let table = catalog_helpers::table_id(&db, "flags").expect("flags is in the catalog");
+    let table = catalog_helpers::table_id::<subql::backend::Postgres, _>(&db, "flags")
+        .expect("flags is in the catalog");
     let mut engine: PgEngine = SubscriptionEngine::new(db, PostgreSqlDialect {});
     engine
         .register(SubscriptionRequest::new(1u64, predicate))
@@ -67,7 +68,8 @@ fn bool_ordering_matches_the_engine() {
 #[test]
 fn mysql_bool_ordering_matches_the_engine() {
     let db = ParserDB::parse::<MySqlDialect>(MYSQL_DDL).expect("DDL parses");
-    let table = catalog_helpers::table_id(&db, "flags").expect("flags is in the catalog");
+    let table = catalog_helpers::table_id::<subql::backend::Postgres, _>(&db, "flags")
+        .expect("flags is in the catalog");
     let mut engine: MySqlEngine = SubscriptionEngine::new(db, MySqlDialect {});
     engine
         .register(SubscriptionRequest::new(
@@ -93,7 +95,8 @@ fn mysql_bool_ordering_matches_the_engine() {
 #[test]
 fn sqlite_bool_ordering_is_integer_comparison() {
     let db = ParserDB::parse::<SQLiteDialect>(SQLITE_DDL).expect("DDL parses");
-    let table = catalog_helpers::table_id(&db, "flags").expect("flags is in the catalog");
+    let table = catalog_helpers::table_id::<subql::backend::Postgres, _>(&db, "flags")
+        .expect("flags is in the catalog");
     let notifies = |predicate: &str, cell: Value<SQLite>| {
         let mut engine: SqliteEngine = SubscriptionEngine::new(db.clone(), SQLiteDialect {});
         engine

@@ -80,7 +80,8 @@ fn v1_update(changed: usize) -> ChangeV1 {
 /// Resolving every column name of a wide table by ordinal.
 fn column_name_benchmark(c: &mut Criterion) {
     let db = wide_catalog();
-    let table = catalog_helpers::table_id(&db, "wide").expect("wide resolves");
+    let table = catalog_helpers::table_id::<subql::backend::Postgres, _>(&db, "wide")
+        .expect("wide resolves");
     let mut group = c.benchmark_group("catalog_column_name");
     group.bench_function("wide_table_every_ordinal", |b| {
         b.iter(|| {

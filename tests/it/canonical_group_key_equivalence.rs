@@ -368,7 +368,7 @@ fn mysql_keys_match_binary_collations_and_decimal_equality() {
         .load::<(String, i64)>(&mut connection)
         .unwrap();
     assert_eq!(padded_groups.len(), 1);
-    let padded_encoder = MySql::group_key_encoder(vec![column(
+    let padded_encoder = <MySql as Backend>::group_key_encoder(vec![column(
         ScalarFamily::String,
         named("utf8mb4_bin", None, Some(MySqlCollationPadding::PadSpace)),
     )])
@@ -404,7 +404,7 @@ fn mysql_keys_match_binary_collations_and_decimal_equality() {
         .load::<(f32, i64)>(&mut connection)
         .unwrap();
     assert_eq!(single_groups.len(), 2);
-    assert!(MySql::group_key_encoder(vec![column(
+    assert!(<MySql as Backend>::group_key_encoder(vec![column(
         ScalarFamily::Float,
         ColumnCollation::DatabaseDefault,
     )])

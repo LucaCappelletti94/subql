@@ -97,10 +97,16 @@ mod tests {
              CREATE TABLE public.users (id INT PRIMARY KEY, name TEXT);",
         )
         .expect("ambiguous DDL parses");
-        let qualified_id =
-            crate::catalog_helpers::table_id(&catalog, "public.users").expect("public.users id");
-        let unqualified_id =
-            crate::catalog_helpers::table_id(&catalog, "other.users").expect("other.users id");
+        let qualified_id = crate::catalog_helpers::table_id::<crate::backend::Postgres, _>(
+            &catalog,
+            "public.users",
+        )
+        .expect("public.users id");
+        let unqualified_id = crate::catalog_helpers::table_id::<crate::backend::Postgres, _>(
+            &catalog,
+            "other.users",
+        )
+        .expect("other.users id");
         assert_ne!(qualified_id, unqualified_id);
 
         // `resolve_table("public", "users", ...)` looks up both
@@ -112,8 +118,12 @@ mod tests {
         // delegate to `resolve_table_reference` with two distinct
         // table-name strings (one playing the role of qualified, the
         // other unqualified).
-        let err = resolve_table_reference(Some("public.users"), "other.users", &catalog)
-            .expect_err("ambiguous lookup must fail");
+        let err = resolve_table_reference::<crate::backend::Postgres, _>(
+            Some("public.users"),
+            "other.users",
+            &catalog,
+        )
+        .expect_err("ambiguous lookup must fail");
         assert!(matches!(
             err,
             TableResolutionError::Ambiguous {
@@ -129,7 +139,9 @@ mod tests {
         let catalog =
             ParserDB::parse::<PostgreSqlDialect>("CREATE TABLE users (id INT PRIMARY KEY);")
                 .expect("users DDL parses");
-        let expected = crate::catalog_helpers::table_id(&catalog, "users").expect("users id");
+        let expected =
+            crate::catalog_helpers::table_id::<crate::backend::Postgres, _>(&catalog, "users")
+                .expect("users id");
 
         let table_id =
             resolve_table("public", "users", &catalog).expect("table should be resolved");
@@ -145,8 +157,11 @@ mod tests {
              CREATE TABLE public.users (id INT PRIMARY KEY);",
         )
         .expect("public.users DDL parses");
-        let expected =
-            crate::catalog_helpers::table_id(&catalog, "public.users").expect("public.users id");
+        let expected = crate::catalog_helpers::table_id::<crate::backend::Postgres, _>(
+            &catalog,
+            "public.users",
+        )
+        .expect("public.users id");
 
         let table_id =
             resolve_table("public", "users", &catalog).expect("table should be resolved");

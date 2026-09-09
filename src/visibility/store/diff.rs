@@ -360,7 +360,7 @@ CREATE TABLE readings(tenant_id INTEGER, reading_id INTEGER, starts_at TIMESTAMP
     }
 
     fn table(shapes: &Shapes<ParserDB>, name: &str) -> TableId {
-        catalog_helpers::table_id(shapes.catalog(), name).unwrap()
+        catalog_helpers::table_id::<crate::backend::Postgres, _>(shapes.catalog(), name).unwrap()
     }
 
     fn text(value: &str) -> Value<Postgres> {

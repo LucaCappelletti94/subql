@@ -48,7 +48,8 @@ const FILTERS: &[(u64, &str)] = &[
 
 fn pg_engine() -> (PgEngine, TableId) {
     let db = ParserDB::parse::<PostgreSqlDialect>(PG_DDL).expect("parse DDL");
-    let table_id = catalog_helpers::table_id(&db, "cells").expect("table cells exists");
+    let table_id =
+        catalog_helpers::table_id::<Postgres, _>(&db, "cells").expect("table cells exists");
     (SubscriptionEngine::new(db, PostgreSqlDialect {}), table_id)
 }
 
@@ -193,7 +194,8 @@ fn a_sqlite_bool_equality_filter_fires_although_the_cell_is_an_integer() {
         "CREATE TABLE flags (id INTEGER PRIMARY KEY, flag BOOLEAN);",
     )
     .expect("parse DDL");
-    let table_id = catalog_helpers::table_id(&db, "flags").expect("table flags exists");
+    let table_id =
+        catalog_helpers::table_id::<Postgres, _>(&db, "flags").expect("table flags exists");
     let mut engine: SqliteEngine = SubscriptionEngine::new(db, SQLiteDialect {});
     engine
         .register(SubscriptionRequest::new(

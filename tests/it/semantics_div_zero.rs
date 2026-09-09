@@ -38,7 +38,8 @@ const SQLITE_DDL: &str = "CREATE TABLE t (id INTEGER PRIMARY KEY, qty INTEGER, r
 macro_rules! dispatch {
     ($backend:ty, $dialect:ty, $ddl:expr, $predicate:expr, $cells:expr) => {{
         let db = ParserDB::parse::<$dialect>($ddl).expect("DDL parses");
-        let table = catalog_helpers::table_id(&db, "t").expect("t is in the catalog");
+        let table = catalog_helpers::table_id::<subql::backend::Postgres, _>(&db, "t")
+            .expect("t is in the catalog");
         let mut engine: SubscriptionEngine<TestEvent<$backend>, DefaultIds, ParserDB> =
             SubscriptionEngine::new(db, <$dialect>::default()).with_division_precision_increment(
                 subql::backend::DivisionPrecisionIncrement::new(4).expect("4 is in range"),

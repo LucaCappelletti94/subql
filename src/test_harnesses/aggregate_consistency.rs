@@ -116,7 +116,7 @@ struct AggEngineCell {
 impl AggEngineCell {
     fn new() -> Self {
         let database = agg_catalog();
-        let table_id = catalog_helpers::table_id(&database, "orders")
+        let table_id = catalog_helpers::table_id::<Postgres, _>(&database, "orders")
             .expect("agg_catalog must expose an `orders` table");
         let pk_col = catalog_helpers::column_id(&database, table_id, "id")
             .expect("agg_catalog `orders` must expose an `id` column");
@@ -201,7 +201,7 @@ struct RlsGuardCell {
 impl RlsGuardCell {
     fn new() -> Self {
         let rls_db = rls_agg_catalog();
-        let rls_table_id = catalog_helpers::table_id(&rls_db, "orders")
+        let rls_table_id = catalog_helpers::table_id::<Postgres, _>(&rls_db, "orders")
             .expect("rls_agg_catalog must expose an `orders` table");
         let rls_engine = SubscriptionEngine::new(rls_db, PostgreSqlDialect {});
         let plain_engine = SubscriptionEngine::new(agg_catalog(), PostgreSqlDialect {});

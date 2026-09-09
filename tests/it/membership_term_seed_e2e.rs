@@ -88,7 +88,7 @@ fn translator() -> Translator {
 
 fn engine() -> (Engine, TableId) {
     let db = ParserDB::parse::<PostgreSqlDialect>(SCHEMA).unwrap();
-    let docs = catalog_helpers::table_id(&db, "docs").unwrap();
+    let docs = catalog_helpers::table_id::<Postgres, _>(&db, "docs").unwrap();
     (
         SubscriptionEngine::new(db, PostgreSqlDialect {}).with_translator(translator()),
         docs,

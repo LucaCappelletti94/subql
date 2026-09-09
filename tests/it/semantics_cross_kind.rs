@@ -39,7 +39,8 @@ use subql::{catalog_helpers, DefaultIds, NotServed, SubscriptionEngine, Subscrip
 macro_rules! notifies {
     ($backend:ty, $dialect:ty, $ddl:expr, $predicate:expr, $cells:expr) => {{
         let db = ParserDB::parse::<$dialect>($ddl).expect("DDL parses");
-        let table = catalog_helpers::table_id(&db, "t").expect("t is in the catalog");
+        let table = catalog_helpers::table_id::<subql::backend::Postgres, _>(&db, "t")
+            .expect("t is in the catalog");
         let mut engine: SubscriptionEngine<TestEvent<$backend>, DefaultIds, ParserDB> =
             SubscriptionEngine::new(db, <$dialect>::default());
         engine
@@ -232,7 +233,8 @@ fn mysql_matches_the_numeric_widening() {
 #[test]
 fn non_numeric_cross_kind_is_not_served_in_process() {
     let db = ParserDB::parse::<PostgreSqlDialect>(PG_DDL).expect("DDL parses");
-    let table = catalog_helpers::table_id(&db, "t").expect("t is in the catalog");
+    let table = catalog_helpers::table_id::<subql::backend::Postgres, _>(&db, "t")
+        .expect("t is in the catalog");
     let qty = catalog_helpers::column_id(&db, table, "qty").expect("qty is in the catalog");
     let label = catalog_helpers::column_id(&db, table, "label").expect("label is in the catalog");
 
@@ -366,7 +368,8 @@ fn sqlite_orders_an_infinity_against_an_integer() {
 #[test]
 fn a_decimal_past_the_double_range_refuses_the_comparison() {
     let db = ParserDB::parse::<PostgreSqlDialect>(PG_DDL).expect("DDL parses");
-    let table = catalog_helpers::table_id(&db, "t").expect("t is in the catalog");
+    let table = catalog_helpers::table_id::<subql::backend::Postgres, _>(&db, "t")
+        .expect("t is in the catalog");
     let mut engine: SubscriptionEngine<TestEvent<Postgres>, DefaultIds, ParserDB> =
         SubscriptionEngine::new(db, PostgreSqlDialect {});
     let subscription = engine

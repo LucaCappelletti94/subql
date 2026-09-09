@@ -948,7 +948,9 @@ mod render_tests {
             "CREATE TABLE blobs (id INTEGER PRIMARY KEY, name TEXT, payload BLOB);",
         )
         .expect("catalog");
-        let table_id = crate::catalog_helpers::table_id(&catalog, "blobs").expect("blobs table");
+        let table_id =
+            crate::catalog_helpers::table_id::<crate::backend::Postgres, _>(&catalog, "blobs")
+                .expect("blobs table");
         let mut engine = SubscriptionEngine::<TestEvent<SQLite>, crate::DefaultIds, _>::new(
             catalog,
             SQLiteDialect {},
@@ -998,7 +1000,9 @@ mod render_tests {
             "CREATE TABLE blobs (id INTEGER PRIMARY KEY, name TEXT, payload BLOB);",
         )
         .expect("catalog");
-        let table_id = crate::catalog_helpers::table_id(&catalog, "blobs").expect("blobs table");
+        let table_id =
+            crate::catalog_helpers::table_id::<crate::backend::Postgres, _>(&catalog, "blobs")
+                .expect("blobs table");
         let mut engine = SubscriptionEngine::<TestEvent<SQLite>, crate::DefaultIds, _>::new(
             catalog,
             SQLiteDialect {},

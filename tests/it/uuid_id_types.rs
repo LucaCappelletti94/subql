@@ -51,7 +51,8 @@ fn insert_event(table_id: TableId, id: i64, amount: i64) -> TestEvent<Postgres> 
 #[test]
 fn uuid_consumer_ids_dispatch() {
     let database = catalog();
-    let orders = catalog_helpers::table_id(&database, "orders").unwrap();
+    let orders =
+        catalog_helpers::table_id::<subql::backend::Postgres, _>(&database, "orders").unwrap();
     let mut engine: SubscriptionEngine<TestEvent<Postgres>, UuidIds, ParserDB> =
         SubscriptionEngine::new(database, PostgreSqlDialect {});
 
@@ -86,7 +87,8 @@ fn uuid_consumer_ids_dispatch() {
 #[test]
 fn uuid_session_scope_unregister() {
     let database = catalog();
-    let orders = catalog_helpers::table_id(&database, "orders").unwrap();
+    let orders =
+        catalog_helpers::table_id::<subql::backend::Postgres, _>(&database, "orders").unwrap();
     let mut engine: SubscriptionEngine<TestEvent<Postgres>, UuidIds, ParserDB> =
         SubscriptionEngine::new(database, PostgreSqlDialect {});
 
@@ -131,7 +133,8 @@ fn uuid_session_scope_unregister() {
 fn uuid_consumer_ids_survive_snapshot_restore() {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().to_path_buf();
-    let orders = catalog_helpers::table_id(&catalog(), "orders").unwrap();
+    let orders =
+        catalog_helpers::table_id::<subql::backend::Postgres, _>(&catalog(), "orders").unwrap();
     let consumer = Uuid::from_u128(0x00C0_FFEE);
 
     {

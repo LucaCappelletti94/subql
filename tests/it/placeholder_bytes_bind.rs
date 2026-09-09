@@ -21,7 +21,7 @@ fn pg_engine() -> (PgEngine, TableId) {
     let db =
         ParserDB::parse::<PostgreSqlDialect>("CREATE TABLE t (id INT PRIMARY KEY, payload BYTEA);")
             .expect("parse DDL");
-    let table_id = catalog_helpers::table_id(&db, "t").expect("table t exists");
+    let table_id = catalog_helpers::table_id::<Postgres, _>(&db, "t").expect("table t exists");
     (SubscriptionEngine::new(db, PostgreSqlDialect {}), table_id)
 }
 
@@ -307,7 +307,8 @@ fn positional_bytes_bind_matches_identically() {
     let db =
         ParserDB::parse::<SQLiteDialect>("CREATE TABLE t (id INTEGER PRIMARY KEY, payload BLOB);")
             .expect("parse DDL");
-    let table_id: TableId = catalog_helpers::table_id(&db, "t").expect("table t exists");
+    let table_id: TableId =
+        catalog_helpers::table_id::<Postgres, _>(&db, "t").expect("table t exists");
     let mut engine: SubscriptionEngine<TestEvent<SQLite>, DefaultIds, ParserDB> =
         SubscriptionEngine::new(db, SQLiteDialect {});
 

@@ -19,7 +19,8 @@ type Engine = SubscriptionEngine<Event, DefaultIds, ParserDB>;
 
 fn engine() -> (Engine, TableId) {
     let catalog = ParserDB::parse::<PostgreSqlDialect>(DDL).expect("parse DDL");
-    let table = catalog_helpers::table_id(&catalog, "orders").expect("orders resolves");
+    let table =
+        catalog_helpers::table_id::<Postgres, _>(&catalog, "orders").expect("orders resolves");
     (
         SubscriptionEngine::new(catalog, PostgreSqlDialect {}),
         table,
@@ -200,7 +201,8 @@ fn positional_registration_binds_follow_rewritten_sql_order_mysql() {
          amount INT, status VARCHAR(32) COLLATE utf8mb4_bin);",
     )
     .expect("parse DDL");
-    let orders = catalog_helpers::table_id(&catalog, "orders").expect("orders resolves");
+    let orders =
+        catalog_helpers::table_id::<Postgres, _>(&catalog, "orders").expect("orders resolves");
     let mut engine =
         SubscriptionEngine::<TestEvent<MySql, PgLsn>, DefaultIds, _>::new(catalog, MySqlDialect {});
     let registered = engine
@@ -273,7 +275,8 @@ fn positional_registration_binds_follow_rewritten_sql_order_sqlite() {
         "CREATE TABLE orders (id INTEGER PRIMARY KEY, region TEXT COLLATE BINARY, amount INTEGER, status TEXT);",
     )
     .expect("parse DDL");
-    let orders = catalog_helpers::table_id(&catalog, "orders").expect("orders resolves");
+    let orders =
+        catalog_helpers::table_id::<Postgres, _>(&catalog, "orders").expect("orders resolves");
     let mut engine = SubscriptionEngine::<TestEvent<SQLite, PgLsn>, DefaultIds, _>::new(
         catalog,
         SQLiteDialect {},
@@ -348,7 +351,8 @@ fn positional_registration_binds_skip_null_group_values_sqlite() {
         "CREATE TABLE orders (id INTEGER PRIMARY KEY, region TEXT COLLATE BINARY, category TEXT COLLATE BINARY, amount INTEGER, status TEXT);",
     )
     .expect("parse DDL");
-    let orders = catalog_helpers::table_id(&catalog, "orders").expect("orders resolves");
+    let orders =
+        catalog_helpers::table_id::<Postgres, _>(&catalog, "orders").expect("orders resolves");
     let mut engine = SubscriptionEngine::<TestEvent<SQLite, PgLsn>, DefaultIds, _>::new(
         catalog,
         SQLiteDialect {},
@@ -885,7 +889,8 @@ fn every_postgres_group_kind_renders_into_a_scoped_read() {
         amount INT
     );";
     let catalog = ParserDB::parse::<PostgreSqlDialect>(ddl).expect("parse DDL");
-    let table = catalog_helpers::table_id(&catalog, "samples").expect("samples resolves");
+    let table =
+        catalog_helpers::table_id::<Postgres, _>(&catalog, "samples").expect("samples resolves");
     let mut engine =
         SubscriptionEngine::<Event, DefaultIds, ParserDB>::new(catalog, PostgreSqlDialect {});
     let sql = "SELECT enabled, payload, created, zoned, day, clock, label, token, metric, doc, MIN(amount) \

@@ -110,6 +110,8 @@ impl Backend for Custom {
     /// identifiers keep their case.
     const DELIMITED_IDENTIFIERS_FOLD_CASE: bool = false;
 
+    const TABLE_NAMES_FOLD_CASE: bool = false;
+
     /// This backend speaks the PostgreSQL dialect, so it takes
     /// PostgreSQL's `LIKE` escape rule with it.
     const LIKE_ESCAPE: Option<LikeEscape> = Some(LikeEscape {
@@ -299,7 +301,7 @@ fn db() -> ParserDB {
 
 fn kind_of_column(name: &str) -> Option<ScalarKindOf<Custom>> {
     let db = db();
-    let table = catalog_helpers::table_id(&db, "feelings").unwrap();
+    let table = catalog_helpers::table_id::<Postgres, _>(&db, "feelings").unwrap();
     let column = catalog_helpers::column_id(&db, table, name).unwrap();
     catalog_helpers::column_scalar_kind::<Custom, _>(&db, table, column)
 }
@@ -477,7 +479,7 @@ fn a_custom_value_names_its_own_kind() {
 /// happened twice in this codebase, so it is pinned here rather than assumed.
 #[test]
 fn a_custom_filter_fires_on_the_row_it_names() {
-    let table = catalog_helpers::table_id(&db(), "feelings").unwrap();
+    let table = catalog_helpers::table_id::<Postgres, _>(&db(), "feelings").unwrap();
     let mut engine: SubscriptionEngine<TestEvent<Custom>, DefaultIds, ParserDB> =
         SubscriptionEngine::new(db(), PostgreSqlDialect {});
     engine
@@ -523,7 +525,7 @@ fn a_custom_filter_fires_on_the_row_it_names() {
 /// text that carried it.
 #[test]
 fn a_filter_written_with_one_spelling_matches_a_row_written_with_another() {
-    let table = catalog_helpers::table_id(&db(), "feelings").unwrap();
+    let table = catalog_helpers::table_id::<Postgres, _>(&db(), "feelings").unwrap();
     let mut engine: SubscriptionEngine<TestEvent<Custom>, DefaultIds, ParserDB> =
         SubscriptionEngine::new(db(), PostgreSqlDialect {});
     engine

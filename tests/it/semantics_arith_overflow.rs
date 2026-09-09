@@ -44,7 +44,8 @@ const OVERFLOWS: &str = "SELECT * FROM t WHERE qty + 9223372036854775807 > 0";
 macro_rules! dispatch {
     ($backend:ty, $dialect:ty, $ddl:expr, $predicate:expr, $qty:expr) => {{
         let db = ParserDB::parse::<$dialect>($ddl).expect("DDL parses");
-        let table = catalog_helpers::table_id(&db, "t").expect("t is in the catalog");
+        let table = catalog_helpers::table_id::<subql::backend::Postgres, _>(&db, "t")
+            .expect("t is in the catalog");
         let mut engine: SubscriptionEngine<TestEvent<$backend>, DefaultIds, ParserDB> =
             SubscriptionEngine::new(db, <$dialect>::default());
         engine
@@ -127,7 +128,8 @@ fn sqlite_overflow_promotes_to_float() {
 #[test]
 fn overflow_fails_only_its_own_subscription() {
     let db = ParserDB::parse::<PostgreSqlDialect>(DDL).expect("DDL parses");
-    let table = catalog_helpers::table_id(&db, "t").expect("t is in the catalog");
+    let table = catalog_helpers::table_id::<subql::backend::Postgres, _>(&db, "t")
+        .expect("t is in the catalog");
     let mut engine: SubscriptionEngine<TestEvent<Postgres>, DefaultIds, ParserDB> =
         SubscriptionEngine::new(db, PostgreSqlDialect {});
     engine
@@ -183,7 +185,8 @@ fn sound_arithmetic_still_answers() {
 #[test]
 fn one_consumer_with_two_subscriptions_fails_only_the_overflowing_one() {
     let db = ParserDB::parse::<PostgreSqlDialect>(DDL).expect("DDL parses");
-    let table = catalog_helpers::table_id(&db, "t").expect("t is in the catalog");
+    let table = catalog_helpers::table_id::<subql::backend::Postgres, _>(&db, "t")
+        .expect("t is in the catalog");
     let mut engine: SubscriptionEngine<TestEvent<Postgres>, DefaultIds, ParserDB> =
         SubscriptionEngine::new(db, PostgreSqlDialect {});
 
@@ -232,7 +235,8 @@ fn one_consumer_with_two_subscriptions_fails_only_the_overflowing_one() {
 #[test]
 fn an_update_refused_on_one_version_reports_no_transition() {
     let db = ParserDB::parse::<PostgreSqlDialect>(DDL).expect("DDL parses");
-    let table = catalog_helpers::table_id(&db, "t").expect("t is in the catalog");
+    let table = catalog_helpers::table_id::<subql::backend::Postgres, _>(&db, "t")
+        .expect("t is in the catalog");
     let mut engine: SubscriptionEngine<TestEvent<Postgres>, DefaultIds, ParserDB> =
         SubscriptionEngine::new(db, PostgreSqlDialect {});
     // The first disjunct short-circuits for a negative `qty`, so only a
@@ -307,7 +311,8 @@ fn a_term_that_short_circuits_the_overflow_keeps_its_subscriber_answered() {
          OR qty + 9223372036854775807 > 0";
 
     let db = ParserDB::parse::<PostgreSqlDialect>(DDL_TERM).expect("DDL parses");
-    let docs = catalog_helpers::table_id(&db, "docs").expect("docs is in the catalog");
+    let docs = catalog_helpers::table_id::<subql::backend::Postgres, _>(&db, "docs")
+        .expect("docs is in the catalog");
     let mut engine: SubscriptionEngine<TestEvent<Postgres>, DefaultIds, ParserDB> =
         SubscriptionEngine::new(db, PostgreSqlDialect {}).with_translator(
             TranslatorBuilder::new()
@@ -369,7 +374,8 @@ fn a_term_that_short_circuits_the_overflow_keeps_its_subscriber_answered() {
 #[test]
 fn an_overflowing_aggregate_filter_stops_maintenance() {
     let db = ParserDB::parse::<PostgreSqlDialect>(DDL).expect("DDL parses");
-    let table = catalog_helpers::table_id(&db, "t").expect("t is in the catalog");
+    let table = catalog_helpers::table_id::<subql::backend::Postgres, _>(&db, "t")
+        .expect("t is in the catalog");
     let mut engine: SubscriptionEngine<TestEvent<Postgres>, DefaultIds, ParserDB> =
         SubscriptionEngine::new(db, PostgreSqlDialect {});
     let subscription = engine
@@ -420,7 +426,8 @@ fn an_aggregate_update_refused_on_one_version_folds_nothing() {
         (1, -1, "the mirror"),
     ] {
         let db = ParserDB::parse::<PostgreSqlDialect>(DDL).expect("DDL parses");
-        let table = catalog_helpers::table_id(&db, "t").expect("t is in the catalog");
+        let table = catalog_helpers::table_id::<subql::backend::Postgres, _>(&db, "t")
+            .expect("t is in the catalog");
         let mut engine: SubscriptionEngine<TestEvent<Postgres>, DefaultIds, ParserDB> =
             SubscriptionEngine::new(db, PostgreSqlDialect {});
         let subscription = engine

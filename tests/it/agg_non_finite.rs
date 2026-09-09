@@ -69,7 +69,7 @@ where
     D: sqlparser::dialect::Dialect + Default,
 {
     let database = ParserDB::parse::<D>(ddl).unwrap();
-    let table: TableId = catalog_helpers::table_id(&database, "t").unwrap();
+    let table: TableId = catalog_helpers::table_id::<Postgres, _>(&database, "t").unwrap();
     let mut engine: SubscriptionEngine<TestEvent<B, PgLsn>, DefaultIds, ParserDB> =
         SubscriptionEngine::new(database, dialect);
     let registered = engine.register(SubscriptionRequest::new(7, sql)).unwrap();
@@ -265,7 +265,7 @@ enum Change {
 /// last reported, so a removal can be asked about as well as an arrival.
 fn pg_stream(sql: &str, changes: &[Change], components: usize) -> Option<AggValue> {
     let database = ParserDB::parse::<PostgreSqlDialect>(PG_DDL).unwrap();
-    let table: TableId = catalog_helpers::table_id(&database, "t").unwrap();
+    let table: TableId = catalog_helpers::table_id::<Postgres, _>(&database, "t").unwrap();
     let mut engine: SubscriptionEngine<TestEvent<Postgres, PgLsn>, DefaultIds, ParserDB> =
         SubscriptionEngine::new(database, PostgreSqlDialect {});
     let registered = engine.register(SubscriptionRequest::new(7, sql)).unwrap();
@@ -541,7 +541,7 @@ fn a_widened_count_counts_a_non_finite_float() {
     const GROUPED_DDL: &str =
         "CREATE TABLE t (id INT PRIMARY KEY, region TEXT, approx DOUBLE PRECISION)";
     let database = ParserDB::parse::<PostgreSqlDialect>(GROUPED_DDL).unwrap();
-    let table: TableId = catalog_helpers::table_id(&database, "t").unwrap();
+    let table: TableId = catalog_helpers::table_id::<Postgres, _>(&database, "t").unwrap();
     let mut engine: SubscriptionEngine<TestEvent<Postgres, PgLsn>, DefaultIds, ParserDB> =
         SubscriptionEngine::new(database, PostgreSqlDialect {});
     let registered = engine

@@ -47,7 +47,7 @@ fn engine_from(ddl: &str) -> Engine {
 /// Deterministic `table_id` for `t` in a catalog parsed from `ddl`.
 fn table_id_of(ddl: &str) -> TableId {
     let catalog = ParserDB::parse::<PostgreSqlDialect>(ddl).unwrap();
-    subql::catalog_helpers::table_id(&catalog, "t").unwrap()
+    subql::catalog_helpers::table_id::<subql::backend::Postgres, _>(&catalog, "t").unwrap()
 }
 
 fn register(engine: &mut Engine, sql: &str) -> Result<Registered, RegisterError> {

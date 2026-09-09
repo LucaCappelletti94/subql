@@ -53,7 +53,8 @@ fn event(text: &str) -> impl CdcEvent<Backend = subql::backend::Postgres> {
 #[test]
 fn a_real_cell_decodes_at_float4_width() {
     let db = catalog();
-    let table = catalog_helpers::table_id(&db, "readings").expect("readings is cataloged");
+    let table = catalog_helpers::table_id::<subql::backend::Postgres, _>(&db, "readings")
+        .expect("readings is cataloged");
     let single = catalog_helpers::column_id(&db, table, "single").expect("single");
     let double = catalog_helpers::column_id(&db, table, "double").expect("double");
     let ev = event("0.1");
@@ -161,7 +162,8 @@ fn mysql_float_arithmetic_stays_double() {
         "CREATE TABLE readings (id INT PRIMARY KEY, single FLOAT, double DOUBLE)",
     )
     .expect("DDL parses");
-    let table = catalog_helpers::table_id(&db, "readings").expect("readings is cataloged");
+    let table = catalog_helpers::table_id::<subql::backend::Postgres, _>(&db, "readings")
+        .expect("readings is cataloged");
     let mut engine: SubscriptionEngine<TestEvent<MySql>, DefaultIds, ParserDB> =
         SubscriptionEngine::new(db, MySqlDialect {});
     engine
@@ -191,7 +193,8 @@ fn sqlite_real_arithmetic_is_never_narrowed() {
         "CREATE TABLE readings (id INTEGER PRIMARY KEY, single REAL, double REAL)",
     )
     .expect("DDL parses");
-    let table = catalog_helpers::table_id(&db, "readings").expect("readings is cataloged");
+    let table = catalog_helpers::table_id::<subql::backend::Postgres, _>(&db, "readings")
+        .expect("readings is cataloged");
     let mut engine: SubscriptionEngine<TestEvent<SQLite>, DefaultIds, ParserDB> =
         SubscriptionEngine::new(db, SQLiteDialect {});
     engine

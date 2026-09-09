@@ -38,7 +38,7 @@ fn insert_event(table_id: subql::TableId, id: i64, amount: i64) -> TestEvent<Pos
 fn restore_populates_column_kinds_cache() {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().to_path_buf();
-    let orders = catalog_helpers::table_id(&catalog(), "orders").unwrap();
+    let orders = catalog_helpers::table_id::<Postgres, _>(&catalog(), "orders").unwrap();
 
     // Register a range predicate; the prefilter emits a `Range` atom for
     // `amount > 100`, so `arity` matters at dispatch time.

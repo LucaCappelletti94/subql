@@ -1419,7 +1419,7 @@ where
     /// let database = ParserDB::parse::<PostgreSqlDialect>(
     ///     "CREATE TABLE orders (id INT PRIMARY KEY, amount INT, status TEXT);",
     /// )?;
-    /// let orders_id = catalog_helpers::table_id(&database, "orders").unwrap();
+    /// let orders_id = catalog_helpers::table_id::<subql::backend::Postgres, _>(&database, "orders").unwrap();
     /// let mut engine: SubscriptionEngine<TestEvent<Postgres>, DefaultIds, ParserDB> =
     ///     SubscriptionEngine::new(database, PostgreSqlDialect {});
     ///
@@ -2743,7 +2743,7 @@ where
         table: &str,
         pk: Vec<crate::backend::Value<E::Backend>>,
     ) -> Result<Registered<E::Backend>, RegisterError> {
-        let table_id = catalog_helpers::table_id(&self.database, table)
+        let table_id = catalog_helpers::table_id::<E::Backend, _>(&self.database, table)
             .ok_or_else(|| RegisterError::UnknownTable(table.to_string()))?;
         let pk_cols = catalog_helpers::primary_key_columns(&self.database, table_id)?;
         if pk_cols.is_empty() {
@@ -2830,7 +2830,7 @@ where
     /// let database = ParserDB::parse::<PostgreSqlDialect>(
     ///     "CREATE TABLE orders (id INT PRIMARY KEY, amount INT, status TEXT);",
     /// )?;
-    /// let orders_id = catalog_helpers::table_id(&database, "orders").unwrap();
+    /// let orders_id = catalog_helpers::table_id::<subql::backend::Postgres, _>(&database, "orders").unwrap();
     /// let mut engine: SubscriptionEngine<TestEvent<Postgres>, DefaultIds, ParserDB> =
     ///     SubscriptionEngine::new(database, PostgreSqlDialect {});
     ///
@@ -3631,7 +3631,7 @@ where
     /// let database = ParserDB::parse::<PostgreSqlDialect>(
     ///     "CREATE TABLE orders (id INT PRIMARY KEY, amount INT, status TEXT);",
     /// )?;
-    /// let orders_id = catalog_helpers::table_id(&database, "orders").unwrap();
+    /// let orders_id = catalog_helpers::table_id::<subql::backend::Postgres, _>(&database, "orders").unwrap();
     /// let mut engine: SubscriptionEngine<TestEvent<Postgres>, DefaultIds, ParserDB> =
     ///     SubscriptionEngine::new(database, PostgreSqlDialect {});
     ///
@@ -3977,7 +3977,7 @@ where
     ///     "CREATE TABLE orders (id INT PRIMARY KEY, amount INT, status TEXT);",
     /// )
     /// .expect("the DDL parses");
-    /// let orders_id = catalog_helpers::table_id(&database, "orders").expect("orders is cataloged");
+    /// let orders_id = catalog_helpers::table_id::<subql::backend::Postgres, _>(&database, "orders").expect("orders is cataloged");
     /// let mut engine: SubscriptionEngine<TestEvent<Postgres>, DefaultIds, ParserDB> =
     ///     SubscriptionEngine::new(database, PostgreSqlDialect {});
     ///
@@ -5035,7 +5035,9 @@ mod tests {
     #[test]
     fn the_core_delivers_no_read_answers() {
         let database = ParserDB::parse::<PostgreSqlDialect>(DDL).expect("the DDL parses");
-        let table = crate::catalog_helpers::table_id(&database, "orders").expect("orders resolves");
+        let table =
+            crate::catalog_helpers::table_id::<crate::backend::Postgres, _>(&database, "orders")
+                .expect("orders resolves");
         let mut engine: Engine = SubscriptionEngine::new(database, PostgreSqlDialect {});
         engine
             .register(SubscriptionRequest::new(
@@ -5166,7 +5168,8 @@ mod tests {
     #[test]
     fn dispatch_resolves_the_event_table_once() {
         let db = ParserDB::parse::<PostgreSqlDialect>(DDL).expect("parse DDL");
-        let table_id = catalog_helpers::table_id(&db, "orders").expect("orders exists");
+        let table_id = catalog_helpers::table_id::<crate::backend::Postgres, _>(&db, "orders")
+            .expect("orders exists");
         let mut engine: SubscriptionEngine<CountingEvent, DefaultIds, ParserDB> =
             SubscriptionEngine::new(db, PostgreSqlDialect {});
         engine
@@ -5219,7 +5222,8 @@ mod tests {
     #[test]
     fn dispatch_reads_primary_keys_through_the_resolved_event() {
         let db = ParserDB::parse::<PostgreSqlDialect>(DDL).expect("parse DDL");
-        let table_id = catalog_helpers::table_id(&db, "orders").expect("orders exists");
+        let table_id = catalog_helpers::table_id::<crate::backend::Postgres, _>(&db, "orders")
+            .expect("orders exists");
         let mut engine: SubscriptionEngine<CountingEvent, DefaultIds, ParserDB> =
             SubscriptionEngine::new(db, PostgreSqlDialect {});
         engine
@@ -5577,7 +5581,9 @@ mod tests {
 
     fn rls_engine() -> (Engine, TableId) {
         let db = ParserDB::parse::<PostgreSqlDialect>(RLS_DDL).expect("parse RLS DDL");
-        let table_id = crate::catalog_helpers::table_id(&db, "orders").expect("orders exists");
+        let table_id =
+            crate::catalog_helpers::table_id::<crate::backend::Postgres, _>(&db, "orders")
+                .expect("orders exists");
         (SubscriptionEngine::new(db, PostgreSqlDialect {}), table_id)
     }
 
@@ -5715,7 +5721,9 @@ mod tests {
     fn keyed_transition_preserves_registration_binds_and_mode() {
         let db = ParserDB::parse::<PostgreSqlDialect>(DDL).expect("parse DDL");
         let mut engine: Engine = SubscriptionEngine::new(db, PostgreSqlDialect {});
-        let table = catalog_helpers::table_id(engine.database(), "orders").expect("orders");
+        let table =
+            catalog_helpers::table_id::<crate::backend::Postgres, _>(engine.database(), "orders")
+                .expect("orders");
         let registered = engine
             .register(
                 SubscriptionRequest::new(1u64, "SELECT * FROM orders WHERE lower(status) = $1")
@@ -5774,8 +5782,11 @@ mod tests {
              CREATE TABLE project_members(project_id INTEGER REFERENCES projects(id), user_id TEXT, PRIMARY KEY(project_id, user_id));
              CREATE TABLE docs(id INTEGER PRIMARY KEY, project_id INTEGER, title TEXT);";
         let db = ParserDB::parse::<PostgreSqlDialect>(ddl).expect("DDL parses");
-        let docs = crate::catalog_helpers::table_id(&db, "docs").expect("docs");
-        let members = crate::catalog_helpers::table_id(&db, "project_members").expect("members");
+        let docs = crate::catalog_helpers::table_id::<crate::backend::Postgres, _>(&db, "docs")
+            .expect("docs");
+        let members =
+            crate::catalog_helpers::table_id::<crate::backend::Postgres, _>(&db, "project_members")
+                .expect("members");
         let translator = TranslatorBuilder::new()
             .with_min_confidence(ConfidenceLevel::B)
             .build();

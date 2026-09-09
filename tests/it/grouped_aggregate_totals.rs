@@ -18,7 +18,8 @@ type Engine = SubscriptionEngine<Event, DefaultIds, ParserDB>;
 
 fn engine() -> (Engine, TableId) {
     let catalog = ParserDB::parse::<PostgreSqlDialect>(DDL).expect("parse DDL");
-    let table = catalog_helpers::table_id(&catalog, "orders").expect("orders resolves");
+    let table =
+        catalog_helpers::table_id::<Postgres, _>(&catalog, "orders").expect("orders resolves");
     (
         SubscriptionEngine::new(catalog, PostgreSqlDialect {}),
         table,
@@ -375,7 +376,7 @@ fn an_unencodable_runtime_group_demotes_without_folding() {
         "CREATE TABLE readings (id INT PRIMARY KEY, region DOUBLE PRECISION, amount INT);",
     )
     .unwrap();
-    let table = catalog_helpers::table_id(&catalog, "readings").unwrap();
+    let table = catalog_helpers::table_id::<Postgres, _>(&catalog, "readings").unwrap();
     let mut engine: Engine = SubscriptionEngine::new(catalog, PostgreSqlDialect {});
     let subscription = engine
         .register(SubscriptionRequest::new(

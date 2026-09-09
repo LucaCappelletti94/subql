@@ -105,7 +105,11 @@ fn every_shape_reports_the_tier_that_maintains_it() {
     match keyed {
         Tier::KeyedRows { table_id, .. } => assert_eq!(
             table_id,
-            subql::catalog_helpers::table_id(engine.database(), "orders").expect("orders resolves"),
+            subql::catalog_helpers::table_id::<subql::backend::Postgres, _>(
+                engine.database(),
+                "orders"
+            )
+            .expect("orders resolves"),
             "a keyed re-read reads exactly one table"
         ),
         other => panic!("expected a keyed re-read, got {other:?}"),
@@ -235,7 +239,9 @@ fn every_tier_draws_its_identity_from_one_counter() {
 #[test]
 fn not_served_because_carries_structured_operands() {
     let catalog = ParserDB::parse::<PostgreSqlDialect>(DDL).expect("parse DDL");
-    let orders = subql::catalog_helpers::table_id(&catalog, "orders").expect("orders is known");
+    let orders =
+        subql::catalog_helpers::table_id::<subql::backend::Postgres, _>(&catalog, "orders")
+            .expect("orders is known");
     let status =
         subql::catalog_helpers::column_id(&catalog, orders, "status").expect("status column");
     let mut engine: Engine = SubscriptionEngine::new(catalog, PostgreSqlDialect {});
@@ -277,7 +283,9 @@ fn a_row_security_read_names_its_table() {
          ALTER TABLE guarded ENABLE ROW LEVEL SECURITY;",
     )
     .expect("parse DDL");
-    let table = subql::catalog_helpers::table_id(&catalog, "guarded").expect("guarded is known");
+    let table =
+        subql::catalog_helpers::table_id::<subql::backend::Postgres, _>(&catalog, "guarded")
+            .expect("guarded is known");
     let mut engine: Engine = SubscriptionEngine::new(catalog, PostgreSqlDialect {});
     let registered = engine
         .register(
