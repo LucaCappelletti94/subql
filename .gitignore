@@ -40,3 +40,7 @@ fuzz/hfuzz_target/
 # Added by cargo
 
 /target
+
+# Lockfiles would freeze git dependencies instead of following their branches.
+/Cargo.lock
+/fuzz/Cargo.lock

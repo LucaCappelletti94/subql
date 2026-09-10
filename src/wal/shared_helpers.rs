@@ -12,13 +12,13 @@ use super::WalParseError;
 /// 1. If `schema.table` resolves, it is preferred.
 /// 2. If only `table` resolves, use it.
 /// 3. If both resolve to different IDs, return ambiguity instead of guessing.
-pub fn resolve_table<DB: DatabaseLike>(
+pub fn resolve_table<B: crate::backend::Backend, DB: DatabaseLike>(
     schema: &str,
     table: &str,
     database: &DB,
 ) -> Result<TableId, WalParseError> {
-    resolve_table_parts((!schema.is_empty()).then_some(schema), table, database).map_err(|err| {
-        match err {
+    resolve_table_parts::<B, DB>((!schema.is_empty()).then_some(schema), table, database).map_err(
+        |err| match err {
             TableResolutionError::Ambiguous {
                 qualified,
                 qualified_id,
@@ -35,8 +35,8 @@ pub fn resolve_table<DB: DatabaseLike>(
                 schema: schema.to_string(),
                 table: table.to_string(),
             },
-        }
-    })
+        },
+    )
 }
 
 /// Derive the changed columns of an UPDATE by comparing the old and new
@@ -143,8 +143,8 @@ mod tests {
             crate::catalog_helpers::table_id::<crate::backend::Postgres, _>(&catalog, "users")
                 .expect("users id");
 
-        let table_id =
-            resolve_table("public", "users", &catalog).expect("table should be resolved");
+        let table_id = resolve_table::<crate::backend::Postgres, _>("public", "users", &catalog)
+            .expect("table should be resolved");
         assert_eq!(table_id, expected);
     }
 
@@ -163,8 +163,8 @@ mod tests {
         )
         .expect("public.users id");
 
-        let table_id =
-            resolve_table("public", "users", &catalog).expect("table should be resolved");
+        let table_id = resolve_table::<crate::backend::Postgres, _>("public", "users", &catalog)
+            .expect("table should be resolved");
         assert_eq!(table_id, expected);
     }
 
@@ -173,7 +173,8 @@ mod tests {
         let catalog = ParserDB::parse::<PostgreSqlDialect>("CREATE TABLE other (id INT);")
             .expect("empty fixture DDL parses");
 
-        let err = resolve_table("public", "users", &catalog).expect_err("must fail");
+        let err = resolve_table::<crate::backend::Postgres, _>("public", "users", &catalog)
+            .expect_err("must fail");
         match err {
             WalParseError::UnknownTable { schema, table } => {
                 assert_eq!(schema, "public");

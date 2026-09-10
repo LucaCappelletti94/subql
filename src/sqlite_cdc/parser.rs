@@ -102,7 +102,7 @@ fn op_to_event<DB: DatabaseLike>(
 ) -> Result<Option<SqliteChangesetEvent>, WalParseError> {
     let schema = op.table();
     let table_name = schema.name();
-    let table_id = resolve_table("", table_name.as_str(), database)?;
+    let table_id = resolve_table::<crate::backend::SQLite, DB>("", table_name.as_str(), database)?;
     let arity = catalog_helpers::table_arity(database, table_id).map_err(|_| {
         WalParseError::UnknownTable {
             schema: alloc::string::String::new(),

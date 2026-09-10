@@ -2,6 +2,7 @@
 name = "subql-fuzz"
 version = "0.0.0"
 edition = "2021"
+rust-version = "1.88"
 publish = false
 
 [package.metadata]
@@ -19,6 +20,7 @@ subql = { path = "..", features = ["testing", "pg-sqlite-emu"] }
 # per-package profile overrides, so the cleanest fix is to keep this
 # crate in its own workspace with its own (no-LTO) release profile.
 [workspace]
+resolver = "3"
 members = ["."]
 
 [patch.crates-io]

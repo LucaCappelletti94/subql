@@ -71,11 +71,13 @@ fn event_table_id<DB: DatabaseLike>(event: &ChangeEvent, db: &DB) -> Option<Tabl
     match &event.event_type {
         EventType::Insert { schema, table, .. }
         | EventType::Update { schema, table, .. }
-        | EventType::Delete { schema, table, .. } => resolve_table(schema, table, db).ok(),
+        | EventType::Delete { schema, table, .. } => {
+            resolve_table::<crate::backend::Postgres, DB>(schema, table, db).ok()
+        }
         EventType::Truncate(names) => {
             let full = names.first()?.as_ref();
             let (schema, table) = full.rsplit_once('.').unwrap_or(("", full));
-            resolve_table(schema, table, db).ok()
+            resolve_table::<crate::backend::Postgres, DB>(schema, table, db).ok()
         }
         _ => None,
     }

@@ -72,7 +72,9 @@ impl WireEvent for ChangeV1 {
 
     fn wire_table_id<DB: DatabaseLike>(&self, db: &DB) -> TableId {
         v1_naming(self)
-            .and_then(|(schema, table)| resolve_table(schema, table, db).ok())
+            .and_then(|(schema, table)| {
+                resolve_table::<crate::backend::Postgres, DB>(schema, table, db).ok()
+            })
             .unwrap_or(TableId::MAX)
     }
 
