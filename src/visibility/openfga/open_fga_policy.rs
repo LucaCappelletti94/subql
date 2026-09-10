@@ -48,6 +48,8 @@ const DEFAULT_CONNECT_RETRIES: u32 = 2;
 /// `T` is the transport the caller built, so TLS, bearer tokens and
 /// interceptors stay its business: it hands over whatever
 /// [`OpenFgaServiceClient`] it assembled.
+///
+/// Requires OpenFGA 1.10 or newer for retry-safe writes.
 #[derive(Debug, Clone)]
 pub struct OpenFgaPolicy<DB, T, W, B> {
     shapes: SharedShapes<DB>,
@@ -481,16 +483,17 @@ where
     /// The relation that answers a read of `table`, as the model reports it, or
     /// [`Asked::Refused`] where the model grants nobody.
     ///
-    /// A read judges the row as it is, so its answer is one relation against one
-    /// version. Anything else, including a table the model names no type for,
-    /// leaves the question unputtable rather than guessed at.
+    /// A read judges the existing row against one relation.
     ///
     /// # Errors
     ///
-    /// [`OpenFgaError::StatementNotAnswered`] when the model says nothing this
-    /// can ask. A refusal is not one of those cases: it is an answer, and it
-    /// comes back as [`Asked::Refused`].
+    /// [`OpenFgaError::RowCannotBeNamed`] when the model names no row type, and
+    /// [`OpenFgaError::StatementNotAnswered`] when it reports no single
+    /// existing-row relation to ask.
     fn read_relation(&self, table: TableId) -> Result<Asked<RelationName>, OpenFgaError> {
+        if self.shapes.naming(table).is_none() {
+            return Err(OpenFgaError::RowCannotBeNamed);
+        }
         let statement = ActionStatement::Select;
         let unanswered = || OpenFgaError::StatementNotAnswered { statement };
         match self
@@ -946,11 +949,11 @@ where
                 .write(
                     (!writes.is_empty()).then(|| WriteRequestWrites {
                         tuple_keys: writes,
-                        on_duplicate: String::new(),
+                        on_duplicate: "ignore".to_owned(),
                     }),
                     (!deletes.is_empty()).then(|| WriteRequestDeletes {
                         tuple_keys: deletes,
-                        on_missing: String::new(),
+                        on_missing: "ignore".to_owned(),
                     }),
                 )
                 .await;
@@ -968,7 +971,7 @@ where
                 None,
                 Some(WriteRequestDeletes {
                     tuple_keys: chunk.to_vec(),
-                    on_missing: String::new(),
+                    on_missing: "ignore".to_owned(),
                 }),
             )
             .await?;
@@ -977,7 +980,7 @@ where
             self.write(
                 Some(WriteRequestWrites {
                     tuple_keys: chunk.to_vec(),
-                    on_duplicate: String::new(),
+                    on_duplicate: "ignore".to_owned(),
                 }),
                 None,
             )
@@ -1005,7 +1008,7 @@ where
             self.write(
                 Some(WriteRequestWrites {
                     tuple_keys,
-                    on_duplicate: String::new(),
+                    on_duplicate: "ignore".to_owned(),
                 }),
                 None,
             )
@@ -1322,8 +1325,9 @@ where
 #[allow(clippy::unwrap_used)]
 mod tests {
     use alloc::borrow::Cow;
-    use alloc::collections::BTreeMap;
+    use alloc::collections::{BTreeMap, VecDeque};
     use alloc::vec;
+    use alloc::vec::Vec;
 
     use rls2fga::classifier::function_registry::{SessionAttribute, SessionAttributeKind};
     use rls2fga::translator::TranslatorBuilder;
@@ -1333,22 +1337,34 @@ mod tests {
     use super::{
         batch_request, condition_of, consistency_for, context_for, difference, fits_one_call,
         triple_of, tuple_of, usable_index, ActionStatement, Asked, BatchCheckItem,
-        CheckRequestTupleKey, ConsistencyPreference, Kind, OpenFgaError, OpenFgaPolicy,
-        OpenFgaServiceClient, Question, Record, RecordContextValue, RequestValues,
-        RequiredParameter, RowWrite, Subject, TupleKeyWithoutCondition, MAX_TUPLES_PER_WRITE,
+        BatchCheckRequest, CheckRequestTupleKey, ConsistencyPreference, Kind, OpenFgaError,
+        OpenFgaPolicy, OpenFgaServiceClient, Question, Record, RecordContextValue, RequestValues,
+        RequiredParameter, RowWrite, Subject, TupleKeyWithoutCondition, WriteRequest,
+        MAX_TUPLES_PER_WRITE,
     };
     use crate::backend::{Postgres, Value};
     use crate::testing::{block_on, TestEvent};
     use crate::visibility::shapes::Shapes;
-    use crate::visibility::store::Enumeration;
+    use crate::visibility::store::{Enumeration, Requery, StoreDiff};
     use crate::visibility::{test_names, EventRow, Verdict, VisibilityPolicy};
     use crate::{catalog_helpers, ParserDB};
     use alloc::string::String;
     use alloc::sync::Arc;
+    use core::future::Future;
+    use core::pin::Pin;
     use core::task::{Context as CoreContext, Poll};
+    use openfga_client::client::{
+        batch_check_single_result::CheckResult, BatchCheckResponse, BatchCheckSingleResult,
+        WriteResponse,
+    };
     use openfga_client::tonic::client::GrpcService;
+    use openfga_client::tonic::codec::{Codec, EncodeBody, SingleMessageCompressionOverride};
     use openfga_client::tonic::codegen::http::{Request, Response};
+    use openfga_client::tonic::codegen::{Body as HttpBody, Bytes};
     use openfga_client::tonic::{body::Body, Code, Status};
+    use parking_lot::Mutex;
+    use tonic_prost::prost::Message;
+    use tonic_prost::ProstCodec;
 
     /// The four statements a write can be, which is what `statement_of` reports
     /// for the four [`RowWrite`](crate::visibility::RowWrite) shapes.
@@ -1359,20 +1375,39 @@ mod tests {
         ActionStatement::Delete,
     ];
 
-    /// One question, enough to read the request built around it.
-    fn a_question() -> Question {
+    fn question(place: usize, correlation_id: &str) -> Question {
         Question {
-            place: 0,
+            place,
             item: BatchCheckItem {
                 tuple_key: Some(CheckRequestTupleKey {
-                    user: "user:one".to_string(),
+                    user: alloc::format!("user:{place}"),
                     relation: "can_select".to_string(),
                     object: "docs:1".to_string(),
                 }),
                 contextual_tuples: None,
                 context: None,
-                correlation_id: "w0n0".to_string(),
+                correlation_id: correlation_id.to_string(),
             },
+        }
+    }
+
+    fn a_question() -> Question {
+        question(0, "w0n0")
+    }
+
+    fn batch_response(results: impl IntoIterator<Item = (String, bool)>) -> BatchCheckResponse {
+        BatchCheckResponse {
+            result: results
+                .into_iter()
+                .map(|(correlation, allowed)| {
+                    (
+                        correlation,
+                        BatchCheckSingleResult {
+                            check_result: Some(CheckResult::Allowed(allowed)),
+                        },
+                    )
+                })
+                .collect(),
         }
     }
 
@@ -1784,7 +1819,120 @@ CREATE POLICY notes_p ON notes USING (
         }
     }
 
-    fn policy_over(sql: &str) -> OpenFgaPolicy<ParserDB, NeverAsked, String, Postgres> {
+    enum ScriptedReply {
+        Status(Status),
+        Response(Response<Body>),
+    }
+
+    impl ScriptedReply {
+        fn message<M>(message: M) -> Self
+        where
+            M: Message + Default + Send + 'static,
+        {
+            let mut codec = ProstCodec::<M, M>::default();
+            let body = EncodeBody::new_server(
+                codec.encoder(),
+                futures_util::stream::once(async move { Ok::<_, Status>(message) }),
+                None,
+                SingleMessageCompressionOverride::default(),
+                None,
+            );
+            Self::Response(
+                Response::builder()
+                    .header("content-type", "application/grpc")
+                    .body(Body::new(body))
+                    .unwrap(),
+            )
+        }
+    }
+
+    #[derive(Clone)]
+    struct RecordedCall {
+        path: String,
+        body: Bytes,
+    }
+
+    struct ScriptedState {
+        replies: VecDeque<ScriptedReply>,
+        calls: Vec<RecordedCall>,
+    }
+
+    #[derive(Clone)]
+    struct Scripted {
+        state: Arc<Mutex<ScriptedState>>,
+    }
+
+    impl Scripted {
+        fn new(replies: impl IntoIterator<Item = ScriptedReply>) -> Self {
+            Self {
+                state: Arc::new(Mutex::new(ScriptedState {
+                    replies: replies.into_iter().collect(),
+                    calls: Vec::new(),
+                })),
+            }
+        }
+
+        fn calls(&self) -> Vec<RecordedCall> {
+            self.state.lock().calls.clone()
+        }
+    }
+
+    async fn collect_body(body: Body) -> Result<Bytes, Status> {
+        let mut body = Box::pin(body);
+        let mut out = Vec::new();
+        while let Some(frame) = core::future::poll_fn(|cx| body.as_mut().poll_frame(cx)).await {
+            if let Ok(data) = frame?.into_data() {
+                out.extend_from_slice(&data);
+            }
+        }
+        Ok(Bytes::from(out))
+    }
+
+    impl GrpcService<Body> for Scripted {
+        type ResponseBody = Body;
+        type Error = Status;
+        type Future =
+            Pin<Box<dyn Future<Output = Result<Response<Body>, Status>> + Send + 'static>>;
+
+        fn poll_ready(&mut self, _: &mut CoreContext<'_>) -> Poll<Result<(), Status>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, request: Request<Body>) -> Self::Future {
+            let state = Arc::clone(&self.state);
+            Box::pin(async move {
+                let path = request.uri().path().to_string();
+                let body = collect_body(request.into_body()).await?;
+                let reply = {
+                    let mut state = state.lock();
+                    state.calls.push(RecordedCall { path, body });
+                    state
+                        .replies
+                        .pop_front()
+                        .expect("every scripted call has a reply")
+                };
+                match reply {
+                    ScriptedReply::Status(status) => Err(status),
+                    ScriptedReply::Response(response) => Ok(response),
+                }
+            })
+        }
+    }
+
+    fn decode_request<M>(call: &RecordedCall) -> M
+    where
+        M: Message + Default,
+    {
+        assert_eq!(call.body.first(), Some(&0), "the frame is not compressed");
+        let length = usize::try_from(u32::from_be_bytes(
+            call.body[1..5].try_into().expect("the frame has a length"),
+        ))
+        .expect("a framed request fits in memory");
+        assert_eq!(call.body.len(), length + 5);
+        M::decode(&call.body[5..]).expect("decode the framed request")
+    }
+
+    fn shapes_over(sql: &str) -> Arc<Shapes<ParserDB>> {
         let db = ParserDB::parse::<PostgreSqlDialect>(sql).unwrap();
         let outputs = TranslatorBuilder::new()
             .with_min_confidence(ConfidenceLevel::B)
@@ -1796,12 +1944,49 @@ CREATE POLICY notes_p ON notes USING (
         let naming = Cow::from(translation.row_naming()).into_owned();
         let answers = translation.action_relations().to_vec();
         let enumerations = enumerations_of(&outputs);
-        let shapes = Arc::new(
+        Arc::new(
             Shapes::new::<crate::backend::Postgres>(db, translation.relations(), &enumerations)
                 .with_row_naming(&naming)
                 .with_action_relations(&answers),
-        );
-        OpenFgaPolicy::new(shapes, OpenFgaServiceClient::new(NeverAsked), "store").unwrap()
+        )
+    }
+
+    fn shapes_over_without_naming(sql: &str) -> Arc<Shapes<ParserDB>> {
+        let db = ParserDB::parse::<PostgreSqlDialect>(sql).unwrap();
+        let outputs = TranslatorBuilder::new()
+            .with_min_confidence(ConfidenceLevel::B)
+            .build()
+            .translate(&db)
+            .unwrap()
+            .outputs_accepting_gaps();
+        let translation = outputs.translation();
+        let answers = translation.action_relations().to_vec();
+        let enumerations = enumerations_of(&outputs);
+        Arc::new(
+            Shapes::new::<crate::backend::Postgres>(db, translation.relations(), &enumerations)
+                .with_action_relations(&answers),
+        )
+    }
+
+    fn policy_over(sql: &str) -> OpenFgaPolicy<ParserDB, NeverAsked, String, Postgres> {
+        OpenFgaPolicy::new(
+            shapes_over(sql),
+            OpenFgaServiceClient::new(NeverAsked),
+            "store",
+        )
+        .unwrap()
+    }
+
+    fn scripted_policy_over(
+        sql: &str,
+        transport: Scripted,
+    ) -> OpenFgaPolicy<ParserDB, Scripted, String, Postgres> {
+        OpenFgaPolicy::new(
+            shapes_over(sql),
+            OpenFgaServiceClient::new(transport),
+            "store",
+        )
+        .unwrap()
     }
 
     /// Row-level security on with no policy: the model refuses every statement.
@@ -1809,6 +1994,447 @@ CREATE POLICY notes_p ON notes USING (
 CREATE TABLE ledger(id INTEGER PRIMARY KEY, amount INTEGER);
 ALTER TABLE ledger ENABLE ROW LEVEL SECURITY;
 ";
+
+    const OWNED: &str = "
+CREATE TABLE docs(id INTEGER PRIMARY KEY, owner_id TEXT);
+ALTER TABLE docs ENABLE ROW LEVEL SECURITY;
+CREATE POLICY p ON docs FOR SELECT USING (owner_id = current_user);
+";
+
+    const UPDATE_TWO_SIDED: &str = "
+CREATE TABLE docs(id INTEGER PRIMARY KEY, owner_id TEXT, editor_id TEXT);
+ALTER TABLE docs ENABLE ROW LEVEL SECURITY;
+CREATE POLICY ps ON docs FOR SELECT USING (owner_id = current_user);
+CREATE POLICY pu ON docs FOR UPDATE
+  USING (owner_id = current_user) WITH CHECK (editor_id = current_user);
+";
+
+    const EXPIRING: &str = "
+CREATE TABLE teams(id INTEGER PRIMARY KEY);
+CREATE TABLE team_members(team_id INTEGER REFERENCES teams(id), user_id TEXT,
+                          expires_at TIMESTAMPTZ);
+CREATE TABLE docs(id INTEGER PRIMARY KEY, team_id INTEGER REFERENCES teams(id));
+ALTER TABLE docs ENABLE ROW LEVEL SECURITY;
+CREATE POLICY p ON docs FOR SELECT USING (
+  EXISTS (SELECT 1 FROM team_members
+          WHERE team_members.team_id = docs.team_id AND team_members.user_id = current_user
+            AND team_members.expires_at > now()));
+";
+
+    fn expiring_diff(shapes: &Shapes<ParserDB>) -> StoreDiff<'_, Postgres> {
+        let members =
+            catalog_helpers::table_id::<Postgres, _>(shapes.catalog(), "team_members").unwrap();
+        let event = TestEvent::<Postgres>::delete(
+            members,
+            vec![
+                Value::Int(3),
+                Value::String("alice".into()),
+                Value::String("2027-01-01T00:00:00Z".into()),
+            ],
+        );
+        shapes.diff(&event).unwrap()
+    }
+
+    /// A generated reply is encoded and decoded by the upstream `tonic` codec.
+    #[test]
+    fn a_generated_reply_crosses_the_scripted_transport() {
+        let mut response = BatchCheckResponse::default();
+        response.result.insert(
+            "w0n0".to_string(),
+            BatchCheckSingleResult {
+                check_result: Some(CheckResult::Allowed(true)),
+            },
+        );
+        let transport = Scripted::new([ScriptedReply::message(response)]);
+        let policy = scripted_policy_over(CLOSED, transport);
+
+        let got = block_on(policy.batch_check(batch_request(
+            "store",
+            "",
+            &[a_question()],
+            ConsistencyPreference::MinimizeLatency,
+        )))
+        .unwrap();
+
+        assert_eq!(got, BTreeMap::from([("w0n0".to_string(), true)]));
+    }
+
+    /// The retry setting counts retries after the first transport attempt.
+    #[test]
+    fn batch_check_stops_after_the_configured_transport_retries() {
+        let transport = Scripted::new([
+            ScriptedReply::Status(Status::unavailable("offline")),
+            ScriptedReply::Status(Status::unavailable("offline")),
+            ScriptedReply::Status(Status::unavailable("offline")),
+        ]);
+        let policy = scripted_policy_over(CLOSED, transport.clone()).connect_retries(2);
+
+        let got = block_on(policy.batch_check(batch_request(
+            "store",
+            "",
+            &[a_question()],
+            ConsistencyPreference::MinimizeLatency,
+        )));
+
+        assert_eq!(
+            got,
+            Err(OpenFgaError::Transport {
+                attempts: 3,
+                message: "offline".to_string(),
+            })
+        );
+        let calls = transport.calls();
+        assert_eq!(calls.len(), 3);
+        assert!(calls
+            .iter()
+            .all(|call| call.path == "/openfga.v1.OpenFGAService/BatchCheck"));
+        assert!(calls.windows(2).all(|pair| pair[0].body == pair[1].body));
+    }
+
+    /// A permanent service status is rejected without retrying.
+    #[test]
+    fn batch_check_rejects_a_permanent_status_once() {
+        let transport = Scripted::new([ScriptedReply::Status(Status::invalid_argument(
+            "invalid check",
+        ))]);
+        let policy = scripted_policy_over(CLOSED, transport.clone());
+
+        let got = block_on(policy.batch_check(batch_request(
+            "store",
+            "",
+            &[a_question()],
+            ConsistencyPreference::MinimizeLatency,
+        )));
+
+        assert_eq!(
+            got,
+            Err(OpenFgaError::Rejected {
+                message: "invalid check".to_string(),
+            })
+        );
+        assert_eq!(transport.calls().len(), 1);
+    }
+
+    /// An omitted correlation is incomplete and leaves its denial unchanged.
+    #[test]
+    fn an_omitted_batch_answer_stays_denied_and_is_incomplete() {
+        let transport = Scripted::new([ScriptedReply::message(BatchCheckResponse::default())]);
+        let policy = scripted_policy_over(CLOSED, transport.clone());
+        let mut verdicts = [Verdict::Deny];
+
+        let got = block_on(policy.ask(
+            vec![a_question()],
+            &mut verdicts,
+            ConsistencyPreference::MinimizeLatency,
+        ));
+
+        assert_eq!(got, Err(OpenFgaError::Incomplete { questions: 1 }));
+        assert_eq!(verdicts, [Verdict::Deny]);
+        assert_eq!(transport.calls().len(), 1);
+    }
+
+    /// A correlation without an answer remains incomplete.
+    #[test]
+    fn a_malformed_batch_answer_is_incomplete() {
+        let transport = Scripted::new([ScriptedReply::message(BatchCheckResponse {
+            result: core::iter::once((
+                "w0n0".to_string(),
+                BatchCheckSingleResult { check_result: None },
+            ))
+            .collect(),
+        })]);
+        let policy = scripted_policy_over(CLOSED, transport.clone());
+        let mut verdicts = [Verdict::Deny];
+
+        let got = block_on(policy.ask(
+            vec![a_question()],
+            &mut verdicts,
+            ConsistencyPreference::MinimizeLatency,
+        ));
+
+        assert_eq!(got, Err(OpenFgaError::Incomplete { questions: 1 }));
+        assert_eq!(verdicts, [Verdict::Deny]);
+        assert_eq!(transport.calls().len(), 1);
+    }
+
+    /// A zero batch cap is clamped to one without dropping either question.
+    #[test]
+    fn a_zero_batch_cap_sends_one_question_per_call() {
+        let transport = Scripted::new([
+            ScriptedReply::message(batch_response([("first".to_string(), true)])),
+            ScriptedReply::message(batch_response([("second".to_string(), true)])),
+        ]);
+        let policy = scripted_policy_over(CLOSED, transport.clone()).max_checks_per_batch(0);
+        let mut verdicts = [Verdict::Deny, Verdict::Deny];
+
+        block_on(policy.ask(
+            vec![question(0, "first"), question(1, "second")],
+            &mut verdicts,
+            ConsistencyPreference::MinimizeLatency,
+        ))
+        .unwrap();
+
+        assert_eq!(verdicts, [Verdict::Allow, Verdict::Allow]);
+        assert_eq!(transport.calls().len(), 2);
+    }
+
+    /// A row absent from the naming report causes no service call.
+    #[test]
+    fn a_row_without_naming_returns_before_the_transport() {
+        let shapes = shapes_over_without_naming(OWNED);
+        let transport = Scripted::new([]);
+        let policy = OpenFgaPolicy::<_, _, String, Postgres>::new(
+            shapes,
+            OpenFgaServiceClient::new(transport.clone()),
+            "store",
+        )
+        .unwrap();
+        let docs =
+            catalog_helpers::table_id::<Postgres, _>(policy.shapes().catalog(), "docs").unwrap();
+        let event =
+            TestEvent::<Postgres>::insert(docs, vec![Value::Int(1), Value::String("alice".into())])
+                .with_pk_columns([0u16]);
+        let row = EventRow::current(&event, policy.shapes().catalog()).unwrap();
+        let watchers = ["user:alice".to_string()];
+        let mut verdicts = [Verdict::Deny];
+
+        let got = block_on(policy.may_see(&row, &watchers, &mut verdicts));
+
+        assert!(matches!(got, Err(OpenFgaError::RowCannotBeNamed)));
+        assert_eq!(verdicts, [Verdict::Deny]);
+        assert!(transport.calls().is_empty());
+    }
+
+    /// The asynchronous read answer remains movable between executor threads.
+    #[test]
+    fn may_see_returns_a_send_future() {
+        fn assert_send<T: Send>(_: &T) {}
+
+        let transport = Scripted::new([ScriptedReply::message(batch_response([(
+            "w0n0".to_string(),
+            true,
+        )]))]);
+        let policy = scripted_policy_over(OWNED, transport);
+        let docs =
+            catalog_helpers::table_id::<Postgres, _>(policy.shapes().catalog(), "docs").unwrap();
+        let event =
+            TestEvent::<Postgres>::insert(docs, vec![Value::Int(1), Value::String("0".into())])
+                .with_pk_columns([0u16]);
+        let row = EventRow::current(&event, policy.shapes().catalog()).unwrap();
+        let watchers = ["user:0".to_string()];
+        let mut verdicts = [Verdict::Deny];
+        let future = policy.may_see(&row, &watchers, &mut verdicts);
+
+        assert_send(&future);
+        block_on(future).unwrap();
+        assert_eq!(verdicts, [Verdict::Allow]);
+    }
+
+    /// A refused existing-row judge prevents a resulting-row request.
+    #[test]
+    fn a_replacement_stops_after_the_first_refused_judge() {
+        let transport = Scripted::new([
+            ScriptedReply::message(batch_response([("w0n0".to_string(), false)])),
+            ScriptedReply::message(batch_response([("w0n0".to_string(), true)])),
+        ]);
+        let policy = scripted_policy_over(UPDATE_TWO_SIDED, transport.clone());
+        let docs =
+            catalog_helpers::table_id::<Postgres, _>(policy.shapes().catalog(), "docs").unwrap();
+        let event = TestEvent::<Postgres>::update(
+            docs,
+            vec![
+                Value::Int(4),
+                Value::String("alice".into()),
+                Value::String("bob".into()),
+            ],
+            vec![
+                Value::Int(4),
+                Value::String("alice".into()),
+                Value::String("bob".into()),
+            ],
+        )
+        .with_pk_columns([0u16]);
+        let old = EventRow::previous(&event, policy.shapes().catalog()).unwrap();
+        let new = EventRow::current(&event, policy.shapes().catalog()).unwrap();
+
+        let got = block_on(policy.may_write(
+            RowWrite::Update {
+                old: &old,
+                new: &new,
+            },
+            &"user:bob".to_string(),
+        ));
+
+        assert_eq!(got, Ok(Verdict::Deny));
+        let calls = transport.calls();
+        assert_eq!(calls.len(), 1);
+        let request: BatchCheckRequest = decode_request(&calls[0]);
+        assert_eq!(
+            request.checks[0].tuple_key.as_ref().unwrap().relation,
+            "can_update_using"
+        );
+    }
+
+    /// The store read loop observes the configured transport attempt count.
+    #[test]
+    fn reconcile_records_stops_after_read_transport_retries() {
+        let transport = Scripted::new([
+            ScriptedReply::Status(Status::unavailable("read offline")),
+            ScriptedReply::Status(Status::unavailable("read offline")),
+            ScriptedReply::Status(Status::unavailable("read offline")),
+        ]);
+        let shapes = shapes_over(EXPIRING);
+        let diff = expiring_diff(&shapes);
+        let [Requery::Keyed(requery)] = diff.requeries.as_slice() else {
+            panic!("the fixture produces one keyed requery");
+        };
+        let policy = OpenFgaPolicy::<_, _, String, Postgres>::new(
+            Arc::clone(&shapes),
+            OpenFgaServiceClient::new(transport.clone()),
+            "store",
+        )
+        .unwrap()
+        .connect_retries(2);
+
+        let got = block_on(policy.reconcile_records(requery, &[]));
+
+        assert!(matches!(
+            got,
+            Err(OpenFgaError::Transport {
+                attempts: 3,
+                ref message,
+            }) if message == "read offline"
+        ));
+        let calls = transport.calls();
+        assert_eq!(calls.len(), 3);
+        assert!(calls
+            .iter()
+            .all(|call| call.path == "/openfga.v1.OpenFGAService/Read"));
+        assert!(calls.windows(2).all(|pair| pair[0].body == pair[1].body));
+    }
+
+    /// The store read loop rejects a permanent status without retrying.
+    #[test]
+    fn reconcile_records_rejects_a_permanent_read_status_once() {
+        let transport = Scripted::new([ScriptedReply::Status(Status::permission_denied(
+            "read denied",
+        ))]);
+        let shapes = shapes_over(EXPIRING);
+        let diff = expiring_diff(&shapes);
+        let [Requery::Keyed(requery)] = diff.requeries.as_slice() else {
+            panic!("the fixture produces one keyed requery");
+        };
+        let policy = OpenFgaPolicy::<_, _, String, Postgres>::new(
+            Arc::clone(&shapes),
+            OpenFgaServiceClient::new(transport.clone()),
+            "store",
+        )
+        .unwrap();
+
+        let got = block_on(policy.reconcile_records(requery, &[]));
+
+        assert!(matches!(
+            got,
+            Err(OpenFgaError::Rejected { ref message }) if message == "read denied"
+        ));
+        assert_eq!(transport.calls().len(), 1);
+    }
+
+    /// The store write loop observes the configured transport attempt count.
+    #[test]
+    fn write_records_stops_after_write_transport_retries() {
+        let transport = Scripted::new([
+            ScriptedReply::Status(Status::unavailable("write offline")),
+            ScriptedReply::Status(Status::unavailable("write offline")),
+            ScriptedReply::Status(Status::unavailable("write offline")),
+        ]);
+        let policy = scripted_policy_over(CLOSED, transport.clone()).connect_retries(2);
+
+        let got = block_on(policy.write_records(&[membership_record(None)]));
+
+        assert_eq!(
+            got,
+            Err(OpenFgaError::Transport {
+                attempts: 3,
+                message: "write offline".to_string(),
+            })
+        );
+        let calls = transport.calls();
+        assert_eq!(calls.len(), 3);
+        assert!(calls
+            .iter()
+            .all(|call| call.path == "/openfga.v1.OpenFGAService/Write"));
+        assert!(calls.windows(2).all(|pair| pair[0].body == pair[1].body));
+        assert!(calls.iter().all(|call| {
+            let request: WriteRequest = decode_request(call);
+            request.writes.unwrap().on_duplicate == "ignore"
+        }));
+    }
+
+    /// The store write loop rejects a permanent status without retrying.
+    #[test]
+    fn write_records_rejects_a_permanent_write_status_once() {
+        let transport = Scripted::new([ScriptedReply::Status(Status::permission_denied(
+            "write denied",
+        ))]);
+        let policy = scripted_policy_over(CLOSED, transport.clone());
+
+        let got = block_on(policy.write_records(&[membership_record(None)]));
+
+        assert_eq!(
+            got,
+            Err(OpenFgaError::Rejected {
+                message: "write denied".to_string(),
+            })
+        );
+        assert_eq!(transport.calls().len(), 1);
+    }
+
+    /// A split difference removes first, then sends every write chunk.
+    #[test]
+    fn a_split_difference_sends_deletes_before_writes() {
+        let transport = Scripted::new([
+            ScriptedReply::message(WriteResponse {}),
+            ScriptedReply::message(WriteResponse {}),
+            ScriptedReply::message(WriteResponse {}),
+        ]);
+        let policy = scripted_policy_over(CLOSED, transport.clone());
+        let added: Vec<Record> = (0..=MAX_TUPLES_PER_WRITE)
+            .map(|nth| Record {
+                object: alloc::format!("docs:{nth}"),
+                relation: test_names::relation("owner"),
+                subject: "user:alice".to_string(),
+                context: None,
+            })
+            .collect();
+        let diff = StoreDiff::<Postgres> {
+            added,
+            removed: vec![membership_record(None)],
+            requeries: Vec::new(),
+        };
+
+        block_on(policy.apply(&diff)).unwrap();
+
+        let calls = transport.calls();
+        assert_eq!(calls.len(), 3);
+        let first: WriteRequest = decode_request(&calls[0]);
+        assert!(first.writes.is_none());
+        let deletes = first.deletes.unwrap();
+        assert_eq!(deletes.tuple_keys.len(), 1);
+        assert_eq!(deletes.on_missing, "ignore");
+        let second: WriteRequest = decode_request(&calls[1]);
+        assert!(second.deletes.is_none());
+        let writes = second.writes.unwrap();
+        assert_eq!(writes.tuple_keys.len(), MAX_TUPLES_PER_WRITE);
+        assert_eq!(writes.on_duplicate, "ignore");
+        let third: WriteRequest = decode_request(&calls[2]);
+        assert!(third.deletes.is_none());
+        let final_writes = third.writes.unwrap();
+        assert_eq!(final_writes.on_duplicate, "ignore");
+        let boundary = final_writes.tuple_keys;
+        assert_eq!(boundary.len(), 1);
+        assert_eq!(boundary[0].object, "docs:100");
+    }
 
     /// A refusal the model states is an answer, so it comes back as a denial
     /// rather than as [`OpenFgaError::StatementNotAnswered`]. The difference

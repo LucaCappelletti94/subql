@@ -240,7 +240,7 @@ pub fn openfga_port() -> u16 {
         || {
             // The image does not declare its gRPC port. The log line precedes
             // the listener, so callers still wait for a call to succeed.
-            GenericImage::new("openfga/openfga", "v1.8.13")
+            GenericImage::new("openfga/openfga", "v1.10.0")
                 .with_wait_for(WaitFor::message_on_stdout("starting openfga service"))
                 .with_exposed_port(8081.tcp())
                 .with_cmd(["run"])
