@@ -832,11 +832,8 @@ CREATE POLICY p ON docs FOR SELECT USING (
         .query
         .condition()
         .expect("the membership is conditional");
-    let stale = membership(
-        "user:alice",
-        condition,
-        "2027-01-01T00:00:00+00:00",
-    );
+    let expiry = "2027-01-01T00:00:00+00:00";
+    let stale = membership("user:alice", condition, expiry);
     backend
         .write_records(std::slice::from_ref(&stale))
         .await
