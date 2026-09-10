@@ -39,9 +39,9 @@ use subql::testing::TestEvent;
 use subql::visibility::openfga::{MaterialiseError, OpenFgaPolicy};
 use subql::visibility::policy::{RequestValues, RowPolicy, Subject};
 use subql::visibility::shapes::Shapes;
-use subql::visibility::store::{Enumeration, Replay, Replayer, Requery};
+use subql::visibility::store::{Enumeration, Replay, Replayer, Requery, StoreDiff};
 use subql::visibility::{EventRow, RowWrite, Verdict, VisibilityPolicy};
-use subql::{catalog_helpers, ParserDB};
+use subql::{catalog_helpers, ParserDB, TableId};
 
 /// Everything a policy over one schema needs, from one translation.
 ///
@@ -203,12 +203,134 @@ async fn check_without_context(
         .allowed
 }
 
+struct ReplacementFixture {
+    client: OpenFgaServiceClient<Channel>,
+    policy: ReplacementPolicy,
+    shapes: Arc<Shapes<ParserDB>>,
+    store: String,
+    model_id: String,
+    docs: TableId,
+}
+
+async fn replacement_fixture() -> ReplacementFixture {
+    let mut client = openfga().await;
+    let wired = wiring(UPDATE_TWO_SIDED);
+    let docs = catalog_helpers::table_id::<Postgres, _>(&wired.db, "docs")
+        .expect("docs is in the catalog");
+    let model = wired.model.clone();
+    let (store, model_id) =
+        create_store_with_model(&mut client, "subql-replacement-write", &model).await;
+    let shapes = wired.shapes();
+    let policy = OpenFgaPolicy::<_, _, String, Postgres>::new(
+        Arc::clone(&shapes),
+        client.clone(),
+        store.clone(),
+    )
+    .expect("the index carries both update judges")
+    .authorization_model_id(model_id.clone());
+    let stored =
+        TestEvent::<Postgres>::insert(docs, update_row("alice", "bob")).with_pk_columns([0u16]);
+    policy
+        .apply(
+            &shapes
+                .diff(&stored)
+                .expect("the stored row states its facts"),
+        )
+        .await
+        .expect("write the stored row facts");
+
+    ReplacementFixture {
+        client,
+        policy,
+        shapes,
+        store,
+        model_id,
+        docs,
+    }
+}
+
+async fn assert_independent_replacement_judges(fixture: &ReplacementFixture) {
+    let split = TestEvent::<Postgres>::update(
+        fixture.docs,
+        update_row("alice", "bob"),
+        update_row("alice", "bob"),
+    )
+    .with_pk_columns([0u16]);
+    let old = EventRow::previous(&split, fixture.shapes.catalog()).expect("pre-image");
+    let new = EventRow::current(&split, fixture.shapes.catalog()).expect("post-image");
+    let alice = "user:alice".to_owned();
+    let bob = "user:bob".to_owned();
+
+    assert_eq!(
+        replacement_verdict(&fixture.policy, &old, &new, &bob).await,
+        Verdict::Deny
+    );
+    assert_eq!(
+        replacement_verdict(&fixture.policy, &old, &new, &alice).await,
+        Verdict::Deny
+    );
+    assert_eq!(
+        fixture
+            .policy
+            .may_write(RowWrite::UpdateUsing { old: &old }, &alice)
+            .await
+            .expect("ask the existing-row relation"),
+        Verdict::Allow
+    );
+    assert_eq!(
+        fixture
+            .policy
+            .may_write(RowWrite::UpdateUsing { old: &old }, &bob)
+            .await
+            .expect("ask the existing-row relation"),
+        Verdict::Deny
+    );
+}
+
 struct Aliases(&'static [&'static str]);
 
 impl Subject for Aliases {
     fn subjects(&self) -> impl Iterator<Item = Cow<'_, str>> {
         self.0.iter().copied().map(Cow::Borrowed)
     }
+}
+
+async fn write_subject_fanout_facts(
+    client: &mut OpenFgaServiceClient<Channel>,
+    store: &str,
+    model_id: &str,
+) {
+    client
+        .write(WriteRequest {
+            store_id: store.to_owned(),
+            writes: Some(WriteRequestWrites {
+                tuple_keys: vec![
+                    TupleKey {
+                        user: "teams:1".to_owned(),
+                        relation: "teams".to_owned(),
+                        object: "docs:4".to_owned(),
+                        condition: None,
+                    },
+                    TupleKey {
+                        user: "user:alice-secondary".to_owned(),
+                        relation: "member".to_owned(),
+                        object: "teams:1".to_owned(),
+                        condition: None,
+                    },
+                    TupleKey {
+                        user: "user:bob-secondary".to_owned(),
+                        relation: "member".to_owned(),
+                        object: "teams:2".to_owned(),
+                        condition: None,
+                    },
+                ],
+                on_duplicate: String::new(),
+            }),
+            deletes: None,
+            authorization_model_id: model_id.to_owned(),
+        })
+        .await
+        .expect("write the subject grants");
 }
 
 /// A client on this run's shared OpenFGA whose first call has already come
@@ -334,60 +456,27 @@ async fn a_question_the_row_does_not_settle_is_answered_by_the_service() {
 #[tokio::test(flavor = "current_thread")]
 #[ignore = "requires docker"]
 async fn a_replacement_requires_both_versions_and_resulting_context() {
-    let mut client = openfga().await;
-    let wired = wiring(UPDATE_TWO_SIDED);
-    let docs = catalog_helpers::table_id::<Postgres, _>(&wired.db, "docs")
-        .expect("docs is in the catalog");
-    let model = wired.model.clone();
-    let store = client
-        .create_store(CreateStoreRequest {
-            name: "subql-replacement-write".to_owned(),
-        })
-        .await
-        .expect("create store")
-        .into_inner()
-        .id;
-    let model_id = write_model(&mut client, &store, &model).await;
-    let shapes = wired.shapes();
-    let policy = OpenFgaPolicy::<_, _, String, Postgres>::new(
-        Arc::clone(&shapes),
-        client.clone(),
-        store.clone(),
-    )
-    .expect("the index carries both update judges")
-    .authorization_model_id(model_id.clone());
-
-    let stored =
-        TestEvent::<Postgres>::insert(docs, update_row("alice", "bob")).with_pk_columns([0u16]);
-    policy
-        .apply(
-            &shapes
-                .diff(&stored)
-                .expect("the stored row states its facts"),
-        )
-        .await
-        .expect("write the stored row facts");
-
+    let mut fixture = replacement_fixture().await;
     let replacement = TestEvent::<Postgres>::update(
-        docs,
+        fixture.docs,
         update_row("alice", "bob"),
         update_row("alice", "alice"),
     )
     .with_pk_columns([0u16]);
-    let old = EventRow::previous(&replacement, shapes.catalog()).expect("pre-image");
-    let new = EventRow::current(&replacement, shapes.catalog()).expect("post-image");
+    let old = EventRow::previous(&replacement, fixture.shapes.catalog()).expect("pre-image");
+    let new = EventRow::current(&replacement, fixture.shapes.catalog()).expect("post-image");
     let alice = "user:alice".to_owned();
+
     assert_eq!(
-        replacement_verdict(&policy, &old, &new, &alice).await,
+        replacement_verdict(&fixture.policy, &old, &new, &alice).await,
         Verdict::Allow
     );
-
     let without_context = check_without_context(
-        &mut client,
-        &store,
-        &model_id,
+        &mut fixture.client,
+        &fixture.store,
+        &fixture.model_id,
         CheckRequestTupleKey {
-            user: alice.clone(),
+            user: alice,
             relation: "can_update_check".to_owned(),
             object: "docs:4".to_owned(),
         },
@@ -398,37 +487,7 @@ async fn a_replacement_requires_both_versions_and_resulting_context() {
         "alice is not the stored editor, so the resulting facts are required"
     );
 
-    let split =
-        TestEvent::<Postgres>::update(docs, update_row("alice", "bob"), update_row("alice", "bob"))
-            .with_pk_columns([0u16]);
-    let old = EventRow::previous(&split, shapes.catalog()).expect("pre-image");
-    let new = EventRow::current(&split, shapes.catalog()).expect("post-image");
-    let bob = "user:bob".to_owned();
-
-    assert_eq!(
-        replacement_verdict(&policy, &old, &new, "user:bob").await,
-        Verdict::Deny,
-        "the resulting-row judge grants bob, but the existing-row judge refuses"
-    );
-    assert_eq!(
-        replacement_verdict(&policy, &old, &new, &alice).await,
-        Verdict::Deny,
-        "the existing-row judge grants alice, but the resulting-row judge refuses"
-    );
-    assert_eq!(
-        policy
-            .may_write(RowWrite::UpdateUsing { old: &old }, &alice)
-            .await
-            .expect("ask the existing-row relation"),
-        Verdict::Allow
-    );
-    assert_eq!(
-        policy
-            .may_write(RowWrite::UpdateUsing { old: &old }, &bob)
-            .await
-            .expect("ask the existing-row relation"),
-        Verdict::Deny
-    );
+    assert_independent_replacement_judges(&fixture).await;
 }
 
 /// Any subject name may grant its watcher without changing another watcher.
@@ -442,37 +501,7 @@ async fn a_second_subject_name_grants_only_its_watcher() {
     let model = wired.model.clone();
     let (store, model_id) =
         create_store_with_model(&mut client, "subql-subject-fanout", &model).await;
-    client
-        .write(WriteRequest {
-            store_id: store.clone(),
-            writes: Some(WriteRequestWrites {
-                tuple_keys: vec![
-                    TupleKey {
-                        user: "teams:1".to_owned(),
-                        relation: "teams".to_owned(),
-                        object: "docs:4".to_owned(),
-                        condition: None,
-                    },
-                    TupleKey {
-                        user: "user:alice-secondary".to_owned(),
-                        relation: "member".to_owned(),
-                        object: "teams:1".to_owned(),
-                        condition: None,
-                    },
-                    TupleKey {
-                        user: "user:bob-decoy".to_owned(),
-                        relation: "member".to_owned(),
-                        object: "teams:1".to_owned(),
-                        condition: None,
-                    },
-                ],
-                on_duplicate: String::new(),
-            }),
-            deletes: None,
-            authorization_model_id: model_id.clone(),
-        })
-        .await
-        .expect("write the subject grants");
+    write_subject_fanout_facts(&mut client, &store, &model_id).await;
     let shapes = wired.shapes();
     let policy = OpenFgaPolicy::<_, _, Aliases, Postgres>::new(Arc::clone(&shapes), client, store)
         .expect("the index carries the read relation")
@@ -495,11 +524,11 @@ async fn a_second_subject_name_grants_only_its_watcher() {
     assert_eq!(
         verdicts,
         [Verdict::Allow, Verdict::Deny],
-        "the second Alice name grants only Alice and the decoy grants nobody queried"
+        "Alice's second name grants only Alice and Bob's decoy names another team"
     );
 }
 
-/// A direct write preserves the chunk beyond the service limit.
+/// Direct writes are idempotent and preserve the chunk beyond the service limit.
 #[tokio::test(flavor = "current_thread")]
 #[ignore = "requires docker"]
 async fn direct_writes_preserve_the_final_chunk() {
@@ -525,6 +554,10 @@ async fn direct_writes_preserve_the_final_chunk() {
         .write_records(&records)
         .await
         .expect("write every chunk");
+    policy
+        .write_records(&records)
+        .await
+        .expect("retry every chunk");
 
     let mut stored = stored_members(&mut client, &store).await;
     expected.sort();
@@ -799,12 +832,13 @@ CREATE POLICY p ON docs FOR SELECT USING (
         .query
         .condition()
         .expect("the membership is conditional");
+    let stale = membership(
+        "user:alice",
+        condition,
+        "2027-01-01T00:00:00+00:00",
+    );
     backend
-        .write_records(&[membership(
-            "user:alice",
-            condition,
-            "2027-01-01T00:00:00+00:00",
-        )])
+        .write_records(std::slice::from_ref(&stale))
         .await
         .expect("seed the membership");
 
@@ -831,6 +865,15 @@ CREATE POLICY p ON docs FOR SELECT USING (
     assert_eq!(withdrawn_fact.subject, "user:alice");
     assert_eq!(withdrawn_fact.object, "teams:3");
     assert_eq!(withdrawn_fact.relation, member_relation().to_string());
+    let retry = StoreDiff::<Postgres> {
+        added: Vec::new(),
+        removed: vec![stale],
+        requeries: Vec::new(),
+    };
+    backend
+        .apply(&retry)
+        .await
+        .expect("retry the applied deletion");
 
     assert_eq!(
         stored_members(&mut client, &store).await,

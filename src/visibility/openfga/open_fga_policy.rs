@@ -48,6 +48,8 @@ const DEFAULT_CONNECT_RETRIES: u32 = 2;
 /// `T` is the transport the caller built, so TLS, bearer tokens and
 /// interceptors stay its business: it hands over whatever
 /// [`OpenFgaServiceClient`] it assembled.
+///
+/// Requires OpenFGA 1.10 or newer for retry-safe writes.
 #[derive(Debug, Clone)]
 pub struct OpenFgaPolicy<DB, T, W, B> {
     shapes: SharedShapes<DB>,
@@ -947,11 +949,11 @@ where
                 .write(
                     (!writes.is_empty()).then(|| WriteRequestWrites {
                         tuple_keys: writes,
-                        on_duplicate: String::new(),
+                        on_duplicate: "ignore".to_owned(),
                     }),
                     (!deletes.is_empty()).then(|| WriteRequestDeletes {
                         tuple_keys: deletes,
-                        on_missing: String::new(),
+                        on_missing: "ignore".to_owned(),
                     }),
                 )
                 .await;
@@ -969,7 +971,7 @@ where
                 None,
                 Some(WriteRequestDeletes {
                     tuple_keys: chunk.to_vec(),
-                    on_missing: String::new(),
+                    on_missing: "ignore".to_owned(),
                 }),
             )
             .await?;
@@ -978,7 +980,7 @@ where
             self.write(
                 Some(WriteRequestWrites {
                     tuple_keys: chunk.to_vec(),
-                    on_duplicate: String::new(),
+                    on_duplicate: "ignore".to_owned(),
                 }),
                 None,
             )
@@ -1006,7 +1008,7 @@ where
             self.write(
                 Some(WriteRequestWrites {
                     tuple_keys,
-                    on_duplicate: String::new(),
+                    on_duplicate: "ignore".to_owned(),
                 }),
                 None,
             )
@@ -2363,6 +2365,10 @@ CREATE POLICY p ON docs FOR SELECT USING (
             .iter()
             .all(|call| call.path == "/openfga.v1.OpenFGAService/Write"));
         assert!(calls.windows(2).all(|pair| pair[0].body == pair[1].body));
+        assert!(calls.iter().all(|call| {
+            let request: WriteRequest = decode_request(call);
+            request.writes.unwrap().on_duplicate == "ignore"
+        }));
     }
 
     /// The store write loop rejects a permanent status without retrying.
@@ -2413,16 +2419,19 @@ CREATE POLICY p ON docs FOR SELECT USING (
         assert_eq!(calls.len(), 3);
         let first: WriteRequest = decode_request(&calls[0]);
         assert!(first.writes.is_none());
-        assert_eq!(first.deletes.unwrap().tuple_keys.len(), 1);
+        let deletes = first.deletes.unwrap();
+        assert_eq!(deletes.tuple_keys.len(), 1);
+        assert_eq!(deletes.on_missing, "ignore");
         let second: WriteRequest = decode_request(&calls[1]);
         assert!(second.deletes.is_none());
-        assert_eq!(
-            second.writes.unwrap().tuple_keys.len(),
-            MAX_TUPLES_PER_WRITE
-        );
+        let writes = second.writes.unwrap();
+        assert_eq!(writes.tuple_keys.len(), MAX_TUPLES_PER_WRITE);
+        assert_eq!(writes.on_duplicate, "ignore");
         let third: WriteRequest = decode_request(&calls[2]);
         assert!(third.deletes.is_none());
-        let boundary = third.writes.unwrap().tuple_keys;
+        let final_writes = third.writes.unwrap();
+        assert_eq!(final_writes.on_duplicate, "ignore");
+        let boundary = final_writes.tuple_keys;
         assert_eq!(boundary.len(), 1);
         assert_eq!(boundary[0].object, "docs:100");
     }
