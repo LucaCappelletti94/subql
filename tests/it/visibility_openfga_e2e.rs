@@ -22,8 +22,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use openfga_client::client::{
-    ConsistencyPreference, CreateStoreRequest, ListStoresRequest, OpenFgaServiceClient,
-    ReadRequest, ReadRequestTupleKey, TupleKey, WriteRequest, WriteRequestWrites,
+    CheckRequest, CheckRequestTupleKey, ConsistencyPreference, CreateStoreRequest,
+    ListStoresRequest, OpenFgaServiceClient, ReadRequest, ReadRequestTupleKey, TupleKey,
+    WriteRequest, WriteRequestWrites,
 };
 use openfga_client::tonic::transport::Channel;
 use rls2fga::classifier::function_registry::{SessionAttribute, SessionAttributeKind};
@@ -39,7 +40,7 @@ use subql::visibility::openfga::{MaterialiseError, OpenFgaPolicy};
 use subql::visibility::policy::{RequestValues, RowPolicy, Subject};
 use subql::visibility::shapes::Shapes;
 use subql::visibility::store::{Enumeration, Replay, Replayer, Requery};
-use subql::visibility::{EventRow, Verdict, VisibilityPolicy};
+use subql::visibility::{EventRow, RowWrite, Verdict, VisibilityPolicy};
 use subql::{catalog_helpers, ParserDB};
 
 /// Everything a policy over one schema needs, from one translation.
@@ -114,6 +115,23 @@ async fn write_model(
         .expect("write the model")
 }
 
+async fn create_store_with_model(
+    client: &mut OpenFgaServiceClient<Channel>,
+    name: &str,
+    model: &rls2fga::generator::json_model::AuthorizationModel,
+) -> (String, String) {
+    let store = client
+        .create_store(CreateStoreRequest {
+            name: name.to_owned(),
+        })
+        .await
+        .expect("create store")
+        .into_inner()
+        .id;
+    let model_id = write_model(client, &store, model).await;
+    (store, model_id)
+}
+
 /// `can_select: member from teams`, which one row never decides: whether a
 /// watcher is a member of the team the row names is not in the row.
 const SCHEMA: &str = "
@@ -126,6 +144,72 @@ CREATE POLICY p ON docs FOR SELECT USING (
   EXISTS (SELECT 1 FROM team_members
           WHERE team_members.team_id = docs.team_id AND team_members.user_id = current_user));
 ";
+
+const UPDATE_TWO_SIDED: &str = "
+CREATE TABLE public.docs(id INTEGER PRIMARY KEY, owner_id TEXT, editor_id TEXT);
+ALTER TABLE docs ENABLE ROW LEVEL SECURITY;
+CREATE POLICY ps ON docs FOR SELECT USING (owner_id = current_user);
+CREATE POLICY pu ON docs FOR UPDATE
+  USING (owner_id = current_user) WITH CHECK (editor_id = current_user);
+";
+
+const WRITE_LIMIT: usize = 100;
+
+fn update_row(owner: &str, editor: &str) -> Vec<Value<Postgres>> {
+    vec![
+        Value::Int(4),
+        Value::String(owner.into()),
+        Value::String(editor.into()),
+    ]
+}
+
+type ReplacementPolicy = OpenFgaPolicy<ParserDB, Channel, String, Postgres>;
+type ReplacementRow<'a> = EventRow<'a, TestEvent<Postgres>, ParserDB>;
+
+async fn replacement_verdict(
+    policy: &ReplacementPolicy,
+    old: &ReplacementRow<'_>,
+    new: &ReplacementRow<'_>,
+    watcher: &str,
+) -> Verdict {
+    const fn assert_send<T: Send>(_: &T) {}
+
+    let watcher = watcher.to_owned();
+    let answer = policy.may_write(RowWrite::Update { old, new }, &watcher);
+    assert_send(&answer);
+    answer.await.expect("the service answered both judges")
+}
+
+async fn check_without_context(
+    client: &mut OpenFgaServiceClient<Channel>,
+    store: &str,
+    model_id: &str,
+    tuple_key: CheckRequestTupleKey,
+) -> bool {
+    client
+        .check(CheckRequest {
+            store_id: store.to_owned(),
+            tuple_key: Some(tuple_key),
+            contextual_tuples: None,
+            authorization_model_id: model_id.to_owned(),
+            trace: false,
+            context: None,
+            // Discriminant extraction: the generated field is a bare `i32`.
+            consistency: ConsistencyPreference::HigherConsistency as i32,
+        })
+        .await
+        .expect("ask without contextual tuples")
+        .into_inner()
+        .allowed
+}
+
+struct Aliases(&'static [&'static str]);
+
+impl Subject for Aliases {
+    fn subjects(&self) -> impl Iterator<Item = Cow<'_, str>> {
+        self.0.iter().copied().map(Cow::Borrowed)
+    }
+}
 
 /// A client on this run's shared OpenFGA whose first call has already come
 /// back.
@@ -244,6 +328,209 @@ async fn a_question_the_row_does_not_settle_is_answered_by_the_service() {
         [Verdict::Allow, Verdict::Deny],
         "alice is a member of the team the row names and bob is not"
     );
+}
+
+/// A replacement requires both row versions and the resulting row's facts.
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "requires docker"]
+async fn a_replacement_requires_both_versions_and_resulting_context() {
+    let mut client = openfga().await;
+    let wired = wiring(UPDATE_TWO_SIDED);
+    let docs = catalog_helpers::table_id::<Postgres, _>(&wired.db, "docs")
+        .expect("docs is in the catalog");
+    let model = wired.model.clone();
+    let store = client
+        .create_store(CreateStoreRequest {
+            name: "subql-replacement-write".to_owned(),
+        })
+        .await
+        .expect("create store")
+        .into_inner()
+        .id;
+    let model_id = write_model(&mut client, &store, &model).await;
+    let shapes = wired.shapes();
+    let policy = OpenFgaPolicy::<_, _, String, Postgres>::new(
+        Arc::clone(&shapes),
+        client.clone(),
+        store.clone(),
+    )
+    .expect("the index carries both update judges")
+    .authorization_model_id(model_id.clone());
+
+    let stored =
+        TestEvent::<Postgres>::insert(docs, update_row("alice", "bob")).with_pk_columns([0u16]);
+    policy
+        .apply(
+            &shapes
+                .diff(&stored)
+                .expect("the stored row states its facts"),
+        )
+        .await
+        .expect("write the stored row facts");
+
+    let replacement = TestEvent::<Postgres>::update(
+        docs,
+        update_row("alice", "bob"),
+        update_row("alice", "alice"),
+    )
+    .with_pk_columns([0u16]);
+    let old = EventRow::previous(&replacement, shapes.catalog()).expect("pre-image");
+    let new = EventRow::current(&replacement, shapes.catalog()).expect("post-image");
+    let alice = "user:alice".to_owned();
+    assert_eq!(
+        replacement_verdict(&policy, &old, &new, &alice).await,
+        Verdict::Allow
+    );
+
+    let without_context = check_without_context(
+        &mut client,
+        &store,
+        &model_id,
+        CheckRequestTupleKey {
+            user: alice.clone(),
+            relation: "can_update_check".to_owned(),
+            object: "docs:4".to_owned(),
+        },
+    )
+    .await;
+    assert!(
+        !without_context,
+        "alice is not the stored editor, so the resulting facts are required"
+    );
+
+    let split =
+        TestEvent::<Postgres>::update(docs, update_row("alice", "bob"), update_row("alice", "bob"))
+            .with_pk_columns([0u16]);
+    let old = EventRow::previous(&split, shapes.catalog()).expect("pre-image");
+    let new = EventRow::current(&split, shapes.catalog()).expect("post-image");
+    let bob = "user:bob".to_owned();
+
+    assert_eq!(
+        replacement_verdict(&policy, &old, &new, "user:bob").await,
+        Verdict::Deny,
+        "the resulting-row judge grants bob, but the existing-row judge refuses"
+    );
+    assert_eq!(
+        replacement_verdict(&policy, &old, &new, &alice).await,
+        Verdict::Deny,
+        "the existing-row judge grants alice, but the resulting-row judge refuses"
+    );
+    assert_eq!(
+        policy
+            .may_write(RowWrite::UpdateUsing { old: &old }, &alice)
+            .await
+            .expect("ask the existing-row relation"),
+        Verdict::Allow
+    );
+    assert_eq!(
+        policy
+            .may_write(RowWrite::UpdateUsing { old: &old }, &bob)
+            .await
+            .expect("ask the existing-row relation"),
+        Verdict::Deny
+    );
+}
+
+/// Any subject name may grant its watcher without changing another watcher.
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "requires docker"]
+async fn a_second_subject_name_grants_only_its_watcher() {
+    let mut client = openfga().await;
+    let wired = wiring(SCHEMA);
+    let docs = catalog_helpers::table_id::<Postgres, _>(&wired.db, "docs")
+        .expect("docs is in the catalog");
+    let model = wired.model.clone();
+    let (store, model_id) =
+        create_store_with_model(&mut client, "subql-subject-fanout", &model).await;
+    client
+        .write(WriteRequest {
+            store_id: store.clone(),
+            writes: Some(WriteRequestWrites {
+                tuple_keys: vec![
+                    TupleKey {
+                        user: "teams:1".to_owned(),
+                        relation: "teams".to_owned(),
+                        object: "docs:4".to_owned(),
+                        condition: None,
+                    },
+                    TupleKey {
+                        user: "user:alice-secondary".to_owned(),
+                        relation: "member".to_owned(),
+                        object: "teams:1".to_owned(),
+                        condition: None,
+                    },
+                    TupleKey {
+                        user: "user:bob-decoy".to_owned(),
+                        relation: "member".to_owned(),
+                        object: "teams:1".to_owned(),
+                        condition: None,
+                    },
+                ],
+                on_duplicate: String::new(),
+            }),
+            deletes: None,
+            authorization_model_id: model_id.clone(),
+        })
+        .await
+        .expect("write the subject grants");
+    let shapes = wired.shapes();
+    let policy = OpenFgaPolicy::<_, _, Aliases, Postgres>::new(Arc::clone(&shapes), client, store)
+        .expect("the index carries the read relation")
+        .authorization_model_id(model_id);
+    let event = TestEvent::<Postgres>::insert(docs, vec![Value::Int(4), Value::Int(1)])
+        .with_pk_columns([0u16]);
+    let row = EventRow::current(&event, shapes.catalog()).expect("post-image");
+    let watchers = [
+        Aliases(&["user:alice-primary", "user:alice-secondary"]),
+        Aliases(&["user:bob-primary", "user:bob-secondary"]),
+    ];
+    let mut verdicts = Vec::new();
+    Verdict::reset(&mut verdicts, watchers.len());
+
+    policy
+        .may_see(&row, &watchers, &mut verdicts)
+        .await
+        .expect("the service answered every subject");
+
+    assert_eq!(
+        verdicts,
+        [Verdict::Allow, Verdict::Deny],
+        "the second Alice name grants only Alice and the decoy grants nobody queried"
+    );
+}
+
+/// A direct write preserves the chunk beyond the service limit.
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "requires docker"]
+async fn direct_writes_preserve_the_final_chunk() {
+    let mut client = openfga().await;
+    let wired = wiring(SCHEMA);
+    let model = wired.model.clone();
+    let (store, model_id) =
+        create_store_with_model(&mut client, "subql-direct-write-limit", &model).await;
+    let shapes = wired.shapes();
+    let policy =
+        OpenFgaPolicy::<_, _, String, Postgres>::new(shapes, client.clone(), store.clone())
+            .expect("the index carries the model")
+            .authorization_model_id(model_id);
+    let mut expected: Vec<String> = (0..=WRITE_LIMIT)
+        .map(|nth| format!("user:{nth:03}"))
+        .collect();
+    let records: Vec<Record> = expected
+        .iter()
+        .map(|subject| plain_membership("teams:3", subject))
+        .collect();
+
+    policy
+        .write_records(&records)
+        .await
+        .expect("write every chunk");
+
+    let mut stored = stored_members(&mut client, &store).await;
+    expected.sort();
+    stored.sort();
+    assert_eq!(stored, expected);
+    assert!(stored.iter().any(|subject| subject == "user:100"));
 }
 
 /// A batch larger than the configured cap is split, and every watcher still gets
@@ -949,6 +1236,40 @@ async fn stored_members(client: &mut OpenFgaServiceClient<Channel>, store: &str)
     stored_relation(client, store, &member_relation().to_string(), "teams:3").await
 }
 
+async fn stored_relation_keys(
+    client: &mut OpenFgaServiceClient<Channel>,
+    store: &str,
+    relation: &str,
+    object: &str,
+) -> Vec<TupleKey> {
+    let mut continuation_token = String::new();
+    let mut stored = Vec::new();
+    loop {
+        let response = client
+            .read(ReadRequest {
+                store_id: store.to_owned(),
+                tuple_key: Some(ReadRequestTupleKey {
+                    user: String::new(),
+                    relation: relation.to_owned(),
+                    object: object.to_owned(),
+                }),
+                page_size: None,
+                continuation_token,
+                // Discriminant extraction: the generated field is a bare `i32`.
+                consistency: ConsistencyPreference::HigherConsistency as i32,
+            })
+            .await
+            .expect("read every relation tuple")
+            .into_inner();
+        stored.extend(response.tuples.into_iter().filter_map(|tuple| tuple.key));
+        continuation_token = response.continuation_token;
+        if continuation_token.is_empty() {
+            break;
+        }
+    }
+    stored
+}
+
 /// Every subject the store holds for one relation on one object.
 async fn stored_relation(
     client: &mut OpenFgaServiceClient<Channel>,
@@ -956,25 +1277,9 @@ async fn stored_relation(
     relation: &str,
     object: &str,
 ) -> Vec<String> {
-    let response = client
-        .read(ReadRequest {
-            store_id: store.to_owned(),
-            tuple_key: Some(ReadRequestTupleKey {
-                user: String::new(),
-                relation: relation.to_owned(),
-                object: object.to_owned(),
-            }),
-            page_size: None,
-            continuation_token: String::new(),
-            consistency: ConsistencyPreference::HigherConsistency as i32,
-        })
+    stored_relation_keys(client, store, relation, object)
         .await
-        .expect("read the relation")
-        .into_inner();
-    response
-        .tuples
         .into_iter()
-        .filter_map(|tuple| tuple.key)
         .map(|key| key.user)
         .collect()
 }

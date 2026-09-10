@@ -331,6 +331,9 @@ tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time", 
 # rule that bans `std::sync::Mutex/RwLock` where the guard is unwrapped.
 parking_lot = "0.12"
 
+# Generated responses for the private OpenFGA transport tests.
+tonic-prost = "0.14"
+
 [features]
 default = ["std"]
 # `std` enables the I/O subsystems: persistence (shard codec + background
