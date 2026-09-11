@@ -22,7 +22,7 @@
 
 use crate::common;
 
-use diesel::{sql_query, QueryableByName, RunQueryDsl};
+use diesel::{sql_query, RunQueryDsl};
 use diesel_async::{AsyncConnection, AsyncMysqlConnection};
 use sql_traits::structs::ParserDB;
 use sqlparser::dialect::MySqlDialect;
@@ -32,14 +32,6 @@ use subql::{DefaultIds, SubscriptionEngine};
 
 const DDL: &str = "CREATE TABLE things (id INT PRIMARY KEY, active BOOLEAN);";
 const MYSQL_DDL: &str = "CREATE TABLE things (id INT PRIMARY KEY, active BOOLEAN)";
-
-#[derive(QueryableByName, Debug, PartialEq)]
-struct ThingRow {
-    #[diesel(sql_type = diesel::sql_types::Integer)]
-    id: i32,
-    #[diesel(sql_type = diesel::sql_types::Bool)]
-    active: bool,
-}
 
 #[test]
 #[ignore = "requires Docker; run with --ignored"]

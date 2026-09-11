@@ -31,14 +31,6 @@ use subql::{DefaultIds, SubscriptionEngine};
 const DDL: &str = "CREATE TABLE things (id INT PRIMARY KEY, active BOOLEAN);";
 const MYSQL_DDL: &str = "CREATE TABLE things (id INT PRIMARY KEY, active BOOLEAN)";
 
-#[derive(QueryableByName, Debug, PartialEq)]
-struct ThingRow {
-    #[diesel(sql_type = diesel::sql_types::Integer)]
-    id: i32,
-    #[diesel(sql_type = diesel::sql_types::Bool)]
-    active: bool,
-}
-
 #[test]
 #[ignore = "requires Docker; run with --ignored"]
 fn apply_patchset_bool_roundtrip_insert_update_delete_mysql() {

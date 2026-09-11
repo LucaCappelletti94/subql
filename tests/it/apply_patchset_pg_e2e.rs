@@ -18,7 +18,7 @@
 
 use crate::common;
 
-use diesel::{sql_query, QueryableByName, RunQueryDsl};
+use diesel::{sql_query, RunQueryDsl};
 use sql_traits::structs::ParserDB;
 use sqlparser::dialect::PostgreSqlDialect;
 use subql::patchset::PgAdapter;
@@ -26,14 +26,6 @@ use subql::{ChangeEvent, DefaultIds, SubscriptionEngine};
 
 const DDL: &str = "CREATE TABLE things (id INT PRIMARY KEY, active BOOLEAN);";
 const PG_DDL: &str = "CREATE TABLE things (id INT PRIMARY KEY, active BOOLEAN)";
-
-#[derive(QueryableByName, Debug, PartialEq)]
-struct ThingRow {
-    #[diesel(sql_type = diesel::sql_types::Integer)]
-    id: i32,
-    #[diesel(sql_type = diesel::sql_types::Bool)]
-    active: bool,
-}
 
 #[test]
 #[ignore = "requires Docker; run with --ignored"]
