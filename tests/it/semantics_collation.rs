@@ -31,43 +31,9 @@
 #![allow(clippy::unwrap_used)]
 
 use sql_traits::structs::ParserDB;
-use sqlparser::dialect::{MySqlDialect, PostgreSqlDialect, SQLiteDialect};
+use sqlparser::dialect::PostgreSqlDialect;
 use subql::backend::{MySql, Postgres, SQLite, Value};
-use subql::testing::TestEvent;
-use subql::{catalog_helpers, DefaultIds, NotServed, SubscriptionEngine, SubscriptionRequest};
-
-/// Registers `predicate`, then reports whether a one-text-column row
-/// carrying `cell` reaches the consumer.
-macro_rules! notifies {
-    ($backend:ty, $dialect:ty, $ddl:expr, $predicate:expr, $cell:expr) => {{
-        let db = ParserDB::parse::<$dialect>($ddl).expect("DDL parses");
-        let table = catalog_helpers::table_id::<subql::backend::Postgres, _>(&db, "people")
-            .expect("people is in the catalog");
-        let mut engine: SubscriptionEngine<TestEvent<$backend>, DefaultIds, ParserDB> =
-            SubscriptionEngine::new(db, <$dialect>::default());
-        engine
-            .register(SubscriptionRequest::new(1u64, $predicate))
-            .expect("registration succeeds, in process or as a read");
-        let row = vec![Value::Int(1), Value::String($cell.to_string())];
-        let notifications = engine
-            .consumers(&TestEvent::insert(table, row))
-            .expect("dispatch succeeds");
-        !notifications.inserted().is_empty()
-    }};
-}
-
-/// The registration for `predicate`, for the tests that assert a tier
-/// rather than an answer.
-macro_rules! registered {
-    ($backend:ty, $dialect:ty, $ddl:expr, $predicate:expr) => {{
-        let db = ParserDB::parse::<$dialect>($ddl).expect("DDL parses");
-        let mut engine: SubscriptionEngine<TestEvent<$backend>, DefaultIds, ParserDB> =
-            SubscriptionEngine::new(db, <$dialect>::default());
-        engine
-            .register(SubscriptionRequest::new(1u64, $predicate))
-            .expect("a read answers it, so registration succeeds")
-    }};
-}
+use subql::{catalog_helpers, NotServed};
 
 const PG_DDL: &str = "CREATE TABLE people (id INT PRIMARY KEY, name TEXT)";
 const PG_C_DDL: &str = "CREATE TABLE people (id INT PRIMARY KEY, name TEXT COLLATE \"C\")";
@@ -81,44 +47,40 @@ const SQLITE_RTRIM_DDL: &str =
 #[test]
 fn sqlite_nocase_and_rtrim_are_reproduced() {
     assert!(
-        notifies!(
-            SQLite,
-            SQLiteDialect,
+        crate::common::semantics::notifies::<SQLite>(
             SQLITE_DDL,
+            "people",
             "SELECT * FROM people WHERE name = 'ALICE'",
-            "alice"
+            vec![Value::Int(1), Value::String("alice".to_string())]
         ),
         "NOCASE equality folds ASCII case, so the row matches"
     );
     assert!(
-        !notifies!(
-            SQLite,
-            SQLiteDialect,
+        !crate::common::semantics::notifies::<SQLite>(
             SQLITE_DDL,
+            "people",
             "SELECT * FROM people WHERE name = '\u{c9}'",
-            "\u{e9}"
+            vec![Value::Int(1), Value::String("\u{e9}".to_string())]
         ),
         "NOCASE folds ASCII only, so the accented pair stays unequal, \
          measured as 0. Unicode case folding would answer 1 here, which is \
          what makes this the vector that distinguishes the two."
     );
     assert!(
-        !notifies!(
-            SQLite,
-            SQLiteDialect,
+        !crate::common::semantics::notifies::<SQLite>(
             SQLITE_DDL,
+            "people",
             "SELECT * FROM people WHERE name = 'fi'",
-            "\u{fb01}"
+            vec![Value::Int(1), Value::String("\u{fb01}".to_string())]
         ),
         "and the ligature is not decomposed either"
     );
     assert!(
-        notifies!(
-            SQLite,
-            SQLiteDialect,
+        crate::common::semantics::notifies::<SQLite>(
             SQLITE_RTRIM_DDL,
+            "people",
             "SELECT * FROM people WHERE name = 'ab'",
-            "ab  "
+            vec![Value::Int(1), Value::String("ab  ".to_string())]
         ),
         "RTRIM ignores trailing spaces"
     );
@@ -130,32 +92,29 @@ fn sqlite_nocase_and_rtrim_are_reproduced() {
 #[test]
 fn deterministic_pg_text_equality_stays_byte_exact() {
     assert!(
-        notifies!(
-            Postgres,
-            PostgreSqlDialect,
+        crate::common::semantics::notifies::<Postgres>(
             PG_DDL,
+            "people",
             "SELECT * FROM people WHERE name = 'alice'",
-            "alice"
+            vec![Value::Int(1), Value::String("alice".to_string())]
         ),
         "equal bytes are equal"
     );
     assert!(
-        !notifies!(
-            Postgres,
-            PostgreSqlDialect,
+        !crate::common::semantics::notifies::<Postgres>(
             PG_DDL,
+            "people",
             "SELECT * FROM people WHERE name = 'ALICE'",
-            "alice"
+            vec![Value::Int(1), Value::String("alice".to_string())]
         ),
         "a deterministic collation does not fold case"
     );
     assert!(
-        !notifies!(
-            Postgres,
-            PostgreSqlDialect,
+        !crate::common::semantics::notifies::<Postgres>(
             PG_DDL,
+            "people",
             "SELECT * FROM people WHERE name = 'e\u{301}'",
-            "\u{e9}"
+            vec![Value::Int(1), Value::String("\u{e9}".to_string())]
         ),
         "nor does it equate the NFC and NFD spellings, measured as f"
     );
@@ -166,11 +125,9 @@ fn deterministic_pg_text_equality_stays_byte_exact() {
 /// typed cause.
 #[test]
 fn locale_ordering_is_classified_not_served() {
-    let registered = registered!(
-        Postgres,
-        PostgreSqlDialect,
+    let registered = crate::common::semantics::register::<Postgres>(
         PG_DDL,
-        "SELECT * FROM people WHERE name < 'B'"
+        "SELECT * FROM people WHERE name < 'B'",
     );
     assert!(
         registered.served().is_none(),
@@ -200,33 +157,29 @@ fn locale_ordering_is_classified_not_served() {
 /// such a column stays in process and answers what the server answers.
 #[test]
 fn c_collation_ordering_is_served() {
-    let registered = registered!(
-        Postgres,
-        PostgreSqlDialect,
+    let registered = crate::common::semantics::register::<Postgres>(
         PG_C_DDL,
-        "SELECT * FROM people WHERE name < 'B'"
+        "SELECT * FROM people WHERE name < 'B'",
     );
     assert!(
         registered.served().is_some(),
         "byte ordering reproduces the C collation exactly"
     );
     assert!(
-        !notifies!(
-            Postgres,
-            PostgreSqlDialect,
+        !crate::common::semantics::notifies::<Postgres>(
             PG_C_DDL,
+            "people",
             "SELECT * FROM people WHERE name < 'B'",
-            "a"
+            vec![Value::Int(1), Value::String("a".to_string())]
         ),
         "under C, lowercase a is above uppercase B, measured as f"
     );
     assert!(
-        notifies!(
-            Postgres,
-            PostgreSqlDialect,
+        crate::common::semantics::notifies::<Postgres>(
             PG_C_DDL,
+            "people",
             "SELECT * FROM people WHERE name < 'B'",
-            "A"
+            vec![Value::Int(1), Value::String("A".to_string())]
         ),
         "and uppercase A is below it"
     );
@@ -239,11 +192,9 @@ fn nondeterministic_pg_equality_is_classified() {
     let ddl = "CREATE COLLATION ci (provider = icu, locale = 'und-u-ks-level2', \
                deterministic = false); \
                CREATE TABLE people (id INT PRIMARY KEY, name TEXT COLLATE ci)";
-    let registered = registered!(
-        Postgres,
-        PostgreSqlDialect,
+    let registered = crate::common::semantics::register::<Postgres>(
         ddl,
-        "SELECT * FROM people WHERE name = 'A'"
+        "SELECT * FROM people WHERE name = 'A'",
     );
     assert!(
         registered.served().is_none(),
@@ -265,11 +216,9 @@ fn nondeterministic_pg_equality_is_classified() {
 #[test]
 fn mysql_text_comparison_is_classified_unless_binary() {
     let default_ddl = "CREATE TABLE people (id INT PRIMARY KEY, name TEXT)";
-    let registered = registered!(
-        MySql,
-        MySqlDialect,
+    let registered = crate::common::semantics::register::<MySql>(
         default_ddl,
-        "SELECT * FROM people WHERE name = 'A'"
+        "SELECT * FROM people WHERE name = 'A'",
     );
     assert!(
         registered.served().is_none(),
@@ -278,9 +227,7 @@ fn mysql_text_comparison_is_classified_unless_binary() {
 
     let bin_ddl = "CREATE TABLE people (id INT PRIMARY KEY, name TEXT COLLATE utf8mb4_bin)";
     assert!(
-        registered!(
-            MySql,
-            MySqlDialect,
+        crate::common::semantics::register::<MySql>(
             bin_ddl,
             "SELECT * FROM people WHERE name = 'A'"
         )
@@ -289,12 +236,11 @@ fn mysql_text_comparison_is_classified_unless_binary() {
         "utf8mb4_bin is byte comparison, which is reproducible"
     );
     assert!(
-        !notifies!(
-            MySql,
-            MySqlDialect,
+        !crate::common::semantics::notifies::<MySql>(
             bin_ddl,
+            "people",
             "SELECT * FROM people WHERE name = 'A'",
-            "a"
+            vec![Value::Int(1), Value::String("a".to_string())]
         ),
         "and under utf8mb4_bin the case difference is a mismatch, measured as 0"
     );
@@ -307,12 +253,8 @@ fn mysql_text_comparison_is_classified_unless_binary() {
 fn mysql_case_sensitive_uca_collation_is_not_byte_exact() {
     let ddl = "CREATE TABLE people (id INT PRIMARY KEY, \
                name TEXT COLLATE utf8mb4_0900_as_cs)";
-    let registered = registered!(
-        MySql,
-        MySqlDialect,
-        ddl,
-        "SELECT * FROM people WHERE name = 'A'"
-    );
+    let registered =
+        crate::common::semantics::register::<MySql>(ddl, "SELECT * FROM people WHERE name = 'A'");
     assert!(
         registered.served().is_none(),
         "case sensitivity is not byte exactness: NFC equals NFD here, measured as 1"

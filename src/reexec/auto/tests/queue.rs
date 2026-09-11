@@ -96,30 +96,13 @@ fn applied_burst_coalesces_repeated_triggers() {
     // Connector serves a single value, which is what we expect since
     // the trigger should be deduplicated to one call.
     let (mut e, tid) = engine_with_values(alloc::vec![Value::Float(99.0)]);
-    let qid = match e
-        .register(
-            SubscriptionRequest::new(1u64, "SELECT MIN(price) FROM orders"),
-            (),
-        )
-        .unwrap()
-    {
-        Registered {
-            subscription_id,
-            tier: Tier::Scalar { .. },
-            ..
-        } => subscription_id,
-        other => panic!("expected ReExec, got {other:?}"),
-    };
     // Bootstrap: extreme is 5.0.
-    assert!(crate::Install::install(
+    crate::reexec::test_fixtures::bootstrap_scalar_query(
         &mut e,
-        qid,
-        crate::ScalarInstall {
-            value: Value::Float(5.0),
-            checkpoint: None::<crate::NoCheckpoint>
-        }
-    )
-    .is_ok());
+        1u64,
+        "SELECT MIN(price) FROM orders",
+        5.0,
+    );
 
     // Three DELETEs of the current extreme. Each one in isolation
     // would emit a trigger, the batch should collapse them.
@@ -152,29 +135,12 @@ fn applied_burst_coalesces_repeated_triggers() {
 fn applied_burst_error_surfaces_from_resolve() {
     // Empty value queue: connector errors on first call.
     let (mut e, tid) = engine_with_values(alloc::vec![]);
-    let qid = match e
-        .register(
-            SubscriptionRequest::new(1u64, "SELECT MIN(price) FROM orders"),
-            (),
-        )
-        .unwrap()
-    {
-        Registered {
-            subscription_id,
-            tier: Tier::Scalar { .. },
-            ..
-        } => subscription_id,
-        other => panic!("expected ReExec, got {other:?}"),
-    };
-    assert!(crate::Install::install(
+    crate::reexec::test_fixtures::bootstrap_scalar_query(
         &mut e,
-        qid,
-        crate::ScalarInstall {
-            value: Value::Float(5.0),
-            checkpoint: None::<crate::NoCheckpoint>
-        }
-    )
-    .is_ok());
+        1u64,
+        "SELECT MIN(price) FROM orders",
+        5.0,
+    );
 
     let events = alloc::vec![delete_event(tid, 1, 5.0)];
     for ev in &events {
@@ -200,34 +166,16 @@ fn applied_burst_keeps_distinct_queries_apart() {
     // MockConnector pops from the back, so push values in reverse:
     // first pop = 22.0, second pop = 11.0.
     let (mut e, tid) = engine_with_values(alloc::vec![Value::Float(22.0), Value::Float(11.0)]);
-    let qid1 = match e
-        .register(
-            SubscriptionRequest::new(1u64, "SELECT MIN(price) FROM orders"),
-            (),
-        )
-        .unwrap()
-    {
-        Registered {
-            subscription_id,
-            tier: Tier::Scalar { .. },
-            ..
-        } => subscription_id,
-        other => panic!("expected ReExec for MIN, got {other:?}"),
-    };
-    let qid2 = match e
-        .register(
-            SubscriptionRequest::new(2u64, "SELECT MAX(price) FROM orders"),
-            (),
-        )
-        .unwrap()
-    {
-        Registered {
-            subscription_id,
-            tier: Tier::Scalar { .. },
-            ..
-        } => subscription_id,
-        other => panic!("expected ReExec for MAX, got {other:?}"),
-    };
+    let qid1 = crate::reexec::test_fixtures::register_scalar_query(
+        &mut e,
+        1u64,
+        "SELECT MIN(price) FROM orders",
+    );
+    let qid2 = crate::reexec::test_fixtures::register_scalar_query(
+        &mut e,
+        2u64,
+        "SELECT MAX(price) FROM orders",
+    );
     // Bootstrap both at 7.0 so deleting price=7.0 displaces both.
     assert!(crate::Install::install(
         &mut e,

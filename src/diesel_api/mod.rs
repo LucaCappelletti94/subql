@@ -108,7 +108,7 @@ where
 
 /// Render only the placeholder SQL skeleton for a backend, no binds. Needs just
 /// the backend type, no connection.
-fn render_sql<B, Q>(query: &Q) -> Result<String, RegisterError>
+fn render_sql<B, Q>(query: &Q, what: &str) -> Result<String, RegisterError>
 where
     B: Backend + Default,
     <B as Backend>::QueryBuilder: Default,
@@ -116,7 +116,7 @@ where
 {
     let mut qb = <B as Backend>::QueryBuilder::default();
     query.to_sql(&mut qb, &B::default()).map_err(|e| {
-        RegisterError::UnsupportedSql(format!("diesel query rendering failed: {e}"))
+        RegisterError::UnsupportedSql(format!("diesel {what} rendering failed: {e}"))
     })?;
     Ok(qb.finish())
 }
@@ -150,7 +150,7 @@ impl BindDecode<Postgres> for Pg {
     where
         Q: QueryFragment<Self>,
     {
-        let sql = render_sql::<Self, _>(query)?;
+        let sql = render_sql::<Self, _>(query, "query")?;
 
         // Binds as serialized wire bytes + type OIDs, decoded per OID.
         let mut collector = RawBytesBindCollector::<Self>::new();
@@ -185,7 +185,7 @@ impl BindDecode<crate::backend::SQLite> for diesel::sqlite::Sqlite {
         use diesel::query_builder::MoveableBindCollector;
         use diesel::sqlite::SqliteBindCollector;
 
-        let sql = render_sql::<Self, _>(query)?;
+        let sql = render_sql::<Self, _>(query, "query")?;
 
         let mut collector = SqliteBindCollector::default();
         query
@@ -214,7 +214,7 @@ impl<C: crate::backend::MySqlTableNameCase> BindDecode<crate::backend::MySql<C>>
     where
         Q: QueryFragment<Self>,
     {
-        let sql = render_sql::<Self, _>(query)?;
+        let sql = render_sql::<Self, _>(query, "query")?;
 
         let mut collector = RawBytesBindCollector::<Self>::new();
         query
@@ -245,11 +245,7 @@ where
     DB: Backend + Default,
     <DB as Backend>::QueryBuilder: Default,
 {
-    let mut qb = <DB as Backend>::QueryBuilder::default();
-    QueryFragment::<DB>::to_sql(&T::default(), &mut qb, &DB::default()).map_err(|e| {
-        RegisterError::UnsupportedSql(format!("diesel table rendering failed: {e}"))
-    })?;
-    let rendered = qb.finish();
+    let rendered = render_sql::<DB, T>(&T::default(), "table")?;
     let bare = rendered
         .rsplit('.')
         .next()

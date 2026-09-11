@@ -14,20 +14,11 @@ fn async_engine_dispatch_round_trip() {
     // Mock pops from the back so push in reverse order.
     let (mut e, tid) = engine_with_values(vec![Value::Float(9.0), Value::Float(5.0)]);
 
-    let qid = match e
-        .register(
-            SubscriptionRequest::new(1u64, "SELECT MIN(price) FROM orders"),
-            (),
-        )
-        .unwrap()
-    {
-        Registered {
-            subscription_id,
-            tier: Tier::Scalar { .. },
-            ..
-        } => subscription_id,
-        other => panic!("expected ReExec, got {other:?}"),
-    };
+    let qid = crate::reexec::test_fixtures::register_scalar_query(
+        &mut e,
+        1u64,
+        "SELECT MIN(price) FROM orders",
+    );
 
     // Snapshot bootstraps. Future is Send-bound and ready immediately.
     let snap = block_on(e.snapshot(qid))
@@ -60,29 +51,12 @@ fn async_engine_dispatch_round_trip() {
 #[test]
 fn async_engine_unrelated_column_update_skips_connector() {
     let (mut e, tid) = engine_with_values(vec![]);
-    let qid = match e
-        .register(
-            SubscriptionRequest::new(1u64, "SELECT MAX(price) FROM orders"),
-            (),
-        )
-        .unwrap()
-    {
-        Registered {
-            subscription_id,
-            tier: Tier::Scalar { .. },
-            ..
-        } => subscription_id,
-        other => panic!("expected ReExec, got {other:?}"),
-    };
-    assert!(crate::Install::install(
+    crate::reexec::test_fixtures::bootstrap_scalar_query(
         &mut e,
-        qid,
-        crate::ScalarInstall {
-            value: Value::Float(10.0),
-            checkpoint: None::<crate::NoCheckpoint>
-        }
-    )
-    .is_ok());
+        1u64,
+        "SELECT MAX(price) FROM orders",
+        10.0,
+    );
 
     let event = update_status_only(tid, 1, 10.0);
 
@@ -104,29 +78,12 @@ fn async_engine_snapshot_unknown_query_returns_none() {
 #[test]
 fn async_engine_connector_error_aborts_batch() {
     let (mut e, tid) = engine_with_values(vec![]);
-    let qid = match e
-        .register(
-            SubscriptionRequest::new(1u64, "SELECT MIN(price) FROM orders"),
-            (),
-        )
-        .unwrap()
-    {
-        Registered {
-            subscription_id,
-            tier: Tier::Scalar { .. },
-            ..
-        } => subscription_id,
-        other => panic!("expected ReExec, got {other:?}"),
-    };
-    assert!(crate::Install::install(
+    crate::reexec::test_fixtures::bootstrap_scalar_query(
         &mut e,
-        qid,
-        crate::ScalarInstall {
-            value: Value::Float(5.0),
-            checkpoint: None::<crate::NoCheckpoint>
-        }
-    )
-    .is_ok());
+        1u64,
+        "SELECT MIN(price) FROM orders",
+        5.0,
+    );
 
     e.apply(&delete_event(tid, 1, 5.0)).unwrap();
     match block_on(e.resolve_collect()) {
@@ -142,20 +99,11 @@ fn async_engine_connector_error_aborts_batch() {
 #[test]
 fn async_connector_error_names_its_subscription() {
     let (mut e, tid) = engine_with_values(vec![]);
-    let qid = match e
-        .register(
-            SubscriptionRequest::new(1u64, "SELECT MIN(price) FROM orders"),
-            (),
-        )
-        .unwrap()
-    {
-        Registered {
-            subscription_id,
-            tier: Tier::Scalar { .. },
-            ..
-        } => subscription_id,
-        other => panic!("expected Scalar, got {other:?}"),
-    };
+    let qid = crate::reexec::test_fixtures::register_scalar_query(
+        &mut e,
+        1u64,
+        "SELECT MIN(price) FROM orders",
+    );
     crate::Install::install(
         &mut e,
         qid,

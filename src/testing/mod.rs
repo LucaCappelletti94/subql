@@ -1,6 +1,6 @@
 #![allow(clippy::match_same_arms)]
-//! Test-only fixtures shared across unit tests, doctests, and
-//! integration tests.
+//! Test-only fixtures shared across unit tests, doctests, integration
+//! tests, and the benchmark targets.
 //!
 //! [`TestEvent<B>`] is the concrete [`CdcEvent`] tests build to drive
 //! the engine when no real WAL parser is in the loop. It stays in the
@@ -8,6 +8,9 @@
 //! downstream integration tests can construct it the same way as unit
 //! tests. The type is small and shape-stable, so leaving it always
 //! compiled keeps every test path unified.
+
+#[doc(hidden)]
+pub mod workload;
 
 use alloc::vec::Vec;
 

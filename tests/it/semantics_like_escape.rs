@@ -16,7 +16,7 @@
 #![allow(clippy::unwrap_used)]
 
 use sql_traits::structs::ParserDB;
-use sqlparser::dialect::{MySqlDialect, PostgreSqlDialect, SQLiteDialect};
+use sqlparser::dialect::{MySqlDialect, PostgreSqlDialect};
 use subql::backend::{Backend, MySql, Postgres, SQLite, Value};
 use subql::compiler::vm::refusal::DanglingEscape;
 use subql::testing::TestEvent;
@@ -36,41 +36,41 @@ const PG_FOLDING_DDL: &str = "CREATE TABLE names (id INT PRIMARY KEY, name TEXT 
 /// collation is reproducible, so that is where the escape rule is asserted.
 const MYSQL_DDL: &str = "CREATE TABLE names (id INT PRIMARY KEY, name TEXT COLLATE utf8mb4_bin)";
 
-/// One `names` row carrying `name`, for a backend whose text payload is a
-/// `String`.
-macro_rules! notifies {
-    ($backend:ty, $dialect:ty, $ddl:expr, $predicate:expr, $name:expr) => {{
-        let db = ParserDB::parse::<$dialect>($ddl).expect("DDL parses");
-        let table = catalog_helpers::table_id::<subql::backend::Postgres, _>(&db, "names")
-            .expect("names is in the catalog");
-        let mut engine: SubscriptionEngine<TestEvent<$backend>, DefaultIds, ParserDB> =
-            SubscriptionEngine::new(db, <$dialect>::default());
-        engine
-            .register(SubscriptionRequest::new(1u64, $predicate))
-            .expect("the predicate registers");
-        let row = vec![Value::Int(1), Value::String($name.to_string())];
-        let notifications = engine
-            .consumers(&TestEvent::insert(table, row))
-            .expect("dispatch succeeds");
-        !notifications.inserted().is_empty()
-    }};
-}
-
 fn pg_notifies(predicate: &str, name: &str) -> bool {
-    notifies!(Postgres, PostgreSqlDialect, DDL, predicate, name)
+    crate::common::semantics::notifies::<Postgres>(
+        DDL,
+        "names",
+        predicate,
+        vec![Value::Int(1), Value::String(name.to_string())],
+    )
 }
 
 /// As [`pg_notifies`], on a column whose collation folds ASCII only.
 fn pg_folding_notifies(predicate: &str, name: &str) -> bool {
-    notifies!(Postgres, PostgreSqlDialect, PG_FOLDING_DDL, predicate, name)
+    crate::common::semantics::notifies::<Postgres>(
+        PG_FOLDING_DDL,
+        "names",
+        predicate,
+        vec![Value::Int(1), Value::String(name.to_string())],
+    )
 }
 
 fn mysql_notifies(predicate: &str, name: &str) -> bool {
-    notifies!(MySql, MySqlDialect, MYSQL_DDL, predicate, name)
+    crate::common::semantics::notifies::<MySql>(
+        MYSQL_DDL,
+        "names",
+        predicate,
+        vec![Value::Int(1), Value::String(name.to_string())],
+    )
 }
 
 fn sqlite_notifies(predicate: &str, name: &str) -> bool {
-    notifies!(SQLite, SQLiteDialect, DDL, predicate, name)
+    crate::common::semantics::notifies::<SQLite>(
+        DDL,
+        "names",
+        predicate,
+        vec![Value::Int(1), Value::String(name.to_string())],
+    )
 }
 
 /// The finding: an escaped wildcard is a literal wildcard character.

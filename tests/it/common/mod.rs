@@ -1,8 +1,13 @@
-//! Shared helpers for the Docker-backed integration tests.
+//! Shared helpers for the integration tests.
 //!
-//! One server per engine per nextest run, looked up by name and label from
-//! every test process, and one database per test on it. Requires Docker. The
-//! Postgres image `subql-test/postgres-wal2json:16` is built from
+//! Some need no server: [`semantics`] holds the register-and-dispatch
+//! scaffold the `semantics_*` suites share, and [`throttle`] holds the
+//! in-memory concurrency probe.
+//!
+//! The Docker-backed helpers below run one server per engine per nextest
+//! run, looked up by name and label from every test process, with one
+//! database per test on it. Those require Docker. The Postgres image
+//! `subql-test/postgres-wal2json:16` is built from
 //! `tests/fixtures/Dockerfile.postgres` on first use.
 
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -20,6 +25,23 @@ use testcontainers::{ContainerRequest, GenericImage, ImageExt, ReuseDirective};
     feature = "sqlite-cdc"
 ))]
 pub mod dispatch;
+#[cfg(any(
+    feature = "apply-patchset-postgres",
+    feature = "apply-patchset-mysql",
+    feature = "apply-patchset-postgres-async",
+    feature = "apply-patchset-mysql-async",
+))]
+pub mod patchset;
+#[cfg(any(
+    feature = "executor-diesel-postgres",
+    feature = "executor-diesel-postgres-r2d2",
+    feature = "executor-diesel-async-postgres",
+    feature = "executor-diesel-mysql",
+    feature = "executor-diesel-async-mysql",
+))]
+pub mod reexec;
+pub mod semantics;
+pub mod throttle;
 
 const PG_IMAGE: &str = "subql-test/postgres-wal2json";
 const PG_TAG: &str = "16";
@@ -204,7 +226,7 @@ fn fresh_db_name() -> String {
     )
 }
 
-mod mysql;
+pub mod mysql;
 #[cfg(any(
     feature = "executor-diesel-postgres",
     feature = "executor-diesel-async-postgres",
@@ -213,7 +235,7 @@ mod mysql;
     feature = "executor-diesel-async-mysql",
 ))]
 mod parked_reads;
-mod pg;
+pub mod pg;
 
 pub use mysql::{maxwell_collect, mysql_database, start_maxwell};
 #[cfg(any(

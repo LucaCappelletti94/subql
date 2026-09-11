@@ -38,48 +38,6 @@ use subql::{
 };
 
 const SLOT: &str = "subql_test";
-const DDL: &str =
-    "CREATE TABLE orders (id INT PRIMARY KEY, price FLOAT, quantity INT, status TEXT);";
-
-/// PG-side DDL used in the actual container. Uses DOUBLE PRECISION (the
-/// canonical PG type for an 8-byte float) so the diesel `Nullable<Double>`
-/// row type in `DieselConnector` decodes cleanly.
-const PG_DDL: &str = "CREATE TABLE orders (
-    id INT PRIMARY KEY,
-    price DOUBLE PRECISION,
-    quantity INT,
-    status TEXT
-)";
-
-/// Set up the PG side: DDL, REPLICA IDENTITY FULL, seed rows, replication
-/// slot. The slot starts empty (the seeds are inserted **before** creating
-/// the slot, so their WAL records never reach it). After this returns we
-/// can drive test-specific DML and observe it cleanly.
-fn setup_pg(conn: &mut PgConnection, seed: &[(i64, f64)], slot: &str) {
-    sql_query(PG_DDL).execute(conn).expect("CREATE TABLE");
-    sql_query("ALTER TABLE orders REPLICA IDENTITY FULL")
-        .execute(conn)
-        .expect("REPLICA IDENTITY FULL");
-    for (id, price) in seed {
-        sql_query(format!(
-            "INSERT INTO orders (id, price, quantity, status) \
-             VALUES ({id}, {price}, 1, 'paid')"
-        ))
-        .execute(conn)
-        .expect("seed insert");
-    }
-    common::create_slot(conn, slot);
-}
-
-/// One more row, for a commit that lands while a read is parked.
-fn insert(id: i64) -> String {
-    format!("INSERT INTO orders (id, price, quantity, status) VALUES ({id}, 7.0, 1, 'paid')")
-}
-
-/// Build the in-process catalog the engine + parser share.
-fn catalog() -> ParserDB {
-    ParserDB::parse::<PostgreSqlDialect>(DDL).expect("parse DDL")
-}
 
 fn build_engine(
     catalog: ParserDB,
@@ -110,9 +68,9 @@ fn scaffold_registers_both_subscription_kinds() {
     let mut conn_setup = db.connect();
     let _conn_dml = db.connect();
     let conn_exec = db.connect();
-    setup_pg(&mut conn_setup, &[(1, 5.0), (2, 9.0)], &slot);
+    common::pg::setup_orders(&mut conn_setup, &[(1, 5.0), (2, 9.0)], &slot);
 
-    let mut engine = build_engine(catalog(), conn_exec);
+    let mut engine = build_engine(common::pg::orders_catalog(), conn_exec);
 
     let engine_reg = engine
         .register(
@@ -189,9 +147,9 @@ fn engine_and_captured_paths_coexist_through_pg_connector() {
     let mut conn_setup = db.connect();
     let mut conn_dml = db.connect();
     let conn_exec = db.connect();
-    setup_pg(&mut conn_setup, &[(1, 5.0), (2, 9.0)], &slot);
+    common::pg::setup_orders(&mut conn_setup, &[(1, 5.0), (2, 9.0)], &slot);
 
-    let mut engine = build_engine(catalog(), conn_exec);
+    let mut engine = build_engine(common::pg::orders_catalog(), conn_exec);
 
     let engine_consumer: u64 = 1;
     let engine_reg = engine
@@ -211,20 +169,8 @@ fn engine_and_captured_paths_coexist_through_pg_connector() {
         }
     ));
 
-    let captured_qid = match engine
-        .register(
-            SubscriptionRequest::<DefaultIds, Postgres>::new(2u64, "SELECT MIN(price) FROM orders"),
-            (),
-        )
-        .expect("captured registration")
-    {
-        Registered {
-            subscription_id,
-            tier: Tier::Scalar { .. },
-            ..
-        } => subscription_id,
-        other => panic!("expected ReExec, got {other:?}"),
-    };
+    let captured_qid =
+        common::reexec::register_captured(&mut engine, 2u64, "SELECT MIN(price) FROM orders");
     assert!(subql::Install::install(
         &mut engine,
         captured_qid,
@@ -324,24 +270,12 @@ fn update_displacing_extreme_resolves_via_pg_connector() {
     let mut conn_setup = db.connect();
     let mut conn_dml = db.connect();
     let conn_exec = db.connect();
-    setup_pg(&mut conn_setup, &[(1, 5.0)], &slot);
+    common::pg::setup_orders(&mut conn_setup, &[(1, 5.0)], &slot);
 
-    let mut engine = build_engine(catalog(), conn_exec);
+    let mut engine = build_engine(common::pg::orders_catalog(), conn_exec);
 
-    let captured_qid = match engine
-        .register(
-            SubscriptionRequest::<DefaultIds, Postgres>::new(1u64, "SELECT MIN(price) FROM orders"),
-            (),
-        )
-        .expect("captured registration")
-    {
-        Registered {
-            subscription_id,
-            tier: Tier::Scalar { .. },
-            ..
-        } => subscription_id,
-        other => panic!("expected ReExec, got {other:?}"),
-    };
+    let captured_qid =
+        common::reexec::register_captured(&mut engine, 1u64, "SELECT MIN(price) FROM orders");
     assert!(subql::Install::install(
         &mut engine,
         captured_qid,
@@ -387,24 +321,12 @@ fn snapshot_reads_value_and_lsn_from_pg() {
     let slot = db.slot(SLOT);
     let mut conn_setup = db.connect();
     let conn_exec = db.connect();
-    setup_pg(&mut conn_setup, &[(1, 5.0), (2, 9.0)], &slot);
+    common::pg::setup_orders(&mut conn_setup, &[(1, 5.0), (2, 9.0)], &slot);
 
-    let mut engine = build_engine(catalog(), conn_exec);
+    let mut engine = build_engine(common::pg::orders_catalog(), conn_exec);
 
-    let captured_qid = match engine
-        .register(
-            SubscriptionRequest::<DefaultIds, Postgres>::new(1u64, "SELECT MIN(price) FROM orders"),
-            (),
-        )
-        .expect("captured registration")
-    {
-        Registered {
-            subscription_id,
-            tier: Tier::Scalar { .. },
-            ..
-        } => subscription_id,
-        other => panic!("expected ReExec, got {other:?}"),
-    };
+    let captured_qid =
+        common::reexec::register_captured(&mut engine, 1u64, "SELECT MIN(price) FROM orders");
 
     // Snapshot reads value + LSN inside a single transaction.
     let snap = engine
@@ -564,19 +486,20 @@ fn every_read_reports_a_position_taken_before_its_snapshot() {
     let db = common::pg_database();
     let slot = db.slot(SLOT);
     let mut conn = db.connect();
-    setup_pg(&mut conn, &[(1, 5.0)], &slot);
+    common::pg::setup_orders(&mut conn, &[(1, 5.0)], &slot);
 
     let sql = format!("SELECT count(*)::bigint AS v FROM orders {}", common::PARK);
     let url = db.url();
-    let ((value, position), after_commit) = common::park_a_read(&db, &insert(2), move || {
-        PgDieselConnector::new(PgConnection::establish(&url).expect("pg connection"))
-            .execute_scalar(
-                &subql::reexec::ReadQuery::without_binds(&sql),
-                ScalarFamily::Int,
-                &(),
-            )
-            .expect("scalar read")
-    });
+    let ((value, position), after_commit) =
+        common::park_a_read(&db, &common::pg::orders_insert(2), move || {
+            PgDieselConnector::new(PgConnection::establish(&url).expect("pg connection"))
+                .execute_scalar(
+                    &subql::reexec::ReadQuery::without_binds(&sql),
+                    ScalarFamily::Int,
+                    &(),
+                )
+                .expect("scalar read")
+        });
     assert_eq!(
         value,
         Value::Int(1),
@@ -589,7 +512,7 @@ fn every_read_reports_a_position_taken_before_its_snapshot() {
 
     let sql = format!("SELECT id FROM orders {} ORDER BY id", common::PARK);
     let url = db.url();
-    let (page, after_commit) = common::park_a_read(&db, &insert(3), move || {
+    let (page, after_commit) = common::park_a_read(&db, &common::pg::orders_insert(3), move || {
         PgDieselConnector::new(PgConnection::establish(&url).expect("pg connection"))
             .read_page(&subql::reexec::ReadQuery::without_binds(&sql), 1 << 20, &())
             .expect("page read")
@@ -606,15 +529,16 @@ fn every_read_reports_a_position_taken_before_its_snapshot() {
 
     let sql = format!("SELECT count(*)::bigint AS c0 FROM orders {}", common::PARK);
     let url = db.url();
-    let ((values, position), after_commit) = common::park_a_read(&db, &insert(4), move || {
-        PgDieselConnector::new(PgConnection::establish(&url).expect("pg connection"))
-            .execute_scalar_row(
-                &subql::reexec::ReadQuery::without_binds(&sql),
-                &[ScalarFamily::Int],
-                &(),
-            )
-            .expect("seed read")
-    });
+    let ((values, position), after_commit) =
+        common::park_a_read(&db, &common::pg::orders_insert(4), move || {
+            PgDieselConnector::new(PgConnection::establish(&url).expect("pg connection"))
+                .execute_scalar_row(
+                    &subql::reexec::ReadQuery::without_binds(&sql),
+                    &[ScalarFamily::Int],
+                    &(),
+                )
+                .expect("seed read")
+        });
     assert_eq!(
         values,
         vec![Value::Int(3)],
@@ -697,7 +621,7 @@ fn each_read_runs_read_only_at_repeatable_read() {
     let db = common::pg_database();
     let slot = db.slot(SLOT);
     let mut conn = db.connect();
-    setup_pg(&mut conn, &[(1, 5.0)], &slot);
+    common::pg::setup_orders(&mut conn, &[(1, 5.0)], &slot);
 
     let connector = PgDieselConnector::new(db.connect());
     let (isolation, _) = connector

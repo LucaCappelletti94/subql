@@ -153,29 +153,12 @@ fn async_dispatch_reports_the_reads_it_queued() {
 #[test]
 fn async_applied_burst_coalesces_repeated_triggers() {
     let (mut e, tid) = engine_with_values(vec![Value::Float(99.0)]);
-    let qid = match e
-        .register(
-            SubscriptionRequest::new(1u64, "SELECT MIN(price) FROM orders"),
-            (),
-        )
-        .unwrap()
-    {
-        Registered {
-            subscription_id,
-            tier: Tier::Scalar { .. },
-            ..
-        } => subscription_id,
-        other => panic!("expected ReExec, got {other:?}"),
-    };
-    assert!(crate::Install::install(
+    crate::reexec::test_fixtures::bootstrap_scalar_query(
         &mut e,
-        qid,
-        crate::ScalarInstall {
-            value: Value::Float(5.0),
-            checkpoint: None::<crate::NoCheckpoint>
-        }
-    )
-    .is_ok());
+        1u64,
+        "SELECT MIN(price) FROM orders",
+        5.0,
+    );
 
     let events = [
         delete_event(tid, 1, 5.0),
@@ -200,20 +183,11 @@ fn async_applied_burst_coalesces_repeated_triggers() {
 #[test]
 fn dropped_resolve_keeps_the_read_queued() {
     let (mut e, tid) = engine_with_values(vec![Value::Float(7.0)]);
-    let qid = match e
-        .register(
-            SubscriptionRequest::new(1u64, "SELECT MIN(price) FROM orders"),
-            (),
-        )
-        .unwrap()
-    {
-        Registered {
-            subscription_id,
-            tier: Tier::Scalar { .. },
-            ..
-        } => subscription_id,
-        other => panic!("expected Scalar, got {other:?}"),
-    };
+    let qid = crate::reexec::test_fixtures::register_scalar_query(
+        &mut e,
+        1u64,
+        "SELECT MIN(price) FROM orders",
+    );
     crate::Install::install(
         &mut e,
         qid,

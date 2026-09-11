@@ -35,56 +35,10 @@ use subql::{
 type Engine =
     AutoResolvingEngine<TestEvent<MySql>, DefaultIds, ParserDB, SyncMode<MysqlDieselConnector>>;
 
-/// Catalog DDL shared by the engine + planner. `FLOAT` maps to subql's
-/// `Float` scalar kind under the MySQL parser.
-const DDL: &str =
-    "CREATE TABLE orders (id INT PRIMARY KEY, price FLOAT, quantity INT, status TEXT);";
-
-/// MySQL-side DDL that actually runs on the server. Uses `DOUBLE` (MySQL's
-/// 8-byte float) so the diesel `Nullable<Double>` row type decodes cleanly.
-const MYSQL_DDL: &str = "CREATE TABLE orders (
-    id INT PRIMARY KEY,
-    price DOUBLE,
-    quantity INT,
-    status TEXT
-)";
-
-fn setup_mysql(conn: &mut MysqlConnection, seed: &[(i64, f64)]) {
-    sql_query(MYSQL_DDL).execute(conn).expect("CREATE TABLE");
-    for (id, price) in seed {
-        sql_query(format!(
-            "INSERT INTO orders (id, price, quantity, status) \
-             VALUES ({id}, {price}, 1, 'paid')"
-        ))
-        .execute(conn)
-        .expect("seed insert");
-    }
-}
-
-/// One more row, for a commit that lands while a read is parked.
-fn insert(id: i64) -> String {
-    format!("INSERT INTO orders (id, price, quantity, status) VALUES ({id}, 7.0, 1, 'paid')")
-}
-
-fn catalog() -> ParserDB {
-    ParserDB::parse::<MySqlDialect>(DDL).expect("parse DDL")
-}
-
 fn build_engine(catalog: ParserDB, conn_exec: MysqlConnection) -> Engine {
     let inner =
         SubscriptionEngine::<TestEvent<MySql>, DefaultIds, ParserDB>::new(catalog, MySqlDialect {});
     AutoResolvingEngine::new(inner, SyncMode(MysqlDieselConnector::new(conn_exec)))
-}
-
-/// Build the full `orders` row image for the hand-built delete event.
-/// Column order matches the catalog: id=0, price=1, quantity=2, status=3.
-fn orders_row(id: i64, price: f64) -> Vec<Value<MySql>> {
-    vec![
-        Value::Int(id),
-        Value::Float(price),
-        Value::Int(1),
-        Value::String("paid".into()),
-    ]
 }
 
 #[test]
@@ -95,9 +49,9 @@ fn scaffold_registers_both_and_executes_scalar() {
     let mut conn_setup = db.connect();
     let conn_exec = db.connect();
 
-    setup_mysql(&mut conn_setup, &[(1, 5.0), (2, 9.0)]);
+    common::mysql::setup_orders(&mut conn_setup, &[(1, 5.0), (2, 9.0)]);
 
-    let mut engine = build_engine(catalog(), conn_exec);
+    let mut engine = build_engine(common::mysql::orders_catalog(), conn_exec);
 
     let engine_reg = engine
         .register(
@@ -160,24 +114,12 @@ fn snapshot_reads_value_and_binlog_pos_from_mysql() {
     let mut conn_setup = db.connect();
     let conn_exec = db.connect();
 
-    setup_mysql(&mut conn_setup, &[(1, 5.0), (2, 9.0)]);
+    common::mysql::setup_orders(&mut conn_setup, &[(1, 5.0), (2, 9.0)]);
 
-    let mut engine = build_engine(catalog(), conn_exec);
+    let mut engine = build_engine(common::mysql::orders_catalog(), conn_exec);
 
-    let captured_qid = match engine
-        .register(
-            SubscriptionRequest::<DefaultIds, MySql>::new(1u64, "SELECT MIN(price) FROM orders"),
-            (),
-        )
-        .expect("captured registration")
-    {
-        Registered {
-            subscription_id,
-            tier: Tier::Scalar { .. },
-            ..
-        } => subscription_id,
-        other => panic!("expected ReExec, got {other:?}"),
-    };
+    let captured_qid =
+        common::reexec::register_captured(&mut engine, 1u64, "SELECT MIN(price) FROM orders");
 
     let snap = engine
         .snapshot(captured_qid)
@@ -204,29 +146,17 @@ fn delete_displacing_extreme_resolves_via_mysql_connector() {
     let mut conn_setup = db.connect();
     let mut conn_dml = db.connect();
     let conn_exec = db.connect();
-    setup_mysql(&mut conn_setup, &[(1, 5.0), (2, 9.0)]);
+    common::mysql::setup_orders(&mut conn_setup, &[(1, 5.0), (2, 9.0)]);
 
-    let cat = catalog();
+    let cat = common::mysql::orders_catalog();
     let table_id: TableId =
         catalog_helpers::table_id::<subql::backend::Postgres, _>(&cat, "orders")
             .expect("resolve orders");
 
     let mut engine = build_engine(cat, conn_exec);
 
-    let captured_qid = match engine
-        .register(
-            SubscriptionRequest::<DefaultIds, MySql>::new(1u64, "SELECT MIN(price) FROM orders"),
-            (),
-        )
-        .expect("captured registration")
-    {
-        Registered {
-            subscription_id,
-            tier: Tier::Scalar { .. },
-            ..
-        } => subscription_id,
-        other => panic!("expected ReExec, got {other:?}"),
-    };
+    let captured_qid =
+        common::reexec::register_captured(&mut engine, 1u64, "SELECT MIN(price) FROM orders");
     assert!(subql::Install::install(
         &mut engine,
         captured_qid,
@@ -241,7 +171,8 @@ fn delete_displacing_extreme_resolves_via_mysql_connector() {
         .execute(&mut conn_dml)
         .expect("delete id=1");
 
-    let event = TestEvent::<MySql>::delete(table_id, orders_row(1, 5.0)).with_pk_columns([0u16]);
+    let event = TestEvent::<MySql>::delete(table_id, common::mysql::orders_row(1, 5.0))
+        .with_pk_columns([0u16]);
 
     engine.apply(&event).expect("apply");
     let notifs = engine.resolve_collect().expect("consumers dispatch");
@@ -345,7 +276,7 @@ fn every_read_reports_a_position_taken_before_its_snapshot() {
     common::assert_docker_available();
     let db = Arc::new(common::mysql_database());
     let mut conn = db.connect();
-    setup_mysql(&mut conn, &[(1, 5.0)]);
+    common::mysql::setup_orders(&mut conn, &[(1, 5.0)]);
 
     // Each lock name carries a column, so MySQL cannot fold the condition to a
     // constant and take the lock before its read view exists. The gate holds
@@ -353,8 +284,11 @@ fn every_read_reports_a_position_taken_before_its_snapshot() {
     // first.
     let sql = "SELECT count(*) AS v FROM orders WHERE GET_LOCK(CONCAT(DATABASE(), '_park_scalar_', id), 60) = 1";
     let db2 = Arc::clone(&db);
-    let ((value, position), after_commit) =
-        common::park_a_mysql_read(&db, "park_scalar_1", &insert(2), move || {
+    let ((value, position), after_commit) = common::park_a_mysql_read(
+        &db,
+        "park_scalar_1",
+        &common::mysql::orders_insert(2),
+        move || {
             MysqlDieselConnector::new(db2.connect())
                 .execute_scalar(
                     &subql::reexec::ReadQuery::without_binds(sql),
@@ -362,7 +296,8 @@ fn every_read_reports_a_position_taken_before_its_snapshot() {
                     &(),
                 )
                 .expect("scalar read")
-        });
+        },
+    );
     assert_eq!(
         value,
         Value::Int(1),
@@ -375,12 +310,16 @@ fn every_read_reports_a_position_taken_before_its_snapshot() {
 
     let sql = "SELECT id FROM orders WHERE GET_LOCK(CONCAT(DATABASE(), '_park_page_', id), 60) = 1 ORDER BY id";
     let db2 = Arc::clone(&db);
-    let (page, after_commit) =
-        common::park_a_mysql_read(&db, "park_page_1", &insert(3), move || {
+    let (page, after_commit) = common::park_a_mysql_read(
+        &db,
+        "park_page_1",
+        &common::mysql::orders_insert(3),
+        move || {
             MysqlDieselConnector::new(db2.connect())
                 .read_page(&subql::reexec::ReadQuery::without_binds(sql), 1 << 20, &())
                 .expect("page read")
-        });
+        },
+    );
     assert_eq!(
         page.value.rows.len(),
         2,
@@ -395,8 +334,11 @@ fn every_read_reports_a_position_taken_before_its_snapshot() {
 
     let sql = "SELECT count(*) AS c0 FROM orders WHERE GET_LOCK(CONCAT(DATABASE(), '_park_seed_', id), 60) = 1";
     let db2 = Arc::clone(&db);
-    let ((values, position), after_commit) =
-        common::park_a_mysql_read(&db, "park_seed_1", &insert(4), move || {
+    let ((values, position), after_commit) = common::park_a_mysql_read(
+        &db,
+        "park_seed_1",
+        &common::mysql::orders_insert(4),
+        move || {
             MysqlDieselConnector::new(db2.connect())
                 .execute_scalar_row(
                     &subql::reexec::ReadQuery::without_binds(sql),
@@ -404,7 +346,8 @@ fn every_read_reports_a_position_taken_before_its_snapshot() {
                     &(),
                 )
                 .expect("seed read")
-        });
+        },
+    );
     assert_eq!(
         values,
         vec![Value::Int(3)],

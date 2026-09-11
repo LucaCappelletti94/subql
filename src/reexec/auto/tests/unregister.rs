@@ -8,20 +8,11 @@ use super::*;
 #[test]
 fn unregister_drops_auth_context() {
     let (mut e, _tid) = engine_with_values(alloc::vec![]);
-    let qid = match e
-        .register(
-            SubscriptionRequest::new(1u64, "SELECT MIN(price) FROM orders"),
-            (),
-        )
-        .unwrap()
-    {
-        Registered {
-            subscription_id,
-            tier: Tier::Scalar { .. },
-            ..
-        } => subscription_id,
-        other => panic!("expected ReExec, got {other:?}"),
-    };
+    let qid = crate::reexec::test_fixtures::register_scalar_query(
+        &mut e,
+        1u64,
+        "SELECT MIN(price) FROM orders",
+    );
     assert_eq!(e.contexts.len(), 1);
     assert!(e.unregister_subscription(qid));
     assert_eq!(e.contexts.len(), 0);
@@ -32,20 +23,11 @@ fn unregister_drops_auth_context() {
 fn unregister_subscription_resolves_either_registry() {
     let (mut e, _tid) = engine_with_values(alloc::vec![]);
     // Captured re-execution query: lands in the read registry with a context.
-    let captured = match e
-        .register(
-            SubscriptionRequest::new(1u64, "SELECT MIN(price) FROM orders"),
-            (),
-        )
-        .unwrap()
-    {
-        Registered {
-            subscription_id,
-            tier: Tier::Scalar { .. },
-            ..
-        } => subscription_id,
-        other => panic!("expected Scalar, got {other:?}"),
-    };
+    let captured = crate::reexec::test_fixtures::register_scalar_query(
+        &mut e,
+        1u64,
+        "SELECT MIN(price) FROM orders",
+    );
     // In-process row subscription: lands in the in-process registry, no context.
     let in_process = match e
         .register(
@@ -78,20 +60,11 @@ fn unregister_subscription_resolves_either_registry() {
 #[test]
 fn unregister_subscription_drops_the_resolve_context() {
     let (mut e, tid) = engine_with_values(alloc::vec![Value::Float(7.0)]);
-    let captured = match e
-        .register(
-            SubscriptionRequest::new(1u64, "SELECT MIN(price) FROM orders"),
-            (),
-        )
-        .unwrap()
-    {
-        Registered {
-            subscription_id,
-            tier: Tier::Scalar { .. },
-            ..
-        } => subscription_id,
-        other => panic!("expected Scalar, got {other:?}"),
-    };
+    let captured = crate::reexec::test_fixtures::register_scalar_query(
+        &mut e,
+        1u64,
+        "SELECT MIN(price) FROM orders",
+    );
     crate::Install::install(
         &mut e,
         captured,
@@ -120,20 +93,11 @@ fn unregister_subscription_drops_the_resolve_context() {
 #[test]
 fn unregister_subscription_drops_the_queued_read() {
     let (mut e, tid) = engine_with_values(alloc::vec![Value::Float(5.0)]);
-    let captured = match e
-        .register(
-            SubscriptionRequest::new(1u64, "SELECT MIN(price) FROM orders"),
-            (),
-        )
-        .unwrap()
-    {
-        Registered {
-            subscription_id,
-            tier: Tier::Scalar { .. },
-            ..
-        } => subscription_id,
-        other => panic!("expected Scalar, got {other:?}"),
-    };
+    let captured = crate::reexec::test_fixtures::register_scalar_query(
+        &mut e,
+        1u64,
+        "SELECT MIN(price) FROM orders",
+    );
     crate::Install::install(
         &mut e,
         captured,
@@ -169,6 +133,8 @@ fn unregister_subscription_drops_the_queued_read() {
 fn unregister_session_drops_the_queued_reads() {
     let (mut e, tid) = engine_with_values(alloc::vec![Value::Float(5.0)]);
     let session = 9u64;
+    // Not the shared scaffold: this one registers into a session scope,
+    // which is the whole subject of the test.
     let captured = match e
         .register(
             SubscriptionRequest::new(1u64, "SELECT MIN(price) FROM orders")

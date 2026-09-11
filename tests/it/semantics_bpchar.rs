@@ -22,35 +22,18 @@
 #![allow(clippy::unwrap_used)]
 
 use sql_traits::structs::{ParserDB, TargetName};
-use sqlparser::dialect::{MySqlDialect, PostgreSqlDialect, SQLiteDialect};
+use sqlparser::dialect::{MySqlDialect, PostgreSqlDialect};
 use subql::backend::{
     Backend, ColumnCollation, ColumnComparison, ColumnComparisonOf, ComparisonContext, MySql,
     NamedColumnCollation, Postgres, SQLite, ScalarFamily, TextOperation, Value,
 };
 use subql::testing::TestEvent;
-use subql::{catalog_helpers, DefaultIds, SubscriptionEngine, SubscriptionRequest};
+use subql::{DefaultIds, NotServed, SubscriptionEngine, SubscriptionRequest};
 
 /// `code` is the padded type under test, `loose` a `varchar`, `free` a
 /// `text`, so one schema serves the whole rule.
 const PG_DDL: &str = "CREATE TABLE codes (id INT PRIMARY KEY, code CHAR(5), \
                       loose VARCHAR(9), free TEXT)";
-
-macro_rules! notifies {
-    ($backend:ty, $dialect:ty, $ddl:expr, $predicate:expr, $cells:expr) => {{
-        let db = ParserDB::parse::<$dialect>($ddl).expect("DDL parses");
-        let table = catalog_helpers::table_id::<subql::backend::Postgres, _>(&db, "codes")
-            .expect("codes is in the catalog");
-        let mut engine: SubscriptionEngine<TestEvent<$backend>, DefaultIds, ParserDB> =
-            SubscriptionEngine::new(db, <$dialect>::default());
-        engine
-            .register(SubscriptionRequest::new(1u64, $predicate))
-            .expect("the predicate registers");
-        let notifications = engine
-            .consumers(&TestEvent::insert(table, $cells))
-            .expect("dispatch succeeds");
-        !notifications.inserted().is_empty()
-    }};
-}
 
 /// A `codes` row: `(id, code, loose, free)`, each text cell as given.
 fn row(code: &str, loose: &str, free: &str) -> Vec<Value<Postgres>> {
@@ -63,7 +46,7 @@ fn row(code: &str, loose: &str, free: &str) -> Vec<Value<Postgres>> {
 }
 
 fn pg_notifies(predicate: &str, cells: Vec<Value<Postgres>>) -> bool {
-    notifies!(Postgres, PostgreSqlDialect, PG_DDL, predicate, cells)
+    crate::common::semantics::notifies::<Postgres>(PG_DDL, "codes", predicate, cells)
 }
 
 /// The finding: the padding a `char(n)` column carries is not part of its
@@ -102,7 +85,7 @@ fn char_ordering_ignores_trailing_spaces() {
     let ddl = "CREATE TABLE codes (id INT PRIMARY KEY, code CHAR(5) COLLATE \"C\")";
     let notifies = |predicate: &str, code: &str| {
         let cells = vec![Value::<Postgres>::Int(1), Value::String(code.to_string())];
-        notifies!(Postgres, PostgreSqlDialect, ddl, predicate, cells)
+        crate::common::semantics::notifies::<Postgres>(ddl, "codes", predicate, cells)
     };
     assert!(
         !notifies("SELECT * FROM codes WHERE code > 'ab'", "ab   "),
@@ -235,26 +218,34 @@ fn mysql_binary_collation_padding_is_per_collation() {
 }
 
 /// With the padding unknown, which is every catalog parsed from DDL, the
-/// comparison is exact. That is right for MySQL 8.0's own default
-/// `utf8mb4_0900_ai_ci`, which is `NO PAD`, and wrong for a legacy
-/// `PAD SPACE` collation, so a named collation whose rules subql cannot
-/// establish is a candidate for classification as a database read rather
-/// than an in-process answer. That decision belongs with the collation
-/// work and is not taken here.
+/// comparison never reaches the comparator: `utf8mb4_general_ci` folds case
+/// and accent, byte comparison does not reproduce that, and the predicate is
+/// classified as a database read before padding can matter.
+///
+/// This test used to assert that "the bytes decide" and pass vacuously. The
+/// classification it names as an untaken decision was taken by the collation
+/// work, measured in `semantics_collation.rs`, and it subsumes the padding
+/// question here. A named collation subql cannot establish is a read.
 #[test]
-fn mysql_unknown_padding_compares_exactly() {
+fn mysql_unknown_padding_is_classified_not_served() {
     let ddl = "CREATE TABLE codes (id INT PRIMARY KEY, \
                code CHAR(5) COLLATE utf8mb4_general_ci)";
-    let cells = vec![Value::<MySql>::Int(1), Value::String("ab   ".to_string())];
-    assert!(
-        !notifies!(
-            MySql,
-            MySqlDialect,
-            ddl,
+    let db = ParserDB::parse::<MySqlDialect>(ddl).expect("DDL parses");
+    let mut engine: SubscriptionEngine<TestEvent<MySql>, DefaultIds, ParserDB> =
+        SubscriptionEngine::new(db, MySqlDialect::default());
+    let registered = engine
+        .register(SubscriptionRequest::new(
+            1u64,
             "SELECT * FROM codes WHERE code = 'ab'",
-            cells
+        ))
+        .expect("registration succeeds, as a read");
+    assert!(
+        matches!(
+            registered.not_served_because,
+            Some(NotServed::CollationNotReproducible { .. })
         ),
-        "the padding is not known from the name, so the bytes decide"
+        "a collation subql cannot establish is handed to the database, got {:?}",
+        registered.not_served_because
     );
 }
 
@@ -265,10 +256,9 @@ fn sqlite_char_keeps_trailing_spaces() {
     let ddl = "CREATE TABLE codes (id INTEGER PRIMARY KEY, code CHAR(5))";
     let cells = vec![Value::<SQLite>::Int(1), Value::String("ab   ".to_string())];
     assert!(
-        !notifies!(
-            SQLite,
-            SQLiteDialect,
+        !crate::common::semantics::notifies::<SQLite>(
             ddl,
+            "codes",
             "SELECT * FROM codes WHERE code = 'ab'",
             cells
         ),
@@ -393,7 +383,7 @@ fn between_applies_the_padding_rule_to_both_bounds() {
     let ddl = "CREATE TABLE codes (id INT PRIMARY KEY, code CHAR(5) COLLATE \"C\")";
     let notifies = |predicate: &str, code: &str| {
         let cells = vec![Value::<Postgres>::Int(1), Value::String(code.to_string())];
-        notifies!(Postgres, PostgreSqlDialect, ddl, predicate, cells)
+        crate::common::semantics::notifies::<Postgres>(ddl, "codes", predicate, cells)
     };
 
     assert!(
@@ -449,10 +439,9 @@ fn each_between_bound_resolves_its_own_rule() {
         Value::String("ab   ".to_string()),
     ];
     assert!(
-        !notifies!(
-            Postgres,
-            PostgreSqlDialect,
+        !crate::common::semantics::notifies::<Postgres>(
             ddl,
+            "codes",
             "SELECT * FROM codes WHERE free BETWEEN loose AND code",
             cells.clone()
         ),
@@ -460,10 +449,9 @@ fn each_between_bound_resolves_its_own_rule() {
          char's padding while the lower bound compares exactly"
     );
     assert!(
-        notifies!(
-            Postgres,
-            PostgreSqlDialect,
+        crate::common::semantics::notifies::<Postgres>(
             ddl,
+            "codes",
             "SELECT * FROM codes WHERE free >= loose",
             cells
         ),

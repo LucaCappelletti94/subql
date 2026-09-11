@@ -88,40 +88,6 @@ const SUBQL_CURSORS_OPEN: &str =
     "SELECT count(*) AS n FROM pg_cursors WHERE starts_with(name, 'subql_cursor_')";
 
 const SLOT: &str = "subql_test";
-const DDL: &str =
-    "CREATE TABLE orders (id INT PRIMARY KEY, price FLOAT, quantity INT, status TEXT);";
-
-const PG_DDL: &str = "CREATE TABLE orders (
-    id INT PRIMARY KEY,
-    price DOUBLE PRECISION,
-    quantity INT,
-    status TEXT
-)";
-
-fn setup_pg(conn: &mut PgConnection, seed: &[(i64, f64)], slot: &str) {
-    sql_query(PG_DDL).execute(conn).expect("CREATE TABLE");
-    sql_query("ALTER TABLE orders REPLICA IDENTITY FULL")
-        .execute(conn)
-        .expect("REPLICA IDENTITY FULL");
-    for (id, price) in seed {
-        sql_query(format!(
-            "INSERT INTO orders (id, price, quantity, status) \
-             VALUES ({id}, {price}, 1, 'paid')"
-        ))
-        .execute(conn)
-        .expect("seed insert");
-    }
-    common::create_slot(conn, slot);
-}
-
-/// One more row, for a commit that lands while a read is parked.
-fn insert(id: i64) -> String {
-    format!("INSERT INTO orders (id, price, quantity, status) VALUES ({id}, 7.0, 1, 'paid')")
-}
-
-fn catalog() -> ParserDB {
-    ParserDB::parse::<PostgreSqlDialect>(DDL).expect("parse DDL")
-}
 
 fn build_pool(url: &str) -> r2d2::Pool<ConnectionManager<PgConnection>> {
     let manager = ConnectionManager::<PgConnection>::new(url);
@@ -156,25 +122,13 @@ fn r2d2_pool_drives_snapshot_and_reexec() {
     let slot = db.slot(SLOT);
     let mut conn_setup = db.connect();
     let mut conn_dml = db.connect();
-    setup_pg(&mut conn_setup, &[(1, 5.0), (2, 9.0)], &slot);
+    common::pg::setup_orders(&mut conn_setup, &[(1, 5.0), (2, 9.0)], &slot);
 
     let pool = build_pool(&db.url());
-    let mut engine = build_engine(catalog(), pool);
+    let mut engine = build_engine(common::pg::orders_catalog(), pool);
 
-    let captured_qid = match engine
-        .register(
-            SubscriptionRequest::<DefaultIds, Postgres>::new(1u64, "SELECT MIN(price) FROM orders"),
-            (),
-        )
-        .expect("captured registration")
-    {
-        Registered {
-            subscription_id,
-            tier: Tier::Scalar { .. },
-            ..
-        } => subscription_id,
-        other => panic!("expected ReExec, got {other:?}"),
-    };
+    let captured_qid =
+        common::reexec::register_captured(&mut engine, 1u64, "SELECT MIN(price) FROM orders");
 
     // Snapshot: must come back with value=5.0 and a non-zero LSN.
     let snap = engine
@@ -245,7 +199,7 @@ fn a_cursor_pages_one_snapshot_of_a_keyless_result() {
     let seed: Vec<(i64, f64)> = (1..=40_u32)
         .map(|id| (i64::from(id), f64::from(id)))
         .collect();
-    setup_pg(&mut conn_setup, &seed, &slot);
+    common::pg::setup_orders(&mut conn_setup, &seed, &slot);
 
     let connector = PgR2D2DieselConnector::new(build_pool(&db.url()));
     // DISTINCT has no key to resume from, which is what cursors exist for.
@@ -317,9 +271,10 @@ fn a_captured_query_delivers_its_rows_again_when_the_table_changes() {
     let seed: Vec<(i64, f64)> = (1..=40_u32)
         .map(|id| (i64::from(id), f64::from(id)))
         .collect();
-    setup_pg(&mut conn_setup, &seed, &slot);
+    common::pg::setup_orders(&mut conn_setup, &seed, &slot);
 
-    let mut engine = build_engine(catalog(), build_pool(&db.url())).with_max_page_bytes(64);
+    let mut engine =
+        build_engine(common::pg::orders_catalog(), build_pool(&db.url())).with_max_page_bytes(64);
     let registered = engine
         .register(
             SubscriptionRequest::<DefaultIds, Postgres>::new(
@@ -411,9 +366,10 @@ fn a_captured_query_snapshots_its_answer_at_registration() {
     let seed: Vec<(i64, f64)> = (1..=30_u32)
         .map(|id| (i64::from(id), f64::from(id)))
         .collect();
-    setup_pg(&mut conn_setup, &seed, &slot);
+    common::pg::setup_orders(&mut conn_setup, &seed, &slot);
 
-    let mut engine = build_engine(catalog(), build_pool(&db.url())).with_max_page_bytes(64);
+    let mut engine =
+        build_engine(common::pg::orders_catalog(), build_pool(&db.url())).with_max_page_bytes(64);
     let subscription_id = match engine
         .register(
             SubscriptionRequest::<DefaultIds, Postgres>::new(
@@ -473,7 +429,7 @@ fn a_joined_capture_is_triggered_by_either_table() {
     let slot = db.slot(SLOT);
     let mut conn_setup = db.connect();
     let mut conn_dml = db.connect();
-    setup_pg(&mut conn_setup, &[(1, 5.0), (2, 9.0)], &slot);
+    common::pg::setup_orders(&mut conn_setup, &[(1, 5.0), (2, 9.0)], &slot);
     sql_query("CREATE TABLE couriers (status TEXT PRIMARY KEY, name TEXT)")
         .execute(&mut conn_setup)
         .expect("create couriers");
@@ -569,7 +525,7 @@ fn the_wal_position_is_not_bound_to_the_transaction_snapshot() {
     let slot = db.slot(SLOT);
     let mut reader = db.connect();
     let mut writer = db.connect();
-    setup_pg(&mut reader, &[(1, 5.0)], &slot);
+    common::pg::setup_orders(&mut reader, &[(1, 5.0)], &slot);
 
     sql_query("BEGIN").execute(&mut reader).expect("begin");
     sql_query("SET TRANSACTION READ ONLY, ISOLATION LEVEL REPEATABLE READ")
@@ -624,19 +580,20 @@ fn every_read_reports_a_position_taken_before_its_snapshot() {
     let db = common::pg_database();
     let slot = db.slot(SLOT);
     let mut conn = db.connect();
-    setup_pg(&mut conn, &[(1, 5.0)], &slot);
+    common::pg::setup_orders(&mut conn, &[(1, 5.0)], &slot);
     let connector = Arc::new(PgR2D2DieselConnector::new(build_pool(&db.url())));
 
     let held = Arc::clone(&connector);
     let sql = format!("SELECT count(*)::bigint AS v FROM orders {}", common::PARK);
-    let ((value, position), after_commit) = common::park_a_read(&db, &insert(2), move || {
-        held.execute_scalar(
-            &subql::reexec::ReadQuery::without_binds(&sql),
-            ScalarFamily::Int,
-            &(),
-        )
-        .expect("scalar read")
-    });
+    let ((value, position), after_commit) =
+        common::park_a_read(&db, &common::pg::orders_insert(2), move || {
+            held.execute_scalar(
+                &subql::reexec::ReadQuery::without_binds(&sql),
+                ScalarFamily::Int,
+                &(),
+            )
+            .expect("scalar read")
+        });
     assert_eq!(
         value,
         Value::Int(1),
@@ -649,7 +606,7 @@ fn every_read_reports_a_position_taken_before_its_snapshot() {
 
     let held = Arc::clone(&connector);
     let sql = format!("SELECT id FROM orders {} ORDER BY id", common::PARK);
-    let (page, after_commit) = common::park_a_read(&db, &insert(3), move || {
+    let (page, after_commit) = common::park_a_read(&db, &common::pg::orders_insert(3), move || {
         held.read_page(&subql::reexec::ReadQuery::without_binds(&sql), 1 << 20, &())
             .expect("page read")
     });
@@ -665,14 +622,15 @@ fn every_read_reports_a_position_taken_before_its_snapshot() {
 
     let held = Arc::clone(&connector);
     let sql = format!("SELECT count(*)::bigint AS c0 FROM orders {}", common::PARK);
-    let ((values, position), after_commit) = common::park_a_read(&db, &insert(4), move || {
-        held.execute_scalar_row(
-            &subql::reexec::ReadQuery::without_binds(&sql),
-            &[ScalarFamily::Int],
-            &(),
-        )
-        .expect("seed read")
-    });
+    let ((values, position), after_commit) =
+        common::park_a_read(&db, &common::pg::orders_insert(4), move || {
+            held.execute_scalar_row(
+                &subql::reexec::ReadQuery::without_binds(&sql),
+                &[ScalarFamily::Int],
+                &(),
+            )
+            .expect("seed read")
+        });
     assert_eq!(
         values,
         vec![Value::Int(3)],
@@ -699,7 +657,7 @@ fn an_abandoned_cursor_ends_its_transaction_and_keeps_its_connection() {
     let db = common::pg_database();
     let slot = db.slot(SLOT);
     let mut conn = db.connect();
-    setup_pg(&mut conn, &[(1, 10.0), (2, 20.0), (3, 30.0)], &slot);
+    common::pg::setup_orders(&mut conn, &[(1, 10.0), (2, 20.0), (3, 30.0)], &slot);
 
     let mut observer = db.connect();
 
@@ -780,7 +738,7 @@ fn a_cursor_whose_read_failed_reports_as_unknown() {
     let db = common::pg_database();
     let slot = db.slot(SLOT);
     let mut conn = db.connect();
-    setup_pg(&mut conn, &[(1, 10.0), (2, 20.0), (3, 30.0)], &slot);
+    common::pg::setup_orders(&mut conn, &[(1, 10.0), (2, 20.0), (3, 30.0)], &slot);
     let mut observer = db.connect();
 
     let connector = PgR2D2DieselConnector::new(build_pool(&db.url()));
@@ -912,14 +870,14 @@ fn a_panic_during_a_read_leaves_no_transaction_behind() {
     let db = common::pg_database();
     let slot = db.slot(SLOT);
     let mut conn = db.connect();
-    setup_pg(&mut conn, &[(1, 10.0), (2, 20.0), (3, 30.0)], &slot);
+    common::pg::setup_orders(&mut conn, &[(1, 10.0), (2, 20.0), (3, 30.0)], &slot);
     let mut observer = db.connect();
 
     let connector = PanicMidRead {
         inner: PgR2D2DieselConnector::new(build_pool(&db.url())),
         fetches: parking_lot::Mutex::new(0),
     };
-    let cat = catalog();
+    let cat = common::pg::orders_catalog();
     let table = subql::catalog_helpers::table_id::<subql::backend::Postgres, _>(&cat, "orders")
         .expect("orders");
     let inner =
@@ -985,12 +943,13 @@ fn a_keyed_capture_snapshots_its_rows() {
     let seed: Vec<(i64, f64)> = (1..=12_u32)
         .map(|id| (i64::from(id), f64::from(id)))
         .collect();
-    setup_pg(&mut conn_setup, &seed, &slot);
+    common::pg::setup_orders(&mut conn_setup, &seed, &slot);
     sql_query("UPDATE orders SET status = 'void' WHERE id = 7")
         .execute(&mut conn_setup)
         .expect("take one row out of the answer");
 
-    let mut engine = build_engine(catalog(), build_pool(&db.url())).with_max_page_bytes(1);
+    let mut engine =
+        build_engine(common::pg::orders_catalog(), build_pool(&db.url())).with_max_page_bytes(1);
     let subscription_id = match engine
         .register(
             SubscriptionRequest::<DefaultIds, Postgres>::new(
@@ -1051,9 +1010,9 @@ fn a_keyless_change_transitions_and_runs_the_sync_replacement_read() {
     let db = common::pg_database();
     let slot = db.slot(SLOT);
     let mut conn_setup = db.connect();
-    setup_pg(&mut conn_setup, &[(1, 5.0), (2, 9.0)], &slot);
+    common::pg::setup_orders(&mut conn_setup, &[(1, 5.0), (2, 9.0)], &slot);
 
-    let mut engine = build_engine(catalog(), build_pool(&db.url()));
+    let mut engine = build_engine(common::pg::orders_catalog(), build_pool(&db.url()));
     let subscription_id = match engine
         .register(
             SubscriptionRequest::<DefaultIds, Postgres>::new(
@@ -1116,7 +1075,7 @@ fn grouped_min_snapshots_and_rereads_one_group_sync() {
     let db = common::pg_database();
     let slot = db.slot(SLOT);
     let mut conn = db.connect();
-    setup_pg(&mut conn, &[(1, 5.0), (2, 9.0), (3, 11.0)], &slot);
+    common::pg::setup_orders(&mut conn, &[(1, 5.0), (2, 9.0), (3, 11.0)], &slot);
     // Diesel has no DDL query builder.
     sql_query(r"ALTER TABLE orders ADD COLUMN bucket BYTEA NOT NULL DEFAULT '\x01'")
         .execute(&mut conn)
@@ -1203,7 +1162,7 @@ fn a_scalar_over_a_narrow_integer_column_decodes() {
     let db = common::pg_database();
     let slot = db.slot(SLOT);
     let mut conn = db.connect();
-    setup_pg(&mut conn, &[(1, 5.0), (2, 9.0)], &slot);
+    common::pg::setup_orders(&mut conn, &[(1, 5.0), (2, 9.0)], &slot);
     sql_query("CREATE TABLE probe (small INT, tiny SMALLINT)")
         .execute(&mut conn)
         .expect("probe table");
@@ -1259,7 +1218,7 @@ fn session_setup_runs_inside_each_read_transaction() {
     let db = common::pg_database();
     let slot = db.slot(SLOT);
     let mut conn = db.connect();
-    setup_pg(&mut conn, &[(1, 5.0)], &slot);
+    common::pg::setup_orders(&mut conn, &[(1, 5.0)], &slot);
 
     let read_marker = "SELECT current_setting('app.marker', true) AS v";
     let setup = MarkerSetup(vec!["SET LOCAL app.marker = 'seen'".to_string()]);
@@ -1343,7 +1302,7 @@ fn a_cursor_holds_a_read_only_repeatable_read_snapshot() {
     let db = common::pg_database();
     let slot = db.slot(SLOT);
     let mut conn = db.connect();
-    setup_pg(&mut conn, &[(1, 5.0)], &slot);
+    common::pg::setup_orders(&mut conn, &[(1, 5.0)], &slot);
 
     let connector = PgR2D2DieselConnector::new(build_pool(&db.url()));
     let cursor = connector
@@ -1420,7 +1379,7 @@ fn two_cursors_open_at_once_page_independently() {
     let seed: Vec<(i64, f64)> = (1..=40_u32)
         .map(|id| (i64::from(id), f64::from(id)))
         .collect();
-    setup_pg(&mut conn, &seed, &slot);
+    common::pg::setup_orders(&mut conn, &seed, &slot);
 
     let connector = PgR2D2DieselConnector::new(build_pool(&db.url()));
     let (ascending, descending) = open_ordered_cursors(&connector);
@@ -1528,7 +1487,7 @@ fn a_second_reader_of_one_cursor_is_told_it_is_busy() {
     let db = common::pg_database();
     let slot = db.slot(SLOT);
     let mut conn = db.connect();
-    setup_pg(&mut conn, &[(1, 1.0), (2, 2.0), (3, 3.0)], &slot);
+    common::pg::setup_orders(&mut conn, &[(1, 1.0), (2, 2.0), (3, 3.0)], &slot);
 
     let connector = Arc::new(PgR2D2DieselConnector::new(build_pool(&db.url())));
     let cursor = open_slow_cursor(&connector);
@@ -1563,7 +1522,7 @@ fn a_cursor_is_served_while_another_is_mid_fetch() {
     let db = common::pg_database();
     let slot = db.slot(SLOT);
     let mut conn = db.connect();
-    setup_pg(&mut conn, &[(1, 1.0), (2, 2.0), (3, 3.0)], &slot);
+    common::pg::setup_orders(&mut conn, &[(1, 1.0), (2, 2.0), (3, 3.0)], &slot);
 
     let connector = Arc::new(PgR2D2DieselConnector::new(build_pool(&db.url())));
     let held = open_slow_cursor(&connector);
@@ -1610,7 +1569,7 @@ fn a_cursor_that_fails_to_open_keeps_its_connection_and_leaves_no_transaction() 
     let db = common::pg_database();
     let slot = db.slot(SLOT);
     let mut conn = db.connect();
-    setup_pg(&mut conn, &[(1, 1.0)], &slot);
+    common::pg::setup_orders(&mut conn, &[(1, 1.0)], &slot);
     let mut observer = db.connect();
 
     let manager = ConnectionManager::<PgConnection>::new(db.url());
@@ -1658,7 +1617,7 @@ fn every_page_of_a_cursor_names_its_columns() {
     let seed: Vec<(i64, f64)> = (1..=8_u32)
         .map(|id| (i64::from(id), f64::from(id)))
         .collect();
-    setup_pg(&mut conn, &seed, &slot);
+    common::pg::setup_orders(&mut conn, &seed, &slot);
 
     let connector = PgR2D2DieselConnector::new(build_pool(&db.url()));
     let cursor = connector

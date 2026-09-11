@@ -22,6 +22,75 @@ use alloc::vec::Vec;
 use sql_traits::structs::ParserDB;
 use sqlparser::dialect::PostgreSqlDialect;
 
+/// Register `sql` for `consumer` and assert it landed on the scalar tier.
+///
+/// Both suites open a test this way, 35 times between them, and the
+/// scaffold is mode-independent: `register` is synchronous in both modes,
+/// and every mock in both suites uses `AuthContext = ()`. `M` is therefore
+/// passive here, not a generic over sync-versus-async execution.
+///
+/// The copies spelled the panic three ways, and one of them, "expected
+/// ReExec for MIN", distinguished which of a test's two registrations
+/// failed. That distinction is kept rather than normalised away: the
+/// message names the query, which identifies the site at every call and
+/// says more than "for MIN" did.
+pub(super) fn register_scalar_query<M>(
+    engine: &mut crate::reexec::AutoResolvingEngine<
+        TestEvent<Postgres>,
+        crate::DefaultIds,
+        ParserDB,
+        M,
+    >,
+    consumer: u64,
+    sql: &str,
+) -> crate::SubscriptionId
+where
+    M: crate::reexec::ResolverMode<Postgres, AuthContext = ()>,
+{
+    match engine
+        .register(crate::SubscriptionRequest::new(consumer, sql), ())
+        .expect("registration succeeds")
+    {
+        crate::Registered {
+            subscription_id,
+            tier: crate::Tier::Scalar { .. },
+            ..
+        } => subscription_id,
+        other => panic!("expected the scalar re-execution tier for {sql}, got {other:?}"),
+    }
+}
+
+/// [`register_scalar_query`] followed by seeding the captured extremum.
+///
+/// The seed is what makes a later delete of the matching row trigger a
+/// re-execution, so a test that forgets it measures nothing.
+pub(super) fn bootstrap_scalar_query<M>(
+    engine: &mut crate::reexec::AutoResolvingEngine<
+        TestEvent<Postgres>,
+        crate::DefaultIds,
+        ParserDB,
+        M,
+    >,
+    consumer: u64,
+    sql: &str,
+    seed: f64,
+) -> crate::SubscriptionId
+where
+    M: crate::reexec::ResolverMode<Postgres, AuthContext = ()>,
+{
+    let subscription_id = register_scalar_query(engine, consumer, sql);
+    crate::Install::install(
+        engine,
+        subscription_id,
+        crate::ScalarInstall {
+            value: Value::Float(seed),
+            checkpoint: None::<crate::NoCheckpoint>,
+        },
+    )
+    .expect("the bootstrap seed installs");
+    subscription_id
+}
+
 /// The one table both suites subscribe to.
 ///
 /// Four columns, chosen so that a test can change a column the predicate

@@ -21,34 +21,16 @@ fn async_applied_burst_respects_max_concurrent_cap() {
     // batch. Both must resolve regardless of the cap.
     let (e0, tid) = engine_with_values(vec![Value::Float(22.0), Value::Float(11.0)]);
     let mut e = e0.with_max_concurrent_reexecutions(1);
-    let qid1 = match e
-        .register(
-            SubscriptionRequest::new(1u64, "SELECT MIN(price) FROM orders"),
-            (),
-        )
-        .unwrap()
-    {
-        Registered {
-            subscription_id,
-            tier: Tier::Scalar { .. },
-            ..
-        } => subscription_id,
-        other => panic!("expected ReExec for MIN, got {other:?}"),
-    };
-    let qid2 = match e
-        .register(
-            SubscriptionRequest::new(2u64, "SELECT MAX(price) FROM orders"),
-            (),
-        )
-        .unwrap()
-    {
-        Registered {
-            subscription_id,
-            tier: Tier::Scalar { .. },
-            ..
-        } => subscription_id,
-        other => panic!("expected ReExec for MAX, got {other:?}"),
-    };
+    let qid1 = crate::reexec::test_fixtures::register_scalar_query(
+        &mut e,
+        1u64,
+        "SELECT MIN(price) FROM orders",
+    );
+    let qid2 = crate::reexec::test_fixtures::register_scalar_query(
+        &mut e,
+        2u64,
+        "SELECT MAX(price) FROM orders",
+    );
     assert!(crate::Install::install(
         &mut e,
         qid1,
@@ -118,34 +100,16 @@ fn throttle_zero_cap_normalised_to_one() {
 fn throttle_inflight_returns_to_zero_after_batch() {
     let (e0, tid) = engine_with_values(vec![Value::Float(22.0), Value::Float(11.0)]);
     let mut e = e0.with_max_concurrent_reexecutions(1);
-    let qid1 = match e
-        .register(
-            SubscriptionRequest::new(1u64, "SELECT MIN(price) FROM orders"),
-            (),
-        )
-        .unwrap()
-    {
-        Registered {
-            subscription_id,
-            tier: Tier::Scalar { .. },
-            ..
-        } => subscription_id,
-        other => panic!("expected ReExec, got {other:?}"),
-    };
-    let qid2 = match e
-        .register(
-            SubscriptionRequest::new(2u64, "SELECT MAX(price) FROM orders"),
-            (),
-        )
-        .unwrap()
-    {
-        Registered {
-            subscription_id,
-            tier: Tier::Scalar { .. },
-            ..
-        } => subscription_id,
-        other => panic!("expected ReExec, got {other:?}"),
-    };
+    let qid1 = crate::reexec::test_fixtures::register_scalar_query(
+        &mut e,
+        1u64,
+        "SELECT MIN(price) FROM orders",
+    );
+    let qid2 = crate::reexec::test_fixtures::register_scalar_query(
+        &mut e,
+        2u64,
+        "SELECT MAX(price) FROM orders",
+    );
     assert!(crate::Install::install(
         &mut e,
         qid1,
@@ -182,34 +146,16 @@ fn throttle_inflight_returns_to_zero_after_connector_error() {
     // connector call hits "queue empty" and the batch aborts.
     let (e0, tid) = engine_with_values(vec![Value::Float(22.0)]);
     let mut e = e0.with_max_concurrent_reexecutions(2);
-    let qid1 = match e
-        .register(
-            SubscriptionRequest::new(1u64, "SELECT MIN(price) FROM orders"),
-            (),
-        )
-        .unwrap()
-    {
-        Registered {
-            subscription_id,
-            tier: Tier::Scalar { .. },
-            ..
-        } => subscription_id,
-        other => panic!("expected ReExec, got {other:?}"),
-    };
-    let qid2 = match e
-        .register(
-            SubscriptionRequest::new(2u64, "SELECT MAX(price) FROM orders"),
-            (),
-        )
-        .unwrap()
-    {
-        Registered {
-            subscription_id,
-            tier: Tier::Scalar { .. },
-            ..
-        } => subscription_id,
-        other => panic!("expected ReExec, got {other:?}"),
-    };
+    let qid1 = crate::reexec::test_fixtures::register_scalar_query(
+        &mut e,
+        1u64,
+        "SELECT MIN(price) FROM orders",
+    );
+    let qid2 = crate::reexec::test_fixtures::register_scalar_query(
+        &mut e,
+        2u64,
+        "SELECT MAX(price) FROM orders",
+    );
     assert!(crate::Install::install(
         &mut e,
         qid1,
@@ -246,35 +192,14 @@ fn throttle_total_call_count_unchanged_with_cap() {
     let values = vec![Value::Float(30.0), Value::Float(20.0), Value::Float(10.0)];
     let (e0, tid) = engine_with_values(values);
     let mut e = e0.with_max_concurrent_reexecutions(1);
-    let qids: Vec<_> = (1u64..=3)
-        .map(|c| {
-            match e
-                .register(
-                    SubscriptionRequest::new(c, "SELECT MIN(price) FROM orders WHERE quantity = 1"),
-                    (),
-                )
-                .unwrap()
-            {
-                Registered {
-                    subscription_id,
-                    tier: Tier::Scalar { .. },
-                    ..
-                } => subscription_id,
-                other => panic!("expected ReExec, got {other:?}"),
-            }
-        })
-        .collect();
-    for q in &qids {
-        assert!(crate::Install::install(
+    (1u64..=3).for_each(|c| {
+        crate::reexec::test_fixtures::bootstrap_scalar_query(
             &mut e,
-            *q,
-            crate::ScalarInstall {
-                value: Value::Float(7.0),
-                checkpoint: None::<crate::NoCheckpoint>
-            }
-        )
-        .is_ok());
-    }
+            c,
+            "SELECT MIN(price) FROM orders WHERE quantity = 1",
+            7.0,
+        );
+    });
     e.apply(&delete_event(tid, 1, 7.0)).unwrap();
     let outcome = block_on(e.resolve_collect()).unwrap();
     assert_eq!(

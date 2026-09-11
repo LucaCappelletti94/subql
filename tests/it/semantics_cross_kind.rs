@@ -31,38 +31,10 @@
 #![allow(clippy::unwrap_used)]
 
 use sql_traits::structs::ParserDB;
-use sqlparser::dialect::{MySqlDialect, PostgreSqlDialect, SQLiteDialect};
+use sqlparser::dialect::PostgreSqlDialect;
 use subql::backend::{MySql, Postgres, SQLite, ScalarFamily, Value};
 use subql::testing::TestEvent;
 use subql::{catalog_helpers, DefaultIds, NotServed, SubscriptionEngine, SubscriptionRequest};
-
-macro_rules! notifies {
-    ($backend:ty, $dialect:ty, $ddl:expr, $predicate:expr, $cells:expr) => {{
-        let db = ParserDB::parse::<$dialect>($ddl).expect("DDL parses");
-        let table = catalog_helpers::table_id::<subql::backend::Postgres, _>(&db, "t")
-            .expect("t is in the catalog");
-        let mut engine: SubscriptionEngine<TestEvent<$backend>, DefaultIds, ParserDB> =
-            SubscriptionEngine::new(db, <$dialect>::default());
-        engine
-            .register(SubscriptionRequest::new(1u64, $predicate))
-            .expect("registration succeeds");
-        let notifications = engine
-            .consumers(&TestEvent::insert(table, $cells))
-            .expect("dispatch succeeds");
-        !notifications.inserted().is_empty()
-    }};
-}
-
-macro_rules! registered {
-    ($backend:ty, $dialect:ty, $ddl:expr, $predicate:expr) => {{
-        let db = ParserDB::parse::<$dialect>($ddl).expect("DDL parses");
-        let mut engine: SubscriptionEngine<TestEvent<$backend>, DefaultIds, ParserDB> =
-            SubscriptionEngine::new(db, <$dialect>::default());
-        engine
-            .register(SubscriptionRequest::new(1u64, $predicate))
-            .expect("a read answers it, so registration succeeds")
-    }};
-}
 
 const PG_DDL: &str = "CREATE TABLE t (id INT PRIMARY KEY, qty BIGINT, \
                       price DOUBLE PRECISION, amount NUMERIC, label TEXT)";
@@ -84,20 +56,18 @@ fn row(qty: i64, price: f64, amount: &str, label: &str) -> Vec<Value<Postgres>> 
 #[test]
 fn int_column_compares_against_real_column() {
     assert!(
-        notifies!(
-            Postgres,
-            PostgreSqlDialect,
+        crate::common::semantics::notifies::<Postgres>(
             PG_DDL,
+            "t",
             "SELECT * FROM t WHERE qty > price",
             row(5, 1.0, "0", "")
         ),
         "5 is above 1.0"
     );
     assert!(
-        !notifies!(
-            Postgres,
-            PostgreSqlDialect,
+        !crate::common::semantics::notifies::<Postgres>(
             PG_DDL,
+            "t",
             "SELECT * FROM t WHERE qty > price",
             row(1, 5.0, "0", "")
         ),
@@ -110,20 +80,18 @@ fn int_column_compares_against_real_column() {
 #[test]
 fn numeric_column_equals_int_column() {
     assert!(
-        notifies!(
-            Postgres,
-            PostgreSqlDialect,
+        crate::common::semantics::notifies::<Postgres>(
             PG_DDL,
+            "t",
             "SELECT * FROM t WHERE amount = qty",
             row(10, 0.0, "10", "")
         ),
         "10 equals 10 across the two kinds"
     );
     assert!(
-        !notifies!(
-            Postgres,
-            PostgreSqlDialect,
+        !crate::common::semantics::notifies::<Postgres>(
             PG_DDL,
+            "t",
             "SELECT * FROM t WHERE amount = qty",
             row(9_007_199_254_740_993, 0.0, "9007199254740992", "")
         ),
@@ -137,10 +105,9 @@ fn numeric_column_equals_int_column() {
 #[test]
 fn pg_int_against_float_compares_at_float_width() {
     assert!(
-        notifies!(
-            Postgres,
-            PostgreSqlDialect,
+        crate::common::semantics::notifies::<Postgres>(
             PG_DDL,
+            "t",
             "SELECT * FROM t WHERE qty = price",
             row(9_007_199_254_740_993, 9_007_199_254_740_992.0, "0", "")
         ),
@@ -160,30 +127,27 @@ fn sqlite_int_against_real_compares_exactly() {
         ]
     };
     assert!(
-        !notifies!(
-            SQLite,
-            SQLiteDialect,
+        !crate::common::semantics::notifies::<SQLite>(
             SQLITE_DDL,
+            "t",
             "SELECT * FROM t WHERE qty = price",
             cells(9_007_199_254_740_993, 9_007_199_254_740_992.0)
         ),
         "measured as 0: SQLite does not round the integer to compare it"
     );
     assert!(
-        notifies!(
-            SQLite,
-            SQLiteDialect,
+        crate::common::semantics::notifies::<SQLite>(
             SQLITE_DDL,
+            "t",
             "SELECT * FROM t WHERE qty > price",
             cells(9_007_199_254_740_993, 9_007_199_254_740_992.0)
         ),
         "measured as 1: it is above, exactly"
     );
     assert!(
-        notifies!(
-            SQLite,
-            SQLiteDialect,
+        crate::common::semantics::notifies::<SQLite>(
             SQLITE_DDL,
+            "t",
             "SELECT * FROM t WHERE qty > price",
             cells(5, 1.0)
         ),
@@ -206,20 +170,18 @@ fn mysql_matches_the_numeric_widening() {
         ]
     };
     assert!(
-        notifies!(
-            MySql,
-            MySqlDialect,
+        crate::common::semantics::notifies::<MySql>(
             ddl,
+            "t",
             "SELECT * FROM t WHERE qty = price",
             cells(9_007_199_254_740_993, 9_007_199_254_740_992.0, "0")
         ),
         "measured as 1: lossy against a float"
     );
     assert!(
-        !notifies!(
-            MySql,
-            MySqlDialect,
+        !crate::common::semantics::notifies::<MySql>(
             ddl,
+            "t",
             "SELECT * FROM t WHERE qty = amount",
             cells(9_007_199_254_740_993, 0.0, "9007199254740992")
         ),
@@ -238,12 +200,8 @@ fn non_numeric_cross_kind_is_not_served_in_process() {
     let qty = catalog_helpers::column_id(&db, table, "qty").expect("qty is in the catalog");
     let label = catalog_helpers::column_id(&db, table, "label").expect("label is in the catalog");
 
-    let registered = registered!(
-        Postgres,
-        PostgreSqlDialect,
-        PG_DDL,
-        "SELECT * FROM t WHERE qty = label"
-    );
+    let registered =
+        crate::common::semantics::register::<Postgres>(PG_DDL, "SELECT * FROM t WHERE qty = label");
     assert!(
         registered.served().is_none(),
         "there is no in-process answer to reproduce"
@@ -263,17 +221,12 @@ fn non_numeric_cross_kind_is_not_served_in_process() {
 /// The control: a same-kind comparison is untouched by any of this.
 #[test]
 fn same_kind_comparison_still_folds_in_process() {
-    let registered = registered!(
-        Postgres,
-        PostgreSqlDialect,
-        PG_DDL,
-        "SELECT * FROM t WHERE qty > 3"
-    );
+    let registered =
+        crate::common::semantics::register::<Postgres>(PG_DDL, "SELECT * FROM t WHERE qty > 3");
     assert!(registered.served().is_some());
-    assert!(notifies!(
-        Postgres,
-        PostgreSqlDialect,
+    assert!(crate::common::semantics::notifies::<Postgres>(
         PG_DDL,
+        "t",
         "SELECT * FROM t WHERE qty > 3",
         row(5, 0.0, "0", "")
     ));
@@ -310,30 +263,27 @@ fn sqlite_orders_an_infinity_against_an_integer() {
         ]
     };
     assert!(
-        notifies!(
-            SQLite,
-            SQLiteDialect,
+        crate::common::semantics::notifies::<SQLite>(
             SQLITE_DDL,
+            "t",
             "SELECT * FROM t WHERE price > qty",
             cells(1, f64::INFINITY)
         ),
         "measured as 1: an infinity is above every integer"
     );
     assert!(
-        !notifies!(
-            SQLite,
-            SQLiteDialect,
+        !crate::common::semantics::notifies::<SQLite>(
             SQLITE_DDL,
+            "t",
             "SELECT * FROM t WHERE qty > price",
             cells(1, f64::INFINITY)
         ),
         "measured as 0, which is the same fact from the other side"
     );
     assert!(
-        notifies!(
-            SQLite,
-            SQLiteDialect,
+        crate::common::semantics::notifies::<SQLite>(
             SQLITE_DDL,
+            "t",
             "SELECT * FROM t WHERE qty > price",
             cells(1, f64::NEG_INFINITY)
         ),
@@ -424,10 +374,9 @@ fn a_decimal_past_the_double_range_refuses_the_comparison() {
     // A decimal the double range holds is answered, so the refusal is
     // about the range and not about the pairing.
     assert!(
-        notifies!(
-            Postgres,
-            PostgreSqlDialect,
+        crate::common::semantics::notifies::<Postgres>(
             PG_DDL,
+            "t",
             "SELECT * FROM t WHERE amount > price",
             row(5, 1.5, "1e300", "paid")
         ),

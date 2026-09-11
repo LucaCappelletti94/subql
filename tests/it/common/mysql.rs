@@ -193,3 +193,74 @@ pub fn maxwell_collect(
         std::thread::sleep(Duration::from_millis(500));
     }
 }
+
+#[cfg(any(
+    feature = "executor-diesel-mysql",
+    feature = "executor-diesel-async-mysql",
+))]
+pub const ORDERS_DDL: &str =
+    "CREATE TABLE orders (id INT PRIMARY KEY, price FLOAT, quantity INT, status TEXT);";
+
+#[cfg(any(
+    feature = "executor-diesel-mysql",
+    feature = "executor-diesel-async-mysql",
+))]
+/// `DOUBLE` is MySQL's 8-byte float, so `Nullable<Double>` decodes cleanly.
+pub const ORDERS_MYSQL_DDL: &str = "CREATE TABLE orders (
+    id INT PRIMARY KEY,
+    price DOUBLE,
+    quantity INT,
+    status TEXT
+)";
+
+#[cfg(any(
+    feature = "executor-diesel-mysql",
+    feature = "executor-diesel-async-mysql",
+))]
+pub fn setup_orders(conn: &mut diesel::MysqlConnection, seed: &[(i64, f64)]) {
+    use diesel::RunQueryDsl;
+    diesel::sql_query(ORDERS_MYSQL_DDL)
+        .execute(conn)
+        .expect("CREATE TABLE");
+    for (id, price) in seed {
+        diesel::sql_query(format!(
+            "INSERT INTO orders (id, price, quantity, status) \
+             VALUES ({id}, {price}, 1, 'paid')"
+        ))
+        .execute(conn)
+        .expect("seed insert");
+    }
+}
+
+#[cfg(any(
+    feature = "executor-diesel-mysql",
+    feature = "executor-diesel-async-mysql",
+))]
+/// One more row, for a commit that lands while a read is parked.
+pub fn orders_insert(id: i64) -> String {
+    format!("INSERT INTO orders (id, price, quantity, status) VALUES ({id}, 7.0, 1, 'paid')")
+}
+
+#[cfg(any(
+    feature = "executor-diesel-mysql",
+    feature = "executor-diesel-async-mysql",
+))]
+pub fn orders_catalog() -> sql_traits::structs::ParserDB {
+    sql_traits::structs::ParserDB::parse::<sqlparser::dialect::MySqlDialect>(ORDERS_DDL)
+        .expect("parse DDL")
+}
+
+#[cfg(any(
+    feature = "executor-diesel-mysql",
+    feature = "executor-diesel-async-mysql",
+))]
+/// The full `orders` row image, column order id=0, price=1, quantity=2, status=3.
+pub fn orders_row(id: i64, price: f64) -> Vec<subql::backend::Value<subql::backend::MySql>> {
+    use subql::backend::Value;
+    vec![
+        Value::Int(id),
+        Value::Float(price),
+        Value::Int(1),
+        Value::String("paid".into()),
+    ]
+}
