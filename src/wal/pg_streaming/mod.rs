@@ -316,13 +316,7 @@ async fn streaming_task(
     shutdown_token: CancellationToken,
     task_exited: Arc<AtomicBool>,
 ) {
-    struct ExitGuard(Arc<AtomicBool>);
-    impl Drop for ExitGuard {
-        fn drop(&mut self) {
-            self.0.store(true, Ordering::Relaxed);
-        }
-    }
-    let _exit_guard = ExitGuard(task_exited);
+    let _exit_guard = crate::wal::ExitFlagGuard(task_exited);
 
     let mut decoder = PgOutputDecoder::with_protocol_version(1);
     let mut latest_received_lsn: u64 = 0;

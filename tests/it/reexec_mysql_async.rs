@@ -23,7 +23,7 @@ use crate::common;
 
 use std::sync::Arc;
 
-use diesel::{sql_query, MysqlConnection, RunQueryDsl};
+use diesel::{sql_query, RunQueryDsl};
 use diesel_async::pooled_connection::bb8::Pool;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::AsyncMysqlConnection;
@@ -35,9 +35,7 @@ use subql::reexec::{
     SnapshotResult,
 };
 use subql::testing::TestEvent;
-use subql::{
-    catalog_helpers, DefaultIds, Registered, SubscriptionEngine, SubscriptionRequest, TableId, Tier,
-};
+use subql::{catalog_helpers, DefaultIds, SubscriptionEngine, SubscriptionRequest, TableId};
 
 type Engine = AutoResolvingEngine<
     TestEvent<MySql>,
@@ -45,15 +43,6 @@ type Engine = AutoResolvingEngine<
     ParserDB,
     AsyncMode<MysqlAsyncDieselConnector>,
 >;
-
-const DDL: &str =
-    "CREATE TABLE orders (id INT PRIMARY KEY, price FLOAT, quantity INT, status TEXT);";
-const MYSQL_DDL: &str = "CREATE TABLE orders (
-    id INT PRIMARY KEY,
-    price DOUBLE,
-    quantity INT,
-    status TEXT
-)";
 
 /// Build a `bb8` pool over `AsyncMysqlConnection` for the database URL.
 async fn mysql_async_pool(url: String) -> Pool<AsyncMysqlConnection> {
@@ -64,41 +53,10 @@ async fn mysql_async_pool(url: String) -> Pool<AsyncMysqlConnection> {
         .expect("build async mysql pool")
 }
 
-fn setup_mysql(conn: &mut MysqlConnection, seed: &[(i64, f64)]) {
-    sql_query(MYSQL_DDL).execute(conn).expect("CREATE TABLE");
-    for (id, price) in seed {
-        sql_query(format!(
-            "INSERT INTO orders (id, price, quantity, status) \
-             VALUES ({id}, {price}, 1, 'paid')"
-        ))
-        .execute(conn)
-        .expect("seed insert");
-    }
-}
-
-/// One more row, for a commit that lands while a read is parked.
-fn insert(id: i64) -> String {
-    format!("INSERT INTO orders (id, price, quantity, status) VALUES ({id}, 7.0, 1, 'paid')")
-}
-
-fn catalog() -> ParserDB {
-    ParserDB::parse::<MySqlDialect>(DDL).expect("parse DDL")
-}
-
 fn build_engine(catalog: ParserDB, pool: Pool<AsyncMysqlConnection>) -> Engine {
     let inner =
         SubscriptionEngine::<TestEvent<MySql>, DefaultIds, ParserDB>::new(catalog, MySqlDialect {});
     AutoResolvingEngine::new(inner, AsyncMode::new(MysqlAsyncDieselConnector::new(pool)))
-}
-
-/// Column order matches the catalog: id=0, price=1, quantity=2, status=3.
-fn orders_row(id: i64, price: f64) -> Vec<Value<MySql>> {
-    vec![
-        Value::Int(id),
-        Value::Float(price),
-        Value::Int(1),
-        Value::String("paid".into()),
-    ]
 }
 
 /// Snapshot reads value plus a binlog coordinate through the async
@@ -109,30 +67,15 @@ fn snapshot_reads_value_and_binlog_pos_from_mysql_async() {
     common::assert_docker_available();
     let db = common::mysql_database();
     let mut conn_setup = db.connect();
-    setup_mysql(&mut conn_setup, &[(1, 5.0), (2, 9.0)]);
+    common::mysql::setup_orders(&mut conn_setup, &[(1, 5.0), (2, 9.0)]);
 
     let url = db.url();
     common::multi_thread_rt().block_on(async move {
         let pool = mysql_async_pool(url).await;
-        let mut engine = build_engine(catalog(), pool);
+        let mut engine = build_engine(common::mysql::orders_catalog(), pool);
 
-        let captured_qid = match engine
-            .register(
-                SubscriptionRequest::<DefaultIds, MySql>::new(
-                    1u64,
-                    "SELECT MIN(price) FROM orders",
-                ),
-                (),
-            )
-            .expect("captured registration")
-        {
-            Registered {
-                subscription_id,
-                tier: Tier::Scalar { .. },
-                ..
-            } => subscription_id,
-            other => panic!("expected ReExec, got {other:?}"),
-        };
+        let captured_qid =
+            common::reexec::register_captured(&mut engine, 1u64, "SELECT MIN(price) FROM orders");
 
         let snap = engine
             .snapshot(captured_qid)
@@ -162,9 +105,9 @@ fn delete_displacing_extreme_resolves_via_mysql_async_connector() {
     let db = common::mysql_database();
     let mut conn_setup = db.connect();
     let mut conn_dml = db.connect();
-    setup_mysql(&mut conn_setup, &[(1, 5.0), (2, 9.0)]);
+    common::mysql::setup_orders(&mut conn_setup, &[(1, 5.0), (2, 9.0)]);
 
-    let cat = catalog();
+    let cat = common::mysql::orders_catalog();
     let table_id: TableId =
         catalog_helpers::table_id::<subql::backend::Postgres, _>(&cat, "orders")
             .expect("resolve orders");
@@ -174,23 +117,8 @@ fn delete_displacing_extreme_resolves_via_mysql_async_connector() {
         let pool = mysql_async_pool(url).await;
         let mut engine = build_engine(cat, pool);
 
-        let captured_qid = match engine
-            .register(
-                SubscriptionRequest::<DefaultIds, MySql>::new(
-                    1u64,
-                    "SELECT MIN(price) FROM orders",
-                ),
-                (),
-            )
-            .expect("captured registration")
-        {
-            Registered {
-                subscription_id,
-                tier: Tier::Scalar { .. },
-                ..
-            } => subscription_id,
-            other => panic!("expected ReExec, got {other:?}"),
-        };
+        let captured_qid =
+            common::reexec::register_captured(&mut engine, 1u64, "SELECT MIN(price) FROM orders");
         assert!(subql::Install::install(
             &mut engine,
             captured_qid,
@@ -205,8 +133,8 @@ fn delete_displacing_extreme_resolves_via_mysql_async_connector() {
             .execute(&mut conn_dml)
             .expect("delete id=1");
 
-        let event =
-            TestEvent::<MySql>::delete(table_id, orders_row(1, 5.0)).with_pk_columns([0u16]);
+        let event = TestEvent::<MySql>::delete(table_id, common::mysql::orders_row(1, 5.0))
+            .with_pk_columns([0u16]);
 
         engine.apply(&event).expect("apply");
         let notifs = engine.resolve_collect().await.expect("consumers dispatch");
@@ -301,7 +229,7 @@ fn every_read_reports_a_position_taken_before_its_snapshot() {
     common::assert_docker_available();
     let db = common::mysql_database();
     let mut conn = db.connect();
-    setup_mysql(&mut conn, &[(1, 5.0)]);
+    common::mysql::setup_orders(&mut conn, &[(1, 5.0)]);
 
     let rt = common::multi_thread_rt();
     let connector = Arc::new(MysqlAsyncDieselConnector::new(
@@ -315,8 +243,11 @@ fn every_read_reports_a_position_taken_before_its_snapshot() {
     // the name the lowest id builds, which a clustered-index scan reaches
     // first.
     let sql = "SELECT count(*) AS v FROM orders WHERE GET_LOCK(CONCAT(DATABASE(), '_park_scalar_', id), 60) = 1";
-    let ((value, position), after_commit) =
-        common::park_a_mysql_read(&db, "park_scalar_1", &insert(2), move || {
+    let ((value, position), after_commit) = common::park_a_mysql_read(
+        &db,
+        "park_scalar_1",
+        &common::mysql::orders_insert(2),
+        move || {
             on.block_on(async move {
                 held.execute_scalar(
                     &subql::reexec::ReadQuery::without_binds(sql),
@@ -326,7 +257,8 @@ fn every_read_reports_a_position_taken_before_its_snapshot() {
                 .await
             })
             .expect("scalar read")
-        });
+        },
+    );
     assert_eq!(
         value,
         Value::Int(1),
@@ -340,8 +272,11 @@ fn every_read_reports_a_position_taken_before_its_snapshot() {
     let held = Arc::clone(&connector);
     let on = rt.handle().clone();
     let sql = "SELECT count(*) AS c0 FROM orders WHERE GET_LOCK(CONCAT(DATABASE(), '_park_seed_', id), 60) = 1";
-    let ((values, position), after_commit) =
-        common::park_a_mysql_read(&db, "park_seed_1", &insert(3), move || {
+    let ((values, position), after_commit) = common::park_a_mysql_read(
+        &db,
+        "park_seed_1",
+        &common::mysql::orders_insert(3),
+        move || {
             on.block_on(async move {
                 held.execute_scalar_row(
                     &subql::reexec::ReadQuery::without_binds(sql),
@@ -351,7 +286,8 @@ fn every_read_reports_a_position_taken_before_its_snapshot() {
                 .await
             })
             .expect("seed read")
-        });
+        },
+    );
     assert_eq!(
         values,
         vec![Value::Int(2)],

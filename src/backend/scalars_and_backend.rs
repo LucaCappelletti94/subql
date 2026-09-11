@@ -61,6 +61,8 @@ pub trait ScalarText: ScalarCore {
     fn scalar_text(&self) -> Cow<'_, str>;
 }
 
+// A blanket `impl<T: ScalarCore + Display> ScalarText for T` is E0119 against
+// the `String` and `DateTime<Utc>` impls, and specialisation is unstable.
 impl ScalarText for alloc::string::String {
     fn scalar_text(&self) -> Cow<'_, str> {
         Cow::Borrowed(self.as_str())

@@ -30,20 +30,11 @@ fn async_match_rows_replays_without_reading_or_folding() {
     // match_rows must be a plain sync call here: the inner match does no
     // I/O, so no block_on wraps it. One value, for the single live read.
     let (mut e, tid) = engine_with_values(vec![Value::Float(7.0)]);
-    let min_id = match e
-        .register(
-            SubscriptionRequest::new(1u64, "SELECT MIN(price) FROM orders"),
-            (),
-        )
-        .unwrap()
-    {
-        Registered {
-            subscription_id,
-            tier: Tier::Scalar { .. },
-            ..
-        } => subscription_id,
-        other => panic!("expected Scalar, got {other:?}"),
-    };
+    let min_id = crate::reexec::test_fixtures::register_scalar_query(
+        &mut e,
+        1u64,
+        "SELECT MIN(price) FROM orders",
+    );
     crate::Install::install(
         &mut e,
         min_id,

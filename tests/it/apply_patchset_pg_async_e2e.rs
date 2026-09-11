@@ -26,9 +26,6 @@ use crate::common;
 use diesel::{sql_query, Connection, PgConnection, QueryableByName, RunQueryDsl};
 use diesel_async::{AsyncConnection, AsyncPgConnection};
 use sql_traits::structs::ParserDB;
-use sqlite_diff_rs::{
-    DiffOps, Insert, PatchDelete, PatchSet, PatchsetFormat, SimpleTable, Update, Value,
-};
 use sqlparser::dialect::PostgreSqlDialect;
 use subql::patchset::PgAdapter;
 use subql::{ChangeEvent, DefaultIds, SubscriptionEngine};
@@ -63,96 +60,47 @@ fn apply_patchset_async_bool_roundtrip_insert_update_delete() {
         let catalog = ParserDB::parse::<PostgreSqlDialect>(DDL).expect("parse subql DDL");
         let engine: SubscriptionEngine<ChangeEvent, DefaultIds, ParserDB> =
             SubscriptionEngine::new(catalog, PostgreSqlDialect {});
-
-        let things = SimpleTable::new("things", &["id", "active"], &[0]);
         let adapter = PgAdapter::new(engine.database()).expect("the catalog indexes");
 
-        let inserts = PatchSet::<SimpleTable, String, Vec<u8>>::new()
-            .insert(
-                Insert::from(things.clone())
-                    .set(0, 1_i64)
-                    .unwrap()
-                    .set(1, 1_i64)
-                    .unwrap(),
-            )
-            .insert(
-                Insert::from(things.clone())
-                    .set(0, 2_i64)
-                    .unwrap()
-                    .set(1, 0_i64)
-                    .unwrap(),
-            );
+        let (inserts, updates, deletes) = common::patchset::bool_roundtrip_ops();
 
-        let n = engine
-            .apply_patchset_async(&inserts, &mut conn, &adapter)
-            .await
-            .expect("apply inserts");
-        assert_eq!(n, 2, "two rows inserted");
-
-        let rows: Vec<ThingRow> = sql_query("SELECT id, active FROM things ORDER BY id")
-            .load(&mut verify)
-            .expect("load");
         assert_eq!(
-            rows,
-            vec![
-                ThingRow {
-                    id: 1,
-                    active: true
-                },
-                ThingRow {
-                    id: 2,
-                    active: false
-                },
-            ]
+            engine
+                .apply_patchset_async(&inserts, &mut conn, &adapter)
+                .await
+                .expect("apply inserts"),
+            2,
+            "two rows inserted"
+        );
+        assert_eq!(
+            common::patchset::load_all(&mut verify),
+            common::patchset::expected_after_inserts()
         );
 
-        let updates = PatchSet::<SimpleTable, String, Vec<u8>>::new().update(
-            Update::<_, PatchsetFormat, String, Vec<u8>>::from(things.clone())
-                .set(0, 2_i64)
-                .unwrap()
-                .set(1, 1_i64)
-                .unwrap(),
-        );
-        let n = engine
-            .apply_patchset_async(&updates, &mut conn, &adapter)
-            .await
-            .expect("apply updates");
-        assert_eq!(n, 1, "one row updated");
-
-        let row: ThingRow = sql_query("SELECT id, active FROM things WHERE id = 2")
-            .get_result(&mut verify)
-            .expect("load");
         assert_eq!(
-            row,
-            ThingRow {
-                id: 2,
-                active: true
-            }
+            engine
+                .apply_patchset_async(&updates, &mut conn, &adapter)
+                .await
+                .expect("apply updates"),
+            1,
+            "one row updated"
+        );
+        assert_eq!(
+            common::patchset::load_all(&mut verify),
+            common::patchset::expected_after_update()
         );
 
-        let deletes = PatchSet::<SimpleTable, String, Vec<u8>>::new().delete(PatchDelete::<
-            SimpleTable,
-            String,
-            Vec<u8>,
-        >::new(
-            things,
-            vec![Value::Integer(1)],
-        ));
-        let n = engine
-            .apply_patchset_async(&deletes, &mut conn, &adapter)
-            .await
-            .expect("apply deletes");
-        assert_eq!(n, 1, "one row deleted");
-
-        let remaining: Vec<ThingRow> = sql_query("SELECT id, active FROM things ORDER BY id")
-            .load(&mut verify)
-            .expect("load");
         assert_eq!(
-            remaining,
-            vec![ThingRow {
-                id: 2,
-                active: true
-            }]
+            engine
+                .apply_patchset_async(&deletes, &mut conn, &adapter)
+                .await
+                .expect("apply deletes"),
+            1,
+            "one row deleted"
+        );
+        assert_eq!(
+            common::patchset::load_all(&mut verify),
+            common::patchset::expected_after_delete()
         );
     });
 }

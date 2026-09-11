@@ -28,6 +28,8 @@ pub use pg_walstream::ChangeEvent;
 pub(crate) use shared_helpers::{changed_columns_by_name, resolve_table};
 #[cfg(feature = "std")]
 pub use streaming::CdcSource;
+#[cfg(feature = "pg-streaming")]
+pub(crate) use streaming::ExitFlagGuard;
 pub use wal2json::{parse_wal2json_v1, parse_wal2json_v2};
 pub use wal2json_events::{ChangeV1, MessageV2};
 

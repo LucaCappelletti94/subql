@@ -84,14 +84,6 @@ fn poll_once<F: core::future::Future>(fut: &mut core::pin::Pin<Box<F>>) -> bool 
 }
 
 const SLOT: &str = "subql_test_async";
-const DDL: &str =
-    "CREATE TABLE orders (id INT PRIMARY KEY, price FLOAT, quantity INT, status TEXT);";
-const PG_DDL: &str = "CREATE TABLE orders (
-    id INT PRIMARY KEY,
-    price DOUBLE PRECISION,
-    quantity INT,
-    status TEXT
-)";
 
 type Engine =
     AutoResolvingEngine<MessageV2, DefaultIds, ParserDB, AsyncMode<PgAsyncDieselConnector>>;
@@ -103,32 +95,6 @@ async fn pg_async_pool(url: &str) -> Pool<AsyncPgConnection> {
         .build(manager)
         .await
         .expect("build async pg pool")
-}
-
-/// DDL, REPLICA IDENTITY FULL, seed rows, then the given replication slot.
-fn setup_pg(conn: &mut PgConnection, seed: &[(i64, f64)], slot: &str) {
-    sql_query(PG_DDL).execute(conn).expect("CREATE TABLE");
-    sql_query("ALTER TABLE orders REPLICA IDENTITY FULL")
-        .execute(conn)
-        .expect("REPLICA IDENTITY FULL");
-    for (id, price) in seed {
-        sql_query(format!(
-            "INSERT INTO orders (id, price, quantity, status) \
-             VALUES ({id}, {price}, 1, 'paid')"
-        ))
-        .execute(conn)
-        .expect("seed insert");
-    }
-    common::create_slot(conn, slot);
-}
-
-/// One more row, for a commit that lands while a read is parked.
-fn insert(id: i64) -> String {
-    format!("INSERT INTO orders (id, price, quantity, status) VALUES ({id}, 7.0, 1, 'paid')")
-}
-
-fn catalog() -> ParserDB {
-    ParserDB::parse::<PostgreSqlDialect>(DDL).expect("parse DDL")
 }
 
 fn build_engine(catalog: ParserDB, pool: Pool<AsyncPgConnection>) -> Engine {
@@ -154,11 +120,11 @@ fn engine_and_captured_paths_coexist_through_pg_async_connector() {
     let slot = db.slot(SLOT);
     let mut conn_setup = db.connect();
     let mut conn_dml = db.connect();
-    setup_pg(&mut conn_setup, &[(1, 5.0), (2, 9.0)], &slot);
+    common::pg::setup_orders(&mut conn_setup, &[(1, 5.0), (2, 9.0)], &slot);
 
     common::multi_thread_rt().block_on(async move {
         let pool = pg_async_pool(&url).await;
-        let mut engine = build_engine(catalog(), pool);
+        let mut engine = build_engine(common::pg::orders_catalog(), pool);
 
         let engine_consumer: u64 = 1;
         let engine_reg = engine
@@ -178,23 +144,8 @@ fn engine_and_captured_paths_coexist_through_pg_async_connector() {
             }
         ));
 
-        let captured_qid = match engine
-            .register(
-                SubscriptionRequest::<DefaultIds, Postgres>::new(
-                    2u64,
-                    "SELECT MIN(price) FROM orders",
-                ),
-                (),
-            )
-            .expect("captured registration")
-        {
-            Registered {
-                subscription_id,
-                tier: Tier::Scalar { .. },
-                ..
-            } => subscription_id,
-            other => panic!("expected ReExec, got {other:?}"),
-        };
+        let captured_qid =
+            common::reexec::register_captured(&mut engine, 2u64, "SELECT MIN(price) FROM orders");
         assert!(subql::Install::install(
             &mut engine,
             captured_qid,
@@ -269,29 +220,14 @@ fn snapshot_reads_value_and_lsn_from_pg_async() {
     let url = db.url();
     let slot = db.slot(SLOT);
     let mut conn_setup = db.connect();
-    setup_pg(&mut conn_setup, &[(1, 5.0), (2, 9.0)], &slot);
+    common::pg::setup_orders(&mut conn_setup, &[(1, 5.0), (2, 9.0)], &slot);
 
     common::multi_thread_rt().block_on(async move {
         let pool = pg_async_pool(&url).await;
-        let mut engine = build_engine(catalog(), pool);
+        let mut engine = build_engine(common::pg::orders_catalog(), pool);
 
-        let captured_qid = match engine
-            .register(
-                SubscriptionRequest::<DefaultIds, Postgres>::new(
-                    1u64,
-                    "SELECT MIN(price) FROM orders",
-                ),
-                (),
-            )
-            .expect("captured registration")
-        {
-            Registered {
-                subscription_id,
-                tier: Tier::Scalar { .. },
-                ..
-            } => subscription_id,
-            other => panic!("expected ReExec, got {other:?}"),
-        };
+        let captured_qid =
+            common::reexec::register_captured(&mut engine, 1u64, "SELECT MIN(price) FROM orders");
 
         let snap = engine
             .snapshot(captured_qid)
@@ -382,7 +318,7 @@ fn a_cancelled_read_does_not_hand_its_transaction_to_the_next_caller() {
     let url = db.url();
     let slot = db.slot(SLOT);
     let mut setup = db.connect();
-    setup_pg(&mut setup, &[(1, 10.0), (2, 20.0), (3, 30.0)], &slot);
+    common::pg::setup_orders(&mut setup, &[(1, 10.0), (2, 20.0), (3, 30.0)], &slot);
 
     let mut observer = db.connect();
 
@@ -471,7 +407,7 @@ fn a_busy_cursor_and_a_broken_one_report_differently() {
     let url = db.url();
     let slot = db.slot(SLOT);
     let mut setup = db.connect();
-    setup_pg(&mut setup, &[(1, 10.0), (2, 20.0), (3, 30.0)], &slot);
+    common::pg::setup_orders(&mut setup, &[(1, 10.0), (2, 20.0), (3, 30.0)], &slot);
     let mut observer = db.connect();
 
     common::multi_thread_rt().block_on(async move {
@@ -569,7 +505,7 @@ fn closing_a_cursor_during_a_read_does_not_orphan_it() {
     let url = db.url();
     let slot = db.slot(SLOT);
     let mut setup = db.connect();
-    setup_pg(&mut setup, &[(1, 10.0), (2, 20.0), (3, 30.0)], &slot);
+    common::pg::setup_orders(&mut setup, &[(1, 10.0), (2, 20.0), (3, 30.0)], &slot);
     let mut observer = db.connect();
 
     common::multi_thread_rt().block_on(async move {
@@ -636,7 +572,7 @@ fn a_cancelled_read_does_not_poison_its_cursor_id() {
     let url = db.url();
     let slot = db.slot(SLOT);
     let mut setup = db.connect();
-    setup_pg(&mut setup, &[(1, 10.0), (2, 20.0), (3, 30.0)], &slot);
+    common::pg::setup_orders(&mut setup, &[(1, 10.0), (2, 20.0), (3, 30.0)], &slot);
 
     common::multi_thread_rt().block_on(async move {
         let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(&url);
@@ -696,11 +632,11 @@ fn the_keyed_tier_delivers_row_deltas_through_the_async_engine() {
     let slot = db.slot(SLOT);
     let mut conn_setup = db.connect();
     let mut conn_dml = db.connect();
-    setup_pg(&mut conn_setup, &[(1, 5.0), (2, 9.0)], &slot);
+    common::pg::setup_orders(&mut conn_setup, &[(1, 5.0), (2, 9.0)], &slot);
 
     common::multi_thread_rt().block_on(async move {
         let pool = pg_async_pool(&url).await;
-        let mut engine = build_engine(catalog(), pool);
+        let mut engine = build_engine(common::pg::orders_catalog(), pool);
 
         // `lower(status)` is a function call the in-process language cannot
         // evaluate, over one table with a primary key, so this is the keyed tier.
@@ -806,13 +742,13 @@ fn the_whole_reread_tier_delivers_pages_through_the_async_engine() {
     let slot = db.slot(SLOT);
     let mut conn_setup = db.connect();
     let mut conn_dml = db.connect();
-    setup_pg(&mut conn_setup, &[(1, 5.0), (2, 9.0), (3, 11.0)], &slot);
+    common::pg::setup_orders(&mut conn_setup, &[(1, 5.0), (2, 9.0), (3, 11.0)], &slot);
 
     common::multi_thread_rt().block_on(async move {
         let pool = pg_async_pool(&url).await;
         // One row per page, so the cursor has to page and `more` has to be
         // right, which one big page would never test.
-        let mut engine = build_engine(catalog(), pool).with_max_page_bytes(1);
+        let mut engine = build_engine(common::pg::orders_catalog(), pool).with_max_page_bytes(1);
 
         // `DISTINCT` has no key to resume from, so this is the whole-re-read
         // tier rather than the keyed one.
@@ -897,11 +833,11 @@ fn the_async_batch_path_delivers_row_deltas_and_transitions_a_keyless_change() {
     let slot = db.slot(SLOT);
     let mut conn_setup = db.connect();
     let mut conn_dml = db.connect();
-    setup_pg(&mut conn_setup, &[(1, 5.0), (2, 9.0), (3, 11.0)], &slot);
+    common::pg::setup_orders(&mut conn_setup, &[(1, 5.0), (2, 9.0), (3, 11.0)], &slot);
 
     common::multi_thread_rt().block_on(async move {
         let pool = pg_async_pool(&url).await;
-        let mut engine = build_engine(catalog(), pool);
+        let mut engine = build_engine(common::pg::orders_catalog(), pool);
         let subscription_id = match engine
             .register(
                 SubscriptionRequest::<DefaultIds, Postgres>::new(
@@ -1022,7 +958,7 @@ fn a_captured_query_snapshots_its_rows_on_either_tier_async() {
     let seed: Vec<(i64, f64)> = (1..=12_u32)
         .map(|id| (i64::from(id), f64::from(id)))
         .collect();
-    setup_pg(&mut conn_setup, &seed, &slot);
+    common::pg::setup_orders(&mut conn_setup, &seed, &slot);
     // One row outside both filters, so a read that dropped the WHERE is caught.
     sql_query("UPDATE orders SET status = 'void' WHERE id = 7")
         .execute(&mut conn_setup)
@@ -1032,7 +968,7 @@ fn a_captured_query_snapshots_its_rows_on_either_tier_async() {
         let pool = pg_async_pool(&url).await;
         // Below one row's size, so the answer is only complete if the read
         // pages. One big page would pass with the paging deleted.
-        let mut engine = build_engine(catalog(), pool).with_max_page_bytes(1);
+        let mut engine = build_engine(common::pg::orders_catalog(), pool).with_max_page_bytes(1);
 
         // Clause-free, so the keyed tier claims it.
         let keyed = register_captured(
@@ -1132,7 +1068,7 @@ fn every_read_reports_a_position_taken_before_its_snapshot() {
     let url = db.url();
     let slot = db.slot(SLOT);
     let mut conn = db.connect();
-    setup_pg(&mut conn, &[(1, 5.0)], &slot);
+    common::pg::setup_orders(&mut conn, &[(1, 5.0)], &slot);
 
     let rt = common::multi_thread_rt();
     let connector = Arc::new(PgAsyncDieselConnector::new(
@@ -1142,17 +1078,18 @@ fn every_read_reports_a_position_taken_before_its_snapshot() {
     let held = Arc::clone(&connector);
     let on = rt.handle().clone();
     let sql = format!("SELECT count(*)::bigint AS v FROM orders {}", common::PARK);
-    let ((value, position), after_commit) = common::park_a_read(&db, &insert(2), move || {
-        on.block_on(async move {
-            held.execute_scalar(
-                &subql::reexec::ReadQuery::without_binds(&sql),
-                ScalarFamily::Int,
-                &(),
-            )
-            .await
-        })
-        .expect("scalar read")
-    });
+    let ((value, position), after_commit) =
+        common::park_a_read(&db, &common::pg::orders_insert(2), move || {
+            on.block_on(async move {
+                held.execute_scalar(
+                    &subql::reexec::ReadQuery::without_binds(&sql),
+                    ScalarFamily::Int,
+                    &(),
+                )
+                .await
+            })
+            .expect("scalar read")
+        });
     assert_eq!(
         value,
         Value::Int(1),
@@ -1166,7 +1103,7 @@ fn every_read_reports_a_position_taken_before_its_snapshot() {
     let held = Arc::clone(&connector);
     let on = rt.handle().clone();
     let sql = format!("SELECT id FROM orders {} ORDER BY id", common::PARK);
-    let (page, after_commit) = common::park_a_read(&db, &insert(3), move || {
+    let (page, after_commit) = common::park_a_read(&db, &common::pg::orders_insert(3), move || {
         on.block_on(async move {
             held.read_page(&subql::reexec::ReadQuery::without_binds(&sql), 1 << 20, &())
                 .await
@@ -1186,17 +1123,18 @@ fn every_read_reports_a_position_taken_before_its_snapshot() {
     let held = Arc::clone(&connector);
     let on = rt.handle().clone();
     let sql = format!("SELECT count(*)::bigint AS c0 FROM orders {}", common::PARK);
-    let ((values, position), after_commit) = common::park_a_read(&db, &insert(4), move || {
-        on.block_on(async move {
-            held.execute_scalar_row(
-                &subql::reexec::ReadQuery::without_binds(&sql),
-                &[ScalarFamily::Int],
-                &(),
-            )
-            .await
-        })
-        .expect("seed read")
-    });
+    let ((values, position), after_commit) =
+        common::park_a_read(&db, &common::pg::orders_insert(4), move || {
+            on.block_on(async move {
+                held.execute_scalar_row(
+                    &subql::reexec::ReadQuery::without_binds(&sql),
+                    &[ScalarFamily::Int],
+                    &(),
+                )
+                .await
+            })
+            .expect("seed read")
+        });
     assert_eq!(
         values,
         vec![Value::Int(3)],
@@ -1217,7 +1155,7 @@ fn grouped_min_snapshots_and_rereads_one_group_async() {
     let url = db.url();
     let slot = db.slot(SLOT);
     let mut conn_setup = db.connect();
-    setup_pg(&mut conn_setup, &[(1, 5.0), (2, 9.0), (3, 11.0)], &slot);
+    common::pg::setup_orders(&mut conn_setup, &[(1, 5.0), (2, 9.0), (3, 11.0)], &slot);
     diesel::update(grouped_schema::orders::table.find(3))
         .set(grouped_schema::orders::status.eq("void"))
         .execute(&mut conn_setup)
@@ -1226,7 +1164,7 @@ fn grouped_min_snapshots_and_rereads_one_group_async() {
 
     common::multi_thread_rt().block_on(async move {
         let pool = pg_async_pool(&url).await;
-        let mut engine = build_engine(catalog(), pool.clone());
+        let mut engine = build_engine(common::pg::orders_catalog(), pool.clone());
         let subscription = match engine
             .register(
                 SubscriptionRequest::<DefaultIds, Postgres>::new(
@@ -1302,7 +1240,7 @@ fn a_scalar_over_a_narrow_integer_column_decodes_async() {
     let url = db.url();
     let slot = db.slot(SLOT);
     let mut conn = db.connect();
-    setup_pg(&mut conn, &[(1, 5.0)], &slot);
+    common::pg::setup_orders(&mut conn, &[(1, 5.0)], &slot);
     sql_query("CREATE TABLE probe (small INT, tiny SMALLINT)")
         .execute(&mut conn)
         .expect("probe table");
@@ -1430,7 +1368,7 @@ fn async_page_reads_apply_typed_binds() {
     let url = db.url();
     let slot = db.slot(SLOT);
     let mut connection = db.connect();
-    setup_pg(&mut connection, &[(7, 1.0)], &slot);
+    common::pg::setup_orders(&mut connection, &[(7, 1.0)], &slot);
     let runtime = common::multi_thread_rt();
     runtime.block_on(async {
         let connector = PgAsyncDieselConnector::new(pg_async_pool(&url).await);
@@ -1499,7 +1437,7 @@ fn each_async_read_runs_read_only_at_repeatable_read() {
     let url = db.url();
     let slot = db.slot(SLOT);
     let mut conn = db.connect();
-    setup_pg(&mut conn, &[(1, 5.0)], &slot);
+    common::pg::setup_orders(&mut conn, &[(1, 5.0)], &slot);
     sql_query("CREATE SEQUENCE probe_seq")
         .execute(&mut conn)
         .expect("create the sequence");
@@ -1584,7 +1522,7 @@ fn two_async_cursors_open_at_once_page_independently() {
     let seed: Vec<(i64, f64)> = (1..=40_u32)
         .map(|id| (i64::from(id), f64::from(id)))
         .collect();
-    setup_pg(&mut conn, &seed, &slot);
+    common::pg::setup_orders(&mut conn, &seed, &slot);
 
     common::multi_thread_rt().block_on(async {
         let connector = PgAsyncDieselConnector::new(pg_async_pool(&url).await);
@@ -1676,7 +1614,7 @@ fn an_async_cursor_that_fails_to_open_keeps_its_connection() {
     let url = db.url();
     let slot = db.slot(SLOT);
     let mut conn = db.connect();
-    setup_pg(&mut conn, &[(1, 1.0)], &slot);
+    common::pg::setup_orders(&mut conn, &[(1, 1.0)], &slot);
     let mut observer = db.connect();
 
     common::multi_thread_rt().block_on(async {
@@ -1736,7 +1674,7 @@ fn every_page_of_an_async_cursor_names_its_columns() {
     let seed: Vec<(i64, f64)> = (1..=8_u32)
         .map(|id| (i64::from(id), f64::from(id)))
         .collect();
-    setup_pg(&mut conn, &seed, &slot);
+    common::pg::setup_orders(&mut conn, &seed, &slot);
 
     common::multi_thread_rt().block_on(async {
         let connector = PgAsyncDieselConnector::new(pg_async_pool(&url).await);

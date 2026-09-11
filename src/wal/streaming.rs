@@ -87,6 +87,22 @@ pub trait CdcSource: Send {
     ) -> impl core::future::Future<Output = Result<(), Self::Error>> + Send;
 }
 
+/// Sets an `AtomicBool` when the loop task exits, however it exits.
+///
+/// Both Postgres CDC sources run their transport on a task and report
+/// liveness to the owning source through this flag. Declared once because
+/// the two loops must agree on the store: if one of them stopped
+/// publishing the exit, its source would report a dead task as live.
+#[cfg(feature = "pg-streaming")]
+pub struct ExitFlagGuard(pub alloc::sync::Arc<core::sync::atomic::AtomicBool>);
+
+#[cfg(feature = "pg-streaming")]
+impl Drop for ExitFlagGuard {
+    fn drop(&mut self) {
+        self.0.store(true, core::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     // `manual_async_fn` would have us write `async fn next_event(...)`
@@ -137,5 +153,31 @@ mod tests {
     fn cdc_source_send_bounds_compose() {
         assert_send::<NoopSource>();
         accept_no_checkpoint_source(&NoopSource);
+    }
+}
+
+#[cfg(all(test, feature = "pg-streaming"))]
+mod exit_flag_guard_tests {
+    use super::ExitFlagGuard;
+    use alloc::sync::Arc;
+    use core::sync::atomic::{AtomicBool, Ordering};
+
+    /// The two source loops report task liveness only through this flag, so
+    /// a guard that forgot to publish on drop would let a source report a
+    /// dead task as live.
+    #[test]
+    fn the_flag_is_set_when_the_guard_drops() {
+        let flag = Arc::new(AtomicBool::new(false));
+        {
+            let _guard = ExitFlagGuard(Arc::clone(&flag));
+            assert!(
+                !flag.load(Ordering::Relaxed),
+                "the flag stays clear while the guard is alive"
+            );
+        }
+        assert!(
+            flag.load(Ordering::Relaxed),
+            "dropping the guard publishes the exit"
+        );
     }
 }

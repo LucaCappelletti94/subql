@@ -11,7 +11,11 @@ use super::{
 /// time and carries the demotion here, which the facade must apply or a later
 /// snapshot mistakes the demoted subscription for a still-folding aggregate.
 pub trait InstallOutputTransitions<B: crate::backend::Backend> {
-    fn transitions(&self) -> &[crate::MaintenanceTransition<B>];
+    /// Defaults to none, which is what every install shape but the
+    /// grouped-aggregate seed carries.
+    fn transitions(&self) -> &[crate::MaintenanceTransition<B>] {
+        &[]
+    }
 }
 
 impl<I: IdTypes, B: crate::backend::Backend, C: crate::Checkpoint> InstallOutputTransitions<B>
@@ -25,25 +29,16 @@ impl<I: IdTypes, B: crate::backend::Backend, C: crate::Checkpoint> InstallOutput
 impl<I: IdTypes, B: crate::backend::Backend, C: crate::Checkpoint> InstallOutputTransitions<B>
     for crate::reexec::ScalarUpdate<I, B, C>
 {
-    fn transitions(&self) -> &[crate::MaintenanceTransition<B>] {
-        &[]
-    }
 }
 
 impl<I: IdTypes, B: crate::backend::Backend, C: crate::Checkpoint> InstallOutputTransitions<B>
     for alloc::vec::Vec<crate::reexec::RowsUpdate<I, B, C>>
 {
-    fn transitions(&self) -> &[crate::MaintenanceTransition<B>] {
-        &[]
-    }
 }
 
 impl<I: IdTypes, B: crate::backend::Backend, C: crate::Checkpoint> InstallOutputTransitions<B>
     for alloc::vec::Vec<crate::reexec::RowDelta<I, B, C>>
 {
-    fn transitions(&self) -> &[crate::MaintenanceTransition<B>] {
-        &[]
-    }
 }
 
 impl<E, I, DB, M, T> crate::Install<T> for AutoResolvingEngine<E, I, DB, M>

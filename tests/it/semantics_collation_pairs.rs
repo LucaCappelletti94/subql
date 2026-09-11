@@ -28,43 +28,20 @@
 #![allow(clippy::unwrap_used)]
 
 use sql_traits::structs::ParserDB;
-use sqlparser::dialect::{MySqlDialect, PostgreSqlDialect, SQLiteDialect};
+
 use subql::backend::{MySql, Postgres, SQLite, Value};
 use subql::testing::TestEvent;
 use subql::RegisterError;
-use subql::{catalog_helpers, DefaultIds, SubscriptionEngine, SubscriptionRequest};
+use subql::{DefaultIds, SubscriptionEngine, SubscriptionRequest};
 
 /// Register `predicate` against `ddl` and answer what registration said.
 macro_rules! registers {
-    ($backend:ty, $dialect:ty, $ddl:expr, $predicate:expr) => {{
-        let db = ParserDB::parse::<$dialect>($ddl).expect("DDL parses");
+    ($backend:ty, $ddl:expr, $predicate:expr) => {{
+        type D = <$backend as subql::backend::Backend>::Dialect;
+        let db = ParserDB::parse::<D>($ddl).expect("DDL parses");
         let mut engine: SubscriptionEngine<TestEvent<$backend>, DefaultIds, ParserDB> =
-            SubscriptionEngine::new(db, <$dialect>::default());
+            SubscriptionEngine::new(db, <D as Default>::default());
         engine.register(SubscriptionRequest::new(1u64, $predicate))
-    }};
-}
-
-/// Dispatch one row through `predicate` and answer whether it matched.
-macro_rules! notifies {
-    ($backend:ty, $dialect:ty, $ddl:expr, $predicate:expr, $cells:expr) => {{
-        let db = ParserDB::parse::<$dialect>($ddl).expect("DDL parses");
-        let table = catalog_helpers::table_id::<subql::backend::Postgres, _>(&db, "t")
-            .expect("t is in the catalog");
-        let mut engine: SubscriptionEngine<TestEvent<$backend>, DefaultIds, ParserDB> =
-            SubscriptionEngine::new(db, <$dialect>::default());
-        let registered = engine
-            .register(SubscriptionRequest::new(1u64, $predicate))
-            .expect("the predicate registers");
-        assert!(
-            registered.not_served_because.is_none(),
-            "this predicate is served in process, and it was refused: {:?}",
-            registered.not_served_because
-        );
-        !engine
-            .consumers(&TestEvent::insert(table, $cells))
-            .expect("dispatch succeeds")
-            .inserted()
-            .is_empty()
     }};
 }
 
@@ -74,12 +51,7 @@ macro_rules! notifies {
 fn pg_refuses_two_different_named_collations() {
     let ddl = "CREATE TABLE t (id INT PRIMARY KEY, c TEXT COLLATE \"C\", \
                p TEXT COLLATE \"POSIX\")";
-    let refused = registers!(
-        Postgres,
-        PostgreSqlDialect,
-        ddl,
-        "SELECT * FROM t WHERE c = p"
-    );
+    let refused = registers!(Postgres, ddl, "SELECT * FROM t WHERE c = p");
     match refused {
         Err(RegisterError::RefusedByEngine { reason, .. }) => assert!(
             reason.contains("could not determine which collation"),
@@ -100,10 +72,9 @@ fn pg_resolves_a_named_collation_against_the_default() {
         Value::String("ab".to_string()),
     ];
     assert!(
-        notifies!(
-            Postgres,
-            PostgreSqlDialect,
+        crate::common::semantics::notifies::<Postgres>(
             ddl,
+            "t",
             "SELECT * FROM t WHERE c = d",
             cells
         ),
@@ -116,7 +87,7 @@ fn pg_resolves_a_named_collation_against_the_default() {
 fn mysql_refuses_two_different_named_collations() {
     let ddl = "CREATE TABLE t (id INT PRIMARY KEY, b VARCHAR(9) COLLATE utf8mb4_bin, \
                n VARCHAR(9) COLLATE utf8mb4_0900_bin)";
-    let refused = registers!(MySql, MySqlDialect, ddl, "SELECT * FROM t WHERE b = n");
+    let refused = registers!(MySql, ddl, "SELECT * FROM t WHERE b = n");
     match refused {
         Err(RegisterError::RefusedByEngine { reason, .. }) => assert!(
             reason.contains("Illegal mix of collations"),
@@ -141,20 +112,18 @@ fn sqlite_takes_the_leftmost_collation() {
         Value::String("A".to_string()),
     ];
     assert!(
-        notifies!(
-            SQLite,
-            SQLiteDialect,
+        crate::common::semantics::notifies::<SQLite>(
             ddl,
+            "t",
             "SELECT * FROM t WHERE nc = b",
             cells.clone()
         ),
         "measured: with NOCASE on the left, 'a' = 'A' is 1"
     );
     assert!(
-        !notifies!(
-            SQLite,
-            SQLiteDialect,
+        !crate::common::semantics::notifies::<SQLite>(
             ddl,
+            "t",
             "SELECT * FROM t WHERE b = nc",
             cells
         ),
@@ -169,20 +138,18 @@ fn sqlite_reads_a_literal_under_the_columns_collation() {
     let ddl = "CREATE TABLE t (id INTEGER PRIMARY KEY, nc TEXT COLLATE NOCASE)";
     let cells = vec![Value::<SQLite>::Int(1), Value::String("a".to_string())];
     assert!(
-        notifies!(
-            SQLite,
-            SQLiteDialect,
+        crate::common::semantics::notifies::<SQLite>(
             ddl,
+            "t",
             "SELECT * FROM t WHERE nc = 'A'",
             cells.clone()
         ),
         "measured: the column's NOCASE applies"
     );
     assert!(
-        notifies!(
-            SQLite,
-            SQLiteDialect,
+        crate::common::semantics::notifies::<SQLite>(
             ddl,
+            "t",
             "SELECT * FROM t WHERE 'A' = nc",
             cells
         ),

@@ -169,22 +169,39 @@ fn comparison_read<B: crate::backend::Backend, DB: DatabaseLike>(
     }
 }
 
-fn direct_column_read<B: crate::backend::Backend, DB: DatabaseLike>(
+/// Resolve a column's kind, then accept it or refuse it with a message.
+///
+/// The three wrappers below share the resolution and the
+/// [`RowRecordError::UnreadableColumn`] wrap and differ only in which kinds
+/// they accept and how they name the mismatch, so the refusal contract is
+/// stated once. `comparison_read` is not a family member: it matches on the
+/// literal and the kind together.
+fn kind_read<B: crate::backend::Backend, DB: DatabaseLike>(
     column: &ColumnRead,
     db: &DB,
     table: TableId,
+    accept: impl Fn(ColumnKind) -> bool,
+    reject: impl Fn(ColumnKind) -> alloc::string::String,
 ) -> Option<RowRecordError> {
     let kind = match column_read_kind::<B, DB>(column, db, table) {
         Ok(kind) => kind,
         Err(refusal) => return Some(refusal),
     };
-    if direct_kind(kind) {
+    if accept(kind) {
         None
     } else {
-        Some(RowRecordError::UnreadableColumn(alloc::format!(
-            "column {column} has unsupported kind {kind:?}"
-        )))
+        Some(RowRecordError::UnreadableColumn(reject(kind)))
     }
+}
+
+fn direct_column_read<B: crate::backend::Backend, DB: DatabaseLike>(
+    column: &ColumnRead,
+    db: &DB,
+    table: TableId,
+) -> Option<RowRecordError> {
+    kind_read::<B, DB>(column, db, table, direct_kind, |kind| {
+        alloc::format!("column {column} has unsupported kind {kind:?}")
+    })
 }
 
 fn bool_read<B: crate::backend::Backend, DB: DatabaseLike>(
@@ -192,17 +209,13 @@ fn bool_read<B: crate::backend::Backend, DB: DatabaseLike>(
     db: &DB,
     table: TableId,
 ) -> Option<RowRecordError> {
-    let kind = match column_read_kind::<B, DB>(column, db, table) {
-        Ok(kind) => kind,
-        Err(refusal) => return Some(refusal),
-    };
-    if kind == ColumnKind::Bool {
-        None
-    } else {
-        Some(RowRecordError::UnreadableColumn(alloc::format!(
-            "column {column} is {kind:?}, not Bool"
-        )))
-    }
+    kind_read::<B, DB>(
+        column,
+        db,
+        table,
+        |kind| kind == ColumnKind::Bool,
+        |kind| alloc::format!("column {column} is {kind:?}, not Bool"),
+    )
 }
 
 fn document_read<B: crate::backend::Backend, DB: DatabaseLike>(
@@ -210,17 +223,13 @@ fn document_read<B: crate::backend::Backend, DB: DatabaseLike>(
     db: &DB,
     table: TableId,
 ) -> Option<RowRecordError> {
-    let kind = match column_read_kind::<B, DB>(column, db, table) {
-        Ok(kind) => kind,
-        Err(refusal) => return Some(refusal),
-    };
-    if kind == ColumnKind::Json {
-        None
-    } else {
-        Some(RowRecordError::UnreadableColumn(alloc::format!(
-            "column {column} is {kind:?}, not Json"
-        )))
-    }
+    kind_read::<B, DB>(
+        column,
+        db,
+        table,
+        |kind| kind == ColumnKind::Json,
+        |kind| alloc::format!("column {column} is {kind:?}, not Json"),
+    )
 }
 
 pub(super) const fn direct_kind(kind: ColumnKind) -> bool {

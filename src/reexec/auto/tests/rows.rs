@@ -34,20 +34,11 @@ fn match_rows_replays_without_reading_or_folding() {
     // Captured MIN: a delete of its extreme is a read on the live path, and
     // the connector call that read needs is the guard that match_rows stays
     // off the resolving path.
-    let min_id = match e
-        .register(
-            SubscriptionRequest::new(1u64, "SELECT MIN(price) FROM orders"),
-            (),
-        )
-        .unwrap()
-    {
-        Registered {
-            subscription_id,
-            tier: Tier::Scalar { .. },
-            ..
-        } => subscription_id,
-        other => panic!("expected Scalar, got {other:?}"),
-    };
+    let min_id = crate::reexec::test_fixtures::register_scalar_query(
+        &mut e,
+        1u64,
+        "SELECT MIN(price) FROM orders",
+    );
     crate::Install::install(
         &mut e,
         min_id,

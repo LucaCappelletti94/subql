@@ -26,19 +26,34 @@ struct UnsupportedReadBinds;
 /// hands back.
 ///
 /// Implemented for the three shipped backends ([`crate::backend::Postgres`],
-/// [`crate::backend::MySql`], [`crate::backend::SQLite`]), each of which
-/// spells [`crate::backend::Backend::Int`] / [`crate::backend::Backend::Float`] / [`crate::backend::Backend::String`] as
-/// `i64` / `f64` / `String` respectively; the constructors are trivial and
-/// let the generic [`DieselConnector<C, B>`](super::DieselConnector) stay backend-agnostic at the
+/// [`crate::backend::MySql`], [`crate::backend::SQLite`]). The standard
+/// carriers are part of the contract rather than a coincidence, which is what
+/// lets the three value constructors be defaults and keeps the generic
+/// [`DieselConnector<C, B>`](super::DieselConnector) backend-agnostic at the
 /// type level while producing correctly typed [`Value<B>`]s.
+///
+/// Stated as supertrait equality, not a `where` clause: a `where` clause on a
+/// trait is not an implied bound, so every `B: DieselBackend` site would have
+/// to repeat it.
 #[cfg(feature = "executor-diesel")]
-pub trait DieselBackend: crate::backend::Backend + Sized {
+pub trait DieselBackend:
+    crate::backend::Backend<Int = i64, Float = f64, String = String> + Sized
+{
     /// Wrap an `i64` decoded via `Nullable<BigInt>` as [`Value::Int`].
-    fn value_from_i64(x: i64) -> Value<Self>;
+    #[must_use]
+    fn value_from_i64(x: i64) -> Value<Self> {
+        Value::Int(x)
+    }
     /// Wrap an `f64` decoded via `Nullable<Double>` as [`Value::Float`].
-    fn value_from_f64(x: f64) -> Value<Self>;
+    #[must_use]
+    fn value_from_f64(x: f64) -> Value<Self> {
+        Value::Float(x)
+    }
     /// Wrap a `String` decoded via `Nullable<Text>` as [`Value::String`].
-    fn value_from_string(s: String) -> Value<Self>;
+    #[must_use]
+    fn value_from_string(s: String) -> Value<Self> {
+        Value::String(s)
+    }
     /// Converts a subql value to the shared diesel bind vocabulary.
     fn read_bind(value: &Value<Self>) -> Option<DieselReadBind<'_>>;
     /// SQL type name to cast a `SUM` component to double precision in this
@@ -76,15 +91,6 @@ pub enum DieselReadBind<'a> {
 
 #[cfg(feature = "executor-diesel")]
 impl DieselBackend for crate::backend::Postgres {
-    fn value_from_i64(x: i64) -> Value<Self> {
-        Value::Int(x)
-    }
-    fn value_from_f64(x: f64) -> Value<Self> {
-        Value::Float(x)
-    }
-    fn value_from_string(s: String) -> Value<Self> {
-        Value::String(s)
-    }
     fn read_bind(value: &Value<Self>) -> Option<DieselReadBind<'_>> {
         Some(match value {
             Value::Bool(value) => DieselReadBind::Bool(value),
@@ -109,15 +115,6 @@ impl DieselBackend for crate::backend::Postgres {
 
 #[cfg(feature = "executor-diesel")]
 impl<C: crate::backend::MySqlTableNameCase> DieselBackend for crate::backend::MySql<C> {
-    fn value_from_i64(x: i64) -> Value<Self> {
-        Value::Int(x)
-    }
-    fn value_from_f64(x: f64) -> Value<Self> {
-        Value::Float(x)
-    }
-    fn value_from_string(s: String) -> Value<Self> {
-        Value::String(s)
-    }
     fn read_bind(value: &Value<Self>) -> Option<DieselReadBind<'_>> {
         Some(match value {
             Value::Bool(value) => DieselReadBind::Bool(value),
@@ -143,15 +140,6 @@ impl<C: crate::backend::MySqlTableNameCase> DieselBackend for crate::backend::My
 
 #[cfg(feature = "executor-diesel")]
 impl DieselBackend for crate::backend::SQLite {
-    fn value_from_i64(x: i64) -> Value<Self> {
-        Value::Int(x)
-    }
-    fn value_from_f64(x: f64) -> Value<Self> {
-        Value::Float(x)
-    }
-    fn value_from_string(s: String) -> Value<Self> {
-        Value::String(s)
-    }
     fn read_bind(value: &Value<Self>) -> Option<DieselReadBind<'_>> {
         Some(match value {
             Value::Bool(value) | Value::Int(value) => DieselReadBind::Int(value),

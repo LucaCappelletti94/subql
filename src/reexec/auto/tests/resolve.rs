@@ -14,30 +14,13 @@ fn delete_of_extreme_resolves_via_connector() {
     // Connector returns 7.0 when re-run after the extreme is removed.
     let (mut e, tid) = engine_with_values(alloc::vec![Value::Float(7.0)]);
 
-    let qid = match e
-        .register(
-            SubscriptionRequest::new(1u64, "SELECT MIN(price) FROM orders"),
-            (),
-        )
-        .unwrap()
-    {
-        Registered {
-            subscription_id,
-            tier: Tier::Scalar { .. },
-            ..
-        } => subscription_id,
-        other => panic!("expected ReExec, got {other:?}"),
-    };
     // Bootstrap: model = {1=>5.0}. Current MIN = 5.0.
-    assert!(crate::Install::install(
+    let qid = crate::reexec::test_fixtures::bootstrap_scalar_query(
         &mut e,
-        qid,
-        crate::ScalarInstall {
-            value: Value::Float(5.0),
-            checkpoint: None::<crate::NoCheckpoint>
-        }
-    )
-    .is_ok());
+        1u64,
+        "SELECT MIN(price) FROM orders",
+        5.0,
+    );
 
     // Insert price=9.0 (>5.0): in-process Unchanged, no scalar update, no trigger.
     let n = e.apply(&insert_event(tid, 2, 9.0)).unwrap();
@@ -59,29 +42,12 @@ fn delete_of_extreme_resolves_via_connector() {
 #[test]
 fn unrelated_column_update_does_not_call_connector() {
     let (mut e, tid) = engine_with_values(alloc::vec![]);
-    let qid = match e
-        .register(
-            SubscriptionRequest::new(1u64, "SELECT MAX(price) FROM orders"),
-            (),
-        )
-        .unwrap()
-    {
-        Registered {
-            subscription_id,
-            tier: Tier::Scalar { .. },
-            ..
-        } => subscription_id,
-        other => panic!("expected ReExec, got {other:?}"),
-    };
-    assert!(crate::Install::install(
+    crate::reexec::test_fixtures::bootstrap_scalar_query(
         &mut e,
-        qid,
-        crate::ScalarInstall {
-            value: Value::Float(10.0),
-            checkpoint: None::<crate::NoCheckpoint>
-        }
-    )
-    .is_ok());
+        1u64,
+        "SELECT MAX(price) FROM orders",
+        10.0,
+    );
 
     let n = e.apply(&update_status_only(tid, 1, 10.0)).unwrap();
     assert!(n.scalar_updates.is_empty());
@@ -92,29 +58,12 @@ fn unrelated_column_update_does_not_call_connector() {
 fn connector_error_aborts_batch() {
     // Empty queue: the connector errors on first call.
     let (mut e, tid) = engine_with_values(alloc::vec![]);
-    let qid = match e
-        .register(
-            SubscriptionRequest::new(1u64, "SELECT MIN(price) FROM orders"),
-            (),
-        )
-        .unwrap()
-    {
-        Registered {
-            subscription_id,
-            tier: Tier::Scalar { .. },
-            ..
-        } => subscription_id,
-        other => panic!("expected ReExec, got {other:?}"),
-    };
-    assert!(crate::Install::install(
+    crate::reexec::test_fixtures::bootstrap_scalar_query(
         &mut e,
-        qid,
-        crate::ScalarInstall {
-            value: Value::Float(5.0),
-            checkpoint: None::<crate::NoCheckpoint>
-        }
-    )
-    .is_ok());
+        1u64,
+        "SELECT MIN(price) FROM orders",
+        5.0,
+    );
 
     e.apply(&delete_event(tid, 1, 5.0)).unwrap();
     match e.resolve_collect() {
@@ -132,20 +81,11 @@ fn connector_error_aborts_batch() {
 #[test]
 fn snapshot_installs_via_connector() {
     let (mut e, tid) = engine_with_values(alloc::vec![Value::Float(12.5)]);
-    let qid = match e
-        .register(
-            SubscriptionRequest::new(1u64, "SELECT MIN(price) FROM orders"),
-            (),
-        )
-        .unwrap()
-    {
-        Registered {
-            subscription_id,
-            tier: Tier::Scalar { .. },
-            ..
-        } => subscription_id,
-        other => panic!("expected ReExec, got {other:?}"),
-    };
+    let qid = crate::reexec::test_fixtures::register_scalar_query(
+        &mut e,
+        1u64,
+        "SELECT MIN(price) FROM orders",
+    );
 
     // No bootstrap install: snapshot does it.
     let snap = e.snapshot(qid).unwrap().expect("subscription_id exists");
@@ -181,20 +121,11 @@ fn snapshot_unknown_query_returns_none() {
 fn connector_error_names_its_subscription() {
     // Empty queue: the connector errors on the triggered read.
     let (mut e, tid) = engine_with_values(alloc::vec![]);
-    let qid = match e
-        .register(
-            SubscriptionRequest::new(1u64, "SELECT MIN(price) FROM orders"),
-            (),
-        )
-        .unwrap()
-    {
-        Registered {
-            subscription_id,
-            tier: Tier::Scalar { .. },
-            ..
-        } => subscription_id,
-        other => panic!("expected Scalar, got {other:?}"),
-    };
+    let qid = crate::reexec::test_fixtures::register_scalar_query(
+        &mut e,
+        1u64,
+        "SELECT MIN(price) FROM orders",
+    );
     crate::Install::install(
         &mut e,
         qid,

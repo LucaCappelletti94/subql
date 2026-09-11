@@ -701,39 +701,24 @@ where
     ))
 }
 
-/// Record one unanswerable predicate against every subscription bound to
-/// it, for the same reason refusals are recorded per subscription.
-fn collect_unanswered_for_predicate<I: IdTypes, B: Backend>(
-    predicates: &PredicateStore<I, B>,
-    pred_id: PredicateId,
-    consumers: &RoaringBitmap,
-    column: crate::ColumnId,
-    out: &mut Vec<(ConsumerOrdinal, SubscriptionId, crate::ColumnId)>,
-) {
-    for ord_u32 in consumers {
-        let ord = ConsumerOrdinal::new(ord_u32);
-        if let Some(sub_ids) = predicates.binding_lookup.get(&(pred_id, ord)) {
-            out.extend(sub_ids.iter().map(|sub_id| (ord, *sub_id, column)));
-        }
-    }
-}
-
-/// Record one refused predicate against every subscription bound to it.
+/// Record one per-subscription report row against every subscription bound
+/// to a predicate.
 ///
 /// The failure is per subscription, not per consumer: one consumer can hold
-/// several subscriptions, and only the ones whose predicate was refused
-/// failed.
-fn collect_refusals_for_predicate<I: IdTypes, B: Backend>(
+/// several subscriptions, and only the ones bound to this predicate are
+/// affected. `payload` is the reason, an unreadable [`crate::ColumnId`] or
+/// an [`EvaluationRefusal`], carried unchanged onto each row.
+fn collect_bound_subscriptions<I: IdTypes, B: Backend, T: Copy>(
     predicates: &PredicateStore<I, B>,
     pred_id: PredicateId,
     consumers: &RoaringBitmap,
-    failure: EvaluationRefusal,
-    out: &mut Vec<(ConsumerOrdinal, SubscriptionId, EvaluationRefusal)>,
+    payload: T,
+    out: &mut Vec<(ConsumerOrdinal, SubscriptionId, T)>,
 ) {
     for ord_u32 in consumers {
         let ord = ConsumerOrdinal::new(ord_u32);
         if let Some(sub_ids) = predicates.binding_lookup.get(&(pred_id, ord)) {
-            out.extend(sub_ids.iter().map(|sub_id| (ord, *sub_id, failure)));
+            out.extend(sub_ids.iter().map(|sub_id| (ord, *sub_id, payload)));
         }
     }
 }
@@ -829,7 +814,7 @@ where
             .into_iter()
             .flatten()
         {
-            collect_refusals_for_predicate(
+            collect_bound_subscriptions(
                 &snapshot.predicates,
                 pred_id,
                 &consumers,
@@ -850,7 +835,7 @@ where
         // identity the old image is the key alone, so treating that as
         // unanswerable would report every update on such a table.
         if let Some((consumers, column)) = new_matched.unanswered {
-            collect_unanswered_for_predicate(
+            collect_bound_subscriptions(
                 &snapshot.predicates,
                 pred_id,
                 &consumers,
@@ -962,16 +947,10 @@ where
             context.db,
         )?;
         if let Some((consumers, failure)) = verdict.refused {
-            collect_refusals_for_predicate(
-                store,
-                pred_id,
-                &consumers,
-                failure,
-                &mut reports.refusals,
-            );
+            collect_bound_subscriptions(store, pred_id, &consumers, failure, &mut reports.refusals);
         }
         if let Some((consumers, column)) = verdict.unanswered {
-            collect_unanswered_for_predicate(
+            collect_bound_subscriptions(
                 store,
                 pred_id,
                 &consumers,

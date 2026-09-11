@@ -88,29 +88,12 @@ fn debounce_skips_within_window_and_fires_after() {
         .with_clock(engine_clock)
         .with_debounce_per_query(core::time::Duration::from_millis(100));
 
-    let qid = match e
-        .register(
-            SubscriptionRequest::new(1u64, "SELECT MIN(price) FROM orders"),
-            (),
-        )
-        .unwrap()
-    {
-        Registered {
-            subscription_id,
-            tier: Tier::Scalar { .. },
-            ..
-        } => subscription_id,
-        other => panic!("expected ReExec, got {other:?}"),
-    };
-    assert!(crate::Install::install(
+    let qid = crate::reexec::test_fixtures::bootstrap_scalar_query(
         &mut e,
-        qid,
-        crate::ScalarInstall {
-            value: Value::Float(5.0),
-            checkpoint: None::<crate::NoCheckpoint>
-        }
-    )
-    .is_ok());
+        1u64,
+        "SELECT MIN(price) FROM orders",
+        5.0,
+    );
 
     // First displacing event: re-exec proceeds (no prior stamp).
     e.apply(&delete_event(tid, 1, 5.0)).unwrap();
@@ -172,29 +155,12 @@ fn debounce_without_clock_is_a_noop() {
     let (e0, tid) = engine_with_values(alloc::vec![Value::Float(9.0), Value::Float(7.0)]);
     let mut e = e0.with_debounce_per_query(core::time::Duration::from_secs(3600));
 
-    let qid = match e
-        .register(
-            SubscriptionRequest::new(1u64, "SELECT MIN(price) FROM orders"),
-            (),
-        )
-        .unwrap()
-    {
-        Registered {
-            subscription_id,
-            tier: Tier::Scalar { .. },
-            ..
-        } => subscription_id,
-        other => panic!("expected ReExec, got {other:?}"),
-    };
-    assert!(crate::Install::install(
+    crate::reexec::test_fixtures::bootstrap_scalar_query(
         &mut e,
-        qid,
-        crate::ScalarInstall {
-            value: Value::Float(5.0),
-            checkpoint: None::<crate::NoCheckpoint>
-        }
-    )
-    .is_ok());
+        1u64,
+        "SELECT MIN(price) FROM orders",
+        5.0,
+    );
 
     e.apply(&delete_event(tid, 1, 5.0)).unwrap();
     let result = e.resolve_collect().unwrap();

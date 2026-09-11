@@ -11,20 +11,11 @@ use super::*;
 #[test]
 fn unregister_subscription_drops_the_queued_read() {
     let (mut e, tid) = engine_with_values(vec![Value::Float(5.0)]);
-    let captured = match e
-        .register(
-            SubscriptionRequest::new(1u64, "SELECT MIN(price) FROM orders"),
-            (),
-        )
-        .unwrap()
-    {
-        Registered {
-            subscription_id,
-            tier: Tier::Scalar { .. },
-            ..
-        } => subscription_id,
-        other => panic!("expected Scalar, got {other:?}"),
-    };
+    let captured = crate::reexec::test_fixtures::register_scalar_query(
+        &mut e,
+        1u64,
+        "SELECT MIN(price) FROM orders",
+    );
     crate::Install::install(
         &mut e,
         captured,
@@ -58,20 +49,11 @@ fn unregister_subscription_drops_the_queued_read() {
 #[test]
 fn async_engine_unregister_drops_context() {
     let (mut e, _tid) = engine_with_values(vec![]);
-    let qid = match e
-        .register(
-            SubscriptionRequest::new(1u64, "SELECT MIN(price) FROM orders"),
-            (),
-        )
-        .unwrap()
-    {
-        Registered {
-            subscription_id,
-            tier: Tier::Scalar { .. },
-            ..
-        } => subscription_id,
-        other => panic!("expected ReExec, got {other:?}"),
-    };
+    let qid = crate::reexec::test_fixtures::register_scalar_query(
+        &mut e,
+        1u64,
+        "SELECT MIN(price) FROM orders",
+    );
     assert_eq!(e.contexts.len(), 1);
     assert!(e.unregister_subscription(qid));
     assert_eq!(e.contexts.len(), 0);
@@ -80,20 +62,11 @@ fn async_engine_unregister_drops_context() {
 #[test]
 fn async_unregister_subscription_resolves_either_registry() {
     let (mut e, _tid) = engine_with_values(vec![]);
-    let captured = match e
-        .register(
-            SubscriptionRequest::new(1u64, "SELECT MIN(price) FROM orders"),
-            (),
-        )
-        .unwrap()
-    {
-        Registered {
-            subscription_id,
-            tier: Tier::Scalar { .. },
-            ..
-        } => subscription_id,
-        other => panic!("expected Scalar, got {other:?}"),
-    };
+    let captured = crate::reexec::test_fixtures::register_scalar_query(
+        &mut e,
+        1u64,
+        "SELECT MIN(price) FROM orders",
+    );
     let in_process = match e
         .register(
             SubscriptionRequest::new(2u64, "SELECT * FROM orders WHERE price > 100"),
@@ -125,20 +98,11 @@ fn async_unregister_subscription_resolves_either_registry() {
 #[test]
 fn async_unregister_subscription_drops_the_resolve_context() {
     let (mut e, tid) = engine_with_values(vec![Value::Float(7.0)]);
-    let captured = match e
-        .register(
-            SubscriptionRequest::new(1u64, "SELECT MIN(price) FROM orders"),
-            (),
-        )
-        .unwrap()
-    {
-        Registered {
-            subscription_id,
-            tier: Tier::Scalar { .. },
-            ..
-        } => subscription_id,
-        other => panic!("expected Scalar, got {other:?}"),
-    };
+    let captured = crate::reexec::test_fixtures::register_scalar_query(
+        &mut e,
+        1u64,
+        "SELECT MIN(price) FROM orders",
+    );
     crate::Install::install(
         &mut e,
         captured,

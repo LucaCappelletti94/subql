@@ -48,9 +48,14 @@ macro_rules! dispatch {
             .expect("t is in the catalog");
         let mut engine: SubscriptionEngine<TestEvent<$backend>, DefaultIds, ParserDB> =
             SubscriptionEngine::new(db, <$dialect>::default());
-        engine
+        let registered = engine
             .register(SubscriptionRequest::new(1u64, $predicate))
             .expect("the predicate registers");
+        assert!(
+            registered.not_served_because.is_none(),
+            "this case is about in-process evaluation, but the predicate was refused: {:?}",
+            registered.not_served_because
+        );
         let row = vec![Value::Int(1), Value::Int($qty)];
         engine
             .consumers(&TestEvent::insert(table, row))

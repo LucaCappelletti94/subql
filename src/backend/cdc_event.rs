@@ -237,16 +237,6 @@ impl<'a, E: CdcEvent> ResolvedEvent<'a, E> {
             .get_or_init(|| self.event.changed_columns_resolved(database, self.table_id))
             .as_slice()
     }
-
-    pub(crate) fn value_at<DB: DatabaseLike>(
-        &self,
-        database: &DB,
-        row: RowKind,
-        col: ColumnId,
-    ) -> Result<Value<E::Backend>, crate::ValueError> {
-        self.event
-            .value_at_resolved(database, self.table_id, row, col)
-    }
 }
 
 impl<E: CdcEvent> CdcEvent for ResolvedEvent<'_, E> {

@@ -212,3 +212,74 @@ pub fn create_pgoutput_slot(conn: &mut PgConnection, name: &str) {
     .execute(conn)
     .expect("create pgoutput slot");
 }
+
+/// The catalog DDL the three Postgres re-execution suites share.
+#[cfg(any(
+    feature = "executor-diesel-postgres",
+    feature = "executor-diesel-async-postgres",
+    feature = "executor-diesel-postgres-r2d2",
+))]
+pub const ORDERS_DDL: &str =
+    "CREATE TABLE orders (id INT PRIMARY KEY, price FLOAT, quantity INT, status TEXT);";
+
+/// The server-side DDL. `DOUBLE PRECISION` is the canonical 8-byte float, so
+/// the `Nullable<Double>` row type in `DieselConnector` decodes cleanly.
+#[cfg(any(
+    feature = "executor-diesel-postgres",
+    feature = "executor-diesel-async-postgres",
+    feature = "executor-diesel-postgres-r2d2",
+))]
+pub const ORDERS_PG_DDL: &str = "CREATE TABLE orders (
+    id INT PRIMARY KEY,
+    price DOUBLE PRECISION,
+    quantity INT,
+    status TEXT
+)";
+
+/// DDL, `REPLICA IDENTITY FULL`, seed rows, replication slot.
+///
+/// The seeds are inserted before the slot is created, so their WAL records
+/// never reach it and a test observes only its own DML.
+#[cfg(any(
+    feature = "executor-diesel-postgres",
+    feature = "executor-diesel-async-postgres",
+    feature = "executor-diesel-postgres-r2d2",
+))]
+pub fn setup_orders(conn: &mut diesel::PgConnection, seed: &[(i64, f64)], slot: &str) {
+    diesel::sql_query(ORDERS_PG_DDL)
+        .execute(conn)
+        .expect("CREATE TABLE");
+    diesel::sql_query("ALTER TABLE orders REPLICA IDENTITY FULL")
+        .execute(conn)
+        .expect("REPLICA IDENTITY FULL");
+    for (id, price) in seed {
+        diesel::sql_query(format!(
+            "INSERT INTO orders (id, price, quantity, status) \
+             VALUES ({id}, {price}, 1, 'paid')"
+        ))
+        .execute(conn)
+        .expect("seed insert");
+    }
+    super::create_slot(conn, slot);
+}
+
+/// One more row, for a commit that lands while a read is parked.
+#[cfg(any(
+    feature = "executor-diesel-postgres",
+    feature = "executor-diesel-async-postgres",
+    feature = "executor-diesel-postgres-r2d2",
+))]
+pub fn orders_insert(id: i64) -> String {
+    format!("INSERT INTO orders (id, price, quantity, status) VALUES ({id}, 7.0, 1, 'paid')")
+}
+
+/// The in-process catalog the engine and the parser share.
+#[cfg(any(
+    feature = "executor-diesel-postgres",
+    feature = "executor-diesel-async-postgres",
+    feature = "executor-diesel-postgres-r2d2",
+))]
+pub fn orders_catalog() -> sql_traits::structs::ParserDB {
+    sql_traits::structs::ParserDB::parse::<sqlparser::dialect::PostgreSqlDialect>(ORDERS_DDL)
+        .expect("parse DDL")
+}
