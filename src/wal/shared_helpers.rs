@@ -184,3 +184,37 @@ mod tests {
         }
     }
 }
+
+/// Pull the next event off a source channel shared by the polling and
+/// streaming `CdcSource` implementations. A value becomes `Ok(Some(..))`
+/// and a closed channel ends the stream as `Ok(None)`.
+///
+/// # Errors
+///
+/// Propagates an error the sender pushed through the channel, unchanged.
+#[cfg(feature = "pg-streaming")]
+pub async fn recv_source_event<T, E>(
+    rx: &mut tokio::sync::mpsc::Receiver<Result<T, E>>,
+) -> Result<Option<T>, E> {
+    match rx.recv().await {
+        Some(Ok(event)) => Ok(Some(event)),
+        Some(Err(error)) => Err(error),
+        None => Ok(None),
+    }
+}
+
+#[cfg(all(test, feature = "pg-streaming"))]
+mod recv_source_event_tests {
+    use super::recv_source_event;
+
+    #[tokio::test]
+    async fn delivers_value_error_and_stream_end() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Result<u32, ()>>(4);
+        tx.send(Ok(7)).await.expect("channel open");
+        assert_eq!(recv_source_event(&mut rx).await, Ok(Some(7)));
+        tx.send(Err(())).await.expect("channel open");
+        assert!(recv_source_event(&mut rx).await.is_err());
+        drop(tx);
+        assert_eq!(recv_source_event(&mut rx).await, Ok(None));
+    }
+}

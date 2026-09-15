@@ -8,17 +8,16 @@ use sqlparser::dialect::PostgreSqlDialect;
 use std::hint::black_box;
 use std::time::Duration;
 use subql::backend::{Postgres, Value};
-use subql::testing::workload::{
-    bounded_i64, equality_tree_sql, fallback_tree_sql, mix_seed, mixed_tree_sql, range_tree_sql,
+use subql::testing::dispatch_fixtures::{
+    bench_catalog_folded, bounded_i64, equality_tree_sql, fallback_tree_sql,
+    make_test_event_folded, mix_seed, mixed_tree_sql, order_row, order_values, range_tree_sql,
     realistic_tree_sql, realistic_workload_seed, status_for,
 };
 use subql::testing::TestEvent;
 use subql::{DefaultIds, SubscriptionEngine, SubscriptionRequest};
 
-/// Bench-only: the event corpus is a benchmark input, not part of the
-/// shared workload definition.
 const EVENT_CORPUS_SIZE: usize = 64;
-const EVENT_CORPUS_SALT: u64 = 0xA1B2_C3D4_E5F6_7788;
+const EVENT_CORPUS_SEED: u64 = 0xA1B2_C3D4_E5F6_7788;
 
 fn scaling_equality_sql(seed: u64) -> String {
     let amount = 25 + bounded_i64(seed ^ 0x1111, 1_200);
@@ -79,7 +78,7 @@ fn scaling_tree_sql(seed: u64) -> String {
 fn build_scaling_engine(
     predicate_count: usize,
 ) -> SubscriptionEngine<TestEvent<Postgres>, DefaultIds, ParserDB> {
-    let catalog = bench_catalog();
+    let catalog = bench_catalog_folded();
     let mut engine: SubscriptionEngine<TestEvent<Postgres>, DefaultIds, ParserDB> =
         SubscriptionEngine::new(catalog, PostgreSqlDialect {});
 
@@ -95,179 +94,53 @@ fn build_scaling_engine(
     engine
 }
 
-/// Bench fixture catalog. A placeholder table is declared so the `orders`
-/// table id is stable at 1 (matching `TestEvent::<Postgres>::insert(1, ...)`).
-fn bench_catalog() -> ParserDB {
-    ParserDB::parse::<PostgreSqlDialect>(
-        "CREATE TABLE _bench_pad (id INT);\n\
-         CREATE TABLE orders (\
-             id INT PRIMARY KEY, user_id INT, amount INT, status TEXT, \
-             priority INT, quantity INT, discount INT, tax INT, shipping INT, \
-             created_at INT, folded TEXT COLLATE \"C\"\
-         );",
-    )
-    .expect("bench DDL parses")
-}
-
-fn make_test_event(seed: u64) -> TestEvent<Postgres> {
-    let id = 1 + bounded_i64(seed ^ 0x1A2A, 500_000);
-    let user_id = bounded_i64(seed ^ 0x2B3B, 20_000);
-    let amount = 30 + bounded_i64(seed ^ 0x3C4C, 3_500);
-    let priority = 1 + bounded_i64(seed ^ 0x4D5D, 9);
-    let quantity = 1 + bounded_i64(seed ^ 0x5E6E, 40);
-    let discount = if mix_seed(seed ^ 0x6F7F).is_multiple_of(5) {
-        Value::<Postgres>::Null
-    } else {
-        Value::<Postgres>::Int(bounded_i64(seed ^ 0x7A8A, 18))
-    };
-    let tax = 2 + bounded_i64(seed ^ 0x8B9B, 40);
-    let shipping = 4 + bounded_i64(seed ^ 0x9CAC, 30);
-    let created_at = 1_699_500_000 + bounded_i64(seed ^ 0xADBD, 240 * 24 * 3600);
-    let status = status_for(seed ^ 0xBECF);
-
-    TestEvent::<Postgres>::insert(
-        1,
-        vec![
-            Value::Int(id),
-            Value::Int(user_id),
-            Value::Int(amount),
-            Value::String(status.into()),
-            Value::Int(priority),
-            Value::Int(quantity),
-            discount,
-            Value::Int(tax),
-            Value::Int(shipping),
-            Value::Int(created_at),
-            Value::String(status.into()),
-        ],
-    )
-    .with_pk_columns([0u16])
-}
-
 fn make_test_update_event(seed: u64) -> TestEvent<Postgres> {
-    let id = 1 + bounded_i64(seed ^ 0x1A2A, 500_000);
-    let user_id = bounded_i64(seed ^ 0x2B3B, 20_000);
-    let old_amount = 30 + bounded_i64(seed ^ 0x3C4C, 3_500);
-    let old_priority = 1 + bounded_i64(seed ^ 0x4D5D, 9);
-    let old_quantity = 1 + bounded_i64(seed ^ 0x5E6E, 40);
-    let old_discount = if mix_seed(seed ^ 0x6F7F).is_multiple_of(5) {
-        Value::<Postgres>::Null
-    } else {
-        Value::<Postgres>::Int(bounded_i64(seed ^ 0x7A8A, 18))
-    };
-    let old_tax = 2 + bounded_i64(seed ^ 0x8B9B, 40);
-    let old_shipping = 4 + bounded_i64(seed ^ 0x9CAC, 30);
-    let old_created_at = 1_699_500_000 + bounded_i64(seed ^ 0xADBD, 240 * 24 * 3600);
-    let old_status = status_for(seed ^ 0xBECF);
-
-    let mut new_amount = old_amount;
-    let mut new_priority = old_priority;
-    let mut new_quantity = old_quantity;
-    let mut new_discount = old_discount.clone();
-    let mut new_tax = old_tax;
-    let mut new_shipping = old_shipping;
-    let mut new_status = old_status;
-
+    let old = order_row(seed);
+    let mut new = old.clone();
     let changed_columns: Vec<u16> = match mix_seed(seed ^ 0xDEAD_BEEF) % 4 {
         0 => {
-            new_amount = old_amount + 1 + bounded_i64(seed ^ 0x1111_2222, 40);
+            new.amount += 1 + bounded_i64(seed ^ 0x1111_2222, 40);
             vec![2u16]
         }
         1 => {
-            new_status = status_for(seed ^ 0x3333_4444);
+            new.status = status_for(seed ^ 0x3333_4444);
             vec![3u16]
         }
         2 => {
-            new_priority = old_priority + 1;
-            new_quantity = old_quantity + 2;
+            new.priority += 1;
+            new.quantity += 2;
             vec![4u16, 5u16]
         }
         _ => {
-            new_discount = if matches!(old_discount, Value::Null) {
+            new.discount = if matches!(old.discount, Value::Null) {
                 Value::<Postgres>::Int(1 + bounded_i64(seed ^ 0x5555_6666, 12))
             } else {
                 Value::<Postgres>::Null
             };
-            new_tax = old_tax + 1;
-            new_shipping = old_shipping + 1;
+            new.tax += 1;
+            new.shipping += 1;
             vec![6u16, 7u16, 8u16]
         }
     };
 
-    TestEvent::<Postgres>::update(
-        1,
-        vec![
-            Value::Int(id),
-            Value::Int(user_id),
-            Value::Int(old_amount),
-            Value::String(old_status.into()),
-            Value::Int(old_priority),
-            Value::Int(old_quantity),
-            old_discount,
-            Value::Int(old_tax),
-            Value::Int(old_shipping),
-            Value::Int(old_created_at),
-        ],
-        vec![
-            Value::Int(id),
-            Value::Int(user_id),
-            Value::Int(new_amount),
-            Value::String(new_status.into()),
-            Value::Int(new_priority),
-            Value::Int(new_quantity),
-            new_discount,
-            Value::Int(new_tax),
-            Value::Int(new_shipping),
-            Value::Int(old_created_at),
-        ],
-    )
-    .with_pk_columns([0u16])
-    .with_changed_columns(changed_columns)
+    TestEvent::<Postgres>::update(1, order_values(&old, None), order_values(&new, None))
+        .with_pk_columns([0u16])
+        .with_changed_columns(changed_columns)
 }
 
 fn make_test_delete_event(seed: u64) -> TestEvent<Postgres> {
-    let id = 1 + bounded_i64(seed ^ 0x1A2A, 500_000);
-    let user_id = bounded_i64(seed ^ 0x2B3B, 20_000);
-    let amount = 30 + bounded_i64(seed ^ 0x3C4C, 3_500);
-    let priority = 1 + bounded_i64(seed ^ 0x4D5D, 9);
-    let quantity = 1 + bounded_i64(seed ^ 0x5E6E, 40);
-    let discount = if mix_seed(seed ^ 0x6F7F).is_multiple_of(5) {
-        Value::<Postgres>::Null
-    } else {
-        Value::<Postgres>::Int(bounded_i64(seed ^ 0x7A8A, 18))
-    };
-    let tax = 2 + bounded_i64(seed ^ 0x8B9B, 40);
-    let shipping = 4 + bounded_i64(seed ^ 0x9CAC, 30);
-    let created_at = 1_699_500_000 + bounded_i64(seed ^ 0xADBD, 240 * 24 * 3600);
-    let status = status_for(seed ^ 0xBECF);
-
-    TestEvent::<Postgres>::delete(
-        1,
-        vec![
-            Value::Int(id),
-            Value::Int(user_id),
-            Value::Int(amount),
-            Value::String(status.into()),
-            Value::Int(priority),
-            Value::Int(quantity),
-            discount,
-            Value::Int(tax),
-            Value::Int(shipping),
-            Value::Int(created_at),
-        ],
-    )
-    .with_pk_columns([0u16])
+    TestEvent::<Postgres>::delete(1, order_values(&order_row(seed), None)).with_pk_columns([0u16])
 }
 
 fn event_corpus(
     size: usize,
-    salt: u64,
+    corpus_seed: u64,
     make_event: fn(u64) -> TestEvent<Postgres>,
 ) -> Vec<TestEvent<Postgres>> {
     (0..size)
         .map(|i| {
             let i_u64 = u64::try_from(i).unwrap_or(0);
-            make_event(mix_seed(i_u64 ^ salt))
+            make_event(mix_seed(i_u64 ^ corpus_seed))
         })
         .collect()
 }
@@ -282,7 +155,7 @@ fn dispatch_scaling_benchmark(c: &mut Criterion) {
 
     for &predicate_count in &[100, 1_000, 10_000] {
         let mut engine = build_scaling_engine(predicate_count);
-        let events = event_corpus(EVENT_CORPUS_SIZE, EVENT_CORPUS_SALT, make_test_event);
+        let events = event_corpus(EVENT_CORPUS_SIZE, EVENT_CORPUS_SEED, make_test_event_folded);
         let mut next_event_idx = 0_usize;
 
         group.bench_with_input(
@@ -319,7 +192,7 @@ fn dispatch_kind_scaling_benchmark(c: &mut Criterion) {
         let mut update_engine = build_scaling_engine(predicate_count);
         let update_events = event_corpus(
             EVENT_CORPUS_SIZE,
-            EVENT_CORPUS_SALT ^ 0x1111_2222_3333_4444,
+            EVENT_CORPUS_SEED ^ 0x1111_2222_3333_4444,
             make_test_update_event,
         );
         let mut next_update_event_idx = 0_usize;
@@ -344,7 +217,7 @@ fn dispatch_kind_scaling_benchmark(c: &mut Criterion) {
         let mut delete_engine = build_scaling_engine(predicate_count);
         let delete_events = event_corpus(
             EVENT_CORPUS_SIZE,
-            EVENT_CORPUS_SALT ^ 0x5555_6666_7777_8888,
+            EVENT_CORPUS_SEED ^ 0x5555_6666_7777_8888,
             make_test_delete_event,
         );
         let mut next_delete_event_idx = 0_usize;
@@ -379,7 +252,7 @@ fn index_efficiency_benchmark(c: &mut Criterion) {
     group.measurement_time(Duration::from_secs(3));
 
     let mut equality_engine = {
-        let catalog = bench_catalog();
+        let catalog = bench_catalog_folded();
         let mut engine =
             SubscriptionEngine::<_, DefaultIds, ParserDB>::new(catalog, PostgreSqlDialect {});
 
@@ -392,7 +265,8 @@ fn index_efficiency_benchmark(c: &mut Criterion) {
 
         engine
     };
-    let equality_events = event_corpus(EVENT_CORPUS_SIZE, EVENT_CORPUS_SALT, make_test_event);
+    let equality_events =
+        event_corpus(EVENT_CORPUS_SIZE, EVENT_CORPUS_SEED, make_test_event_folded);
     let mut equality_event_idx = 0_usize;
 
     // Equality predicates (best case)
@@ -410,7 +284,7 @@ fn index_efficiency_benchmark(c: &mut Criterion) {
     });
 
     let mut range_engine = {
-        let catalog = bench_catalog();
+        let catalog = bench_catalog_folded();
         let mut engine =
             SubscriptionEngine::<_, DefaultIds, ParserDB>::new(catalog, PostgreSqlDialect {});
 
@@ -423,7 +297,7 @@ fn index_efficiency_benchmark(c: &mut Criterion) {
 
         engine
     };
-    let range_events = event_corpus(EVENT_CORPUS_SIZE, EVENT_CORPUS_SALT, make_test_event);
+    let range_events = event_corpus(EVENT_CORPUS_SIZE, EVENT_CORPUS_SEED, make_test_event_folded);
     let mut range_event_idx = 0_usize;
 
     // Range predicates (moderate case)
@@ -441,7 +315,7 @@ fn index_efficiency_benchmark(c: &mut Criterion) {
     });
 
     let mut complex_engine = {
-        let catalog = bench_catalog();
+        let catalog = bench_catalog_folded();
         let mut engine =
             SubscriptionEngine::<_, DefaultIds, ParserDB>::new(catalog, PostgreSqlDialect {});
 
@@ -457,7 +331,7 @@ fn index_efficiency_benchmark(c: &mut Criterion) {
 
         engine
     };
-    let complex_events = event_corpus(EVENT_CORPUS_SIZE, EVENT_CORPUS_SALT, make_test_event);
+    let complex_events = event_corpus(EVENT_CORPUS_SIZE, EVENT_CORPUS_SEED, make_test_event_folded);
     let mut complex_event_idx = 0_usize;
 
     // Complex predicates (fallback case)
@@ -490,7 +364,7 @@ fn registration_benchmark(c: &mut Criterion) {
         let mut next_seed = 1_u64;
         b.iter_batched(
             || {
-                let catalog = bench_catalog();
+                let catalog = bench_catalog_folded();
                 let engine = SubscriptionEngine::<TestEvent<Postgres>, DefaultIds, ParserDB>::new(
                     catalog,
                     PostgreSqlDialect {},
@@ -512,7 +386,7 @@ fn registration_benchmark(c: &mut Criterion) {
         let mut next_seed = 1_u64;
         b.iter_batched(
             || {
-                let catalog = bench_catalog();
+                let catalog = bench_catalog_folded();
                 let mut engine =
                     SubscriptionEngine::<TestEvent<Postgres>, DefaultIds, ParserDB>::new(
                         catalog,
@@ -576,7 +450,7 @@ fn deduplication_benchmark(c: &mut Criterion) {
     group.measurement_time(Duration::from_secs(3));
 
     let mut high_dedup_engine = {
-        let catalog = bench_catalog();
+        let catalog = bench_catalog_folded();
         let mut engine =
             SubscriptionEngine::<_, DefaultIds, ParserDB>::new(catalog, PostgreSqlDialect {});
 
@@ -590,7 +464,8 @@ fn deduplication_benchmark(c: &mut Criterion) {
 
         engine
     };
-    let high_dedup_events = event_corpus(EVENT_CORPUS_SIZE, EVENT_CORPUS_SALT, make_test_event);
+    let high_dedup_events =
+        event_corpus(EVENT_CORPUS_SIZE, EVENT_CORPUS_SEED, make_test_event_folded);
     let mut high_dedup_event_idx = 0_usize;
 
     // Many users, same predicate (best dedup)
@@ -608,7 +483,7 @@ fn deduplication_benchmark(c: &mut Criterion) {
     });
 
     let mut low_dedup_engine = {
-        let catalog = bench_catalog();
+        let catalog = bench_catalog_folded();
         let mut engine =
             SubscriptionEngine::<_, DefaultIds, ParserDB>::new(catalog, PostgreSqlDialect {});
 
@@ -624,7 +499,8 @@ fn deduplication_benchmark(c: &mut Criterion) {
 
         engine
     };
-    let low_dedup_events = event_corpus(EVENT_CORPUS_SIZE, EVENT_CORPUS_SALT, make_test_event);
+    let low_dedup_events =
+        event_corpus(EVENT_CORPUS_SIZE, EVENT_CORPUS_SEED, make_test_event_folded);
     let mut low_dedup_event_idx = 0_usize;
 
     // Every user has unique predicate (no dedup)
@@ -660,7 +536,7 @@ fn pattern_dispatch_benchmark(c: &mut Criterion) {
     group.measurement_time(Duration::from_secs(3));
 
     for (label, operator) in [("like", "LIKE"), ("ilike", "ILIKE")] {
-        let catalog = bench_catalog();
+        let catalog = bench_catalog_folded();
         let mut engine: SubscriptionEngine<TestEvent<Postgres>, DefaultIds, ParserDB> =
             SubscriptionEngine::new(catalog, PostgreSqlDialect {});
         for i in 0..1_000_u64 {
@@ -671,7 +547,7 @@ fn pattern_dispatch_benchmark(c: &mut Criterion) {
                 ))
                 .unwrap();
         }
-        let events = event_corpus(EVENT_CORPUS_SIZE, EVENT_CORPUS_SALT, make_test_event);
+        let events = event_corpus(EVENT_CORPUS_SIZE, EVENT_CORPUS_SEED, make_test_event_folded);
         let mut next_event_idx = 0_usize;
 
         group.bench_function(label, |b| {

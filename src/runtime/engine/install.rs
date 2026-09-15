@@ -84,27 +84,16 @@ where
         };
         let grouped = match installed {
             Ok(grouped) => grouped,
-            Err(crate::AggregateInstallError::GroupLimit { .. }) => {
-                return Self::stopped_output(
+            Err(error) => {
+                return self.stopped_for_group_limit(
                     subscription_id,
-                    self.transition_grouped_scalar_to_whole(
-                        subscription_id,
-                        crate::MaintenanceStopReason::GroupLimit { limit: group_limit },
-                        input.read_at.as_ref(),
-                    ),
+                    super::GroupedStopTier::GroupedScalar,
+                    error,
+                    group_limit,
+                    input.read_at.as_ref(),
+                    Some(table_id),
                 );
             }
-            Err(crate::AggregateInstallError::GroupKeyUnencodable(_)) => {
-                return Self::stopped_output(
-                    subscription_id,
-                    self.transition_grouped_scalar_to_whole(
-                        subscription_id,
-                        crate::MaintenanceStopReason::GroupKeyUnencodable { table_id },
-                        input.read_at.as_ref(),
-                    ),
-                );
-            }
-            Err(error) => return Err(error),
         };
         let reason = if grouped.missing_group {
             Some(crate::MaintenanceStopReason::MissingOldRow { table_id })
@@ -114,13 +103,11 @@ where
             None
         };
         if let Some(reason) = reason {
-            return Self::stopped_output(
+            return self.stopped_for_reason(
                 subscription_id,
-                self.transition_grouped_scalar_to_whole(
-                    subscription_id,
-                    reason,
-                    input.read_at.as_ref(),
-                ),
+                super::GroupedStopTier::GroupedScalar,
+                reason,
+                input.read_at.as_ref(),
             );
         }
         Ok(crate::AggregateMaintenanceOutput {
@@ -188,13 +175,11 @@ where
         let change = match installed {
             Ok(change) => change,
             Err(crate::AggregateInstallError::GroupLimit { .. }) => {
-                return Self::stopped_output(
+                return self.stopped_for_reason(
                     subscription_id,
-                    self.transition_grouped_scalar_to_whole(
-                        subscription_id,
-                        crate::MaintenanceStopReason::GroupLimit { limit: group_limit },
-                        input.checkpoint.as_ref(),
-                    ),
+                    super::GroupedStopTier::GroupedScalar,
+                    crate::MaintenanceStopReason::GroupLimit { limit: group_limit },
+                    input.checkpoint.as_ref(),
                 );
             }
             Err(error) => return Err(error),
@@ -347,33 +332,25 @@ where
             };
             let (consumer, opening) = match installed {
                 (consumer, Ok(opening)) => (consumer, opening),
-                (_, Err(crate::AggregateInstallError::GroupLimit { .. })) => {
-                    let limit = self.max_groups_per_aggregate;
-                    return Self::stopped_output(
-                        subscription_id,
-                        self.transition_aggregate_to_whole(
-                            subscription_id,
-                            crate::MaintenanceStopReason::GroupLimit { limit },
-                            read_at.as_ref(),
+                (_, Err(error)) => {
+                    let table_id = match &error {
+                        crate::AggregateInstallError::GroupKeyUnencodable(_) => Some(
+                            self.subscription_to_table
+                                .get(&subscription_id)
+                                .copied()
+                                .expect("a grouped aggregate keeps its source table"),
                         ),
+                        _ => None,
+                    };
+                    return self.stopped_for_group_limit(
+                        subscription_id,
+                        super::GroupedStopTier::Aggregate,
+                        error,
+                        self.max_groups_per_aggregate,
+                        read_at.as_ref(),
+                        table_id,
                     );
                 }
-                (_, Err(crate::AggregateInstallError::GroupKeyUnencodable(_))) => {
-                    let table_id = self
-                        .subscription_to_table
-                        .get(&subscription_id)
-                        .copied()
-                        .expect("a grouped aggregate keeps its source table");
-                    return Self::stopped_output(
-                        subscription_id,
-                        self.transition_aggregate_to_whole(
-                            subscription_id,
-                            crate::MaintenanceStopReason::GroupKeyUnencodable { table_id },
-                            read_at.as_ref(),
-                        ),
-                    );
-                }
-                (_, Err(error)) => return Err(error),
             };
             return Ok(crate::AggregateMaintenanceOutput {
                 updates: opening

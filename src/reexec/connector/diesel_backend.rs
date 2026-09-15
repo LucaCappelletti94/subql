@@ -161,6 +161,63 @@ impl DieselBackend for crate::backend::SQLite {
     }
 }
 
+/// Defines [`ScalarSqlBackend`] and its blanket impl from one bound list,
+/// since the trait declaration and the impl must repeat the same bounds.
+#[cfg(feature = "executor-diesel")]
+macro_rules! define_scalar_sql_backend {
+    ($($ty:ty),+ $(,)?) => {
+        /// A diesel backend that speaks every SQL type the re-execution read
+        /// path routes through.
+        ///
+        /// Naming the conjunction once keeps a new SQL type a one-line
+        /// change. The matching Rust-side `ToSql` pairings stay explicit at
+        /// the consumers, because rustc does not elaborate trait `where`
+        /// clauses into generic contexts, so only supertraits survive.
+        ///
+        /// The `RowFieldDecode` peer is deliberately NOT folded in. Scalar
+        /// reads do not need a row decoder, and requiring it would widen the
+        /// scalar call sites for no reason.
+        pub trait ScalarSqlBackend:
+            diesel::backend::Backend
+            + diesel::backend::DieselReserveSpecialization
+            $(+ diesel::sql_types::HasSqlType<$ty>)+
+        {
+        }
+
+        impl<DB> ScalarSqlBackend for DB where
+            DB: diesel::backend::Backend
+                + diesel::backend::DieselReserveSpecialization
+                $(+ diesel::sql_types::HasSqlType<$ty>)+
+        {
+        }
+    };
+}
+
+#[cfg(feature = "executor-diesel")]
+define_scalar_sql_backend!(
+    Bool, BigInt, Double, Text, Binary, Timestamp, Date, Time, Numeric, Json,
+);
+
+/// Decode one dynamic row column-by-column against `kinds`, falling back to
+/// [`Value::Missing`] for a cell the backend cannot decode. Arity is the
+/// caller's business: the sync and async paths refuse a shape mismatch with
+/// their own error type before calling.
+#[must_use]
+#[cfg(feature = "executor-diesel")]
+pub fn decoded_group_values<B: crate::backend::Backend>(
+    row: crate::diesel_decode::DynamicRow<B>,
+    kinds: &[crate::backend::ScalarFamily],
+) -> Vec<Value<B>> {
+    row.values
+        .into_iter()
+        .zip(kinds)
+        .map(|(value, kind)| {
+            B::decode_group_value(crate::backend::ValueKind::from(*kind), value)
+                .unwrap_or(Value::Missing)
+        })
+        .collect()
+}
+
 /// Build a boxed, bind-populated query for any diesel backend.
 ///
 /// The re-execution SQL is user-supplied and cannot be expressed through the
@@ -170,18 +227,7 @@ pub(super) fn boxed_read_query<'a, DB, B>(
     query: &'a ReadQuery<'_, B>,
 ) -> QueryResult<BoxedSqlQuery<'a, DB, SqlQuery>>
 where
-    DB: diesel::backend::Backend
-        + diesel::backend::DieselReserveSpecialization
-        + diesel::sql_types::HasSqlType<Bool>
-        + diesel::sql_types::HasSqlType<BigInt>
-        + diesel::sql_types::HasSqlType<Double>
-        + diesel::sql_types::HasSqlType<Text>
-        + diesel::sql_types::HasSqlType<Binary>
-        + diesel::sql_types::HasSqlType<Timestamp>
-        + diesel::sql_types::HasSqlType<Date>
-        + diesel::sql_types::HasSqlType<Time>
-        + diesel::sql_types::HasSqlType<Numeric>
-        + diesel::sql_types::HasSqlType<Json>,
+    DB: ScalarSqlBackend,
     B: DieselBackend,
     bool: diesel::serialize::ToSql<Bool, DB>,
     i64: diesel::serialize::ToSql<BigInt, DB>,

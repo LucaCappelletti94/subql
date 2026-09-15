@@ -317,13 +317,7 @@ impl crate::CdcSource for PollingPgCdcSource {
     fn next_event(
         &mut self,
     ) -> impl core::future::Future<Output = Result<Option<Self::Event>, Self::Error>> + Send {
-        async move {
-            match self.event_rx.recv().await {
-                Some(Ok(ev)) => Ok(Some(ev)),
-                Some(Err(e)) => Err(e),
-                None => Ok(None),
-            }
-        }
+        crate::wal::shared_helpers::recv_source_event(&mut self.event_rx)
     }
 
     #[allow(clippy::manual_async_fn, clippy::unused_async)]

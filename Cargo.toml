@@ -68,6 +68,7 @@ required-features = ["dhat-heap"]
 [[bench]]
 name = "dispatch"
 harness = false
+required-features = ["testing"]
 
 [[bench]]
 name = "lookups"
@@ -614,7 +615,7 @@ membership-term = ["visibility-records", "dep:rls2fga"]
 visibility-openfga = ["std", "visibility-records", "dep:openfga-client"]
 
 # Memory profiling with dhat (std-only).
-dhat-heap = ["std", "dep:dhat"]
+dhat-heap = ["std", "dep:dhat", "testing"]
 
 [profile.release]
 lto = true

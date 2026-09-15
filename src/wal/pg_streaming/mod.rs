@@ -277,13 +277,7 @@ impl crate::CdcSource for PgStreamingCdcSource {
     fn next_event(
         &mut self,
     ) -> impl core::future::Future<Output = Result<Option<Self::Event>, Self::Error>> + Send {
-        async move {
-            match self.event_rx.recv().await {
-                Some(Ok(ev)) => Ok(Some(ev)),
-                Some(Err(e)) => Err(e),
-                None => Ok(None),
-            }
-        }
+        super::shared_helpers::recv_source_event(&mut self.event_rx)
     }
 
     // The body is sync (unbounded channel send is sync), but the trait
