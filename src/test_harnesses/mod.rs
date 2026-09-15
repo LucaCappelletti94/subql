@@ -107,8 +107,11 @@ mod tests {
             "fuzz orders should have at least id/amount/status"
         );
 
-        let id_col = crate::catalog_helpers::column_id(catalog, tid, "id");
-        let amount_col = crate::catalog_helpers::column_id(catalog, tid, "amount");
+        let id_col =
+            crate::catalog_helpers::column_id::<crate::backend::Postgres, _>(catalog, tid, "id");
+        let amount_col = crate::catalog_helpers::column_id::<crate::backend::Postgres, _>(
+            catalog, tid, "amount",
+        );
         assert!(id_col.is_some());
         assert!(amount_col.is_some());
         assert_ne!(id_col, amount_col);

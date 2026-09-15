@@ -32,7 +32,8 @@ fn engine() -> (Engine, TableId, ColumnId) {
     let db = ParserDB::parse::<PostgreSqlDialect>(DDL).expect("DDL parses");
     let table = catalog_helpers::table_id::<subql::backend::Postgres, _>(&db, "docs")
         .expect("docs is in the catalog");
-    let column = catalog_helpers::column_id(&db, table, "doc").expect("doc is in the catalog");
+    let column = catalog_helpers::column_id::<Postgres, _>(&db, table, "doc")
+        .expect("doc is in the catalog");
     (
         SubscriptionEngine::new(db, PostgreSqlDialect {}),
         table,

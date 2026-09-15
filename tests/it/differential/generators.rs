@@ -886,8 +886,9 @@ mod tests {
             .expect("the generated DDL parses");
         let table = subql::catalog_helpers::table_id::<Postgres, _>(&database, "t")
             .expect("t is cataloged");
-        let padded = subql::catalog_helpers::column_id(&database, table, "padded_bytes")
-            .expect("the padded column is cataloged");
+        let padded =
+            subql::catalog_helpers::column_id::<Postgres, _>(&database, table, "padded_bytes")
+                .expect("the padded column is cataloged");
         let comparison =
             subql::catalog_helpers::column_comparison::<Postgres, _>(&database, table, padded)
                 .expect("its comparison facts resolve");

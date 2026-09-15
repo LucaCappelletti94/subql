@@ -222,7 +222,7 @@ fn column_read_kind<B: crate::backend::Backend, DB: DatabaseLike>(
             "column {column}, which the catalog does not know or cannot type"
         ))
     };
-    let id = catalog_helpers::column_id(db, table, column.as_str()).ok_or_else(refuse)?;
+    let id = catalog_helpers::column_id::<B, _>(db, table, column.as_str()).ok_or_else(refuse)?;
     let scalar = catalog_helpers::column_scalar_kind::<B, DB>(db, table, id).ok_or_else(refuse)?;
     // A custom type answers `None`: it has no renderable column kind, so a
     // shape that reads this column is refused rather than served a spelling

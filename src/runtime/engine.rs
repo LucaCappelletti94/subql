@@ -826,12 +826,13 @@ where
             let stated: Vec<crate::ColumnId> = column_names
                 .iter()
                 .map(|name| {
-                    catalog_helpers::column_id(&self.database, table_id, name).ok_or_else(|| {
-                        RegisterError::MembershipTermRefused(format!(
+                    catalog_helpers::column_id::<E::Backend, _>(&self.database, table_id, name)
+                        .ok_or_else(|| {
+                            RegisterError::MembershipTermRefused(format!(
                             "this subscription states the values it matches for column {name:?}, \
                              which table {table_id} does not carry."
                         ))
-                    })
+                        })
                 })
                 .collect::<Result<_, _>>()?;
             // The one term comparing exactly this column set, since two terms

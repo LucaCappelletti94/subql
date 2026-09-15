@@ -242,8 +242,8 @@ fn not_served_because_carries_structured_operands() {
     let orders =
         subql::catalog_helpers::table_id::<subql::backend::Postgres, _>(&catalog, "orders")
             .expect("orders is known");
-    let status =
-        subql::catalog_helpers::column_id(&catalog, orders, "status").expect("status column");
+    let status = subql::catalog_helpers::column_id::<Postgres, _>(&catalog, orders, "status")
+        .expect("status column");
     let mut engine: Engine = SubscriptionEngine::new(catalog, PostgreSqlDialect {});
     let registered = engine
         .register(SubscriptionRequest::new(

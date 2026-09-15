@@ -16,7 +16,7 @@ use crate::{ColumnId, RegisterError, TableId};
 use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use sql_traits::prelude::DatabaseLike;
+use sql_traits::prelude::{ColumnLike, DatabaseLike, TableLike};
 use sqlparser::ast::{BinaryOperator, Expr, Ident, SelectItem, SetExpr, Statement};
 use sqlparser::dialect::Dialect;
 
@@ -752,7 +752,8 @@ where
             "a keyed read needs a primary key to identify a delivered row by".to_string(),
         ));
     }
-    let Some(key_positions) = key_projection_positions(&statement, table, &key_columns, database)
+    let Some(key_positions) =
+        key_projection_positions::<B, _>(&statement, table, &key_columns, database)
     else {
         return Err(RegisterError::UnsupportedSql(
             "a keyed read needs the projection to carry the primary key, since that key is \
@@ -860,21 +861,21 @@ fn statement_reads_more_than(
     other
 }
 
-/// Where in the projection each primary key column lands.
-///
-/// `None` when the projection does not carry the whole key. The positions
-/// matter as much as their presence: the resolver reads keys out of returned
-/// rows by index, so a key column's table ordinal is the wrong answer for any
-/// projection that is not a wildcard in table order.
-fn key_projection_positions<DB: DatabaseLike>(
+/// Where in the projection each primary key column lands under the engine's
+/// column comparison, `None` when the projection does not carry the whole
+/// key. The resolver reads keys out of returned rows by index, so a key
+/// column's table ordinal is the wrong answer for a non-wildcard projection,
+/// and comparing names under anything looser than the engine's rule can put
+/// a different column's value in the key slot.
+fn key_projection_positions<B: Backend, DB: DatabaseLike>(
     statement: &Statement,
     table: TableId,
     key_columns: &[ColumnId],
     database: &DB,
 ) -> Option<Vec<usize>> {
     let select = crate::compiler::sql_shape::select_of(statement)?;
-    // A wildcard returns the table's columns in the table's own order, so a key
-    // column's ordinal is its position.
+    // A wildcard returns the table's columns in the table's own order, so a
+    // key column's ordinal is its position.
     if select
         .projection
         .iter()
@@ -883,32 +884,41 @@ fn key_projection_positions<DB: DatabaseLike>(
         return (select.projection.len() == 1).then(|| {
             key_columns
                 .iter()
-                .map(|column| *column as usize)
+                .map(|column| usize::from(*column))
                 .collect::<Vec<_>>()
         });
     }
-    let mut named: Vec<Option<String>> = Vec::with_capacity(select.projection.len());
+    let mut named: Vec<Option<(&Ident, bool)>> = Vec::with_capacity(select.projection.len());
     for item in &select.projection {
         named.push(match item {
-            SelectItem::UnnamedExpr(sqlparser::ast::Expr::Identifier(ident)) => {
-                Some(ident.value.clone())
+            SelectItem::UnnamedExpr(Expr::Identifier(ident)) => {
+                Some((ident, ident.quote_style.is_some()))
             }
-            SelectItem::UnnamedExpr(sqlparser::ast::Expr::CompoundIdentifier(parts)) => {
-                parts.last().map(|last| last.value.clone())
+            SelectItem::UnnamedExpr(Expr::CompoundIdentifier(parts)) => {
+                parts.last().map(|last| (last, last.quote_style.is_some()))
             }
-            // An expression, an alias over one, or a qualified wildcard: the
-            // delivered column is not the table's key column even if it
-            // computes the same value.
+            // An expression, an alias, or a qualified wildcard delivers a
+            // value, not the key column itself.
             _ => None,
         });
     }
+    let case = B::COLUMN_NAME_CASE;
+    let table_like = database.table_by_id(usize::try_from(table).ok()?)?;
     key_columns
         .iter()
         .map(|column| {
-            let name = crate::catalog_helpers::column_name(database, table, *column)?;
+            let stored = table_like
+                .column_by_id(usize::from(*column), database)
+                .ok()??;
             named.iter().position(|got| {
-                got.as_ref()
-                    .is_some_and(|got| got.eq_ignore_ascii_case(&name))
+                got.as_ref().is_some_and(|(written, quoted)| {
+                    case.identifiers_match(
+                        stored.column_name(),
+                        stored.column_name_is_quoted(),
+                        &written.value,
+                        *quoted,
+                    )
+                })
             })
         })
         .collect()
@@ -1229,5 +1239,72 @@ mod scoped_read_tests {
 
         assert!(first.ends_with("WHERE (a = 1) AND id IN (7)"), "{first}");
         assert_eq!(second, first.replace("IN (7)", "IN (9)"));
+    }
+}
+
+#[cfg(test)]
+mod key_projection_tests {
+    use super::key_projection_positions;
+    use crate::backend::{MySql, NamesStoredAsWritten, Postgres};
+    use sql_traits::structs::ParserDB;
+
+    fn statement(
+        dialect: &dyn sqlparser::dialect::Dialect,
+        sql: &str,
+    ) -> sqlparser::ast::Statement {
+        crate::compiler::sql_shape::parse_single_statement(sql, dialect).expect("parses")
+    }
+
+    #[test]
+    fn a_quoted_projection_name_does_not_reach_the_bare_key() {
+        let db = ParserDB::parse::<sqlparser::dialect::PostgreSqlDialect>(
+            r#"CREATE TABLE t (id INT PRIMARY KEY, "Id" INT);"#,
+        )
+        .expect("DDL parses");
+        let table = crate::catalog_helpers::table_id::<Postgres, _>(&db, "t").expect("t exists");
+        let pg = |sql: &str| statement(&sqlparser::dialect::PostgreSqlDialect {}, sql);
+        assert_eq!(
+            key_projection_positions::<Postgres, _>(&pg("SELECT id FROM t"), table, &[0], &db),
+            Some(vec![0]),
+        );
+        assert_eq!(
+            key_projection_positions::<Postgres, _>(&pg("SELECT \"id\" FROM t"), table, &[0], &db),
+            Some(vec![0]),
+        );
+        // `"Id"` names the second column, so the projection carries no key
+        // and a keyed read would ask about the wrong row.
+        assert_eq!(
+            key_projection_positions::<Postgres, _>(&pg("SELECT \"Id\" FROM t"), table, &[0], &db),
+            None,
+        );
+    }
+
+    #[test]
+    fn a_folded_engine_reads_the_key_under_any_spelling() {
+        let db = ParserDB::parse::<sqlparser::dialect::MySqlDialect>(
+            "CREATE TABLE t (Owner INT PRIMARY KEY);",
+        )
+        .expect("DDL parses");
+        let table = crate::catalog_helpers::table_id::<MySql<NamesStoredAsWritten>, _>(&db, "t")
+            .expect("t exists");
+        let my = |sql: &str| statement(&sqlparser::dialect::MySqlDialect {}, sql);
+        assert_eq!(
+            key_projection_positions::<MySql<NamesStoredAsWritten>, _>(
+                &my("SELECT owner FROM t"),
+                table,
+                &[0],
+                &db
+            ),
+            Some(vec![0]),
+        );
+        assert_eq!(
+            key_projection_positions::<MySql<NamesStoredAsWritten>, _>(
+                &my(r"SELECT `OWNER` FROM t"),
+                table,
+                &[0],
+                &db
+            ),
+            Some(vec![0]),
+        );
     }
 }

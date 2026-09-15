@@ -885,7 +885,7 @@ fn index_shape<B: crate::backend::Backend, DB: DatabaseLike>(
                 let Some(id) = catalog_helpers::contract_table_id(db, query.table()) else {
                     continue;
                 };
-                let Some(key) = resolve_key(db, id, query.key_columns()) else {
+                let Some(key) = resolve_key::<B, _>(db, id, query.key_columns()) else {
                     continue;
                 };
                 bound.push(query.table());
@@ -976,7 +976,7 @@ fn index_implied<DB: DatabaseLike>(
 /// key short of a column cannot be run at all, and were it run it would name
 /// every row sharing the columns that remain. An empty list is refused for the
 /// same reason, a query bound to nothing naming the whole table.
-fn resolve_key<DB: DatabaseLike>(
+fn resolve_key<B: crate::backend::Backend, DB: DatabaseLike>(
     db: &DB,
     table: TableId,
     columns: &[ColumnName],
@@ -986,7 +986,7 @@ fn resolve_key<DB: DatabaseLike>(
     }
     columns
         .iter()
-        .map(|column| catalog_helpers::column_id(db, table, column.as_str()))
+        .map(|column| catalog_helpers::column_id::<B, _>(db, table, column.as_str()))
         .collect()
 }
 

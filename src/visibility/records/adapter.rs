@@ -40,7 +40,9 @@ where
     DB: DatabaseLike,
 {
     fn value(&self, column: &str) -> Result<Value<R::Backend>, CellRead> {
-        let Some(id) = catalog_helpers::column_id(self.db, self.row.table_id(), column) else {
+        let Some(id) =
+            catalog_helpers::column_id::<R::Backend, _>(self.db, self.row.table_id(), column)
+        else {
             return Err(CellRead::Absent);
         };
         match self.row.value_at(id) {

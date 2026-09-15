@@ -52,7 +52,7 @@ pub fn plan_term<B: crate::backend::Backend, DB: DatabaseLike>(
     .map_err(|refusal| RegisterError::MembershipTermRefused(refusal.reason))?;
 
     if term.compares_the_caller() {
-        return caller_plan(term, table, database, &shapes);
+        return caller_plan::<B, DB>(term, table, database, &shapes);
     }
 
     let movement = member_columns::<B, DB>(term, table, &shapes, database)?;
@@ -92,7 +92,7 @@ pub fn plan_term<B: crate::backend::Backend, DB: DatabaseLike>(
 ///
 /// Verified against the shapes rather than trusted, in the same spirit as the
 /// kind check above: each divergence admits the wrong rows in silence.
-fn caller_plan<DB: DatabaseLike>(
+fn caller_plan<B: crate::backend::Backend, DB: DatabaseLike>(
     term: &CompiledTerm,
     table: TableId,
     database: &DB,
@@ -147,7 +147,8 @@ fn caller_plan<DB: DatabaseLike>(
     // other guard admits records only for rows the term never re-checks.
     let enforced_by_the_lookup = |guard: &Guard| {
         matches!(guard, Guard::NotNull(column)
-            if catalog_helpers::column_id(database, table, column.as_str()) == Some(term.columns[0]))
+            if catalog_helpers::column_id::<B, _>(database, table, column.as_str())
+                == Some(term.columns[0]))
     };
     if !guards.iter().all(enforced_by_the_lookup) {
         return Err(refuse(
@@ -157,7 +158,7 @@ fn caller_plan<DB: DatabaseLike>(
     if catalog_helpers::contract_table_id(database, row_table) != Some(table) {
         return Err(refuse("read a table other than the subscribed one"));
     }
-    if column_of(template.subject_key.part(), database, table) != Some(term.columns[0]) {
+    if column_of::<B, _>(template.subject_key.part(), database, table) != Some(term.columns[0]) {
         return Err(refuse(
             "name the caller from something other than the compared column",
         ));
@@ -214,7 +215,7 @@ fn member_columns<B: crate::backend::Backend, DB: DatabaseLike>(
             ))
         })?;
 
-    let movement = read_from_one_row(entry, database)?;
+    let movement = read_from_one_row::<B, _>(entry, database)?;
     align_with_the_filter::<B, DB>(term, table, movement, database)
 }
 
@@ -272,7 +273,7 @@ fn align_with_the_filter<B: crate::backend::Backend, DB: DatabaseLike>(
 }
 
 /// Resolve the one shape of `entry` that a changed row settles.
-fn read_from_one_row<DB: DatabaseLike>(
+fn read_from_one_row<B: crate::backend::Backend, DB: DatabaseLike>(
     entry: &RelationShapes,
     database: &DB,
 ) -> Result<TermMovement, RegisterError> {
@@ -300,10 +301,10 @@ fn read_from_one_row<DB: DatabaseLike>(
         .object_key
         .parts()
         .iter()
-        .map(|part| column_of(part, database, table_id))
+        .map(|part| column_of::<B, _>(part, database, table_id))
         .collect::<Option<Vec<_>>>()
         .ok_or_else(|| refuse("name their object from something other than columns"))?;
-    let subject = column_of(template.subject_key.part(), database, table_id)
+    let subject = column_of::<B, _>(template.subject_key.part(), database, table_id)
         .ok_or_else(|| refuse("name their subject from something other than a column"))?;
 
     Ok(TermMovement {
@@ -320,9 +321,15 @@ fn read_from_one_row<DB: DatabaseLike>(
 /// value, and neither is a column whose value a row's cell can be looked up by.
 /// `ValueSource` is `#[non_exhaustive]`, so a shape a later rls2fga adds falls to
 /// the wildcard and refuses rather than being read as a column.
-fn column_of<DB: DatabaseLike>(source: &ValueSource, database: &DB, table: TableId) -> Option<u16> {
+fn column_of<B: crate::backend::Backend, DB: DatabaseLike>(
+    source: &ValueSource,
+    database: &DB,
+    table: TableId,
+) -> Option<u16> {
     match source {
-        ValueSource::Column(name) => catalog_helpers::column_id(database, table, name.as_str()),
+        ValueSource::Column(name) => {
+            catalog_helpers::column_id::<B, _>(database, table, name.as_str())
+        }
         _ => None,
     }
 }

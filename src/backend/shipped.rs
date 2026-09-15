@@ -192,9 +192,10 @@ impl<V: postgres_jsonb_canonical::PgVersion + 'static> Backend for Postgres<V> {
             dangling: crate::compiler::vm::refusal::DanglingEscape::Fails,
         });
 
-    /// PostgreSQL keeps a delimited identifier exactly as written, which is
-    /// what makes `"Owner"` and `owner` two columns.
-    const DELIMITED_IDENTIFIERS_FOLD_CASE: bool = false;
+    /// PostgreSQL reads a delimited column name exactly as written, which
+    /// is what makes `"Owner"` and `owner` two columns.
+    const COLUMN_NAME_CASE: sql_traits::structs::IdentifierCase =
+        sql_traits::structs::IdentifierCase::AsWritten;
 
     /// PostgreSQL folds unquoted written names and preserves quoted names.
     const WRITTEN_TABLE_NAME_CASE: sql_traits::structs::IdentifierCase =
@@ -381,8 +382,7 @@ impl<V: postgres_jsonb_canonical::PgVersion + 'static> Backend for Postgres<V> {
 ///
 /// Column names are not governed by it: they are case-insensitive on every
 /// platform, which is what
-/// [`Backend::DELIMITED_IDENTIFIERS_FOLD_CASE`](super::Backend::DELIMITED_IDENTIFIERS_FOLD_CASE)
-/// answers.
+/// [`Backend::COLUMN_NAME_CASE`](super::Backend::COLUMN_NAME_CASE) answers.
 pub trait MySqlTableNameCase: 'static {
     /// The value `SELECT @@lower_case_table_names` answers.
     const LOWER_CASE_TABLE_NAMES: u8;
@@ -481,7 +481,8 @@ impl<C: MySqlTableNameCase> Backend for MySql<C> {
 
     /// MySQL compares a column name case-insensitively whether or not it
     /// was written in backticks.
-    const DELIMITED_IDENTIFIERS_FOLD_CASE: bool = true;
+    const COLUMN_NAME_CASE: sql_traits::structs::IdentifierCase =
+        sql_traits::structs::IdentifierCase::Folded;
 
     /// Written names follow the server's `lower_case_table_names` setting.
     const WRITTEN_TABLE_NAME_CASE: sql_traits::structs::IdentifierCase = C::TABLE_NAME_CASE;
@@ -844,7 +845,8 @@ impl Backend for SQLite {
     const LIKE_ESCAPE: Option<crate::compiler::vm::refusal::LikeEscape> = None;
 
     /// SQLite compares a column name case-insensitively, quoted or not.
-    const DELIMITED_IDENTIFIERS_FOLD_CASE: bool = true;
+    const COLUMN_NAME_CASE: sql_traits::structs::IdentifierCase =
+        sql_traits::structs::IdentifierCase::Folded;
 
     /// SQLite folds written table names with ASCII case comparison.
     const WRITTEN_TABLE_NAME_CASE: sql_traits::structs::IdentifierCase =
