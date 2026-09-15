@@ -13,14 +13,24 @@ SQL subscription dispatch engine for Change Data Capture fanout.
 
 ## Quick Start
 
+With the `diesel-typed` feature, a subscription is a diesel query. Diesel checks the columns, the types of the values, and the comparison between them at compile time, and subql takes the placeholder SQL and serialized binds that diesel's own backend serializer produces. The predicate never has to exist as a string a caller could mistype.
+
 ```rust
+# #[cfg(feature = "diesel-typed")] {
+use diesel::prelude::*;
 use sql_traits::structs::ParserDB;
 use sqlparser::dialect::PostgreSqlDialect;
 use subql::backend::{Postgres, Value};
 use subql::testing::TestEvent;
-use subql::{
-    catalog_helpers, DefaultIds, SubscriptionEngine, SubscriptionRequest,
-};
+use subql::{catalog_helpers, DefaultIds, SubscriptionEngine};
+
+diesel::table! {
+    orders (id) {
+        id -> Int4,
+        amount -> Int4,
+        status -> Text,
+    }
+}
 
 let catalog = ParserDB::parse::<PostgreSqlDialect>(
     "CREATE TABLE orders (id INT PRIMARY KEY, amount INT, status TEXT);",
@@ -29,9 +39,9 @@ let orders_id = catalog_helpers::table_id::<Postgres, _>(&catalog, "orders").unw
 let mut engine: SubscriptionEngine<TestEvent<Postgres>, DefaultIds, ParserDB> =
     SubscriptionEngine::new(catalog, PostgreSqlDialect {});
 
-engine.register(
-    SubscriptionRequest::new(42, "SELECT * FROM orders WHERE amount > 100")
-        .updated_at_unix_ms(1_704_067_200_000),
+engine.register_select_typed::<diesel::pg::Pg, _>(
+    42,
+    &orders::table.filter(orders::amount.gt(100)),
 )?;
 
 let event = TestEvent::<Postgres>::insert(
@@ -42,26 +52,36 @@ let event = TestEvent::<Postgres>::insert(
 
 let notifs = engine.consumers(&event)?;
 assert_eq!(notifs.inserted(), vec![42]);
-
+# }
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
+Placeholder SQL plus typed binds is the engine's own contract, and `register_select_typed` is a producer for it. It renders the query exactly as diesel would send it and decodes each backend's serialized binds into typed values, so every subscription keeps the SQL the database can re-run when the engine hands the answer back to a re-read. A raw-text subscription (`SubscriptionRequest::new(42, "SELECT * FROM orders WHERE amount > 100")`) enters the same compile, index, and dedup path. SQLite and MySQL join through the `diesel-typed-sqlite` and `diesel-typed-mysql` features.
+
 ## Streaming Aggregates
 
-Alongside row-match subscriptions, register a `SELECT COUNT(*)`, `COUNT(col)`, `SUM(col)`, `AVG(col)`, or variance/stddev (`VAR_POP`/`VAR_SAMP`/`STDDEV_POP`/`STDDEV_SAMP`) query instead of `SELECT *`. The engine keeps the running value and reports it whenever it moves, so the caller stores nothing and folds nothing.
+Alongside row-match subscriptions, register an aggregate instead of a `SELECT *`. Diesel spells `COUNT(*)`, `COUNT(col)`, `SUM(col)` and `AVG(col)` as `.count()`, `diesel::dsl::count(col)`, `sum(col)` and `avg(col)`. The variance/stddev family (`VAR_POP`/`VAR_SAMP`/`STDDEV_POP`/`STDDEV_SAMP`) has no diesel built-in and arrives as SQL text through `register`. The engine keeps the running value and reports it whenever it moves, so the caller stores nothing and folds nothing.
 
 A registration answers with an `aggregate_bootstrap`, a runnable query for the starting numbers. Run it, then pass an `AggregateSeedInstall` to `Install::install` with the decoded row and stream position the read was taken at. Take that position **before** the read's snapshot opens: it is what lets the engine drop the changes the read already saw rather than counting them twice. Until the numbers land the subscription reports nothing, and a read the engine cannot line up against what it folded is refused with a `AggregateInstallError` so the caller can `reset_aggregate` and read again.
 
 Aggregate subscribers never appear in `consumers()` output, and vice versa. `UPDATE` deltas need both old and new row images, so a source that omits old images (`before` / `old`) gets an error for update events. A `TRUNCATE` needs nothing from the caller: the table is empty afterwards, so the engine empties the value itself and reports it.
 
 ```rust
+# #[cfg(feature = "diesel-typed")] {
+use diesel::prelude::*;
 use sql_traits::structs::ParserDB;
 use sqlparser::dialect::PostgreSqlDialect;
 use subql::backend::{Postgres, Value};
 use subql::testing::TestEvent;
-use subql::{
-    catalog_helpers, AggValue, DefaultIds, SubscriptionEngine, SubscriptionRequest,
-};
+use subql::{catalog_helpers, AggValue, DefaultIds, SubscriptionEngine};
+
+diesel::table! {
+    orders (id) {
+        id -> Int4,
+        amount -> Int4,
+        status -> Text,
+    }
+}
 
 let catalog = ParserDB::parse::<PostgreSqlDialect>(
     "CREATE TABLE orders (id INT PRIMARY KEY, amount INT, status TEXT);",
@@ -74,14 +94,18 @@ let mut engine: SubscriptionEngine<TestEvent<Postgres>, DefaultIds, ParserDB> =
 
 // Live count of active orders, and their running total, both for consumer 42.
 let counted = engine
-    .register(SubscriptionRequest::new(
-        42, "SELECT COUNT(*) FROM orders WHERE status = 'active'",
-    ))
+    .register_select_typed::<diesel::pg::Pg, _>(
+        42,
+        &orders::table.filter(orders::status.eq("active")).count(),
+    )
     .expect("the count registers");
 let totalled = engine
-    .register(SubscriptionRequest::new(
-        42, "SELECT SUM(amount) FROM orders WHERE status = 'active'",
-    ))
+    .register_select_typed::<diesel::pg::Pg, _>(
+        42,
+        &orders::table
+            .filter(orders::status.eq("active"))
+            .select(diesel::dsl::sum(orders::amount)),
+    )
     .expect("the sum registers");
 
 // Starting numbers over an empty table. Nothing has been folded yet, so this
@@ -132,6 +156,7 @@ assert_eq!(
         AggValue::Sum(Some(subql::NumericValue::Integer(250))),
     )),
 );
+# }
 ```
 
 ### Aggregate variants
@@ -179,3 +204,5 @@ assert!(rows.not_served_because.is_some());
 
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
+
+This example is text on purpose, because it is the case the typed path cannot produce. Diesel rejects `sum` over a `Text` column, so a caller on `register_select_typed` learns of the mistake from the compiler before `subql` is ever involved.
