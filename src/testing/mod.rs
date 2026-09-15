@@ -10,14 +10,15 @@
 //! compiled keeps every test path unified.
 
 #[doc(hidden)]
-pub mod workload;
-
 use alloc::vec::Vec;
 
 use crate::backend::{Backend, CdcEvent, RowKind, Value};
 use crate::checkpoint::{Checkpoint, NoCheckpoint};
 use crate::{ColumnId, EventKind, TableId};
 use sql_traits::prelude::DatabaseLike;
+
+#[cfg(feature = "testing")]
+pub mod dispatch_fixtures;
 
 /// Concrete [`CdcEvent`] fixture for tests.
 ///

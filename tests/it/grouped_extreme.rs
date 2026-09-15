@@ -808,6 +808,41 @@ fn removing_one_tied_extreme_conservatively_rereads_its_group() {
     assert_eq!(output.triggers().len(), 1);
 }
 
+/// Pins the seed-time group limit stop on the grouped scalar path: the
+/// whole seed gives way to a whole-row re-read under the same identity,
+/// it does not fail installation and it does not half-install groups.
+#[test]
+fn seeding_more_groups_than_the_limit_stops_the_seed_read() {
+    let (engine, _) = engine();
+    let mut engine = engine.with_max_groups_per_aggregate(1);
+    let (subscription, _) = register(&mut engine, "MIN");
+
+    let output = Install::install(
+        &mut engine,
+        subscription,
+        GroupedScalarSeedInstall {
+            rows: vec![
+                vec![Value::String("north".into()), Value::Int(2), Value::Int(1)],
+                vec![Value::String("south".into()), Value::Int(3), Value::Int(1)],
+            ],
+            read_at: Some(PgLsn(5)),
+        },
+    )
+    .expect("the limit changes tier rather than failing installation");
+
+    assert!(output.updates.is_empty(), "no group is half-installed");
+    assert_eq!(output.transitions.len(), 1);
+    assert_eq!(output.transitions[0].subscription_id, subscription);
+    assert_eq!(output.transitions[0].from, TierKind::GroupedScalar);
+    assert_eq!(
+        output.transitions[0].reason,
+        MaintenanceStopReason::GroupLimit { limit: 1 }
+    );
+    assert!(matches!(output.transitions[0].to, Tier::WholeRows { .. }));
+    assert_eq!(output.triggers.len(), 1);
+    assert_eq!(output.triggers[0].subscription_id, subscription);
+}
+
 #[test]
 fn a_new_group_past_the_limit_transitions_under_the_same_identity() {
     let (engine, orders) = engine();

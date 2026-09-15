@@ -21,10 +21,10 @@ use diesel::{Connection, QueryResult, RunQueryDsl};
 /// Returned when the aggregate seed row has the wrong column count.
 #[cfg(feature = "executor-diesel")]
 #[derive(Debug, thiserror::Error)]
-#[error("read returned {got} columns, expected {expected}")]
-struct ReadShapeError {
-    expected: usize,
-    got: usize,
+pub enum ReadShapeError {
+    /// The seed row carries `got` values where `expected` kinds were declared.
+    #[error("read returned {got} columns, expected {expected}")]
+    ColumnCount { expected: usize, got: usize },
 }
 
 /// Sync [`Connector`] backed by a single diesel [`Connection`].
@@ -122,17 +122,7 @@ pub(super) fn load_scalar<C, B>(
 ) -> QueryResult<Value<B>>
 where
     C: Connection,
-    C::Backend: diesel::backend::DieselReserveSpecialization
-        + diesel::sql_types::HasSqlType<Bool>
-        + diesel::sql_types::HasSqlType<BigInt>
-        + diesel::sql_types::HasSqlType<Double>
-        + diesel::sql_types::HasSqlType<Text>
-        + diesel::sql_types::HasSqlType<Binary>
-        + diesel::sql_types::HasSqlType<Timestamp>
-        + diesel::sql_types::HasSqlType<Date>
-        + diesel::sql_types::HasSqlType<Time>
-        + diesel::sql_types::HasSqlType<Numeric>
-        + diesel::sql_types::HasSqlType<Json>,
+    C::Backend: super::ScalarSqlBackend,
     B: DieselBackend,
     bool: diesel::serialize::ToSql<Bool, C::Backend>,
     i64: diesel::serialize::ToSql<BigInt, C::Backend>,
@@ -195,18 +185,7 @@ pub(super) fn load_scalar_row<C, B>(
 ) -> QueryResult<alloc::vec::Vec<Value<B>>>
 where
     C: Connection,
-    C::Backend: crate::diesel_decode::RowFieldDecode
-        + diesel::backend::DieselReserveSpecialization
-        + diesel::sql_types::HasSqlType<Bool>
-        + diesel::sql_types::HasSqlType<BigInt>
-        + diesel::sql_types::HasSqlType<Double>
-        + diesel::sql_types::HasSqlType<Text>
-        + diesel::sql_types::HasSqlType<Binary>
-        + diesel::sql_types::HasSqlType<Timestamp>
-        + diesel::sql_types::HasSqlType<Date>
-        + diesel::sql_types::HasSqlType<Time>
-        + diesel::sql_types::HasSqlType<Numeric>
-        + diesel::sql_types::HasSqlType<Json>,
+    C::Backend: super::ScalarSqlBackend + crate::diesel_decode::RowFieldDecode,
     B: DieselBackend + crate::diesel_decode::SpellCanonical,
     bool: diesel::serialize::ToSql<Bool, C::Backend>,
     i64: diesel::serialize::ToSql<BigInt, C::Backend>,
@@ -225,21 +204,13 @@ where
         .get_result::<crate::diesel_decode::DynamicRow<B>>(conn)?;
     if row.values.len() != kinds.len() {
         return Err(diesel::result::Error::DeserializationError(Box::new(
-            ReadShapeError {
+            ReadShapeError::ColumnCount {
                 expected: kinds.len(),
                 got: row.values.len(),
             },
         )));
     }
-    Ok(row
-        .values
-        .into_iter()
-        .zip(kinds)
-        .map(|(value, kind)| {
-            B::decode_group_value(crate::backend::ValueKind::from(*kind), value)
-                .unwrap_or(Value::Missing)
-        })
-        .collect())
+    Ok(super::decoded_group_values(row, kinds))
 }
 
 #[cfg(feature = "executor-diesel")]
@@ -251,18 +222,7 @@ where
 impl<C, B, S> Connector for DieselConnector<C, B, S>
 where
     C: Connection + diesel::connection::LoadConnection<diesel::connection::DefaultLoadingMode>,
-    C::Backend: crate::diesel_decode::RowFieldDecode
-        + diesel::backend::DieselReserveSpecialization
-        + diesel::sql_types::HasSqlType<Bool>
-        + diesel::sql_types::HasSqlType<BigInt>
-        + diesel::sql_types::HasSqlType<Double>
-        + diesel::sql_types::HasSqlType<Text>
-        + diesel::sql_types::HasSqlType<Binary>
-        + diesel::sql_types::HasSqlType<Timestamp>
-        + diesel::sql_types::HasSqlType<Date>
-        + diesel::sql_types::HasSqlType<Time>
-        + diesel::sql_types::HasSqlType<Numeric>
-        + diesel::sql_types::HasSqlType<Json>,
+    C::Backend: super::ScalarSqlBackend + crate::diesel_decode::RowFieldDecode,
     B: DieselBackend + crate::diesel_decode::SpellCanonical,
     S: SessionSetup,
     bool: diesel::serialize::ToSql<Bool, C::Backend>,
@@ -369,18 +329,7 @@ pub(super) fn load_page<C, B>(
 ) -> QueryResult<RowPage<B>>
 where
     C: diesel::connection::LoadConnection<diesel::connection::DefaultLoadingMode>,
-    C::Backend: crate::diesel_decode::RowFieldDecode
-        + diesel::backend::DieselReserveSpecialization
-        + diesel::sql_types::HasSqlType<Bool>
-        + diesel::sql_types::HasSqlType<BigInt>
-        + diesel::sql_types::HasSqlType<Double>
-        + diesel::sql_types::HasSqlType<Text>
-        + diesel::sql_types::HasSqlType<Binary>
-        + diesel::sql_types::HasSqlType<Timestamp>
-        + diesel::sql_types::HasSqlType<Date>
-        + diesel::sql_types::HasSqlType<Time>
-        + diesel::sql_types::HasSqlType<Numeric>
-        + diesel::sql_types::HasSqlType<Json>,
+    C::Backend: super::ScalarSqlBackend + crate::diesel_decode::RowFieldDecode,
     B: crate::diesel_decode::SpellCanonical + DieselBackend,
     bool: diesel::serialize::ToSql<Bool, C::Backend>,
     i64: diesel::serialize::ToSql<BigInt, C::Backend>,

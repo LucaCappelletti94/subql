@@ -387,7 +387,7 @@ fn a_seed_row_of_the_wrong_width_is_refused_async_mysql() {
             panic!("the refusal comes from the connector");
         };
         assert!(
-            error.to_string().contains("arity"),
+            error.to_string().contains("expected 1"),
             "the refusal names the shape, got {error}"
         );
 

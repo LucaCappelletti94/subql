@@ -64,9 +64,13 @@ mod pg_r2d2_diesel_connector;
 
 // Public types needed by reexec/mod.rs re-exports and by async_diesel.
 #[cfg(feature = "executor-diesel")]
-pub use diesel_backend::DieselBackend;
+pub use diesel_backend::decoded_group_values;
+#[cfg(feature = "executor-diesel")]
+pub use diesel_backend::{DieselBackend, ScalarSqlBackend};
 #[cfg(feature = "executor-diesel")]
 pub use diesel_connector::DieselConnector;
+#[cfg(feature = "executor-diesel")]
+pub use diesel_connector::ReadShapeError;
 // The scalar row shapes travel to the async connectors only, so the
 // re-export follows their backend features rather than `executor-diesel`.
 #[cfg(any(

@@ -145,6 +145,33 @@ struct AggregateRegistration<I: IdTypes, B: Backend> {
     database_reads_per_consumer: bool,
 }
 
+/// A whole-reread transition's answer, spelled once for the install-side
+/// helpers.
+type WholeTransition<I, B, C> = Result<
+    (
+        crate::MaintenanceTransition<B>,
+        crate::reexec::ReExecutionTrigger<I, C, B>,
+    ),
+    DispatchError,
+>;
+
+/// The stopped answer an install path hands back, spelled once for the
+/// install-side helpers.
+type InstallAnswer<I, B, C> =
+    Result<crate::AggregateMaintenanceOutput<I, B, C>, crate::AggregateInstallError>;
+
+/// Which grouped read gives way to a whole re-read when it stops. The two
+/// transitions build their replacement from different state (query runtime
+/// vs aggregate registration), so the choice stays a name and the bodies
+/// never merge.
+#[derive(Clone, Copy)]
+enum GroupedStopTier {
+    /// A grouped-extrema read in the re-execution runtime.
+    GroupedScalar,
+    /// A whole-shape grouped aggregate total.
+    Aggregate,
+}
+
 impl<I: IdTypes, B: Backend> Clone for AggregateRegistration<I, B> {
     fn clone(&self) -> Self {
         Self {
@@ -1985,13 +2012,7 @@ where
         from: crate::TierKind,
         reason: crate::MaintenanceStopReason,
         checkpoint: Option<&E::Checkpoint>,
-    ) -> Result<
-        (
-            crate::MaintenanceTransition<E::Backend>,
-            crate::reexec::ReExecutionTrigger<I, E::Checkpoint, E::Backend>,
-        ),
-        DispatchError,
-    > {
+    ) -> WholeTransition<I, E::Backend, E::Checkpoint> {
         let (consumer, session, source_query, database_reads_per_consumer) = {
             let entry =
                 self.reexec
@@ -2045,13 +2066,7 @@ where
         subscription_id: SubscriptionId,
         table_id: TableId,
         checkpoint: Option<&E::Checkpoint>,
-    ) -> Result<
-        (
-            crate::MaintenanceTransition<E::Backend>,
-            crate::reexec::ReExecutionTrigger<I, E::Checkpoint, E::Backend>,
-        ),
-        DispatchError,
-    > {
+    ) -> WholeTransition<I, E::Backend, E::Checkpoint> {
         self.transition_reread_to_whole(
             subscription_id,
             crate::TierKind::KeyedRows,
@@ -2065,13 +2080,7 @@ where
         subscription_id: SubscriptionId,
         reason: crate::MaintenanceStopReason,
         checkpoint: Option<&E::Checkpoint>,
-    ) -> Result<
-        (
-            crate::MaintenanceTransition<E::Backend>,
-            crate::reexec::ReExecutionTrigger<I, E::Checkpoint, E::Backend>,
-        ),
-        DispatchError,
-    > {
+    ) -> WholeTransition<I, E::Backend, E::Checkpoint> {
         self.transition_reread_to_whole(
             subscription_id,
             crate::TierKind::GroupedScalar,
@@ -2092,10 +2101,7 @@ where
             ),
             DispatchError,
         >,
-    ) -> Result<
-        crate::AggregateMaintenanceOutput<I, E::Backend, E::Checkpoint>,
-        crate::AggregateInstallError,
-    > {
+    ) -> InstallAnswer<I, E::Backend, E::Checkpoint> {
         let (transition, trigger) =
             transitioned.map_err(|error| crate::AggregateInstallError::TierTransition {
                 subscription: subscription_id,
@@ -2107,6 +2113,67 @@ where
             transitions: alloc::vec![transition],
             evaluation_failures: Vec::new(),
         })
+    }
+
+    /// Which grouped read gives way to a whole re-read when it stops. The
+    /// two transitions build their replacement from different state (query
+    /// runtime vs aggregate registration), so the choice stays a name and
+    /// the bodies never merge.
+    fn transition_grouped_to_whole(
+        &mut self,
+        subscription_id: SubscriptionId,
+        grouped_tier: GroupedStopTier,
+        reason: crate::MaintenanceStopReason,
+        checkpoint: Option<&E::Checkpoint>,
+    ) -> WholeTransition<I, E::Backend, E::Checkpoint> {
+        match grouped_tier {
+            GroupedStopTier::GroupedScalar => {
+                self.transition_grouped_scalar_to_whole(subscription_id, reason, checkpoint)
+            }
+            GroupedStopTier::Aggregate => {
+                self.transition_aggregate_to_whole(subscription_id, reason, checkpoint)
+            }
+        }
+    }
+
+    /// The stopped answer for one stop reason, shared by every install path
+    /// that can stop a grouped read.
+    fn stopped_for_reason(
+        &mut self,
+        subscription_id: SubscriptionId,
+        grouped_tier: GroupedStopTier,
+        reason: crate::MaintenanceStopReason,
+        checkpoint: Option<&E::Checkpoint>,
+    ) -> InstallAnswer<I, E::Backend, E::Checkpoint> {
+        let transitioned =
+            self.transition_grouped_to_whole(subscription_id, grouped_tier, reason, checkpoint);
+        Self::stopped_output(subscription_id, transitioned)
+    }
+
+    /// The two group-capacity errors that stop a grouped read. Any other
+    /// error passes back untouched. `table_id` is only consulted for the
+    /// unencodable key, matching what the old per-arm code looked at.
+    fn stopped_for_group_limit(
+        &mut self,
+        subscription_id: SubscriptionId,
+        grouped_tier: GroupedStopTier,
+        error: crate::AggregateInstallError,
+        limit: usize,
+        checkpoint: Option<&E::Checkpoint>,
+        table_id: Option<TableId>,
+    ) -> InstallAnswer<I, E::Backend, E::Checkpoint> {
+        let reason = match error {
+            crate::AggregateInstallError::GroupLimit { .. } => {
+                crate::MaintenanceStopReason::GroupLimit { limit }
+            }
+            crate::AggregateInstallError::GroupKeyUnencodable(_) => {
+                crate::MaintenanceStopReason::GroupKeyUnencodable {
+                    table_id: table_id.expect("callers resolve the table for an unencodable key"),
+                }
+            }
+            other => return Err(other),
+        };
+        self.stopped_for_reason(subscription_id, grouped_tier, reason, checkpoint)
     }
 
     /// Feed `event` to every re-read answer whose table it touches.

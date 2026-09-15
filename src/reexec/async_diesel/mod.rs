@@ -111,7 +111,7 @@ pub(super) async fn load_scalar_postgres_async(
 ) -> diesel::QueryResult<Value<crate::backend::Postgres>> {
     let value = match kind {
         ScalarFamily::Int => {
-            let sql = alloc::format!("SELECT CAST(({}) AS BIGINT) AS v", query.sql());
+            let sql = widened_int_sql::<crate::backend::Postgres>(query);
             let query = ReadQuery::borrowed(&sql, query.binds());
             boxed_postgres_read_query_owned(&query)?
                 .get_result::<IntRow>(conn)
@@ -141,7 +141,7 @@ pub(super) async fn load_scalar_mysql_async<C: crate::backend::MySqlTableNameCas
 ) -> diesel::QueryResult<Value<crate::backend::MySql<C>>> {
     let value = match kind {
         ScalarFamily::Int => {
-            let sql = alloc::format!("SELECT CAST(({}) AS SIGNED) AS v", query.sql());
+            let sql = widened_int_sql::<crate::backend::MySql<C>>(query);
             let query = ReadQuery::borrowed(&sql, query.binds());
             boxed_mysql_read_query_owned(&query)?
                 .get_result::<IntRow>(conn)
@@ -172,23 +172,7 @@ pub(super) async fn load_scalar_row_postgres_async(
     let row = boxed_postgres_read_query_owned(query)?
         .get_result::<crate::diesel_decode::DynamicRow<crate::backend::Postgres>>(conn)
         .await?;
-    if row.values.len() != kinds.len() {
-        return Err(diesel::result::Error::DeserializationError(
-            "aggregate seed row has the wrong arity".into(),
-        ));
-    }
-    Ok(row
-        .values
-        .into_iter()
-        .zip(kinds)
-        .map(|(value, kind)| {
-            crate::backend::Postgres::decode_group_value(
-                crate::backend::ValueKind::from(*kind),
-                value,
-            )
-            .unwrap_or(Value::Missing)
-        })
-        .collect())
+    seed_row_values(row, kinds)
 }
 
 #[cfg(feature = "executor-diesel-async-mysql")]
@@ -200,23 +184,7 @@ pub(super) async fn load_scalar_row_mysql_async<C: crate::backend::MySqlTableNam
     let row = boxed_mysql_read_query_owned(query)?
         .get_result::<crate::diesel_decode::DynamicRow<crate::backend::MySql<C>>>(conn)
         .await?;
-    if row.values.len() != kinds.len() {
-        return Err(diesel::result::Error::DeserializationError(
-            "aggregate seed row has the wrong arity".into(),
-        ));
-    }
-    Ok(row
-        .values
-        .into_iter()
-        .zip(kinds)
-        .map(|(value, kind)| {
-            crate::backend::MySql::<C>::decode_group_value(
-                crate::backend::ValueKind::from(*kind),
-                value,
-            )
-            .unwrap_or(Value::Missing)
-        })
-        .collect())
+    seed_row_values(row, kinds)
 }
 
 /// Async binlog-position-aware [`AsyncConnector`] for MySQL, the async peer
@@ -414,6 +382,49 @@ impl<S: SessionSetup + Send + Sync, C: crate::backend::MySqlTableNameCase> Async
     }
 }
 
+/// SQL for an eight-byte integer scalar read: wraps the projected column in
+/// the backend's own widening `CAST` (see
+/// [`DieselBackend::int_cast_type`](super::connector::DieselBackend::int_cast_type)),
+/// so an aggregate over a column narrower than `bigint` decodes through
+/// `Nullable<BigInt>`.
+#[cfg(any(
+    feature = "executor-diesel-async-postgres",
+    feature = "executor-diesel-async-mysql"
+))]
+fn widened_int_sql<B: super::connector::DieselBackend>(query: &ReadQuery<'_, B>) -> String {
+    alloc::format!(
+        "SELECT CAST(({}) AS {cast}) AS v",
+        query.sql(),
+        cast = B::int_cast_type()
+    )
+}
+
+/// Check an aggregate seed row's arity and lift it through
+/// [`Backend::decode_group_value`], the same decoding the sync connector
+/// applies.
+///
+/// # Errors
+/// [`diesel::result::Error::DeserializationError`] when the row width does
+/// not match `kinds`.
+#[cfg(any(
+    feature = "executor-diesel-async-postgres",
+    feature = "executor-diesel-async-mysql"
+))]
+fn seed_row_values<B: Backend>(
+    row: crate::diesel_decode::DynamicRow<B>,
+    kinds: &[ScalarFamily],
+) -> diesel::QueryResult<Vec<Value<B>>> {
+    if row.values.len() != kinds.len() {
+        return Err(diesel::result::Error::DeserializationError(Box::new(
+            crate::reexec::connector::ReadShapeError::ColumnCount {
+                expected: kinds.len(),
+                got: row.values.len(),
+            },
+        )));
+    }
+    Ok(crate::reexec::connector::decoded_group_values(row, kinds))
+}
+
 /// Read one page off an async diesel connection, decoding each row without a
 /// compile-time schema and bounding the page at `max_bytes`.
 ///
@@ -474,6 +485,58 @@ fn finish_page<B: crate::backend::Backend>(
         columns,
         rows,
         more,
+    }
+}
+
+#[cfg(all(test, feature = "executor-diesel-async-postgres"))]
+mod shared_loader_helpers_tests {
+    use super::{seed_row_values, widened_int_sql};
+    use crate::backend::{MySql, NamesStoredAsWritten, Postgres, ScalarFamily, Value};
+    use crate::diesel_decode::DynamicRow;
+    use crate::reexec::connector::ReadQuery;
+    use alloc::string::ToString as _;
+    use alloc::vec;
+
+    #[test]
+    fn the_int_widening_cast_follows_the_backend() {
+        // A wrong spelling makes the widened read fail (PG) or silently
+        // change width (MySQL), so both spellings are pinned here rather
+        // than discovered by a container test.
+        let query = ReadQuery::<Postgres>::without_binds("SELECT amount FROM orders");
+        assert_eq!(
+            widened_int_sql::<Postgres>(&query),
+            "SELECT CAST((SELECT amount FROM orders) AS BIGINT) AS v"
+        );
+        let query = ReadQuery::<MySql<NamesStoredAsWritten>>::without_binds("SELECT 1");
+        assert_eq!(
+            widened_int_sql::<MySql<NamesStoredAsWritten>>(&query),
+            "SELECT CAST((SELECT 1) AS SIGNED) AS v"
+        );
+    }
+
+    #[test]
+    fn a_seed_row_of_matching_arity_decodes_column_by_column() {
+        let row = DynamicRow::<Postgres> {
+            columns: vec!["id".to_string(), "note".to_string()],
+            values: vec![Value::Int(7), Value::String("x".into())],
+        };
+        let values = seed_row_values(row, &[ScalarFamily::Int, ScalarFamily::String])
+            .expect("arity matches");
+        assert_eq!(values, vec![Value::Int(7), Value::String("x".into())]);
+    }
+
+    #[test]
+    fn a_seed_row_of_wrong_arity_is_a_deserialization_error() {
+        let row = DynamicRow::<Postgres> {
+            columns: vec!["id".to_string()],
+            values: vec![Value::Int(7)],
+        };
+        let error = seed_row_values(row, &[ScalarFamily::Int, ScalarFamily::String])
+            .expect_err("one column cannot answer two kinds");
+        assert!(
+            error.to_string().contains("expected 2"),
+            "the message must survive: {error}"
+        );
     }
 }
 

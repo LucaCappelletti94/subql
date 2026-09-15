@@ -684,7 +684,7 @@ pub fn pgbinary_patchset<B: crate::backend::Backend, DB: DatabaseLike>(
 mod tests {
     use super::*;
     use sql_traits::structs::ParserDB;
-    use sqlite_diff_rs::{ChangesetOp, ParsedDiffSet, PatchsetOp};
+    use sqlite_diff_rs::{ChangesetOp, ParsedDiffSet, PatchsetOp, TableSchema};
     use sqlparser::dialect::PostgreSqlDialect;
     use wal2json_events::parse_v2;
 
@@ -693,6 +693,55 @@ mod tests {
             "CREATE TABLE orders (id INT PRIMARY KEY, amount INT, status TEXT);",
         )
         .unwrap()
+    }
+
+    /// The wal2json line's patchset bytes, with the marker asserted. The
+    /// emitted ops borrow from the returned value, so the caller still
+    /// matches the `Patchset` variant.
+    fn patchset_for_line(db: &ParserDB, line: &str) -> ParsedDiffSet {
+        let msg = parse_v2(line).unwrap();
+        let bytes = wal2json_patchset(db, core::slice::from_ref(&msg)).unwrap();
+        parse_patchset(&bytes)
+    }
+
+    /// Owns the parsed patchset of one wal2json line so a test borrows
+    /// its ops without restating the variant unwrap and collect.
+    struct PatchsetOps {
+        parsed: ParsedDiffSet,
+    }
+
+    /// The op view of a parsed patchset, spelled once for the test bodies.
+    type RowOp<'a> = PatchsetOp<'a, TableSchema<String>, String, Vec<u8>>;
+
+    impl PatchsetOps {
+        fn ops(&self) -> Vec<RowOp<'_>> {
+            let ParsedDiffSet::Patchset(diff) = &self.parsed else {
+                unreachable!("parse_patchset asserted the Patchset variant");
+            };
+            diff.iter().collect()
+        }
+    }
+
+    fn patchset_ops(db: &ParserDB, line: &str) -> PatchsetOps {
+        PatchsetOps {
+            parsed: patchset_for_line(db, line),
+        }
+    }
+
+    /// The pk of the one update op, panicking with the op's shape otherwise.
+    fn update_pk(ops: &[RowOp<'_>]) -> Vec<WireValue<String, Vec<u8>>> {
+        let PatchsetOp::Update { pk, .. } = &ops[0] else {
+            panic!("expected an update op, got {:?}", ops[0]);
+        };
+        pk.to_vec()
+    }
+
+    /// The pk of the one delete op, panicking with the op's shape otherwise.
+    fn delete_pk(ops: &[RowOp<'_>]) -> Vec<WireValue<String, Vec<u8>>> {
+        let PatchsetOp::Delete { pk, .. } = &ops[0] else {
+            panic!("expected a delete op, got {:?}", ops[0]);
+        };
+        pk.to_vec()
     }
 
     fn parse_patchset(bytes: &[u8]) -> ParsedDiffSet {
@@ -733,14 +782,8 @@ mod tests {
     fn insert_emits_patchset_insert_with_row_values() {
         let db = orders_db();
         let line = r#"{"action":"I","schema":"public","table":"orders","columns":[{"name":"id","type":"integer","value":1},{"name":"amount","type":"integer","value":100},{"name":"status","type":"text","value":"new"}]}"#;
-        let msg = parse_v2(line).unwrap();
-
-        let bytes = wal2json_patchset(&db, core::slice::from_ref(&msg)).unwrap();
-        let parsed = parse_patchset(&bytes);
-        let ParsedDiffSet::Patchset(diff) = parsed else {
-            unreachable!("marker checked above");
-        };
-        let ops: Vec<_> = diff.iter().collect();
+        let ps = patchset_ops(&db, line);
+        let ops = ps.ops();
         assert_eq!(ops.len(), 1);
         let PatchsetOp::Insert { table, values, .. } = &ops[0] else {
             panic!("expected an insert op, got {:?}", ops[0]);
@@ -760,14 +803,8 @@ mod tests {
     fn update_emits_patchset_update_with_pk_and_new_values() {
         let db = orders_db();
         let line = r#"{"action":"U","schema":"public","table":"orders","columns":[{"name":"id","type":"integer","value":1},{"name":"amount","type":"integer","value":250},{"name":"status","type":"text","value":"shipped"}],"identity":[{"name":"id","type":"integer","value":1}]}"#;
-        let msg = parse_v2(line).unwrap();
-
-        let bytes = wal2json_patchset(&db, core::slice::from_ref(&msg)).unwrap();
-        let parsed = parse_patchset(&bytes);
-        let ParsedDiffSet::Patchset(diff) = parsed else {
-            unreachable!("marker checked above");
-        };
-        let ops: Vec<_> = diff.iter().collect();
+        let ps = patchset_ops(&db, line);
+        let ops = ps.ops();
         assert_eq!(ops.len(), 1);
         let PatchsetOp::Update { table, pk, .. } = &ops[0] else {
             panic!("expected an update op, got {:?}", ops[0]);
@@ -787,14 +824,8 @@ mod tests {
     fn delete_emits_patchset_delete_with_pk_only() {
         let db = orders_db();
         let line = r#"{"action":"D","schema":"public","table":"orders","identity":[{"name":"id","type":"integer","value":7}]}"#;
-        let msg = parse_v2(line).unwrap();
-
-        let bytes = wal2json_patchset(&db, core::slice::from_ref(&msg)).unwrap();
-        let parsed = parse_patchset(&bytes);
-        let ParsedDiffSet::Patchset(diff) = parsed else {
-            unreachable!("marker checked above");
-        };
-        let ops: Vec<_> = diff.iter().collect();
+        let ps = patchset_ops(&db, line);
+        let ops = ps.ops();
         assert_eq!(ops.len(), 1);
         let PatchsetOp::Delete { table, pk, .. } = &ops[0] else {
             panic!("expected a delete op, got {:?}", ops[0]);
@@ -847,17 +878,10 @@ mod tests {
 
         // UPDATE with a full new image and a key-only identity (default RI).
         let update = r#"{"action":"U","schema":"public","table":"orders","columns":[{"name":"id","type":"integer","value":1},{"name":"amount","type":"integer","value":250},{"name":"status","type":"text","value":"shipped"}],"identity":[{"name":"id","type":"integer","value":1}]}"#;
-        let msg = parse_v2(update).unwrap();
-        let bytes = wal2json_patchset(&db, core::slice::from_ref(&msg)).unwrap();
-        let ParsedDiffSet::Patchset(diff) = parse_patchset(&bytes) else {
-            unreachable!("marker checked above");
-        };
-        let ops: Vec<_> = diff.iter().collect();
-        let PatchsetOp::Update { pk, .. } = &ops[0] else {
-            panic!("expected an update op, got {:?}", ops[0]);
-        };
+        let ps = patchset_ops(&db, update);
+        let ops = ps.ops();
         assert_eq!(
-            pk.to_vec(),
+            update_pk(&ops),
             vec![WireValue::Integer(1)],
             "WHERE key present"
         );
@@ -870,17 +894,10 @@ mod tests {
 
         // DELETE with a key-only identity (default RI).
         let delete = r#"{"action":"D","schema":"public","table":"orders","identity":[{"name":"id","type":"integer","value":1}]}"#;
-        let msg = parse_v2(delete).unwrap();
-        let bytes = wal2json_patchset(&db, core::slice::from_ref(&msg)).unwrap();
-        let ParsedDiffSet::Patchset(diff) = parse_patchset(&bytes) else {
-            unreachable!("marker checked above");
-        };
-        let ops: Vec<_> = diff.iter().collect();
-        let PatchsetOp::Delete { pk, .. } = &ops[0] else {
-            panic!("expected a delete op, got {:?}", ops[0]);
-        };
+        let ps = patchset_ops(&db, delete);
+        let ops = ps.ops();
         assert_eq!(
-            pk.to_vec(),
+            delete_pk(&ops),
             vec![WireValue::Integer(1)],
             "delete matches key"
         );
@@ -894,33 +911,19 @@ mod tests {
         let db = pairs_db();
 
         let update = r#"{"action":"U","schema":"public","table":"pairs","columns":[{"name":"a","type":"integer","value":1},{"name":"b","type":"integer","value":2},{"name":"v","type":"text","value":"y2"}],"identity":[{"name":"a","type":"integer","value":1},{"name":"b","type":"integer","value":2}]}"#;
-        let msg = parse_v2(update).unwrap();
-        let bytes = wal2json_patchset(&db, core::slice::from_ref(&msg)).unwrap();
-        let ParsedDiffSet::Patchset(diff) = parse_patchset(&bytes) else {
-            unreachable!("marker checked above");
-        };
-        let ops: Vec<_> = diff.iter().collect();
-        let PatchsetOp::Update { pk, .. } = &ops[0] else {
-            panic!("expected an update op, got {:?}", ops[0]);
-        };
+        let ps = patchset_ops(&db, update);
+        let ops = ps.ops();
         assert_eq!(
-            pk.to_vec(),
+            update_pk(&ops),
             vec![WireValue::Integer(1), WireValue::Integer(2)],
             "both key columns in the update WHERE"
         );
 
         let delete = r#"{"action":"D","schema":"public","table":"pairs","identity":[{"name":"a","type":"integer","value":1},{"name":"b","type":"integer","value":2}]}"#;
-        let msg = parse_v2(delete).unwrap();
-        let bytes = wal2json_patchset(&db, core::slice::from_ref(&msg)).unwrap();
-        let ParsedDiffSet::Patchset(diff) = parse_patchset(&bytes) else {
-            unreachable!("marker checked above");
-        };
-        let ops: Vec<_> = diff.iter().collect();
-        let PatchsetOp::Delete { pk, .. } = &ops[0] else {
-            panic!("expected a delete op, got {:?}", ops[0]);
-        };
+        let ps = patchset_ops(&db, delete);
+        let ops = ps.ops();
         assert_eq!(
-            pk.to_vec(),
+            delete_pk(&ops),
             vec![WireValue::Integer(1), WireValue::Integer(2)],
             "both key columns in the delete WHERE"
         );
@@ -937,17 +940,10 @@ mod tests {
         // UPDATE orders SET id = 2 WHERE id = 1: new image has id = 2, the
         // old-row identity still has id = 1.
         let line = r#"{"action":"U","schema":"public","table":"orders","columns":[{"name":"id","type":"integer","value":2},{"name":"amount","type":"integer","value":100},{"name":"status","type":"text","value":"new"}],"identity":[{"name":"id","type":"integer","value":1}]}"#;
-        let msg = parse_v2(line).unwrap();
-        let bytes = wal2json_patchset(&db, core::slice::from_ref(&msg)).unwrap();
-        let ParsedDiffSet::Patchset(diff) = parse_patchset(&bytes) else {
-            unreachable!("marker checked above");
-        };
-        let ops: Vec<_> = diff.iter().collect();
-        let PatchsetOp::Update { pk, .. } = &ops[0] else {
-            panic!("expected an update op, got {:?}", ops[0]);
-        };
+        let ps = patchset_ops(&db, line);
+        let ops = ps.ops();
         assert_eq!(
-            pk.to_vec(),
+            update_pk(&ops),
             vec![WireValue::Integer(2)],
             "the emitted WHERE targets the new key, so the old key is lost"
         );
@@ -992,7 +988,7 @@ mod tests {
 
     fn only_insert_values(bytes: &[u8]) -> Vec<WireValue<String, Vec<u8>>> {
         let ParsedDiffSet::Patchset(diff) = parse_patchset(bytes) else {
-            unreachable!("marker checked above");
+            unreachable!("parse_patchset asserted the Patchset variant");
         };
         let ops: Vec<_> = diff.iter().collect();
         assert_eq!(ops.len(), 1);
@@ -1156,12 +1152,8 @@ mod tests {
         )
         .unwrap();
         let line = r#"{"action":"I","schema":"a","table":"items","columns":[{"name":"id","type":"integer","value":1},{"name":"left_text","type":"text","value":"x"}]}"#;
-        let msg = parse_v2(line).unwrap();
-        let bytes = wal2json_patchset(&db, core::slice::from_ref(&msg)).unwrap();
-        let ParsedDiffSet::Patchset(diff) = parse_patchset(&bytes) else {
-            unreachable!("marker checked above");
-        };
-        let ops: Vec<_> = diff.iter().collect();
+        let ps = patchset_ops(&db, line);
+        let ops = ps.ops();
         assert_eq!(ops.len(), 1);
         let PatchsetOp::Insert { values, .. } = &ops[0] else {
             panic!("expected an insert op, got {:?}", ops[0]);
@@ -1204,7 +1196,7 @@ mod tests {
         };
         let bytes = pgoutput_patchset(&db, core::slice::from_ref(&ev)).unwrap();
         let ParsedDiffSet::Patchset(diff) = parse_patchset(&bytes) else {
-            unreachable!("marker checked above");
+            unreachable!("parse_patchset asserted the Patchset variant");
         };
         let ops: Vec<_> = diff.iter().collect();
         assert_eq!(ops.len(), 1);
@@ -1229,7 +1221,7 @@ mod tests {
         .unwrap();
         let bytes = maxwell_patchset(&db, core::slice::from_ref(&msg)).unwrap();
         let ParsedDiffSet::Patchset(diff) = parse_patchset(&bytes) else {
-            unreachable!("marker checked above");
+            unreachable!("parse_patchset asserted the Patchset variant");
         };
         assert_eq!(diff.iter().count(), 1);
     }
