@@ -14,10 +14,7 @@ SQL subscription dispatch engine for Change Data Capture fanout.
 
 ## Quick Start
 
-With the `diesel-typed` feature, a subscription is a diesel query. Diesel checks the
-columns, the values, and the comparison between them at compile time, and subql takes the
-placeholder SQL and serialized binds that diesel's own backend serializer produces. The
-predicate never has to exist as a string a caller could mistype.
+With the `diesel-typed` feature, a subscription is a diesel query. Diesel checks the columns, the values, and the comparison between them at compile time, and subql takes the placeholder SQL and serialized binds that diesel's own backend serializer produces. The predicate never has to exist as a string a caller could mistype.
 
 ```rust
 # #[cfg(feature = "diesel-typed")] {
@@ -60,22 +57,11 @@ assert_eq!(notifs.inserted(), vec![42]);
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
-Placeholder SQL plus typed binds is the engine's own contract, and
-`register_select_typed` is a producer for it. It renders the query exactly as diesel would
-send it and decodes the binds from the wire bytes, so every subscription keeps the SQL the
-database can re-run when the engine hands the answer back to a re-read. A raw-text
-subscription (`SubscriptionRequest::new(42, "SELECT * FROM orders WHERE amount > 100")`)
-enters the same compile, index, and dedup path. SQLite and MySQL join through the
-`diesel-typed-sqlite` and `diesel-typed-mysql` features.
+Placeholder SQL plus typed binds is the engine's own contract, and `register_select_typed` is a producer for it. It renders the query exactly as diesel would send it and decodes each backend's serialized binds into typed values, so every subscription keeps the SQL the database can re-run when the engine hands the answer back to a re-read. A raw-text subscription (`SubscriptionRequest::new(42, "SELECT * FROM orders WHERE amount > 100")`) enters the same compile, index, and dedup path. SQLite and MySQL join through the `diesel-typed-sqlite` and `diesel-typed-mysql` features.
 
 ## Streaming Aggregates
 
-Alongside row-match subscriptions, register an aggregate instead of a `SELECT *`. Diesel
-spells `COUNT(*)`, `SUM(col)` and `AVG(col)` as `.count()`, `sum(col)` and `avg(col)`. The
-variance/stddev family (`VAR_POP`/`VAR_SAMP`/`STDDEV_POP`/`STDDEV_SAMP`) and `COUNT(col)`
-have no diesel built-in and arrive as SQL text through `register`. The engine keeps the
-running value and reports it whenever it moves, so the caller stores nothing and folds
-nothing.
+Alongside row-match subscriptions, register an aggregate instead of a `SELECT *`. Diesel spells `COUNT(*)`, `COUNT(col)`, `SUM(col)` and `AVG(col)` as `.count()`, `diesel::dsl::count(col)`, `sum(col)` and `avg(col)`. The variance/stddev family (`VAR_POP`/`VAR_SAMP`/`STDDEV_POP`/`STDDEV_SAMP`) has no diesel built-in and arrives as SQL text through `register`. The engine keeps the running value and reports it whenever it moves, so the caller stores nothing and folds nothing.
 
 A registration answers with an `aggregate_bootstrap`, a runnable query for the starting numbers. Run it, then pass an `AggregateSeedInstall` to `Install::install` with the decoded row and stream position the read was taken at. Take that position **before** the read's snapshot opens: it is what lets the engine drop the changes the read already saw rather than counting them twice. Until the numbers land the subscription reports nothing, and a read the engine cannot line up against what it folded is refused with a `AggregateInstallError` so the caller can `reset_aggregate` and read again.
 
@@ -220,6 +206,4 @@ assert!(rows.not_served_because.is_some());
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
-This example is text on purpose, because it is the case the typed path cannot produce.
-Diesel rejects `sum` over a `Text` column, so a caller on `register_select_typed` learns
-of the mistake from the compiler before `subql` is ever involved.
+This example is text on purpose, because it is the case the typed path cannot produce. Diesel rejects `sum` over a `Text` column, so a caller on `register_select_typed` learns of the mistake from the compiler before `subql` is ever involved.
