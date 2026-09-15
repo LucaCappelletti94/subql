@@ -14,7 +14,7 @@ SQL subscription dispatch engine for Change Data Capture fanout.
 
 ## Quick Start
 
-With the `diesel-typed` feature, a subscription is a diesel query. Diesel checks the columns, the values, and the comparison between them at compile time, and subql takes the placeholder SQL and serialized binds that diesel's own backend serializer produces. The predicate never has to exist as a string a caller could mistype.
+With the `diesel-typed` feature, a subscription is a diesel query. Diesel checks the columns, the types of the values, and the comparison between them at compile time, and subql takes the placeholder SQL and serialized binds that diesel's own backend serializer produces. The predicate never has to exist as a string a caller could mistype.
 
 ```rust
 # #[cfg(feature = "diesel-typed")] {
