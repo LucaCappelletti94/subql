@@ -188,7 +188,7 @@ pub fn harness_snapshot_restore_roundtrip(data: &[u8]) {
     let Some(table_id) = catalog_helpers::table_id::<Postgres, _>(&database, "orders") else {
         return;
     };
-    let pk_col = match catalog_helpers::column_id(&database, table_id, "id") {
+    let pk_col = match catalog_helpers::column_id::<Postgres, _>(&database, table_id, "id") {
         Some(c) => c,
         None => return,
     };

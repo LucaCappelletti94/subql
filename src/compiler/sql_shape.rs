@@ -2687,8 +2687,11 @@ mod membership_naming_tests {
     fn a_quoted_column_names_the_column_stored_quoted() {
         let db = ParserDB::parse::<PostgreSqlDialect>(DDL).unwrap();
         let docs = catalog_helpers::table_id::<crate::backend::Postgres, _>(&db, "docs").unwrap();
-        let quoted_owner = catalog_helpers::column_id(&db, docs, r#""Owner""#).unwrap();
-        let bare_owner = catalog_helpers::column_id(&db, docs, "owner").unwrap();
+        let quoted_owner =
+            catalog_helpers::column_id::<crate::backend::Postgres, _>(&db, docs, r#""Owner""#)
+                .unwrap();
+        let bare_owner =
+            catalog_helpers::column_id::<crate::backend::Postgres, _>(&db, docs, "owner").unwrap();
         assert_ne!(quoted_owner, bare_owner);
 
         for (written, expected) in [(r#""Owner""#, quoted_owner), ("owner", bare_owner)] {
@@ -2718,7 +2721,9 @@ mod membership_naming_tests {
         let shares =
             catalog_helpers::table_id::<crate::backend::Postgres, _>(&db, r#"app."Shares""#)
                 .unwrap();
-        let dotted = catalog_helpers::column_id(&db, shares, r#""Doc.Id""#).unwrap();
+        let dotted =
+            catalog_helpers::column_id::<crate::backend::Postgres, _>(&db, shares, r#""Doc.Id""#)
+                .unwrap();
         let subquery = exists_subquery(
             r#"SELECT * FROM docs WHERE EXISTS (SELECT 1 FROM app."Shares" s
                WHERE s."Doc.Id" = docs.id
@@ -2756,8 +2761,11 @@ mod written_column_tests {
     /// The ordinals of the quoted column and of the folded one beside it.
     fn columns(db: &ParserDB) -> (crate::TableId, crate::ColumnId, crate::ColumnId) {
         let docs = catalog_helpers::table_id::<crate::backend::Postgres, _>(db, "docs").unwrap();
-        let quoted = catalog_helpers::column_id(db, docs, r#""Owner""#).unwrap();
-        let folded = catalog_helpers::column_id(db, docs, "owner").unwrap();
+        let quoted =
+            catalog_helpers::column_id::<crate::backend::Postgres, _>(db, docs, r#""Owner""#)
+                .unwrap();
+        let folded =
+            catalog_helpers::column_id::<crate::backend::Postgres, _>(db, docs, "owner").unwrap();
         assert_ne!(quoted, folded);
         (docs, quoted, folded)
     }

@@ -367,8 +367,8 @@ fn an_absent_membership_term_column_is_reported() {
     let db = ParserDB::parse::<PostgreSqlDialect>(DDL_TERM).expect("DDL parses");
     let notes = catalog_helpers::table_id::<subql::backend::Postgres, _>(&db, "notes")
         .expect("notes is in the catalog");
-    let project_id =
-        catalog_helpers::column_id(&db, notes, "project_id").expect("project_id resolves");
+    let project_id = catalog_helpers::column_id::<Postgres, _>(&db, notes, "project_id")
+        .expect("project_id resolves");
     let mut engine: Engine = SubscriptionEngine::new(db, PostgreSqlDialect {}).with_translator(
         TranslatorBuilder::new()
             .with_min_confidence(ConfidenceLevel::B)
@@ -493,7 +493,8 @@ fn unchanged_toast_does_not_drop_a_subscription() {
     let catalog = ParserDB::parse::<PostgreSqlDialect>(DDL).expect("DDL parses");
     let table = catalog_helpers::table_id::<subql::backend::Postgres, _>(&catalog, "docs")
         .expect("docs is cataloged");
-    let column = catalog_helpers::column_id(&catalog, table, "body").expect("body is cataloged");
+    let column = catalog_helpers::column_id::<Postgres, _>(&catalog, table, "body")
+        .expect("body is cataloged");
     let config = PgStreamingConfig::new(db.url(), &slot, publication);
 
     let mut engine: SubscriptionEngine<_, DefaultIds, ParserDB> = SubscriptionEngine::new(

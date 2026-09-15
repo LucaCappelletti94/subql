@@ -133,7 +133,7 @@ fn locale_ordering_is_classified_not_served() {
         registered.served().is_none(),
         "byte ordering answers 'a' < 'B' false where the server answers true"
     );
-    let column = catalog_helpers::column_id(
+    let column = catalog_helpers::column_id::<Postgres, _>(
         &ParserDB::parse::<PostgreSqlDialect>(PG_DDL).expect("DDL parses"),
         catalog_helpers::table_id::<subql::backend::Postgres, _>(
             &ParserDB::parse::<PostgreSqlDialect>(PG_DDL).expect("DDL parses"),

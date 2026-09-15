@@ -55,8 +55,10 @@ fn a_real_cell_decodes_at_float4_width() {
     let db = catalog();
     let table = catalog_helpers::table_id::<subql::backend::Postgres, _>(&db, "readings")
         .expect("readings is cataloged");
-    let single = catalog_helpers::column_id(&db, table, "single").expect("single");
-    let double = catalog_helpers::column_id(&db, table, "double").expect("double");
+    let single = catalog_helpers::column_id::<subql::backend::Postgres, _>(&db, table, "single")
+        .expect("single");
+    let double = catalog_helpers::column_id::<subql::backend::Postgres, _>(&db, table, "double")
+        .expect("double");
     let ev = event("0.1");
 
     assert_eq!(

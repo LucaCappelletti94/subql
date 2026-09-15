@@ -118,7 +118,7 @@ impl AggEngineCell {
         let database = agg_catalog();
         let table_id = catalog_helpers::table_id::<Postgres, _>(&database, "orders")
             .expect("agg_catalog must expose an `orders` table");
-        let pk_col = catalog_helpers::column_id(&database, table_id, "id")
+        let pk_col = catalog_helpers::column_id::<Postgres, _>(&database, table_id, "id")
             .expect("agg_catalog `orders` must expose an `id` column");
         let mut engine: SubscriptionEngine<TestEvent<Postgres>, DefaultIds, ParserDB> =
             SubscriptionEngine::new(database, PostgreSqlDialect {});

@@ -173,7 +173,7 @@ impl<C: crate::backend::MySqlTableNameCase> WireEvent for MaxwellEvent<C> {
             return Vec::new();
         };
         old.keys()
-            .filter_map(|name| catalog_helpers::column_id(db, table_id, name))
+            .filter_map(|name| catalog_helpers::column_id::<MySql<C>, _>(db, table_id, name))
             .collect()
     }
 

@@ -197,8 +197,10 @@ fn non_numeric_cross_kind_is_not_served_in_process() {
     let db = ParserDB::parse::<PostgreSqlDialect>(PG_DDL).expect("DDL parses");
     let table = catalog_helpers::table_id::<subql::backend::Postgres, _>(&db, "t")
         .expect("t is in the catalog");
-    let qty = catalog_helpers::column_id(&db, table, "qty").expect("qty is in the catalog");
-    let label = catalog_helpers::column_id(&db, table, "label").expect("label is in the catalog");
+    let qty = catalog_helpers::column_id::<Postgres, _>(&db, table, "qty")
+        .expect("qty is in the catalog");
+    let label = catalog_helpers::column_id::<Postgres, _>(&db, table, "label")
+        .expect("label is in the catalog");
 
     let registered =
         crate::common::semantics::register::<Postgres>(PG_DDL, "SELECT * FROM t WHERE qty = label");

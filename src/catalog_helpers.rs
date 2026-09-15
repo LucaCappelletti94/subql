@@ -17,7 +17,7 @@ use alloc::vec::Vec;
 use sql_traits::{
     prelude::{ColumnLike, DatabaseLike, TableLike},
     structs::{FingerprintError, SchemaFingerprint, TargetName},
-    utils::{identifier_resolution::identifiers_match, scalar_family::scalar_family},
+    utils::scalar_family::scalar_family,
 };
 use sqlite_diff_rs::SimpleTable;
 
@@ -150,12 +150,16 @@ pub fn table_name<DB: DatabaseLike>(database: &DB, table_id: TableId) -> Option<
 
 /// Resolve a column name within a table to subql's compact [`ColumnId`].
 ///
-/// Identifier matching is upstream's, through
-/// [`TableLike::column_id_by_name`], which applies the same quoting rule a
-/// relation lookup applies under `IdentifierCase::AsWritten`: a quoted
-/// lookup of an already folded spelling reaches a bare column, so `"id"`
-/// and `id` answer the same ordinal, while `"ID"` answers a separately
-/// declared quoted column.
+/// The name is read under the engine's own column comparison,
+/// [`Backend::COLUMN_NAME_CASE`](crate::backend::Backend::COLUMN_NAME_CASE),
+/// through [`TableLike::column_id_by_name`]. Under PostgreSQL's rule a quoted
+/// lookup of an already folded spelling reaches a bare column, so `"id"` and
+/// `id` answer the same ordinal, while `"ID"` answers a separately declared
+/// quoted column. MySQL and SQLite fold whatever quoting was written, so
+/// there `"ID"` reaches `id` too, matching what those engines answer. A
+/// folded lookup can never reach two columns: the catalog declares columns
+/// under the same comparison the engine compares by, so one that folds
+/// cannot hold two names a folded lookup cannot tell apart.
 ///
 /// Returns `None` when the table is unknown, the column is not present, or
 /// the column's ordinal exceeds `u16::MAX`, which is 65536 columns in one
@@ -166,13 +170,15 @@ pub fn table_name<DB: DatabaseLike>(database: &DB, table_id: TableId) -> Option<
 /// perform, but it is still a walk: callers needing repeated lookups should
 /// keep the result.
 #[must_use]
-pub fn column_id<DB: DatabaseLike>(
+pub fn column_id<B: crate::backend::Backend, DB: DatabaseLike>(
     database: &DB,
     table_id: TableId,
     column_name: &str,
 ) -> Option<ColumnId> {
-    let table = database.table_by_id(table_id as usize)?;
-    let ordinal = table.column_id_by_name(column_name, database).ok()??;
+    let table = database.table_by_id(usize::try_from(table_id).ok()?)?;
+    let ordinal = table
+        .column_id_by_name(column_name, database, B::COLUMN_NAME_CASE)
+        .ok()??;
     u16::try_from(ordinal).ok()
 }
 
@@ -185,7 +191,7 @@ pub fn column_id<DB: DatabaseLike>(
 /// spelled column, or need an allocation per lookup to put the quotes back.
 ///
 /// The quoting means what the engine says it means, through
-/// [`Backend::DELIMITED_IDENTIFIERS_FOLD_CASE`](crate::backend::Backend::DELIMITED_IDENTIFIERS_FOLD_CASE).
+/// [`Backend::COLUMN_NAME_CASE`](crate::backend::Backend::COLUMN_NAME_CASE).
 /// PostgreSQL keeps a delimited identifier as written, so `"Owner"` and
 /// `owner` are two columns. MySQL and SQLite fold it, so a written
 /// `"Owner"` reaches a column declared `Owner`, and refusing there would
@@ -200,14 +206,13 @@ pub fn column_id_for_name<B: crate::backend::Backend, DB: DatabaseLike>(
     column_name: &str,
     column_name_is_quoted: bool,
 ) -> Option<ColumnId> {
-    let table = database.table_by_id(table_id as usize)?;
-    let lookup_is_quoted = column_name_is_quoted && !B::DELIMITED_IDENTIFIERS_FOLD_CASE;
+    let table = database.table_by_id(usize::try_from(table_id).ok()?)?;
     let ordinal = table.columns(database).ok()?.position(|column| {
-        identifiers_match(
+        B::COLUMN_NAME_CASE.identifiers_match(
             column.column_name(),
-            column.column_name_is_quoted() && !B::DELIMITED_IDENTIFIERS_FOLD_CASE,
+            column.column_name_is_quoted(),
             column_name,
-            lookup_is_quoted,
+            column_name_is_quoted,
         )
     })?;
     u16::try_from(ordinal).ok()
@@ -399,7 +404,7 @@ pub fn resolve_table<B: crate::backend::Backend, DB: DatabaseLike, S: AsRef<str>
     };
     let mut column_ids = Vec::with_capacity(columns.len());
     for name in columns {
-        let Some(column_id) = column_id(database, table_id, name.as_ref()) else {
+        let Some(column_id) = column_id::<B, _>(database, table_id, name.as_ref()) else {
             return Ok(None);
         };
         column_ids.push(column_id);
@@ -1075,9 +1080,9 @@ mod tests {
     fn column_id_resolves_each_column_to_its_ordinal() {
         let db = make_db();
         let tid = table_id::<crate::backend::Postgres, _>(&db, "orders").unwrap();
-        assert_eq!(column_id(&db, tid, "id"), Some(0));
-        assert_eq!(column_id(&db, tid, "amount"), Some(1));
-        assert_eq!(column_id(&db, tid, "status"), Some(2));
+        assert_eq!(column_id::<Postgres, _>(&db, tid, "id"), Some(0));
+        assert_eq!(column_id::<Postgres, _>(&db, tid, "amount"), Some(1));
+        assert_eq!(column_id::<Postgres, _>(&db, tid, "status"), Some(2));
     }
 
     #[test]
@@ -1093,14 +1098,56 @@ mod tests {
     fn column_id_is_case_insensitive_for_unquoted_lookup() {
         let db = make_db();
         let tid = table_id::<crate::backend::Postgres, _>(&db, "orders").unwrap();
-        assert_eq!(column_id(&db, tid, "AMOUNT"), Some(1));
+        assert_eq!(column_id::<Postgres, _>(&db, tid, "AMOUNT"), Some(1));
     }
 
     #[test]
     fn column_id_none_for_unknown_column() {
         let db = make_db();
         let tid = table_id::<crate::backend::Postgres, _>(&db, "orders").unwrap();
-        assert!(column_id(&db, tid, "nope").is_none());
+        assert!(column_id::<Postgres, _>(&db, tid, "nope").is_none());
+    }
+
+    #[test]
+    fn a_folded_engine_reaches_a_column_under_every_written_spelling() {
+        use crate::backend::{MySql, NamesStoredAsWritten, SQLite};
+        let my = ParserDB::parse::<sqlparser::dialect::MySqlDialect>(
+            "CREATE TABLE docs (Owner INT PRIMARY KEY);",
+        )
+        .expect("DDL parses");
+        let tid = table_id::<MySql<NamesStoredAsWritten>, _>(&my, "docs").unwrap();
+        assert_eq!(
+            column_id::<MySql<NamesStoredAsWritten>, _>(&my, tid, "\"Owner\""),
+            Some(0)
+        );
+        assert_eq!(
+            column_id::<MySql<NamesStoredAsWritten>, _>(&my, tid, "\"owner\""),
+            Some(0)
+        );
+        assert_eq!(
+            column_id::<MySql<NamesStoredAsWritten>, _>(&my, tid, "OWNER"),
+            Some(0)
+        );
+
+        let lite = ParserDB::parse::<sqlparser::dialect::SQLiteDialect>(
+            "CREATE TABLE docs (Owner INT PRIMARY KEY);",
+        )
+        .expect("DDL parses");
+        let tid = table_id::<SQLite, _>(&lite, "docs").unwrap();
+        assert_eq!(column_id::<SQLite, _>(&lite, tid, "\"OWNER\""), Some(0));
+    }
+
+    #[test]
+    fn a_folded_catalog_holds_no_two_names_a_folded_lookup_cannot_tell_apart() {
+        // The folded text lookup above relies on the catalog refusing the
+        // duplicate the engine itself refuses.
+        assert!(
+            ParserDB::parse::<sqlparser::dialect::MySqlDialect>(
+                "CREATE TABLE t (\"Col\" INT, \"COL\" INT);",
+            )
+            .is_err(),
+            "MySQL compares column names case-insensitively and refuses the pair"
+        );
     }
 
     #[test]
@@ -1131,11 +1178,11 @@ mod tests {
         .expect("DDL parses");
         let tid = table_id::<crate::backend::Postgres, _>(&db, "mixed").expect("mixed exists");
 
-        assert_eq!(column_id(&db, tid, "id"), Some(0));
-        assert_eq!(column_id(&db, tid, "\"id\""), Some(0));
-        assert_eq!(column_id(&db, tid, "\"ID\""), Some(1));
+        assert_eq!(column_id::<Postgres, _>(&db, tid, "id"), Some(0));
+        assert_eq!(column_id::<Postgres, _>(&db, tid, "\"id\""), Some(0));
+        assert_eq!(column_id::<Postgres, _>(&db, tid, "\"ID\""), Some(1));
         assert_eq!(
-            column_id(&db, tid, "ID"),
+            column_id::<Postgres, _>(&db, tid, "ID"),
             Some(0),
             "an unquoted lookup folds, so it reaches the bare column"
         );

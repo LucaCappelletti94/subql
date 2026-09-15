@@ -108,7 +108,8 @@ struct Custom;
 impl Backend for Custom {
     /// The embedder's own engine here is PostgreSQL's, whose delimited
     /// identifiers keep their case.
-    const DELIMITED_IDENTIFIERS_FOLD_CASE: bool = false;
+    const COLUMN_NAME_CASE: sql_traits::structs::IdentifierCase =
+        sql_traits::structs::IdentifierCase::AsWritten;
 
     const WRITTEN_TABLE_NAME_CASE: sql_traits::structs::IdentifierCase =
         sql_traits::structs::IdentifierCase::AsWritten;
@@ -306,7 +307,7 @@ fn db() -> ParserDB {
 fn kind_of_column(name: &str) -> Option<ScalarKindOf<Custom>> {
     let db = db();
     let table = catalog_helpers::table_id::<Postgres, _>(&db, "feelings").unwrap();
-    let column = catalog_helpers::column_id(&db, table, name).unwrap();
+    let column = catalog_helpers::column_id::<Custom, _>(&db, table, name).unwrap();
     catalog_helpers::column_scalar_kind::<Custom, _>(&db, table, column)
 }
 

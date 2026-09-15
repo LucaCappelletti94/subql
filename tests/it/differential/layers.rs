@@ -839,8 +839,8 @@ mod streamed_tests {
         let database = ParserDB::parse::<PostgreSqlDialect>(DDL).expect("the DDL parses");
         let table = catalog_helpers::table_id::<subql::backend::Postgres, _>(&database, "t")
             .expect("the table is in the catalog");
-        let bulky_column =
-            catalog_helpers::column_id(&database, table, "bulky").expect("`bulky` is a column");
+        let bulky_column = catalog_helpers::column_id::<Postgres, _>(&database, table, "bulky")
+            .expect("`bulky` is a column");
 
         assert_eq!(
             event.presence_at(&database, RowKind::New, bulky_column),
