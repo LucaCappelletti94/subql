@@ -58,6 +58,7 @@ mod async_connector;
 mod async_diesel;
 mod auto;
 mod connector;
+mod dispatch;
 #[cfg(test)]
 mod test_fixtures;
 
@@ -88,6 +89,7 @@ pub use connector::{
 pub use connector::{DieselBackend, DieselConnector};
 #[cfg(feature = "executor-diesel-postgres-r2d2")]
 pub use connector::{PgR2D2DieselConnector, PgR2D2Error};
+pub use dispatch::{Dispatch, Settled};
 pub(crate) use engine::ReExecEntry;
 pub use engine::{
     Dispatched, ReExecNotifications, ReExecutionRead, ReExecutionTrigger, ReadDelivery,

@@ -47,7 +47,9 @@ fn a_debounced_unanswered_read_is_reported() {
             rows: alloc::vec![alloc::vec![Value::Int(1), Value::String("paid".into())]],
             more: false,
         });
-    let first = engine.apply(&unanswerable(1)).expect("the event applies");
+    let first = engine
+        .apply_leaving_reads_queued(&unanswerable(1))
+        .expect("the event applies");
     assert_eq!(
         first.debounced, 0,
         "nothing has run yet, so nothing is dropped"
@@ -57,7 +59,9 @@ fn a_debounced_unanswered_read_is_reported() {
 
     // Inside the window, the same subscription's read is discarded.
     clock.advance(core::time::Duration::from_millis(50));
-    let second = engine.apply(&unanswerable(2)).expect("the event applies");
+    let second = engine
+        .apply_leaving_reads_queued(&unanswerable(2))
+        .expect("the event applies");
     assert_eq!(
         second.debounced, 1,
         "the window dropped the unanswered-cell read and the report says so"
@@ -96,8 +100,11 @@ fn debounce_skips_within_window_and_fires_after() {
     );
 
     // First displacing event: re-exec proceeds (no prior stamp).
-    e.apply(&delete_event(tid, 1, 5.0)).unwrap();
-    let n = e.resolve_collect().unwrap();
+    let settled = e
+        .apply(&delete_event(tid, 1, 5.0))
+        .unwrap()
+        .resolve_collect();
+    let n = settled.reads.expect("first drain runs");
     assert_eq!(n.scalar_updates.len(), 1);
     assert_eq!(n.scalar_updates[0].value, Value::Float(7.0));
     assert_eq!(e.connector().call_count(), 1);
@@ -106,7 +113,9 @@ fn debounce_skips_within_window_and_fires_after() {
     clock.advance(core::time::Duration::from_millis(50));
     // The engine's MIN is currently 7.0 from the prior re-exec. To
     // force a second trigger we delete a row matching 7.0.
-    let dispatched = e.apply(&delete_event(tid, 2, 7.0)).unwrap();
+    let dispatched = e
+        .apply_leaving_reads_queued(&delete_event(tid, 2, 7.0))
+        .unwrap();
     // The queue is empty because the trigger was discarded.
     assert_eq!(
         dispatched.debounced, 1,
@@ -141,8 +150,11 @@ fn debounce_skips_within_window_and_fires_after() {
         }
     )
     .is_ok());
-    e.apply(&delete_event(tid, 3, 7.0)).unwrap();
-    let n = e.resolve_collect().unwrap();
+    let settled = e
+        .apply(&delete_event(tid, 3, 7.0))
+        .unwrap()
+        .resolve_collect();
+    let n = settled.reads.expect("post-window drain runs");
     assert_eq!(n.scalar_updates.len(), 1, "post-window trigger must fire");
     assert_eq!(n.scalar_updates[0].value, Value::Float(20.0));
     assert_eq!(e.connector().call_count(), 2);
@@ -162,12 +174,18 @@ fn debounce_without_clock_is_a_noop() {
         5.0,
     );
 
-    e.apply(&delete_event(tid, 1, 5.0)).unwrap();
-    let result = e.resolve_collect().unwrap();
+    let settled = e
+        .apply(&delete_event(tid, 1, 5.0))
+        .unwrap()
+        .resolve_collect();
+    let result = settled.reads.expect("first drain runs");
     assert!(!result.scalar_updates.is_empty());
     // trigger. The debounce-without-clock case must NOT skip it.
-    e.apply(&delete_event(tid, 2, 7.0)).unwrap();
-    let n = e.resolve_collect().unwrap();
+    let settled = e
+        .apply(&delete_event(tid, 2, 7.0))
+        .unwrap()
+        .resolve_collect();
+    let n = settled.reads.expect("second drain runs");
     assert_eq!(n.scalar_updates.len(), 1, "no clock -> no debounce");
     assert_eq!(e.connector().call_count(), 2);
 }

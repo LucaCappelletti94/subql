@@ -108,6 +108,24 @@ where
         &self.mode.connector
     }
 
+    /// Claim the notifications an abandoned drain parked, if any.
+    ///
+    /// A drain dropped before it finished, by a timeout or a losing
+    /// `select!` arm, leaves what its event folded here rather than
+    /// destroying it. The reads it had not run are still queued, so their
+    /// answers arrive from a later drain, and this answers for the half the
+    /// abandoned drain was carrying.
+    ///
+    /// `None` whenever no drain was abandoned, which is the ordinary case.
+    /// Only this engine can fill it, since a synchronous drain cannot be
+    /// abandoned partway.
+    #[must_use]
+    pub const fn take_undelivered(
+        &mut self,
+    ) -> Option<super::Dispatched<I, E::Backend, E::Checkpoint>> {
+        self.undelivered.take()
+    }
+
     /// Bootstrap a captured query by reading its current answer through the
     /// async connector. Async analogue of
     /// [`AutoResolvingEngine::snapshot`](super::AutoResolvingEngine::snapshot),
@@ -875,14 +893,24 @@ where
     X: AsyncConnector<Backend = E::Backend>,
     X::AuthContext: Send + Sync,
 {
-    type Notifications = super::Dispatched<I, E::Backend, E::Checkpoint>;
+    type Notifications<'engine>
+        = super::Dispatch<'engine, E, I, DB, AsyncMode<X>>
+    where
+        Self: 'engine,
+        E: 'engine;
     type Error = crate::DispatchError;
 
     #[allow(clippy::manual_async_fn)]
-    fn consumers(
-        &mut self,
-        event: &E,
-    ) -> impl core::future::Future<Output = Result<Self::Notifications, Self::Error>> + Send {
+    fn consumers<'engine, 'event>(
+        &'engine mut self,
+        event: &'event E,
+    ) -> impl core::future::Future<Output = Result<Self::Notifications<'engine>, Self::Error>>
+           + Send
+           + 'event
+    where
+        'engine: 'event,
+        E: 'engine,
+    {
         core::future::ready(self.apply(event))
     }
 }

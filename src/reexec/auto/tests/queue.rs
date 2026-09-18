@@ -19,7 +19,7 @@ fn a_dispatch_reports_the_reads_it_queued() {
 
     // An event no subscription cares about queues nothing.
     let quiet = engine
-        .apply(&insert_event(table, 1, 5.0))
+        .apply_leaving_reads_queued(&insert_event(table, 1, 5.0))
         .expect("the event applies");
     let after_first = quiet.outstanding;
 
@@ -45,7 +45,7 @@ fn a_dispatch_reports_the_reads_it_queued() {
     // A second event for the same subscription coalesces: the queue is
     // keyed by subscription, so the depth does not grow.
     let again = engine
-        .apply(&insert_event(table, 2, 6.0))
+        .apply_leaving_reads_queued(&insert_event(table, 2, 6.0))
         .expect("the event applies");
     assert_eq!(
         again.outstanding, after_first,
@@ -60,7 +60,7 @@ fn a_dispatch_reports_the_reads_it_queued() {
         )
         .expect("a second whole read registers");
     let two = engine
-        .apply(&insert_event(table, 4, 8.0))
+        .apply_leaving_reads_queued(&insert_event(table, 4, 8.0))
         .expect("the event applies");
     assert_eq!(
         two.outstanding, 2,
@@ -79,13 +79,55 @@ fn a_dispatch_reports_the_reads_it_queued() {
         });
     engine.resolve_collect().expect("the reads run");
     let settled = engine
-        .apply(&update_status_only(table, 3, 7.0))
+        .apply_leaving_reads_queued(&update_status_only(table, 3, 7.0))
         .expect("the event applies");
     assert_eq!(
         engine.pending_read_count(),
         settled.outstanding,
         "and it still agrees with the queue after a drain"
     );
+}
+
+/// One drain hands back both halves, what the event answered in process
+/// and what its queued reads answered.
+#[test]
+fn the_drain_hands_back_the_notifications_with_the_resolved_reads() {
+    let (mut e, tid) = engine_with_values(alloc::vec![Value::Float(7.0)]);
+    let min_id = crate::reexec::test_fixtures::bootstrap_scalar_query(
+        &mut e,
+        1u64,
+        "SELECT MIN(price) FROM orders",
+        5.0,
+    );
+    e.register(
+        SubscriptionRequest::new(2u64, "SELECT * FROM orders WHERE price < 100"),
+        (),
+    )
+    .expect("an in-process row subscription registers");
+
+    let settled = e
+        .apply(&delete_event(tid, 1, 5.0))
+        .expect("the event applies")
+        .resolve_collect();
+    let reads = settled.reads.expect("the queued read runs");
+
+    assert_eq!(
+        settled.dispatched.engine.deleted(),
+        &[2],
+        "the in-process subscription is answered without a read"
+    );
+    assert_eq!(
+        settled.dispatched.outstanding, 1,
+        "the displaced extreme queued one read"
+    );
+    assert_eq!(
+        reads.scalar_updates.len(),
+        1,
+        "and the same drain delivered its answer"
+    );
+    assert_eq!(reads.scalar_updates[0].subscription_id, min_id);
+    assert_eq!(reads.scalar_updates[0].value, Value::Float(7.0));
+    assert_eq!(e.pending_read_count(), 0, "the drain emptied the queue");
 }
 
 /// T4.1 + T4.2: a batch of 3 events that displace the same captured
@@ -112,7 +154,10 @@ fn applied_burst_coalesces_repeated_triggers() {
         delete_event(tid, 3, 5.0),
     ];
 
-    let per_event: alloc::vec::Vec<_> = events.iter().map(|ev| e.apply(ev).unwrap()).collect();
+    let per_event: alloc::vec::Vec<_> = events
+        .iter()
+        .map(|ev| e.apply_leaving_reads_queued(ev).unwrap())
+        .collect();
     let resolve_outcome = e.resolve_collect().unwrap();
     assert_eq!(
         per_event.len(),
@@ -144,7 +189,7 @@ fn applied_burst_error_surfaces_from_resolve() {
 
     let events = alloc::vec![delete_event(tid, 1, 5.0)];
     for ev in &events {
-        e.apply(ev).unwrap();
+        e.apply_leaving_reads_queued(ev).unwrap();
     }
     match e.resolve_collect() {
         Ok(_) => panic!("expected Connector error, got Ok"),
@@ -198,7 +243,7 @@ fn applied_burst_keeps_distinct_queries_apart() {
 
     let events = alloc::vec![delete_event(tid, 1, 7.0)];
     for ev in &events {
-        e.apply(ev).unwrap();
+        e.apply_leaving_reads_queued(ev).unwrap();
     }
     let resolve_outcome = e.resolve_collect().unwrap();
     assert_eq!(e.connector().call_count(), 2, "one call per distinct query");
@@ -258,10 +303,10 @@ fn grouped_batch_keeps_one_trigger_per_displaced_group() {
         .with_pk_columns([0u16])
     };
     engine
-        .apply(&delete(1, 5.0, "paid"))
+        .apply_leaving_reads_queued(&delete(1, 5.0, "paid"))
         .expect("first delete dispatches");
     engine
-        .apply(&delete(2, 7.0, "void"))
+        .apply_leaving_reads_queued(&delete(2, 7.0, "void"))
         .expect("second delete dispatches");
     assert_eq!(
         engine.pending_read_count(),
@@ -301,7 +346,7 @@ fn a_failed_install_drops_the_read_instead_of_requeueing_it() {
     )
     .expect("group map installs");
     engine
-        .apply(
+        .apply_leaving_reads_queued(
             &TestEvent::<Postgres>::delete(
                 table,
                 vec![
@@ -391,8 +436,10 @@ fn burst_of_displacements_costs_one_read() {
     )
     .unwrap();
 
-    e.apply(&delete_event(tid, 1, 5.0)).unwrap();
-    e.apply(&delete_event(tid, 2, 5.0)).unwrap();
+    e.apply_leaving_reads_queued(&delete_event(tid, 1, 5.0))
+        .unwrap();
+    e.apply_leaving_reads_queued(&delete_event(tid, 2, 5.0))
+        .unwrap();
     assert_eq!(e.pending_read_count(), 1, "same subscription, one read");
 
     let resolved = e.resolve_collect().unwrap();

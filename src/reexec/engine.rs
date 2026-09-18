@@ -223,12 +223,16 @@ pub struct ReExecNotifications<I: IdTypes, B: Backend, C: crate::Checkpoint = cr
     pub transitions: Vec<crate::MaintenanceTransition<B>>,
 }
 
-/// Everything one dispatched event produced when the engine owns the
-/// connector and does the reads itself.
+/// Everything one dispatched event produced in process, when the engine owns
+/// the connector and does the reads itself.
 ///
-/// Carries no `rows_updates`, `row_deltas` or `triggers`: this engine
-/// queues its own reads, and their answers arrive only through
-/// [`resolve`](crate::reexec::AutoResolvingEngine::resolve).
+/// Carries no `rows_updates`, `row_deltas` or `triggers`, because this engine
+/// queues its own reads and their answers arrive as the other half of
+/// [`Settled`](crate::reexec::Settled). Reaching this at all means draining a
+/// [`Dispatch`](crate::reexec::Dispatch), asking for it by name through
+/// [`apply_leaving_reads_queued`](crate::reexec::AutoResolvingEngine::apply_leaving_reads_queued),
+/// or claiming what an abandoned drain parked with
+/// [`take_undelivered`](crate::reexec::AutoResolvingEngine::take_undelivered).
 pub struct Dispatched<I: IdTypes, B: Backend, C: crate::Checkpoint = crate::NoCheckpoint> {
     /// View-relative notifications from the core engine.
     pub engine: ConsumerNotifications<I, C, B>,

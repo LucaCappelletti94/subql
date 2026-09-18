@@ -47,7 +47,9 @@ fn sync_scalar_event_forwards_registration_binds() {
     )
     .expect("scalar installs");
 
-    engine.apply(&delete_event(table, 1, 5.0)).unwrap();
+    engine
+        .apply_leaving_reads_queued(&delete_event(table, 1, 5.0))
+        .unwrap();
     engine.resolve_collect().expect("delete resolves");
     let queries = engine.connector().scalar_queries.borrow();
     assert_eq!(queries.len(), 1);
@@ -86,7 +88,9 @@ fn sync_keyed_event_scopes_registration_binds() {
         )
         .expect("keyed read registers");
 
-    engine.apply(&delete_event(table, 1, 5.0)).unwrap();
+    engine
+        .apply_leaving_reads_queued(&delete_event(table, 1, 5.0))
+        .unwrap();
     let _ = engine.resolve_collect();
     let queries = engine.connector().page_queries.borrow();
     assert_eq!(queries.len(), 1);
@@ -123,8 +127,12 @@ fn sync_keyed_insert_asks_about_the_declared_key() {
         )
         .expect("keyed read registers");
 
-    engine.apply(&insert_event(table, 1, 5.0)).unwrap();
-    engine.apply(&insert_event(table, 2, 6.0)).unwrap();
+    engine
+        .apply_leaving_reads_queued(&insert_event(table, 1, 5.0))
+        .unwrap();
+    engine
+        .apply_leaving_reads_queued(&insert_event(table, 2, 6.0))
+        .unwrap();
     let _ = engine.resolve_collect();
 
     let queries = engine.connector().page_queries.borrow();
@@ -187,7 +195,9 @@ fn sync_grouped_scoped_read_orders_registration_binds() {
         },
     )
     .expect("grouped seed installs");
-    engine.apply(&delete_event(table, 1, 5.0)).unwrap();
+    engine
+        .apply_leaving_reads_queued(&delete_event(table, 1, 5.0))
+        .unwrap();
     let _ = engine.resolve_collect();
     let queries = engine.connector().page_queries.borrow();
     assert_eq!(queries.len(), 1);
@@ -231,7 +241,9 @@ fn sync_whole_event_forwards_registration_binds() {
         )
         .expect("whole read registers");
 
-    engine.apply(&insert_event(table, 2, 9.0)).unwrap();
+    engine
+        .apply_leaving_reads_queued(&insert_event(table, 2, 9.0))
+        .unwrap();
     let _ = engine.resolve_collect();
     let queries = engine.connector().cursor_queries.borrow();
     assert_eq!(queries.len(), 1);

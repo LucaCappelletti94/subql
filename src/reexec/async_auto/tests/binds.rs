@@ -49,7 +49,7 @@ fn async_scalar_event_forwards_registration_binds() {
     .expect("scalar installs");
 
     engine
-        .apply(&delete_event(table, 1, 5.0))
+        .apply_leaving_reads_queued(&delete_event(table, 1, 5.0))
         .expect("apply succeeds");
     let _ = block_on(engine.resolve_collect()).expect("resolve succeeds");
     let queries = engine.connector().scalar_queries.lock();
@@ -91,7 +91,9 @@ fn async_keyed_event_scopes_registration_binds() {
         )
         .expect("keyed read registers");
 
-    engine.apply(&delete_event(table, 1, 5.0)).unwrap();
+    engine
+        .apply_leaving_reads_queued(&delete_event(table, 1, 5.0))
+        .unwrap();
     let _ = block_on(engine.resolve_collect());
     let queries = engine.connector().page_queries.lock();
     assert_eq!(queries.len(), 1);
@@ -156,7 +158,9 @@ fn async_grouped_scoped_read_orders_registration_binds() {
     )
     .expect("grouped seed installs");
 
-    engine.apply(&delete_event(table, 1, 5.0)).unwrap();
+    engine
+        .apply_leaving_reads_queued(&delete_event(table, 1, 5.0))
+        .unwrap();
     let _ = block_on(engine.resolve_collect());
     let queries = engine.connector().page_queries.lock();
     assert_eq!(queries.len(), 1);
@@ -202,7 +206,9 @@ fn async_whole_event_forwards_registration_binds() {
         )
         .expect("whole read registers");
 
-    engine.apply(&insert_event(table, 2, 9.0)).unwrap();
+    engine
+        .apply_leaving_reads_queued(&insert_event(table, 2, 9.0))
+        .unwrap();
     let _ = block_on(engine.resolve_collect());
     let queries = engine.connector().cursor_queries.lock();
     assert_eq!(queries.len(), 1);

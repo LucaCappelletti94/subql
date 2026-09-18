@@ -131,7 +131,8 @@ fn delete_of_extreme_resolves_via_diesel_connector() {
     let (mut e, tid) = build_engine(conn);
     let qid = register_min(&mut e, Value::Float(5.0));
 
-    e.apply(&delete_event(tid, 1, 5.0)).unwrap();
+    e.apply_leaving_reads_queued(&delete_event(tid, 1, 5.0))
+        .unwrap();
     let n = e.resolve_collect().unwrap();
     assert_eq!(e.pending_read_count(), 0, "no pending reads");
     assert_eq!(n.scalar_updates.len(), 1, "expected MIN to be re-executed");
@@ -151,7 +152,8 @@ fn empty_set_min_decodes_as_null() {
     let (mut e, tid) = build_engine(conn);
     let qid = register_min(&mut e, Value::Float(5.0));
 
-    e.apply(&delete_event(tid, 1, 5.0)).unwrap();
+    e.apply_leaving_reads_queued(&delete_event(tid, 1, 5.0))
+        .unwrap();
     let n = e.resolve_collect().unwrap();
     assert_eq!(n.scalar_updates.len(), 1);
     assert_eq!(n.scalar_updates[0].subscription_id, qid);

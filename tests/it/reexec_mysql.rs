@@ -174,7 +174,7 @@ fn delete_displacing_extreme_resolves_via_mysql_connector() {
     let event = TestEvent::<MySql>::delete(table_id, common::mysql::orders_row(1, 5.0))
         .with_pk_columns([0u16]);
 
-    engine.apply(&event).expect("apply");
+    engine.apply_leaving_reads_queued(&event).expect("apply");
     let notifs = engine.resolve_collect().expect("consumers dispatch");
     assert_eq!(
         notifs.scalar_updates.len(),

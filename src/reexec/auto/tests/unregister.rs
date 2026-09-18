@@ -78,7 +78,8 @@ fn unregister_subscription_drops_the_resolve_context() {
     assert!(e.unregister_subscription(captured));
     assert_eq!(e.contexts.len(), 0, "the resolve context is dropped");
     // A later delete of the former extreme must not reach the connector.
-    e.apply(&delete_event(tid, 1, 5.0)).unwrap();
+    e.apply_leaving_reads_queued(&delete_event(tid, 1, 5.0))
+        .unwrap();
     e.resolve_collect().unwrap();
     assert_eq!(
         e.connector().call_count(),
@@ -107,7 +108,8 @@ fn unregister_subscription_drops_the_queued_read() {
         },
     )
     .unwrap();
-    e.apply(&delete_event(tid, 1, 5.0)).unwrap();
+    e.apply_leaving_reads_queued(&delete_event(tid, 1, 5.0))
+        .unwrap();
     assert_eq!(
         e.pending_read_count(),
         1,
@@ -159,7 +161,8 @@ fn unregister_session_drops_the_queued_reads() {
         },
     )
     .unwrap();
-    e.apply(&delete_event(tid, 1, 5.0)).unwrap();
+    e.apply_leaving_reads_queued(&delete_event(tid, 1, 5.0))
+        .unwrap();
     assert_eq!(
         e.pending_read_count(),
         1,

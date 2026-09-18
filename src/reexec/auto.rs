@@ -139,6 +139,15 @@ where
     /// abandoned resolve leaves them here, so retrying costs a read and
     /// never a second application of the event.
     pub(super) pending_reads: ReadQueue<I, E::Checkpoint, E::Backend>,
+    /// In-process notifications of an event whose asynchronous drain was
+    /// abandoned before it could hand them back.
+    ///
+    /// A dropped future takes its contents with it, and these cannot be
+    /// produced a second time, because the event folded exactly once before
+    /// any read began. So the drain parks them here across its awaits and
+    /// claims them on completion, which leaves a cancelled drain losing
+    /// nothing at all.
+    pub(super) undelivered: Option<super::Dispatched<I, E::Backend, E::Checkpoint>>,
 }
 impl<E, I, DB, M> AutoResolvingEngine<E, I, DB, M>
 where
@@ -160,6 +169,7 @@ where
             debounce: None,
             last_reexec_at: HashMap::new(),
             pending_reads: ReadQueue::new(),
+            undelivered: None,
         }
     }
 
@@ -331,14 +341,44 @@ where
         self.pending_reads.len()
     }
 
-    /// Fold one CDC event into in-memory state, exactly once.
+    /// Hold notifications across an asynchronous drain's awaits, per
+    /// [`take_undelivered`](super::AutoResolvingEngine::take_undelivered).
+    pub(super) fn park_undelivered(
+        &mut self,
+        notifications: super::Dispatched<I, E::Backend, E::Checkpoint>,
+    ) {
+        self.undelivered = Some(notifications);
+    }
+
+    /// Reclaim what [`park_undelivered`](Self::park_undelivered) held, for a
+    /// drain that ran to completion.
+    pub(super) const fn claim_undelivered(
+        &mut self,
+    ) -> super::Dispatched<I, E::Backend, E::Checkpoint> {
+        self.undelivered.take().expect(
+            "a drain parks its notifications before its first await and nothing \
+             between that and this claim touches the park",
+        )
+    }
+
+    /// Fold one CDC event into in-memory state, exactly once, and hand back a
+    /// [`Dispatch`](super::Dispatch) that gates its notifications on the
+    /// drain.
     ///
-    /// Returns the notifications that state produces: row matches, in-process
-    /// aggregate and scalar updates, and tier transitions. Reads the event
-    /// makes necessary are queued, deduplicated by subscription and group,
-    /// for `resolve` to execute. `apply` never touches the database, so its
-    /// effects commit exactly once however the later reads fare, and
-    /// retrying an applied event is never correct.
+    /// The notifications are row matches, in-process aggregate and scalar
+    /// updates, and tier transitions. Reads the event makes necessary are
+    /// queued, deduplicated by subscription and group, and
+    /// [`Dispatch::resolve`](super::Dispatch::resolve) is what executes them.
+    /// `apply` never touches the database, so its effects commit exactly once
+    /// however the later reads fare, and retrying an applied event is never
+    /// correct.
+    ///
+    /// The notifications are not readable off the returned value, because a
+    /// caller that took them and never drained would lose every queued read
+    /// with nothing said. [`Dispatch`](super::Dispatch) carries the worked
+    /// examples of what that refuses. A caller that means to drain on a
+    /// schedule of its own asks by name through
+    /// [`apply_leaving_reads_queued`](Self::apply_leaving_reads_queued).
     ///
     /// # Errors
     ///
@@ -347,7 +387,41 @@ where
     pub fn apply(
         &mut self,
         event: &E,
+    ) -> Result<super::Dispatch<'_, E, I, DB, M>, crate::DispatchError> {
+        let notifications = self.apply_leaving_reads_queued(event)?;
+        Ok(super::Dispatch::new(self, notifications))
+    }
+
+    /// Fold one CDC event exactly as [`apply`](Self::apply) does and hand the
+    /// notifications straight back, leaving every read it queued queued.
+    ///
+    /// For a caller that drains on a schedule of its own rather than once per
+    /// event, which is the one case where taking the notifications without
+    /// draining is correct. Reads of one subscription and group coalesce while
+    /// they wait, so a caller applying a burst and draining once reads the
+    /// database fewer times than one draining per event.
+    ///
+    /// Nothing else offers these notifications again, and nothing reschedules
+    /// the queued reads, so a caller taking this owes a
+    /// [`resolve`](Self::resolve) or a
+    /// [`resolve_collect`](Self::resolve_collect) of its own. Forgetting it
+    /// loses every queued read, which is what [`apply`](Self::apply) exists to
+    /// make impossible.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::DispatchError`] when the event cannot be dispatched, and
+    /// [`DispatchError::UndeliveredNotifications`](crate::DispatchError::UndeliveredNotifications)
+    /// when an abandoned drain's notifications are still parked, since
+    /// folding another event over them would destroy what nothing can
+    /// produce again. Nothing is applied in either case.
+    pub fn apply_leaving_reads_queued(
+        &mut self,
+        event: &E,
     ) -> Result<super::Dispatched<I, E::Backend, E::Checkpoint>, crate::DispatchError> {
+        if self.undelivered.is_some() {
+            return Err(crate::DispatchError::UndeliveredNotifications);
+        }
         let ReExecNotifications {
             engine,
             aggregate_updates,

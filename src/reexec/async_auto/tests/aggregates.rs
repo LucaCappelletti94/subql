@@ -31,7 +31,9 @@ fn async_ungrouped_aggregate_folds_through_the_wrapper() {
         },
     )
     .unwrap();
-    let n = e.apply(&insert_event(tid, 1, 5.0)).unwrap();
+    let n = e
+        .apply_leaving_reads_queued(&insert_event(tid, 1, 5.0))
+        .unwrap();
     assert_eq!(
         n.aggregate_updates.len(),
         1,
@@ -77,7 +79,7 @@ fn async_ungrouped_aggregate_folds_across_an_applied_burst() {
     .unwrap();
     let aggregate_updates: Vec<_> = [insert_event(tid, 1, 5.0), insert_event(tid, 2, 6.0)]
         .iter()
-        .flat_map(|ev| e.apply(ev).unwrap().aggregate_updates)
+        .flat_map(|ev| e.apply_leaving_reads_queued(ev).unwrap().aggregate_updates)
         .collect();
     assert_eq!(aggregate_updates.len(), 2, "each insert folds");
     assert_eq!(
@@ -116,8 +118,7 @@ fn async_ungrouped_aggregate_demotion_resolves_through_the_wrapper() {
     let missing_old = TestEvent::<Postgres>::update(tid, vec![], row(1, 5.0))
         .with_pk_columns([0u16])
         .with_changed_columns([3u16]);
-    e.apply(&missing_old).unwrap();
-    match block_on(e.resolve_collect()) {
+    match block_on(e.apply(&missing_old).unwrap().resolve_collect()).reads {
         Err(ReExecError::Cursor { subscription, .. }) => {
             assert_eq!(
                 subscription, count_id,

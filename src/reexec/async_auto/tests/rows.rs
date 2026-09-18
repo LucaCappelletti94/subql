@@ -66,8 +66,8 @@ fn async_match_rows_replays_without_reading_or_folding() {
 
     // The live dispatch of the same delete is still the first read: proof
     // match_rows left the re-execution model untouched.
-    e.apply(&ev).unwrap();
-    let live = block_on(e.resolve_collect()).unwrap();
+    let settled = block_on(e.apply(&ev).unwrap().resolve_collect());
+    let live = settled.reads.unwrap();
     assert_eq!(
         e.connector().call_count(),
         1,
@@ -115,7 +115,9 @@ fn async_ordered_row_query_folds_in_process() {
         } => {}
         other => panic!("expected InProcess for an ordered row query, got {other:?}"),
     }
-    let n = e.apply(&insert_event(tid, 1, 5.0)).unwrap();
+    let n = e
+        .apply_leaving_reads_queued(&insert_event(tid, 1, 5.0))
+        .unwrap();
     assert!(
         n.engine.inserted().contains(&1),
         "the ordered row list is notified of the insert"
@@ -149,7 +151,8 @@ fn async_pages_reach_the_sink_before_the_next_fetch() {
             more: false,
         },
     ]);
-    e.apply(&insert_event(tid, 1, 5.0)).unwrap();
+    e.apply_leaving_reads_queued(&insert_event(tid, 1, 5.0))
+        .unwrap();
 
     let log = Arc::clone(&e.connector().log);
     block_on(e.resolve(move |delivery| {
@@ -188,7 +191,8 @@ fn dropped_stream_is_superseded_by_a_higher_generation() {
             more: false,
         },
     ]);
-    e.apply(&insert_event(tid, 1, 5.0)).unwrap();
+    e.apply_leaving_reads_queued(&insert_event(tid, 1, 5.0))
+        .unwrap();
 
     // The second fetch suspends, and the future is dropped there: one
     // partial page was already delivered.

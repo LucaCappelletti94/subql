@@ -52,7 +52,7 @@ fn async_applied_burst_respects_max_concurrent_cap() {
 
     let events = vec![delete_event(tid, 1, 7.0)];
     for event in &events {
-        e.apply(event).unwrap();
+        e.apply_leaving_reads_queued(event).unwrap();
     }
     let outcome = block_on(e.resolve_collect()).unwrap();
     assert_eq!(e.connector().call_count(), 2);
@@ -129,7 +129,8 @@ fn throttle_inflight_returns_to_zero_after_batch() {
     )
     .is_ok());
 
-    e.apply(&delete_event(tid, 1, 7.0)).unwrap();
+    e.apply_leaving_reads_queued(&delete_event(tid, 1, 7.0))
+        .unwrap();
     let _ = block_on(e.resolve_collect()).unwrap();
     assert_eq!(
         e.inflight(),
@@ -175,7 +176,8 @@ fn throttle_inflight_returns_to_zero_after_connector_error() {
     )
     .is_ok());
 
-    e.apply(&delete_event(tid, 1, 7.0)).unwrap();
+    e.apply_leaving_reads_queued(&delete_event(tid, 1, 7.0))
+        .unwrap();
     assert!(block_on(e.resolve_collect()).is_err());
     assert_eq!(
         e.inflight(),
@@ -200,7 +202,8 @@ fn throttle_total_call_count_unchanged_with_cap() {
             7.0,
         );
     });
-    e.apply(&delete_event(tid, 1, 7.0)).unwrap();
+    e.apply_leaving_reads_queued(&delete_event(tid, 1, 7.0))
+        .unwrap();
     let outcome = block_on(e.resolve_collect()).unwrap();
     assert_eq!(
         e.connector().call_count(),

@@ -158,8 +158,11 @@ fn r2d2_pool_drives_snapshot_and_reexec() {
         events.extend(parse_message(msg));
     }
     assert_eq!(events.len(), 1, "expected one DELETE event");
-    engine.apply(&events[0]).expect("apply dispatch");
-    let notifs = engine.resolve_collect().expect("consumers dispatch");
+    let settled = engine
+        .apply(&events[0])
+        .expect("apply dispatch")
+        .resolve_collect();
+    let notifs = settled.reads.expect("consumers dispatch");
     assert_eq!(notifs.scalar_updates.len(), 1);
     assert_eq!(notifs.scalar_updates[0].value, Value::Float(9.0));
     // The re-execution LSN should be at or after the snapshot LSN
@@ -310,7 +313,7 @@ fn a_captured_query_delivers_its_rows_again_when_the_table_changes() {
     let mut finals = 0;
     let mut pages = 0;
     for event in &events {
-        engine.apply(event).expect("apply");
+        engine.apply_leaving_reads_queued(event).expect("apply");
     }
     let notifications = engine.resolve_collect().expect("dispatch");
     for update in &notifications.rows_updates {
@@ -481,7 +484,7 @@ fn a_joined_capture_is_triggered_by_either_table() {
         let mut delivered = 0;
         for msg in &msgs {
             for event in parse_message(msg) {
-                engine.apply(&event).expect("apply");
+                engine.apply_leaving_reads_queued(&event).expect("apply");
             }
         }
         let notifications = engine.resolve_collect().expect("dispatch");
@@ -913,7 +916,9 @@ fn a_panic_during_a_read_leaves_no_transaction_behind() {
         ],
     )
     .with_pk_columns([0u16]);
-    engine.apply(&event).expect("apply succeeds");
+    engine
+        .apply_leaving_reads_queued(&event)
+        .expect("apply succeeds");
     let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let _ = engine.resolve_collect();
     }));
@@ -1033,7 +1038,7 @@ fn a_keyless_change_transitions_and_runs_the_sync_replacement_read() {
 
     let events = parse_message(r#"{"action":"U","schema":"public","table":"orders"}"#);
     let notifications = engine
-        .apply(&events[0])
+        .apply_leaving_reads_queued(&events[0])
         .expect("keyless change transitions");
     let resolved = engine.resolve_collect().expect("keyless change re-reads");
 
@@ -1138,8 +1143,8 @@ fn grouped_min_snapshots_and_rereads_one_group_sync() {
         .iter()
         .flat_map(|message| parse_message(message))
         .collect();
-    engine.apply(&events[0]).expect("apply");
-    let output = engine.resolve_collect().expect("group re-read");
+    let settled = engine.apply(&events[0]).expect("apply").resolve_collect();
+    let output = settled.reads.expect("group re-read");
     assert_eq!(engine.pending_read_count(), 0, "no pending reads");
     assert_eq!(output.aggregate_updates.len(), 1);
     assert_eq!(
