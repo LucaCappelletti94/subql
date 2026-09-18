@@ -641,11 +641,11 @@ mod refusals {
 }
 
 mod changed_membership {
-    use super::{doc, engine, refusal, subscribe, subscribe_as, Engine};
+    use super::{doc, engine, refusal, subscribe, subscribe_as, Engine, TERM};
     use subql::backend::{Postgres, Value};
     use subql::compiler::MAX_TERMS_PER_FILTER;
     use subql::testing::TestEvent;
-    use subql::{catalog_helpers, SubscriptionRequest, TableId};
+    use subql::{catalog_helpers, SubscriptionRequest, SubscriptionScope, TableId};
 
     /// The membership table, and a row of it: `(project_id, user_id)`.
     fn members_table(engine: &Engine) -> TableId {
@@ -1078,6 +1078,46 @@ mod changed_membership {
         assert_ne!(
             first.subscription_id, second.subscription_id,
             "two subscriptions, one predicate"
+        );
+    }
+
+    /// One consumer registering the same filter under two scopes shares one
+    /// ordinal, so its second seeding is where a single-subject caller turns
+    /// into a several-subject one. What it already held was granted by the
+    /// subject it claimed alone, and losing that attribution would withdraw
+    /// the value on the first membership row to disappear under any other
+    /// subject.
+    #[test]
+    fn a_caller_that_gains_a_subject_keeps_what_the_first_one_granted() {
+        let (mut engine, docs) = engine();
+        let members = members_table(&engine);
+        engine.register(subscribe_as(1, &[("key:a", 7)])).unwrap();
+        engine
+            .register(
+                SubscriptionRequest::new(1u64, TERM)
+                    .scope(SubscriptionScope::Session(9))
+                    .subjects([Value::String("key:a".into()), Value::String("key:b".into())])
+                    .term_values(
+                        vec!["project_id"],
+                        vec![(Value::String("key:b".into()), vec![Value::Int(11)])],
+                    ),
+            )
+            .unwrap();
+
+        let notifs = engine
+            .consumers(&TestEvent::delete(members, membership(7, "key:b")))
+            .unwrap();
+        assert!(
+            notifs.narrowings().is_empty(),
+            "key:b never granted project 7, so its membership leaving changes nothing"
+        );
+        assert_eq!(
+            engine
+                .consumers(&TestEvent::insert(docs, doc(1, 7, "spec")))
+                .unwrap()
+                .inserted(),
+            &[1],
+            "project 7 is still granted by key:a, which the caller claimed before key:b"
         );
     }
 }
