@@ -862,6 +862,10 @@ CREATE POLICY p ON docs FOR SELECT USING (
     assert_eq!(withdrawn_fact.subject, "user:alice");
     assert_eq!(withdrawn_fact.object, "teams:3");
     assert_eq!(withdrawn_fact.relation, member_relation().to_string());
+    assert_eq!(
+        withdrawn_fact.context, stale.context,
+        "the withdrawal carries the context the store held the tuple under"
+    );
     let retry = StoreDiff::<Postgres> {
         added: Vec::new(),
         removed: vec![stale],
