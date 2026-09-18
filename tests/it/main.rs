@@ -146,6 +146,9 @@ mod membership_term;
 #[cfg(feature = "membership-term")]
 mod membership_term_seed_e2e;
 
+#[cfg(feature = "membership-term")]
+mod proptest_membership_subjects;
+
 mod one_identity;
 
 #[cfg(feature = "std")]
