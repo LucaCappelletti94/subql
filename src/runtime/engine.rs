@@ -2289,13 +2289,13 @@ where
                         subscription_id,
                         consumer_id,
                         value,
-                        checkpoint: checkpoint.clone(),
+                        checkpoint,
                     });
                 }
                 Maintenance::NeedsReexecution => {
                     if let QueryRuntime::Keyed(query) = &mut entry.runtime {
                         if let Some(table_id) = query.take_keyless_change() {
-                            keyless.push((subscription_id, table_id, checkpoint.clone()));
+                            keyless.push((subscription_id, table_id, checkpoint));
                             continue;
                         }
                     }
@@ -2303,7 +2303,7 @@ where
                         subscription_id,
                         consumer_id,
                         read: crate::reexec::ReExecutionRead::Subscription,
-                        checkpoint: checkpoint.clone(),
+                        checkpoint,
                     });
                 }
             }
@@ -4648,7 +4648,7 @@ where
                 id: PredicateId::from_slab_index(0),
                 hash: pred_data.hash,
                 normalized_sql: pred_data.normalized_sql.into(),
-                bytecode: Arc::new(bytecode.clone()),
+                bytecode: Arc::new(bytecode),
                 dependency_columns: Arc::from(pred_data.dependency_columns.as_slice()),
                 index_atoms: Arc::from(atoms.as_slice()),
                 prefilter_plan: Arc::new(prefilter_plan),

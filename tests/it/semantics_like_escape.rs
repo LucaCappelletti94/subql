@@ -213,7 +213,7 @@ fn a_pattern_ending_with_the_escape_fails_the_subscription() {
         vec![(subscription, EvaluationRefusal::LikePatternEndsWithEscape)],
         "the report names the subscription and the malformed pattern"
     );
-    assert!(refused.inserted().is_empty());
+    assert_eq!(refused.inserted(), &[] as &[u64]);
 
     // The input ran out first, so the server answers false and so does this.
     let exhausted = dispatch(&mut engine, "a");
@@ -221,7 +221,7 @@ fn a_pattern_ending_with_the_escape_fails_the_subscription() {
         exhausted.evaluation_failures().is_empty(),
         "PostgreSQL answers false here rather than raising"
     );
-    assert!(exhausted.inserted().is_empty());
+    assert_eq!(exhausted.inserted(), &[] as &[u64]);
 }
 
 /// MySQL never raises for a dangling escape: measured, it answers 0
