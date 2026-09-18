@@ -341,24 +341,8 @@ where
         self.pending_reads.len()
     }
 
-    /// Claim the notifications an abandoned drain parked, if any.
-    ///
-    /// A drain dropped before it finished, by a timeout or a losing
-    /// `select!` arm, leaves what its event folded here rather than
-    /// destroying it. The reads it had not run are still queued, so the
-    /// answer to those arrives from a later drain, and this answers for the
-    /// half the drain was carrying.
-    ///
-    /// `None` whenever no drain was abandoned, which is the ordinary case.
-    #[must_use]
-    pub const fn take_undelivered(
-        &mut self,
-    ) -> Option<super::Dispatched<I, E::Backend, E::Checkpoint>> {
-        self.undelivered.take()
-    }
-
-    /// Hold notifications across a drain's awaits, per
-    /// [`undelivered`](Self::take_undelivered).
+    /// Hold notifications across an asynchronous drain's awaits, per
+    /// [`take_undelivered`](super::AutoResolvingEngine::take_undelivered).
     pub(super) fn park_undelivered(
         &mut self,
         notifications: super::Dispatched<I, E::Backend, E::Checkpoint>,
