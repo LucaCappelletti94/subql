@@ -180,7 +180,7 @@ fn sound_arithmetic_still_answers() {
         "SELECT * FROM t WHERE qty + 10 > 12",
         5
     );
-    assert!(notifications.evaluation_failures().is_empty());
+    assert_eq!(notifications.evaluation_failures(), []);
     assert_eq!(notifications.inserted(), &[1], "15 is above 12");
 }
 

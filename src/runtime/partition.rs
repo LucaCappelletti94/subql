@@ -798,9 +798,10 @@ mod tests {
                 &RoaringBitmap::new(),
                 true,
             );
-            assert!(txn
-                .clear_term_admissions(PredicateId::from_slab_index(0), 0)
-                .is_empty());
+            assert_eq!(
+                txn.clear_term_admissions(PredicateId::from_slab_index(0), 0),
+                []
+            );
         });
         assert_eq!(
             partition.publication_count(),

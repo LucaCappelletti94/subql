@@ -85,7 +85,7 @@ fn pg_division_by_zero_fails_the_subscription() {
         }],
         "the report names the operator that could not be evaluated"
     );
-    assert!(notifications.inserted().is_empty());
+    assert_eq!(notifications.inserted(), &[] as &[u64]);
 }
 
 /// Modulo raises the same error, measured, so it is not left behind.
@@ -174,7 +174,7 @@ fn sound_division_still_answers() {
         "SELECT * FROM t WHERE 100 / qty > 9",
         row(10, 1.0)
     );
-    assert!(notifications.evaluation_failures().is_empty());
+    assert_eq!(notifications.evaluation_failures(), []);
     assert_eq!(notifications.inserted(), &[1], "100 / 10 is above 9");
 }
 
@@ -258,7 +258,7 @@ fn modulo_has_no_overflow_case() {
             Value::Float(1.0)
         ]
     );
-    assert!(mysql.evaluation_failures().is_empty());
+    assert_eq!(mysql.evaluation_failures(), []);
     assert_eq!(mysql.inserted(), &[1]);
 
     let sqlite = dispatch!(
@@ -272,6 +272,6 @@ fn modulo_has_no_overflow_case() {
             Value::Float(1.0)
         ]
     );
-    assert!(sqlite.evaluation_failures().is_empty());
+    assert_eq!(sqlite.evaluation_failures(), []);
     assert_eq!(sqlite.inserted(), &[1]);
 }

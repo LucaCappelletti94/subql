@@ -194,7 +194,7 @@ fn current_fixed_read_is_available_by_subscription_identity() {
             .read_query(subscription_id)
             .expect("fixed read has a query");
         assert_eq!(query.sql(), sql);
-        assert!(query.binds().is_empty());
+        assert_eq!(query.binds(), []);
     }
 
     let (in_process, _) = register(&mut engine, 13, "SELECT * FROM orders");

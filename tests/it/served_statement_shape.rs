@@ -554,7 +554,7 @@ fn arithmetic_over_columns_types_the_paired_literal() {
     assert_eq!(engine.consumers(&over).unwrap().inserted(), vec![7]);
 
     let under = TestEvent::<Postgres>::insert(table, row(2, 6));
-    assert!(engine.consumers(&under).unwrap().inserted().is_empty());
+    assert_eq!(engine.consumers(&under).unwrap().inserted(), &[] as &[u64]);
 }
 
 /// A flat operator chain nests one level per term, so the type lookup for the
