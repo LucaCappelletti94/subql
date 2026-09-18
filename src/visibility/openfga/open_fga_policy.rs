@@ -2599,6 +2599,46 @@ CREATE POLICY p ON docs FOR SELECT USING (
         assert_eq!(moved.added, vec![stated], "and the fresh grant is written");
     }
 
+    /// A condition that moved on one triple withdraws the bearer that held it
+    /// and grants the one that holds it now.
+    ///
+    /// The context is no part of the server's tuple key, so this key stands on
+    /// both sides of the difference, and reading the withdrawal off the key
+    /// alone would name the new bearer as the one that lost access. The two
+    /// halves have to disagree about the context and agree about everything
+    /// else.
+    #[test]
+    fn a_context_that_moved_on_one_triple_withdraws_the_bearer_that_held_it() {
+        let (gate, condition) = test_names::gated_relation();
+        let granted = |bearer: &str| Record {
+            object: "shares:1|~6b65793a61".to_string(),
+            relation: gate.clone(),
+            subject: "user:*".to_string(),
+            context: Some(RecordContextValue {
+                condition: condition.clone(),
+                values: BTreeMap::from([("viewer".to_string(), String::from(bearer))]),
+            }),
+        };
+        let held = granted("key:r86k-a");
+        let stated = granted("key:r86k-b");
+        let stored = BTreeMap::from([(triple_of(&held), held.context.as_ref().map(condition_of))]);
+
+        let moved = difference(&stored, core::slice::from_ref(&stated));
+
+        let [withdrawn] = moved.removed.as_slice() else {
+            panic!("the key is withdrawn and written again: {moved:?}");
+        };
+        assert_eq!(
+            withdrawn.context, held.context,
+            "the withdrawal names the bearer that held the grant"
+        );
+        assert_eq!(
+            moved.added,
+            vec![stated],
+            "and the grant is written under the bearer that holds it now"
+        );
+    }
+
     /// A stored context whose value is not a string reports no context at all.
     ///
     /// Every context this policy writes renders its values as the tuple SQL
