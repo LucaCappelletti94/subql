@@ -98,5 +98,5 @@ pub(crate) mod uncovered;
 
 pub(crate) use diff::name_gap;
 pub use group::{Enumeration, Materialisation, Region, RegionPart, Replay, Replayer};
-pub use store_diff::{StoreDiff, StoreDiffError};
+pub use store_diff::{Requeries, StoreDiff, StoreDiffError};
 pub use uncovered::{KeyedRequery, Requery, Uncovered, UncoveredReason};

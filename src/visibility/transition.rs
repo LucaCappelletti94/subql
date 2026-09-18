@@ -25,7 +25,7 @@
 //!
 //! # Withdrawing is the safe direction
 //!
-//! [`Transitions::reset`] pre-fills [`Transition::Withdraw`], and the
+//! Every call pre-fills [`Transition::Withdraw`], and the
 //! combination only ever upgrades out of it. So a call that fails partway
 //! leaves every watcher it did not reach withdrawing, and a caller that
 //! ignores the error cannot leak a row. A client that receives a removal
@@ -102,7 +102,7 @@ pub struct Transitions {
 }
 
 impl Transitions {
-    /// An empty buffer. Size it with [`reset`](Self::reset) before use.
+    /// An empty buffer, ready to be handed to [`transitions`].
     #[must_use]
     pub const fn new() -> Self {
         Self {
@@ -117,7 +117,12 @@ impl Transitions {
     /// Sizes every buffer to exactly `watchers` entries, pre-fills the
     /// verdicts with [`Verdict::Deny`] and the transitions with
     /// [`Transition::Withdraw`]. A stale answer never survives.
-    pub fn reset(&mut self, watchers: usize) {
+    ///
+    /// Private because [`transitions`] does this itself on every call. A
+    /// caller who could skip it would read a previous event's answers,
+    /// and in the allow direction that hands a row to a watcher whose
+    /// access has gone.
+    fn reset(&mut self, watchers: usize) {
         Verdict::reset(&mut self.current, watchers);
         Verdict::reset(&mut self.previous, watchers);
         self.out.clear();
@@ -133,8 +138,10 @@ impl Transitions {
 
 /// Decide, for each watcher, what `event` does to its copy of the row.
 ///
-/// Writes one [`Transition`] per watcher into `buffers`, positionally.
-/// Size the buffer with [`Transitions::reset`] first.
+/// Writes one [`Transition`] per watcher into `buffers`, positionally,
+/// sizing and pre-filling it first so a previous event's answers cannot
+/// survive into this one. `buffers` is scratch kept across events purely
+/// so no event allocates, never state the caller maintains.
 ///
 /// # Errors
 ///
@@ -155,6 +162,7 @@ where
     E: CdcEvent<Backend = P::Backend> + Sync,
     DB: DatabaseLike,
 {
+    buffers.reset(watchers.len());
     if event.kind() == EventKind::Truncate {
         return Err(TransitionError::NotARowEvent);
     }
@@ -359,7 +367,6 @@ mod tests {
         watchers: &[i64],
     ) -> Result<Vec<Transition>, TransitionError<Unreachable>> {
         let mut buffers = Transitions::new();
-        buffers.reset(watchers.len());
         block_on(transitions(policy, event, db, watchers, &mut buffers))?;
         Ok(buffers.get().to_vec())
     }
@@ -516,7 +523,6 @@ mod tests {
         };
         let watchers = [7i64, 9];
         let mut buffers = Transitions::new();
-        buffers.reset(watchers.len());
         let outcome = block_on(transitions(&policy, &event, &db, &watchers, &mut buffers));
         assert_eq!(outcome, Err(TransitionError::Policy(Unreachable)));
         assert_eq!(
@@ -526,38 +532,56 @@ mod tests {
         );
     }
 
-    /// The scratch buffer is meant to be kept across events, so a stale
-    /// answer must not survive a reset.
+    /// The scratch buffer is kept across events, so sizing and pre-filling
+    /// it is this function's own business rather than an obligation on the
+    /// caller. A caller who could leave the previous event's answers in
+    /// place would, in the allow direction, hand a row to a watcher whose
+    /// access has gone.
     #[test]
-    fn reset_clears_a_previous_events_answers() {
+    fn a_reused_buffer_carries_no_answer_from_the_previous_event() {
         let (db, docs) = catalog();
         let policy = OwnerPolicy::default();
         let mut buffers = Transitions::new();
 
         let first: TestEvent<_> = TestEvent::insert(docs, row(1, 7)).with_pk_columns([0u16]);
-        buffers.reset(1);
         block_on(transitions(&policy, &first, &db, &[7], &mut buffers)).unwrap();
         assert_eq!(buffers.get(), [Transition::Deliver]);
 
         let second: TestEvent<_> = TestEvent::insert(docs, row(2, 9)).with_pk_columns([0u16]);
-        buffers.reset(1);
         block_on(transitions(&policy, &second, &db, &[7], &mut buffers)).unwrap();
-        assert_eq!(buffers.get(), [Transition::Nothing], "no stale Deliver");
+        assert_eq!(
+            buffers.get(),
+            [Transition::Nothing],
+            "the watcher who can no longer see the row is not delivered to"
+        );
     }
 
-    /// Sizing the buffer to a different audience must not carry answers
-    /// across, and must not panic.
+    /// A different audience between events must not carry answers across,
+    /// and must not panic.
     #[test]
-    fn reset_resizes_between_events() {
+    fn a_changed_audience_is_resized_by_the_call() {
+        let (db, docs) = catalog();
+        let policy = OwnerPolicy::default();
         let mut buffers = Transitions::new();
-        buffers.reset(3);
-        assert_eq!(buffers.get().len(), 3);
-        buffers.reset(1);
-        assert_eq!(buffers.get(), [Transition::Withdraw]);
-        buffers.reset(0);
+
+        let event: TestEvent<_> = TestEvent::insert(docs, row(1, 7)).with_pk_columns([0u16]);
+        block_on(transitions(&policy, &event, &db, &[1, 7, 9], &mut buffers)).unwrap();
+        assert_eq!(
+            buffers.get(),
+            [
+                Transition::Nothing,
+                Transition::Deliver,
+                Transition::Nothing
+            ]
+        );
+
+        block_on(transitions(&policy, &event, &db, &[9], &mut buffers)).unwrap();
+        assert_eq!(buffers.get(), [Transition::Nothing]);
+
+        block_on(transitions(&policy, &event, &db, &[], &mut buffers)).unwrap();
         assert!(
             buffers.get().is_empty(),
-            "reset to zero produces an empty transition buffer"
+            "an empty audience produces an empty transition buffer"
         );
     }
 
@@ -673,7 +697,6 @@ mod tests {
         let policy = OwnerPolicy::default();
         let watchers = [7i64];
         let mut buffers = Transitions::new();
-        buffers.reset(1);
         let future = transitions(&policy, &event, &db, &watchers, &mut buffers);
         assert_send(&future);
         block_on(future).unwrap();

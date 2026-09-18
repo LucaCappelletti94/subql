@@ -602,17 +602,17 @@ where
     /// single call, or one stating a key on both sides, cannot be, and then
     /// removals go first, which is the fail-closed order.
     ///
-    /// [`StoreDiff::requeries`] is **not** covered here. Those are the facts no
-    /// single row settles, and running their SQL belongs to the caller, which
-    /// then hands the rows back through
-    /// [`reconcile_records`](Self::reconcile_records). A caller that ignores
-    /// them leaves every two-table fact stale.
+    /// The [`Requeries`](crate::visibility::store::Requeries) handed back
+    /// beside the difference are **not** covered here. Those are the facts
+    /// no single row settles, and running their SQL belongs to the caller,
+    /// which then hands the rows back through
+    /// [`reconcile_records`](Self::reconcile_records).
     ///
     /// # Errors
     ///
     /// [`OpenFgaError::Transport`] when the server could not be reached, and
     /// [`OpenFgaError::Rejected`] when it refused the write.
-    pub async fn apply(&self, diff: &StoreDiff<'_, B>) -> Result<(), OpenFgaError> {
+    pub async fn apply(&self, diff: &StoreDiff) -> Result<(), OpenFgaError> {
         let mut writes = Vec::with_capacity(diff.added.len());
         for record in &diff.added {
             writes.push(tuple_of(record));
@@ -1377,7 +1377,7 @@ mod tests {
     use crate::backend::{Postgres, Value};
     use crate::testing::{block_on, TestEvent};
     use crate::visibility::shapes::Shapes;
-    use crate::visibility::store::{Enumeration, Requery, StoreDiff};
+    use crate::visibility::store::{Enumeration, Requeries, Requery, StoreDiff};
     use crate::visibility::{test_names, EventRow, Verdict, VisibilityPolicy};
     use crate::{catalog_helpers, ParserDB};
     use alloc::string::String;
@@ -2053,7 +2053,7 @@ CREATE POLICY p ON docs FOR SELECT USING (
             AND team_members.expires_at > now()));
 ";
 
-    fn expiring_diff(shapes: &Shapes<ParserDB>) -> StoreDiff<'_, Postgres> {
+    fn expiring_diff(shapes: &Shapes<ParserDB>) -> (StoreDiff, Requeries<'_, Postgres>) {
         let members =
             catalog_helpers::table_id::<Postgres, _>(shapes.catalog(), "team_members").unwrap();
         let event = TestEvent::<Postgres>::delete(
@@ -2316,8 +2316,8 @@ CREATE POLICY p ON docs FOR SELECT USING (
             ScriptedReply::Status(Status::unavailable("read offline")),
         ]);
         let shapes = shapes_over(EXPIRING);
-        let diff = expiring_diff(&shapes);
-        let [Requery::Keyed(requery)] = diff.requeries.as_slice() else {
+        let (_, requeries) = expiring_diff(&shapes);
+        let [Requery::Keyed(requery)] = requeries.as_slice() else {
             panic!("the fixture produces one keyed requery");
         };
         let policy = OpenFgaPolicy::<_, _, String, Postgres>::new(
@@ -2352,8 +2352,8 @@ CREATE POLICY p ON docs FOR SELECT USING (
             "read denied",
         ))]);
         let shapes = shapes_over(EXPIRING);
-        let diff = expiring_diff(&shapes);
-        let [Requery::Keyed(requery)] = diff.requeries.as_slice() else {
+        let (_, requeries) = expiring_diff(&shapes);
+        let [Requery::Keyed(requery)] = requeries.as_slice() else {
             panic!("the fixture produces one keyed requery");
         };
         let policy = OpenFgaPolicy::<_, _, String, Postgres>::new(
@@ -2439,10 +2439,9 @@ CREATE POLICY p ON docs FOR SELECT USING (
                 context: None,
             })
             .collect();
-        let diff = StoreDiff::<Postgres> {
+        let diff = StoreDiff {
             added,
             removed: vec![membership_record(None)],
-            requeries: Vec::new(),
         };
 
         block_on(policy.apply(&diff)).unwrap();
