@@ -504,13 +504,13 @@ fn the_difference_a_change_reports_matches_what_the_loader_would_reload() {
     let mut added = BTreeSet::new();
     let mut removed = BTreeSet::new();
     for event in &events {
-        let diff = store
+        let (diff, requeries) = store
             .diff(event)
             .unwrap_or_else(|error| panic!("the difference was refused: {error}"));
         added.extend(diff.added.iter().map(fact));
         removed.extend(diff.removed.iter().map(fact));
         assert!(
-            diff.requeries.is_empty(),
+            requeries.is_empty(),
             "these events are on tables no query is bound to"
         );
     }
@@ -674,14 +674,14 @@ fn a_replayed_compound_key_query_selects_only_the_row_that_changed() {
     let relations = compound_replay_relations(&catalog);
     let store = Shapes::new::<Postgres>(catalog, &relations, &[]);
 
-    let diff = store
+    let (diff, requeries) = store
         .diff(&events[0])
         .unwrap_or_else(|error| panic!("the difference was refused: {error}"));
     assert!(
-        !diff.requeries.is_empty(),
+        !requeries.is_empty(),
         "the change must hand over at least one replay: {diff:?}"
     );
-    for requery in &diff.requeries {
+    for requery in requeries.as_slice() {
         let Requery::Keyed(keyed) = requery else {
             panic!("expected KeyedRequery, got Whole materialisation");
         };

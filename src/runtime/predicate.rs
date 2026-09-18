@@ -120,6 +120,12 @@ impl<I: IdTypes> Copy for SubscriptionBinding<I> {}
 /// subscribers it admits. A changed row of the membership table carries a
 /// subscriber and a value, and asks which of this predicate's subscribers claim
 /// that identity, so it can move them under that value.
+///
+/// A caller states a set of subjects, so the second question is ambiguous when a
+/// row disappears: two of its subjects may grant the same value, and dropping the
+/// caller because one of them stopped would lose rows the other still reaches,
+/// permanently. The granting subjects are therefore kept, for the ordinals
+/// claiming more than one and no others.
 pub struct TermMembers<B: Backend> {
     /// Which consumer ordinals a compared value row admits, keyed by the
     /// values in the filter's column order (one-wide for a single-column
@@ -127,6 +133,15 @@ pub struct TermMembers<B: Backend> {
     by_value: HashMap<TermRow<B>, RoaringBitmap>,
     /// Which consumer ordinals claim each subscriber identity.
     by_subscriber: HashMap<TermKey<B>, RoaringBitmap>,
+    /// Ordinals holding at least one claim, so seeding one a second time is
+    /// recognised without reading the claim index backwards.
+    claimed: RoaringBitmap,
+    /// Ordinals claiming more than one subject, the only ones whose admissions
+    /// are attributed.
+    several: RoaringBitmap,
+    /// Which subjects of a several-subject ordinal grant a value row, keyed by
+    /// ordinal first so a withdrawal reaches them through the row it holds.
+    granted_by: HashMap<ConsumerOrdinal, HashMap<TermRow<B>, Vec<TermKey<B>>>>,
 }
 
 // `Clone` and `Debug` are hand-implemented so their bounds fall on the scalar
@@ -137,6 +152,9 @@ impl<B: Backend> Clone for TermMembers<B> {
         Self {
             by_value: self.by_value.clone(),
             by_subscriber: self.by_subscriber.clone(),
+            claimed: self.claimed.clone(),
+            several: self.several.clone(),
+            granted_by: self.granted_by.clone(),
         }
     }
 }
@@ -146,6 +164,9 @@ impl<B: Backend> core::fmt::Debug for TermMembers<B> {
         f.debug_struct("TermMembers")
             .field("by_value", &self.by_value)
             .field("by_subscriber", &self.by_subscriber)
+            .field("claimed", &self.claimed)
+            .field("several", &self.several)
+            .field("granted_by", &self.granted_by)
             .finish()
     }
 }
@@ -155,6 +176,9 @@ impl<B: Backend> Default for TermMembers<B> {
         Self {
             by_value: HashMap::new(),
             by_subscriber: HashMap::new(),
+            claimed: RoaringBitmap::new(),
+            several: RoaringBitmap::new(),
+            granted_by: HashMap::new(),
         }
     }
 }
@@ -166,20 +190,77 @@ impl<B: Backend> TermMembers<B> {
         self.by_value.get(values)
     }
 
-    /// Record that `ordinal` matches `values` through this term.
-    fn admit(&mut self, values: TermRow<B>, ordinal: ConsumerOrdinal) {
+    /// Record that `ordinal` matches `values` through this term, granted by
+    /// `subject`.
+    fn admit(&mut self, subject: &TermKey<B>, values: TermRow<B>, ordinal: ConsumerOrdinal) {
+        if self.several.contains(ordinal.get()) {
+            let granting = self
+                .granted_by
+                .entry(ordinal)
+                .or_default()
+                .entry(values.clone())
+                .or_default();
+            if !granting.contains(subject) {
+                granting.push(subject.clone());
+            }
+        }
         self.by_value
             .entry(values)
             .or_default()
             .insert(ordinal.get());
     }
 
-    /// Record that `ordinal` filters for `subscriber`.
-    fn claim(&mut self, subscriber: TermKey<B>, ordinal: ConsumerOrdinal) {
+    /// Record that `ordinal` filters for every subject in `subjects`.
+    ///
+    /// An ordinal claiming several of them has its admissions attributed from
+    /// here on. One that claimed a single subject until now was admitted
+    /// through that subject and no other, so the rows it already holds are
+    /// attributed to it here rather than left for the first withdrawal to take.
+    fn claim(&mut self, subjects: &[TermKey<B>], ordinal: ConsumerOrdinal) {
+        let held = if self.claimed.contains(ordinal.get()) && !self.several.contains(ordinal.get())
+        {
+            self.subjects_of(ordinal)
+        } else {
+            Vec::new()
+        };
+        for subject in subjects {
+            self.by_subscriber
+                .entry(subject.clone())
+                .or_default()
+                .insert(ordinal.get());
+        }
+        self.claimed.insert(ordinal.get());
+
+        if self.several.contains(ordinal.get()) {
+            return;
+        }
+        let distinct = held.len() + subjects.iter().filter(|new| !held.contains(new)).count();
+        if distinct < 2 {
+            return;
+        }
+        self.several.insert(ordinal.get());
+        let [granted] = held.as_slice() else {
+            return;
+        };
+        let backfilled = self
+            .by_value
+            .iter()
+            .filter(|(_, admitted)| admitted.contains(ordinal.get()))
+            .map(|(values, _)| (values.clone(), alloc::vec![granted.clone()]))
+            .collect();
+        self.granted_by.insert(ordinal, backfilled);
+    }
+
+    /// The subjects `ordinal` claims today.
+    ///
+    /// Reads the claim index backwards, which only a second seeding of an
+    /// ordinal already claiming one subject needs.
+    fn subjects_of(&self, ordinal: ConsumerOrdinal) -> Vec<TermKey<B>> {
         self.by_subscriber
-            .entry(subscriber)
-            .or_default()
-            .insert(ordinal.get());
+            .iter()
+            .filter(|(_, ordinals)| ordinals.contains(ordinal.get()))
+            .map(|(subject, _)| subject.clone())
+            .collect()
     }
 
     /// The consumer ordinals filtering for `subscriber`.
@@ -188,21 +269,68 @@ impl<B: Backend> TermMembers<B> {
         self.by_subscriber.get(subscriber)
     }
 
-    /// Add `ordinals` to the set `values` admit, as a membership row appearing
-    /// does.
-    pub fn widen(&mut self, values: TermRow<B>, ordinals: &RoaringBitmap) {
-        *self.by_value.entry(values).or_default() |= ordinals;
+    /// Add `ordinals` to the set `values` admit, as a membership row naming
+    /// `subject` appearing does, and report the ones that did not hold it
+    /// already.
+    pub fn widen(
+        &mut self,
+        values: TermRow<B>,
+        subject: &TermKey<B>,
+        ordinals: &RoaringBitmap,
+    ) -> RoaringBitmap {
+        for ordinal in &(ordinals & &self.several) {
+            let granting = self
+                .granted_by
+                .entry(ConsumerOrdinal::new(ordinal))
+                .or_default()
+                .entry(values.clone())
+                .or_default();
+            if !granting.contains(subject) {
+                granting.push(subject.clone());
+            }
+        }
+        let admitted = self.by_value.entry(values).or_default();
+        let entered = ordinals - &*admitted;
+        *admitted |= ordinals;
+        entered
     }
 
     /// Take `ordinals` out of the set `values` admit, as a membership row
-    /// disappearing does.
-    pub fn narrow(&mut self, values: &[TermKey<B>], ordinals: &RoaringBitmap) {
+    /// naming `subject` disappearing does, and report the ones that left.
+    ///
+    /// An ordinal claiming several subjects keeps the row while another of them
+    /// still grants it, which is the whole reason the grants are kept.
+    pub fn narrow(
+        &mut self,
+        values: &[TermKey<B>],
+        subject: &TermKey<B>,
+        ordinals: &RoaringBitmap,
+    ) -> RoaringBitmap {
+        let Some(admitted) = self.by_value.get(values) else {
+            return RoaringBitmap::new();
+        };
+        let mut left = ordinals & admitted;
+        for ordinal in &(&left & &self.several) {
+            let Some(rows) = self.granted_by.get_mut(&ConsumerOrdinal::new(ordinal)) else {
+                continue;
+            };
+            let Some(granting) = rows.get_mut(values) else {
+                continue;
+            };
+            granting.retain(|held| held != subject);
+            if granting.is_empty() {
+                rows.remove(values);
+            } else {
+                left.remove(ordinal);
+            }
+        }
         if let Some(admitted) = self.by_value.get_mut(values) {
-            *admitted -= ordinals;
+            *admitted -= &left;
             if admitted.is_empty() {
                 self.by_value.remove(values);
             }
         }
+        left
     }
 
     /// Take every value this term admits, leaving it admitting none.
@@ -211,6 +339,7 @@ impl<B: Backend> TermMembers<B> {
     /// still filter for the same identities, so a membership row appearing again
     /// moves them back.
     pub fn clear_admissions(&mut self) -> Vec<(TermRow<B>, RoaringBitmap)> {
+        self.granted_by.clear();
         self.by_value.drain().collect()
     }
 
@@ -225,6 +354,9 @@ impl<B: Backend> TermMembers<B> {
         }
         self.by_value.retain(|_, set| !set.is_empty());
         self.by_subscriber.retain(|_, set| !set.is_empty());
+        self.granted_by.remove(&ordinal);
+        self.claimed.remove(ordinal.get());
+        self.several.remove(ordinal.get());
     }
 }
 
@@ -494,25 +626,26 @@ impl<I: IdTypes, B: Backend> PredicateStore<I, B> {
         }
     }
 
-    /// Record that `ordinal` filters for `subscriber` through the term in
-    /// `slot` of `pred`, and matches `values` today.
+    /// Record that `ordinal` filters for `subjects` through the term in `slot`
+    /// of `pred`, and matches `rows` today, each through the subject granting
+    /// it.
     ///
-    /// The values are what the subscription stated at registration, and the
-    /// identity is what a changed membership row is matched against. An empty
-    /// `values` admits nobody until such a row arrives, which is the partial
-    /// list a client is allowed to send.
+    /// The rows are what the subscription stated at registration, and the
+    /// subjects are what a changed membership row is matched against. Empty
+    /// `rows` admit nobody until such a row arrives, which is the partial list
+    /// a client is allowed to send.
     pub fn seed_term(
         &mut self,
         pred: PredicateId,
         slot: u16,
         ordinal: ConsumerOrdinal,
-        subscriber: TermKey<B>,
-        rows: Vec<TermRow<B>>,
+        subjects: &[TermKey<B>],
+        rows: Vec<(TermKey<B>, TermRow<B>)>,
     ) {
         let members = self.term_members.entry((pred, slot)).or_default();
-        members.claim(subscriber, ordinal);
-        for row in rows {
-            members.admit(row, ordinal);
+        members.claim(subjects, ordinal);
+        for (subject, row) in rows {
+            members.admit(&subject, row, ordinal);
         }
     }
 

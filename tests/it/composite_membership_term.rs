@@ -53,12 +53,17 @@ fn subscribe(
     pairs: &[(i64, i64)],
 ) -> SubscriptionRequest<DefaultIds, Postgres> {
     SubscriptionRequest::new(consumer, TERM)
-        .subscriber(Value::String(user.into()))
+        .subjects([Value::String(user.into())])
         .term_values(
             vec!["tenant_id", "id"],
             pairs
                 .iter()
-                .map(|&(tenant, document)| vec![Value::Int(tenant), Value::Int(document)])
+                .map(|&(tenant, document)| {
+                    (
+                        Value::String(user.into()),
+                        vec![Value::Int(tenant), Value::Int(document)],
+                    )
+                })
                 .collect(),
         )
 }
@@ -126,10 +131,13 @@ fn stated_columns_may_come_in_any_order() {
     engine
         .register(
             SubscriptionRequest::new(1u64, TERM)
-                .subscriber(Value::String("alice".into()))
+                .subjects([Value::String("alice".into())])
                 .term_values(
                     vec!["id", "tenant_id"],
-                    vec![vec![Value::Int(5), Value::Int(1)]],
+                    vec![(
+                        Value::String("alice".into()),
+                        vec![Value::Int(5), Value::Int(1)],
+                    )],
                 ),
         )
         .unwrap();
@@ -288,8 +296,11 @@ fn a_one_pair_exists_is_the_in_spelling_in_other_clothes() {
     engine
         .register(
             SubscriptionRequest::new(1u64, ONE_PAIR)
-                .subscriber(Value::String("alice".into()))
-                .term_values(vec!["id"], vec![vec![Value::Int(5)]]),
+                .subjects([Value::String("alice".into())])
+                .term_values(
+                    vec!["id"],
+                    vec![(Value::String("alice".into()), vec![Value::Int(5)])],
+                ),
         )
         .expect("the one-pair EXISTS registers");
 
@@ -329,9 +340,9 @@ fn describe_terms_names_both_pairs_and_the_seed_read() {
     );
     assert_eq!(
         term.seed_sql,
-        "SELECT s.tenant_id, s.doc_id FROM shares s \
+        "SELECT s.viewer, s.tenant_id, s.doc_id FROM shares s \
          WHERE s.viewer = current_setting('app.user_id', true)",
-        "the seed projects the membership columns in pair order for the caller's rows"
+        "the seed projects the granting subject, then the membership columns in pair order"
     );
 }
 
@@ -341,7 +352,7 @@ mod refusals {
     /// serve it, and return the reason the in-process path gave up.
     fn reread_reason(engine: &mut Engine, sql: &str) -> String {
         let registered = engine
-            .register(SubscriptionRequest::new(1u64, sql).subscriber(Value::String("alice".into())))
+            .register(SubscriptionRequest::new(1u64, sql).subjects([Value::String("alice".into())]))
             .expect("the reread tier serves what the bounded form refuses");
         assert!(
             matches!(registered.tier, subql::Tier::WholeRows { .. }),
@@ -375,7 +386,7 @@ mod refusals {
              (SELECT tenant_id, doc_id FROM shares WHERE viewer = current_setting('app.user_id', true))";
         let reason = refusal(
             &mut engine,
-            SubscriptionRequest::new(1u64, tuple_in).subscriber(Value::String("alice".into())),
+            SubscriptionRequest::new(1u64, tuple_in).subjects([Value::String("alice".into())]),
         );
         assert!(
             reason.contains("EXISTS"),
@@ -393,7 +404,7 @@ mod refusals {
                AND s.viewer = current_setting('app.user_id', true))";
         let registered = engine
             .register(
-                SubscriptionRequest::new(1u64, negated).subscriber(Value::String("alice".into())),
+                SubscriptionRequest::new(1u64, negated).subjects([Value::String("alice".into())]),
             )
             .expect("the reread tier serves subtraction");
         assert!(
@@ -451,8 +462,11 @@ mod refusals {
         let reason = refusal(
             &mut engine,
             SubscriptionRequest::new(1u64, TERM)
-                .subscriber(Value::String("alice".into()))
-                .term_values(vec!["tenant_id", "id"], vec![vec![Value::Int(1)]]),
+                .subjects([Value::String("alice".into())])
+                .term_values(
+                    vec!["tenant_id", "id"],
+                    vec![(Value::String("alice".into()), vec![Value::Int(1)])],
+                ),
         );
         assert!(
             reason.contains("carries 1 values where 2 columns were named"),
@@ -467,8 +481,11 @@ mod refusals {
         let reason = refusal(
             &mut engine,
             SubscriptionRequest::new(1u64, TERM)
-                .subscriber(Value::String("alice".into()))
-                .term_values(vec!["tenant_id"], vec![vec![Value::Int(1)]]),
+                .subjects([Value::String("alice".into())])
+                .term_values(
+                    vec!["tenant_id"],
+                    vec![(Value::String("alice".into()), vec![Value::Int(1)])],
+                ),
         );
         assert!(
             reason.contains("compares together"),
@@ -488,10 +505,13 @@ mod refusals {
         engine
             .register(
                 SubscriptionRequest::new(1u64, REVERSED)
-                    .subscriber(Value::String("alice".into()))
+                    .subjects([Value::String("alice".into())])
                     .term_values(
                         vec!["id", "tenant_id"],
-                        vec![vec![Value::Int(5), Value::Int(1)]],
+                        vec![(
+                            Value::String("alice".into()),
+                            vec![Value::Int(5), Value::Int(1)],
+                        )],
                     ),
             )
             .unwrap();

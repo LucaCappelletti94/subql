@@ -230,12 +230,11 @@ async fn replacement_fixture() -> ReplacementFixture {
     .authorization_model_id(model_id.clone());
     let stored =
         TestEvent::<Postgres>::insert(docs, update_row("alice", "bob")).with_pk_columns([0u16]);
+    let (stored_diff, _requeries) = shapes
+        .diff(&stored)
+        .expect("the stored row states its facts");
     policy
-        .apply(
-            &shapes
-                .diff(&stored)
-                .expect("the stored row states its facts"),
-        )
+        .apply(&stored_diff)
         .await
         .expect("write the stored row facts");
 
@@ -712,8 +711,9 @@ CREATE POLICY p ON docs FOR SELECT USING (owner_id = current_user);
     let created =
         TestEvent::<Postgres>::insert(docs, vec![Value::Int(4), Value::String("alice".into())])
             .with_pk_columns([0u16]);
+    let (created_diff, _requeries) = shapes.diff(&created).expect("an insert is all additions");
     backend
-        .apply(&shapes.diff(&created).expect("an insert is all additions"))
+        .apply(&created_diff)
         .await
         .expect("write the additions");
 
@@ -739,7 +739,7 @@ CREATE POLICY p ON docs FOR SELECT USING (owner_id = current_user);
         vec![Value::Int(4), Value::String("bob".into())],
     )
     .with_pk_columns([0u16]);
-    let diff = shapes.diff(&moved).expect("both images are complete");
+    let (diff, _requeries) = shapes.diff(&moved).expect("both images are complete");
     assert_eq!(diff.added.len(), 1, "one fact stated");
     assert_eq!(diff.removed.len(), 1, "one fact withdrawn");
     backend.apply(&diff).await.expect("write the difference");
@@ -822,10 +822,10 @@ CREATE POLICY p ON docs FOR SELECT USING (
             Value::String("2027-01-01T00:00:00Z".into()),
         ],
     );
-    let diff = shapes
+    let (diff, requeries) = shapes
         .diff(&withdrawn)
         .expect("the previous image is whole");
-    let [Requery::Keyed(requery)] = diff.requeries.as_slice() else {
+    let [Requery::Keyed(requery)] = requeries.as_slice() else {
         panic!("one keyed replay, one table the change arrived on: {diff:?}");
     };
     let condition = requery
@@ -862,10 +862,13 @@ CREATE POLICY p ON docs FOR SELECT USING (
     assert_eq!(withdrawn_fact.subject, "user:alice");
     assert_eq!(withdrawn_fact.object, "teams:3");
     assert_eq!(withdrawn_fact.relation, member_relation().to_string());
-    let retry = StoreDiff::<Postgres> {
+    assert_eq!(
+        withdrawn_fact.context, stale.context,
+        "the withdrawal carries the context the store held the tuple under"
+    );
+    let retry = StoreDiff {
         added: Vec::new(),
         removed: vec![stale],
-        requeries: Vec::new(),
     };
     backend
         .apply(&retry)
@@ -1224,8 +1227,8 @@ async fn a_reconcile_removes_a_fact_for_an_object_the_event_never_named() {
             Value::String("7".into()),
         ],
     );
-    let diff = shapes.diff(&event).expect("the previous image is whole");
-    let [Requery::Whole(group)] = diff.requeries.as_slice() else {
+    let (diff, requeries) = shapes.diff(&event).expect("the previous image is whole");
+    let [Requery::Whole(group)] = requeries.as_slice() else {
         panic!("the change schedules its whole group: {diff:?}");
     };
 
@@ -1407,8 +1410,9 @@ CREATE POLICY notes_p ON notes FOR ALL USING (
     let created =
         TestEvent::<Postgres>::insert(notes, vec![Value::Int(1), Value::String("alice".into())])
             .with_pk_columns([0u16]);
+    let (created_diff, _requeries) = shapes.diff(&created).expect("an insert is all additions");
     backend
-        .apply(&shapes.diff(&created).expect("an insert is all additions"))
+        .apply(&created_diff)
         .await
         .expect("write the additions");
 
@@ -1437,7 +1441,7 @@ CREATE POLICY notes_p ON notes FOR ALL USING (
         vec![Value::Int(1), Value::String("carol".into())],
     )
     .with_pk_columns([0u16]);
-    let diff = shapes.diff(&moved).expect("both images are complete");
+    let (diff, _requeries) = shapes.diff(&moved).expect("both images are complete");
     let conditional = |record: &rls2fga::types::Record| record.context.is_some();
     assert!(
         diff.added.iter().any(conditional) && diff.removed.iter().any(conditional),

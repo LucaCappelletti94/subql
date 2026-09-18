@@ -602,17 +602,17 @@ where
     /// single call, or one stating a key on both sides, cannot be, and then
     /// removals go first, which is the fail-closed order.
     ///
-    /// [`StoreDiff::requeries`] is **not** covered here. Those are the facts no
-    /// single row settles, and running their SQL belongs to the caller, which
-    /// then hands the rows back through
-    /// [`reconcile_records`](Self::reconcile_records). A caller that ignores
-    /// them leaves every two-table fact stale.
+    /// The [`Requeries`](crate::visibility::store::Requeries) handed back
+    /// beside the difference are **not** covered here. Those are the facts
+    /// no single row settles, and running their SQL belongs to the caller,
+    /// which then hands the rows back through
+    /// [`reconcile_records`](Self::reconcile_records).
     ///
     /// # Errors
     ///
     /// [`OpenFgaError::Transport`] when the server could not be reached, and
     /// [`OpenFgaError::Rejected`] when it refused the write.
-    pub async fn apply(&self, diff: &StoreDiff<'_, B>) -> Result<(), OpenFgaError> {
+    pub async fn apply(&self, diff: &StoreDiff) -> Result<(), OpenFgaError> {
         let mut writes = Vec::with_capacity(diff.added.len());
         for record in &diff.added {
             writes.push(tuple_of(record));
@@ -1104,10 +1104,11 @@ fn difference(
     let removed: Vec<WithdrawnFact> = stored
         .iter()
         .filter(|(key, condition)| desired.get(*key) != Some(condition))
-        .map(|((subject, relation, object), _)| WithdrawnFact {
+        .map(|((subject, relation, object), condition)| WithdrawnFact {
             subject: subject.clone(),
             relation: relation.clone(),
             object: object.clone(),
+            context: condition.as_ref().and_then(context_of),
         })
         .collect();
     let mut added = Vec::new();
@@ -1173,9 +1174,10 @@ pub struct Reconciled {
 
 /// One fact the store held and the reconciled slice no longer states.
 ///
-/// The condition a conditional tuple carried is not repeated here: the fact's
-/// identity is the triple, and the triple is what a consumer telling somebody
-/// their access changed needs.
+/// The context the withdrawn tuple carried travels with it, in the currency an
+/// added [`Record`] states its own in. A conditional grant names the wildcard
+/// as its subject, so the triple alone says that somebody lost access without
+/// saying who, and only the context names the bearer.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WithdrawnFact {
     /// `type:key`, or `user:*` for a wildcard.
@@ -1184,6 +1186,15 @@ pub struct WithdrawnFact {
     pub relation: String,
     /// `type:key`.
     pub object: String,
+    /// The condition context the deleted tuple carried, and `None` for an
+    /// unconditional one.
+    ///
+    /// Also `None` where the store spelled a value no context this policy
+    /// writes can hold, since those render as the tuple SQL rendered them and
+    /// nothing here may invent a rendering for anything else. A consumer
+    /// reading `None` on a wildcard subject cannot name a bearer and has to
+    /// tell everyone the shape reaches.
+    pub context: Option<RecordContextValue>,
 }
 
 /// One tuple's identity to the server: subject, relation, object. A condition's
@@ -1254,6 +1265,27 @@ fn condition_of(context: &RecordContextValue) -> RelationshipCondition {
                 .collect(),
         }),
     }
+}
+
+/// What a stored condition states, read back into the currency a record's
+/// context is written in, so a withdrawal and a grant compare directly.
+///
+/// `None` where a value is not a string, which no context this policy writes
+/// can be. A record renders its values as the tuple SQL rendered them and the
+/// spelling is the identity there, so a number read as `1` where the database
+/// rendered `1.00` would name a bearer nothing granted.
+fn context_of(condition: &RelationshipCondition) -> Option<RecordContextValue> {
+    let mut values = BTreeMap::new();
+    for (key, value) in condition.context.iter().flat_map(|struct_| &struct_.fields) {
+        let Some(Kind::StringValue(text)) = &value.kind else {
+            return None;
+        };
+        values.insert(key.clone(), text.clone());
+    }
+    Some(RecordContextValue {
+        condition: condition.name.clone(),
+        values,
+    })
 }
 
 impl<DB, T, W, B> VisibilityPolicy for OpenFgaPolicy<DB, T, W, B>
@@ -1338,14 +1370,14 @@ mod tests {
         batch_request, condition_of, consistency_for, context_for, difference, fits_one_call,
         triple_of, tuple_of, usable_index, ActionStatement, Asked, BatchCheckItem,
         BatchCheckRequest, CheckRequestTupleKey, ConsistencyPreference, Kind, OpenFgaError,
-        OpenFgaPolicy, OpenFgaServiceClient, Question, Record, RecordContextValue, RequestValues,
-        RequiredParameter, RowWrite, Subject, TupleKeyWithoutCondition, WriteRequest,
-        MAX_TUPLES_PER_WRITE,
+        OpenFgaPolicy, OpenFgaServiceClient, ProstValue, Question, Record, RecordContextValue,
+        RelationshipCondition, RequestValues, RequiredParameter, RowWrite, Struct, Subject,
+        TupleKeyWithoutCondition, WriteRequest, MAX_TUPLES_PER_WRITE,
     };
     use crate::backend::{Postgres, Value};
     use crate::testing::{block_on, TestEvent};
     use crate::visibility::shapes::Shapes;
-    use crate::visibility::store::{Enumeration, Requery, StoreDiff};
+    use crate::visibility::store::{Enumeration, Requeries, Requery, StoreDiff};
     use crate::visibility::{test_names, EventRow, Verdict, VisibilityPolicy};
     use crate::{catalog_helpers, ParserDB};
     use alloc::string::String;
@@ -2021,7 +2053,7 @@ CREATE POLICY p ON docs FOR SELECT USING (
             AND team_members.expires_at > now()));
 ";
 
-    fn expiring_diff(shapes: &Shapes<ParserDB>) -> StoreDiff<'_, Postgres> {
+    fn expiring_diff(shapes: &Shapes<ParserDB>) -> (StoreDiff, Requeries<'_, Postgres>) {
         let members =
             catalog_helpers::table_id::<Postgres, _>(shapes.catalog(), "team_members").unwrap();
         let event = TestEvent::<Postgres>::delete(
@@ -2284,8 +2316,8 @@ CREATE POLICY p ON docs FOR SELECT USING (
             ScriptedReply::Status(Status::unavailable("read offline")),
         ]);
         let shapes = shapes_over(EXPIRING);
-        let diff = expiring_diff(&shapes);
-        let [Requery::Keyed(requery)] = diff.requeries.as_slice() else {
+        let (_, requeries) = expiring_diff(&shapes);
+        let [Requery::Keyed(requery)] = requeries.as_slice() else {
             panic!("the fixture produces one keyed requery");
         };
         let policy = OpenFgaPolicy::<_, _, String, Postgres>::new(
@@ -2320,8 +2352,8 @@ CREATE POLICY p ON docs FOR SELECT USING (
             "read denied",
         ))]);
         let shapes = shapes_over(EXPIRING);
-        let diff = expiring_diff(&shapes);
-        let [Requery::Keyed(requery)] = diff.requeries.as_slice() else {
+        let (_, requeries) = expiring_diff(&shapes);
+        let [Requery::Keyed(requery)] = requeries.as_slice() else {
             panic!("the fixture produces one keyed requery");
         };
         let policy = OpenFgaPolicy::<_, _, String, Postgres>::new(
@@ -2407,10 +2439,9 @@ CREATE POLICY p ON docs FOR SELECT USING (
                 context: None,
             })
             .collect();
-        let diff = StoreDiff::<Postgres> {
+        let diff = StoreDiff {
             added,
             removed: vec![membership_record(None)],
-            requeries: Vec::new(),
         };
 
         block_on(policy.apply(&diff)).unwrap();
@@ -2529,6 +2560,118 @@ CREATE POLICY p ON docs FOR SELECT USING (
         assert!(
             moved.added.is_empty(),
             "and it is already stored as the record the write would send: {moved:?}"
+        );
+    }
+
+    /// A withdrawn fact names the bearer whose grant it withdrew.
+    ///
+    /// A conditional grant states the wildcard as its subject, so its triple
+    /// says only that somebody lost access. The bearer is written in the
+    /// context, and a consumer narrowing the withdrawal to it has nowhere else
+    /// to read it, since the object id encodes the key under an encoding only
+    /// rls2fga can spell.
+    #[test]
+    fn a_withdrawn_fact_carries_the_context_it_withdrew() {
+        let (gate, condition) = test_names::gated_relation();
+        let granted = |object: &str, bearer: &str| Record {
+            object: String::from(object),
+            relation: gate.clone(),
+            subject: "user:*".to_string(),
+            context: Some(RecordContextValue {
+                condition: condition.clone(),
+                values: BTreeMap::from([("viewer".to_string(), String::from(bearer))]),
+            }),
+        };
+        let held = granted("shares:1|~6b65793a61", "key:r86k-a");
+        let stated = granted("shares:1|~6b65793a62", "key:r86k-b");
+        let stored = BTreeMap::from([(triple_of(&held), held.context.as_ref().map(condition_of))]);
+
+        let moved = difference(&stored, core::slice::from_ref(&stated));
+
+        let [withdrawn] = moved.removed.as_slice() else {
+            panic!("the fact the store held alone is withdrawn: {moved:?}");
+        };
+        assert_eq!(
+            withdrawn.context, held.context,
+            "the withdrawal carries the context it deleted, not the one it wrote"
+        );
+        assert_eq!(moved.added, vec![stated], "and the fresh grant is written");
+    }
+
+    /// A condition that moved on one triple withdraws the bearer that held it
+    /// and grants the one that holds it now.
+    ///
+    /// The context is no part of the server's tuple key, so this key stands on
+    /// both sides of the difference, and reading the withdrawal off the key
+    /// alone would name the new bearer as the one that lost access. The two
+    /// halves have to disagree about the context and agree about everything
+    /// else.
+    #[test]
+    fn a_context_that_moved_on_one_triple_withdraws_the_bearer_that_held_it() {
+        let (gate, condition) = test_names::gated_relation();
+        let granted = |bearer: &str| Record {
+            object: "shares:1|~6b65793a61".to_string(),
+            relation: gate.clone(),
+            subject: "user:*".to_string(),
+            context: Some(RecordContextValue {
+                condition: condition.clone(),
+                values: BTreeMap::from([("viewer".to_string(), String::from(bearer))]),
+            }),
+        };
+        let held = granted("key:r86k-a");
+        let stated = granted("key:r86k-b");
+        let stored = BTreeMap::from([(triple_of(&held), held.context.as_ref().map(condition_of))]);
+
+        let moved = difference(&stored, core::slice::from_ref(&stated));
+
+        let [withdrawn] = moved.removed.as_slice() else {
+            panic!("the key is withdrawn and written again: {moved:?}");
+        };
+        assert_eq!(
+            withdrawn.context, held.context,
+            "the withdrawal names the bearer that held the grant"
+        );
+        assert_eq!(
+            moved.added,
+            vec![stated],
+            "and the grant is written under the bearer that holds it now"
+        );
+    }
+
+    /// A stored context whose value is not a string reports no context at all.
+    ///
+    /// Every context this policy writes renders its values as the tuple SQL
+    /// rendered them, so anything else is somebody else's tuple. A rendering
+    /// invented for it would name a bearer nothing granted, and `1` against
+    /// `1.00` is the same value under two names, so a consumer would narrow a
+    /// withdrawal to the wrong holder and leave the row where it is.
+    #[test]
+    fn a_context_value_that_is_not_a_string_is_not_rendered() {
+        let held = membership_record(Some("when_two"));
+        let stored = BTreeMap::from([(
+            triple_of(&held),
+            Some(RelationshipCondition {
+                name: "when_two".to_string(),
+                context: Some(Struct {
+                    fields: core::iter::once((
+                        "expires_at".to_string(),
+                        ProstValue {
+                            kind: Some(Kind::NumberValue(1.0)),
+                        },
+                    ))
+                    .collect(),
+                }),
+            }),
+        )]);
+
+        let moved = difference(&stored, &[]);
+
+        let [withdrawn] = moved.removed.as_slice() else {
+            panic!("an empty replay withdraws what the store held: {moved:?}");
+        };
+        assert!(
+            withdrawn.context.is_none(),
+            "a value this policy could not have written is not spelled: {withdrawn:?}"
         );
     }
 

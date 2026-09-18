@@ -1628,8 +1628,28 @@ pub(super) fn encode_sqlite_component(
 
 /// The custom scalar set of a backend that has none. Uninhabited, so
 /// [`ScalarKind::Custom`] cannot be constructed for such a backend.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[allow(
+    unknown_lints,
+    clippy::empty_enums,
+    reason = "an uninhabited type is the point, the never type that would replace it is unstable in a generic argument, and this cannot be an expect because the lint does not exist on the 1.88 toolchain the crate also builds under"
+)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum NoCustom {}
+
+impl serde::Serialize for NoCustom {
+    /// Never runs, since no value of this type exists to be serialized.
+    fn serialize<S: serde::Serializer>(&self, _serializer: S) -> Result<S::Ok, S::Error> {
+        unreachable!("a backend with no custom scalars holds no value to write")
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for NoCustom {
+    fn deserialize<D: serde::Deserializer<'de>>(_deserializer: D) -> Result<Self, D::Error> {
+        Err(serde::de::Error::custom(
+            "a backend with no custom scalars has no custom scalar to read",
+        ))
+    }
+}
 
 impl<C> From<DeclaredType> for ScalarKind<C> {
     fn from(builtin: DeclaredType) -> Self {

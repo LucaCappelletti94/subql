@@ -104,7 +104,7 @@ fn a_present_cell_still_notifies() {
             ],
         ))
         .expect("dispatch succeeds");
-    assert!(notifications.unanswered().is_empty());
+    assert_eq!(notifications.unanswered(), []);
     assert_eq!(notifications.inserted(), &[1]);
 }
 
@@ -131,7 +131,7 @@ fn a_null_cell_is_not_reported() {
         notifications.unanswered().is_empty(),
         "SQL's own unknown, not an absent cell"
     );
-    assert!(notifications.inserted().is_empty());
+    assert_eq!(notifications.inserted(), &[] as &[u64]);
 }
 
 /// `IS NULL` over a cell the event did not carry is unanswerable, not
@@ -208,7 +208,7 @@ fn a_not_null_test_on_a_missing_cell_is_unanswered() {
         vec![(subscription, 1)],
         "the same absent cell, reported through the opposite operator"
     );
-    assert!(notifications.inserted().is_empty());
+    assert_eq!(notifications.inserted(), &[] as &[u64]);
 }
 
 /// A null test over a cell the event carried as SQL `NULL` still
@@ -314,7 +314,7 @@ fn a_short_circuit_before_the_absent_cell_reports_nothing() {
         &[1],
         "the first disjunct held, so the absent cell was never read"
     );
-    assert!(notifications.unanswered().is_empty());
+    assert_eq!(notifications.unanswered(), []);
 }
 
 /// A decisive answer is an answer, even when the absent cell was read.
@@ -343,7 +343,7 @@ fn a_decisive_false_after_the_absent_cell_reports_nothing() {
         "unknown AND false is false, which is decided: {:?}",
         notifications.unanswered()
     );
-    assert!(notifications.inserted().is_empty());
+    assert_eq!(notifications.inserted(), &[] as &[u64]);
 }
 
 /// A membership term's columns are read outside the VM, so an absent one is
@@ -377,8 +377,11 @@ fn an_absent_membership_term_column_is_reported() {
     let subscription = engine
         .register(
             SubscriptionRequest::new(1u64, TERM)
-                .subscriber(Value::String("alice".into()))
-                .term_values(vec!["project_id"], vec![vec![Value::Int(7)]]),
+                .subjects([Value::String("alice".into())])
+                .term_values(
+                    vec!["project_id"],
+                    vec![(Value::String("alice".into()), vec![Value::Int(7)])],
+                ),
         )
         .expect("the term registers")
         .subscription_id;
@@ -400,7 +403,7 @@ fn an_absent_membership_term_column_is_reported() {
         vec![(subscription, project_id)],
         "the term cannot say who the row admits, so the answer is missing"
     );
-    assert!(notifications.inserted().is_empty());
+    assert_eq!(notifications.inserted(), &[] as &[u64]);
 }
 
 /// An update whose row image omits the cell is reported too, which is the

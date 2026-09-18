@@ -20,7 +20,7 @@
 use crate::common;
 
 use diesel::prelude::*;
-use diesel::sql_types::Integer;
+use diesel::sql_types::{Integer, Text};
 use diesel::{sql_query, PgConnection, QueryableByName};
 use rls2fga::translator::{Translator, TranslatorBuilder};
 use rls2fga::types::ConfidenceLevel;
@@ -70,10 +70,14 @@ diesel::table! {
 
 diesel::allow_tables_to_appear_in_same_query!(docs, project_members);
 
-/// One value of the seed read. Bound by column name, which the description
-/// states as `member_key`, and typed as it states in `key_kind`.
+/// One row of the seed read: the subject granting it, then the value it
+/// grants. Bound by column name, which the description states as
+/// `member_subject` and `member_key`, and typed as it states in `subject_kind`
+/// and `key_kind`.
 #[derive(QueryableByName)]
 struct SeedValue {
+    #[diesel(sql_type = Text)]
+    user_id: String,
     #[diesel(sql_type = Integer)]
     project_id: i32,
 }
@@ -145,21 +149,24 @@ fn become_caller(conn: &mut PgConnection) {
 
 /// Run the seed read subql handed over. Raw because the statement is text the
 /// engine produced at run time, so no typed schema describes it.
-fn run_seed(conn: &mut PgConnection, description: &MembershipTermDescription) -> Vec<i64> {
-    let mut values: Vec<i64> = sql_query(&description.seed_sql)
+fn run_seed(
+    conn: &mut PgConnection,
+    description: &MembershipTermDescription,
+) -> Vec<(String, i64)> {
+    let mut rows: Vec<(String, i64)> = sql_query(&description.seed_sql)
         .load::<SeedValue>(conn)
         .unwrap_or_else(|error| panic!("seed read failed: {error}\n{}", description.seed_sql))
         .into_iter()
-        .map(|row| i64::from(row.project_id))
+        .map(|row| (row.user_id, i64::from(row.project_id)))
         .collect();
-    values.sort_unstable();
-    values
+    rows.sort_unstable();
+    rows
 }
 
 /// What the wrong advice yields: the compared column of the rows the caller's
 /// snapshot returns. Typed, because this one is the client's own query.
-fn snapshot_seed(conn: &mut PgConnection) -> Vec<i64> {
-    let mut values: Vec<i64> = docs::table
+fn snapshot_seed(conn: &mut PgConnection) -> Vec<(String, i64)> {
+    let mut values: Vec<(String, i64)> = docs::table
         .filter(
             docs::project_id.eq_any(
                 project_members::table
@@ -172,7 +179,7 @@ fn snapshot_seed(conn: &mut PgConnection) -> Vec<i64> {
         .load::<i32>(conn)
         .unwrap()
         .into_iter()
-        .map(i64::from)
+        .map(|value| (CALLER.to_string(), i64::from(value)))
         .collect();
     values.sort_unstable();
     values
@@ -180,9 +187,9 @@ fn snapshot_seed(conn: &mut PgConnection) -> Vec<i64> {
 
 /// Register `TERM` for `CALLER` with `values`, then report whether a document
 /// inserted under `project` reaches it.
-fn delivers(values: &[i64], project: i64) -> bool {
+fn delivers(granted: &[(String, i64)], project: i64) -> bool {
     let (mut engine, docs_id) = engine();
-    let mut request = SubscriptionRequest::new(1u64, TERM).subscriber(Value::String(CALLER.into()));
+    let mut request = SubscriptionRequest::new(1u64, TERM).subjects([Value::String(CALLER.into())]);
     let TermDescription::Membership(description) =
         engine.describe_terms(&request).unwrap().remove(0)
     else {
@@ -194,9 +201,9 @@ fn delivers(values: &[i64], project: i64) -> bool {
             .iter()
             .map(|pair| pair.column.clone())
             .collect(),
-        values
+        granted
             .iter()
-            .map(|&value| vec![Value::Int(value)])
+            .map(|(subject, value)| (Value::String(subject.clone()), vec![Value::Int(*value)]))
             .collect(),
     );
     engine.register(request).unwrap();
@@ -247,14 +254,15 @@ fn the_described_seed_read_runs_and_admits_a_parent_with_no_rows_yet() {
     let from_membership = run_seed(&mut pg, description);
     assert_eq!(
         from_membership,
-        [1, 2],
-        "the caller belongs to both projects, whether or not either has documents"
+        [(CALLER.to_string(), 1), (CALLER.to_string(), 2)],
+        "the caller belongs to both projects, whether or not either has documents, and each \
+         row names the subject granting it"
     );
 
     let from_snapshot = snapshot_seed(&mut pg);
     assert_eq!(
         from_snapshot,
-        [1],
+        [(CALLER.to_string(), 1)],
         "project 2 has no documents, so the snapshot never names it"
     );
 
