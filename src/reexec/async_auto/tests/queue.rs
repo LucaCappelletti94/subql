@@ -149,6 +149,99 @@ fn the_trait_method_gates_its_notifications_too() {
     assert_eq!(reads.scalar_updates[0].value, Value::Float(7.0));
 }
 
+/// A drain abandoned mid-read keeps its in-process notifications reachable.
+///
+/// The event folded exactly once before the read started and nothing offers
+/// those notifications again, so a dropped future may not be allowed to take
+/// them with it. The engine parks them instead, refuses the next event until
+/// they are claimed, and hands them over on request.
+#[test]
+fn a_dropped_drain_parks_the_notifications_it_could_not_deliver() {
+    let (mut e, tid) = engine_with_values(vec![Value::Float(7.0)]);
+    let qid = crate::reexec::test_fixtures::register_scalar_query(
+        &mut e,
+        1u64,
+        "SELECT MIN(price) FROM orders",
+    );
+    crate::Install::install(
+        &mut e,
+        qid,
+        crate::ScalarInstall {
+            value: Value::Float(5.0),
+            checkpoint: None::<NoCheckpoint>,
+        },
+    )
+    .unwrap();
+    e.register(
+        SubscriptionRequest::new(2u64, "SELECT * FROM orders WHERE price < 100"),
+        (),
+    )
+    .expect("an in-process row subscription registers");
+
+    // A future dropped before its first poll is the harder case, since an
+    // `async fn` body would not have run at all by then.
+    drop(
+        e.apply(&delete_event(tid, 1, 5.0))
+            .expect("the event applies")
+            .resolve_collect(),
+    );
+    assert_eq!(
+        e.take_undelivered()
+            .expect("an unpolled drain parked them too")
+            .engine
+            .deleted(),
+        &[2],
+        "the fold survived a future that never ran"
+    );
+
+    *e.connector().pend_next_read.lock() = true;
+    {
+        let mut ctx = Context::from_waker(core::task::Waker::noop());
+        let fut = e
+            .apply(&delete_event(tid, 1, 5.0))
+            .expect("the event applies")
+            .resolve_collect();
+        let mut pinned = pin!(fut);
+        assert!(
+            pinned.as_mut().poll(&mut ctx).is_pending(),
+            "the drain suspends inside the connector read"
+        );
+        // Dropped here, mid-read, as a timeout or a losing select arm drops it.
+    }
+
+    assert_eq!(e.pending_read_count(), 1, "the dropped read stayed queued");
+    assert!(
+        matches!(
+            e.apply(&delete_event(tid, 2, 6.0)),
+            Err(crate::DispatchError::UndeliveredNotifications)
+        ),
+        "a second event is refused while undelivered notifications are held"
+    );
+
+    let parked = e
+        .take_undelivered()
+        .expect("the abandoned drain parked what it had folded");
+    assert_eq!(
+        parked.engine.deleted(),
+        &[2],
+        "the in-process verdict survived the dropped future"
+    );
+    assert!(
+        e.take_undelivered().is_none(),
+        "claiming them clears the park"
+    );
+
+    let settled = block_on(
+        e.apply(&delete_event(tid, 3, 7.0))
+            .expect("the engine accepts events again")
+            .resolve_collect(),
+    );
+    assert!(
+        settled.reads.is_ok(),
+        "and the queued read still resolves afterwards"
+    );
+}
+
 /// Mirrors `auto::tests::a_dispatch_reports_the_reads_it_queued`,
 /// because a shared line tested on one side only is correct for the
 /// other by luck.

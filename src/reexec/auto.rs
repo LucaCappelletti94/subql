@@ -139,6 +139,15 @@ where
     /// abandoned resolve leaves them here, so retrying costs a read and
     /// never a second application of the event.
     pub(super) pending_reads: ReadQueue<I, E::Checkpoint, E::Backend>,
+    /// In-process notifications of an event whose asynchronous drain was
+    /// abandoned before it could hand them back.
+    ///
+    /// A dropped future takes its contents with it, and these cannot be
+    /// produced a second time, because the event folded exactly once before
+    /// any read began. So the drain parks them here across its awaits and
+    /// claims them on completion, which leaves a cancelled drain losing
+    /// nothing at all.
+    pub(super) undelivered: Option<super::Dispatched<I, E::Backend, E::Checkpoint>>,
 }
 impl<E, I, DB, M> AutoResolvingEngine<E, I, DB, M>
 where
@@ -160,6 +169,7 @@ where
             debounce: None,
             last_reexec_at: HashMap::new(),
             pending_reads: ReadQueue::new(),
+            undelivered: None,
         }
     }
 
@@ -331,6 +341,38 @@ where
         self.pending_reads.len()
     }
 
+    /// Claim the notifications an abandoned drain parked, if any.
+    ///
+    /// A drain dropped before it finished, by a timeout or a losing
+    /// `select!` arm, leaves what its event folded here rather than
+    /// destroying it. The reads it had not run are still queued, so the
+    /// answer to those arrives from a later drain, and this answers for the
+    /// half the drain was carrying.
+    ///
+    /// `None` whenever no drain was abandoned, which is the ordinary case.
+    #[must_use]
+    pub fn take_undelivered(&mut self) -> Option<super::Dispatched<I, E::Backend, E::Checkpoint>> {
+        self.undelivered.take()
+    }
+
+    /// Hold notifications across a drain's awaits, per
+    /// [`undelivered`](Self::take_undelivered).
+    pub(super) fn park_undelivered(
+        &mut self,
+        notifications: super::Dispatched<I, E::Backend, E::Checkpoint>,
+    ) {
+        self.undelivered = Some(notifications);
+    }
+
+    /// Reclaim what [`park_undelivered`](Self::park_undelivered) held, for a
+    /// drain that ran to completion.
+    pub(super) fn claim_undelivered(&mut self) -> super::Dispatched<I, E::Backend, E::Checkpoint> {
+        self.undelivered.take().expect(
+            "a drain parks its notifications before its first await and nothing \
+             between that and this claim touches the park",
+        )
+    }
+
     /// Fold one CDC event into in-memory state, exactly once, and hand back a
     /// [`Dispatch`](super::Dispatch) that gates its notifications on the
     /// drain.
@@ -380,12 +422,18 @@ where
     ///
     /// # Errors
     ///
-    /// [`crate::DispatchError`] when the event cannot be dispatched. Nothing
-    /// is applied in that case.
+    /// [`crate::DispatchError`] when the event cannot be dispatched, and
+    /// [`DispatchError::UndeliveredNotifications`](crate::DispatchError::UndeliveredNotifications)
+    /// when an abandoned drain's notifications are still parked, since
+    /// folding another event over them would destroy what nothing can
+    /// produce again. Nothing is applied in either case.
     pub fn apply_leaving_reads_queued(
         &mut self,
         event: &E,
     ) -> Result<super::Dispatched<I, E::Backend, E::Checkpoint>, crate::DispatchError> {
+        if self.undelivered.is_some() {
+            return Err(crate::DispatchError::UndeliveredNotifications);
+        }
         let ReExecNotifications {
             engine,
             aggregate_updates,

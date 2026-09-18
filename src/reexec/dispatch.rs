@@ -190,7 +190,7 @@ where
     }
 }
 
-impl<E, I, DB, X> Dispatch<'_, E, I, DB, AsyncMode<X>>
+impl<'engine, E, I, DB, X> Dispatch<'engine, E, I, DB, AsyncMode<X>>
 where
     E: CdcEvent + Sync,
     E::Backend: SqlLiteralParse,
@@ -200,29 +200,59 @@ where
 {
     /// Async twin of the synchronous `resolve`, with the concurrency the
     /// async engine's drain describes.
-    pub async fn resolve<S>(self, sink: S) -> Settled<I, E::Backend, E::Checkpoint, X::Error, ()>
+    ///
+    /// Dropping the returned future loses nothing. The reads it had not run
+    /// stay queued, as
+    /// [`AutoResolvingEngine::resolve`](crate::reexec::AutoResolvingEngine::resolve)
+    /// promises, and the notifications are parked on the engine rather than
+    /// carried inside the future, so a timeout or a losing `select!` arm
+    /// cannot destroy them. They are claimed with
+    /// [`take_undelivered`](crate::reexec::AutoResolvingEngine::take_undelivered).
+    ///
+    /// The parking happens in the call rather than in the future, because an
+    /// `async fn` body waits for its first poll and a future may be dropped
+    /// before ever being polled.
+    #[allow(clippy::manual_async_fn)]
+    pub fn resolve<S>(
+        self,
+        sink: S,
+    ) -> impl core::future::Future<Output = Settled<I, E::Backend, E::Checkpoint, X::Error, ()>> + 'engine
     where
-        S: FnMut(ReadDelivery<I, E::Backend, E::Checkpoint>) + Send,
+        S: FnMut(ReadDelivery<I, E::Backend, E::Checkpoint>) + Send + 'engine,
     {
         let Self {
             engine,
             notifications,
         } = self;
-        Settled {
-            dispatched: notifications,
-            reads: engine.resolve(sink).await,
+        engine.park_undelivered(notifications);
+        async move {
+            let reads = engine.resolve(sink).await;
+            Settled {
+                dispatched: engine.claim_undelivered(),
+                reads,
+            }
         }
     }
 
-    /// Async twin of the synchronous `resolve_collect`.
-    pub async fn resolve_collect(self) -> Settled<I, E::Backend, E::Checkpoint, X::Error> {
+    /// Async twin of the synchronous `resolve_collect`, abandoned as safely
+    /// as [`resolve`](Self::resolve) and parking in the call for the same
+    /// reason.
+    #[allow(clippy::manual_async_fn)]
+    pub fn resolve_collect(
+        self,
+    ) -> impl core::future::Future<Output = Settled<I, E::Backend, E::Checkpoint, X::Error>> + 'engine
+    {
         let Self {
             engine,
             notifications,
         } = self;
-        Settled {
-            dispatched: notifications,
-            reads: engine.resolve_collect().await,
+        engine.park_undelivered(notifications);
+        async move {
+            let reads = engine.resolve_collect().await;
+            Settled {
+                dispatched: engine.claim_undelivered(),
+                reads,
+            }
         }
     }
 }

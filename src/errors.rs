@@ -379,6 +379,16 @@ pub enum DispatchError {
     /// event is refused rather than dispatched with invented metadata.
     #[error(transparent)]
     Catalog(#[from] CatalogError),
+
+    /// A drain abandoned before it finished parked the notifications it had
+    /// already folded, and they have not been claimed.
+    ///
+    /// Applying another event would overwrite what nothing else can produce
+    /// again, so the engine refuses until
+    /// [`take_undelivered`](crate::reexec::AutoResolvingEngine::take_undelivered)
+    /// hands them over. Nothing is applied when this is returned.
+    #[error("undelivered notifications from an abandoned drain are still held")]
+    UndeliveredNotifications,
 }
 
 /// Errors during persistence operations
