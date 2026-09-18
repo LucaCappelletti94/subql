@@ -228,10 +228,11 @@ pub struct ReExecNotifications<I: IdTypes, B: Backend, C: crate::Checkpoint = cr
 ///
 /// Carries no `rows_updates`, `row_deltas` or `triggers`, because this engine
 /// queues its own reads and their answers arrive as the other half of
-/// [`Settled`](crate::reexec::Settled). Reaching this at all means either
-/// draining a [`Dispatch`](crate::reexec::Dispatch) or asking for it by name
-/// through
-/// [`apply_leaving_reads_queued`](crate::reexec::AutoResolvingEngine::apply_leaving_reads_queued).
+/// [`Settled`](crate::reexec::Settled). Reaching this at all means draining a
+/// [`Dispatch`](crate::reexec::Dispatch), asking for it by name through
+/// [`apply_leaving_reads_queued`](crate::reexec::AutoResolvingEngine::apply_leaving_reads_queued),
+/// or claiming what an abandoned drain parked with
+/// [`take_undelivered`](crate::reexec::AutoResolvingEngine::take_undelivered).
 pub struct Dispatched<I: IdTypes, B: Backend, C: crate::Checkpoint = crate::NoCheckpoint> {
     /// View-relative notifications from the core engine.
     pub engine: ConsumerNotifications<I, C, B>,
