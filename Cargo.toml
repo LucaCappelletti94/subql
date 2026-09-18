@@ -79,6 +79,11 @@ name = "memory"
 harness = false
 required-features = ["dhat-heap"]
 
+[[bench]]
+name = "term_events"
+harness = false
+required-features = ["testing", "membership-term"]
+
 # Time the two cursed fuzz inputs that libFuzzer flagged as timeouts under
 # the instrumented build, against an uninstrumented release. Sets the floor
 # for how much headroom the libFuzzer `-timeout=N` knob actually needs.
