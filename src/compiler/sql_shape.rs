@@ -2050,6 +2050,9 @@ pub(crate) struct ExistsParts<'a> {
     pub pairs: Vec<ExistsPair<'a>>,
     /// The caller comparison conjunct, verbatim.
     pub caller: &'a Expr,
+    /// The membership column the caller comparison names, verbatim, so the
+    /// seed read says which subject grants each row.
+    pub subject: &'a Expr,
     /// The membership table clause, verbatim, alias included.
     pub from: &'a sqlparser::ast::TableWithJoins,
     /// The membership table, resolved. Read only by the `membership-term`
@@ -2257,7 +2260,7 @@ pub(crate) fn membership_exists_parts<'a, B: crate::backend::Backend, DB: Databa
     conjuncts_of(selection, &mut flat);
 
     let mut pairs = Vec::new();
-    let mut caller = None;
+    let mut caller: Option<(&Expr, &Expr)> = None;
     for conjunct in flat {
         if is_caller_comparison(conjunct) {
             if caller.is_some() {
@@ -2276,7 +2279,7 @@ pub(crate) fn membership_exists_parts<'a, B: crate::backend::Backend, DB: Databa
                     "compares the caller against something other than a membership column",
                 ));
             }
-            caller = Some(conjunct);
+            caller = Some((conjunct, column_side));
             continue;
         }
         let Expr::BinaryOp {
@@ -2298,7 +2301,7 @@ pub(crate) fn membership_exists_parts<'a, B: crate::backend::Backend, DB: Databa
         };
         pairs.push(pair);
     }
-    let Some(caller) = caller else {
+    let Some((caller, subject)) = caller else {
         return Err(exists_refusal("never names the caller"));
     };
     if pairs.is_empty() {
@@ -2309,6 +2312,7 @@ pub(crate) fn membership_exists_parts<'a, B: crate::backend::Backend, DB: Databa
     Ok(ExistsParts {
         pairs,
         caller,
+        subject,
         from: &select.from[0],
         #[cfg(feature = "membership-term")]
         member_table,
@@ -2328,8 +2332,13 @@ pub(super) fn check_membership_exists_bound<B: crate::backend::Backend, DB: Data
         .collect())
 }
 
-/// The seed read of a bounded membership `EXISTS`: the membership columns the
-/// pairs name, projected in pair order, for the rows naming the caller.
+/// The seed read of a bounded membership `EXISTS`: the subject each row grants
+/// through, then the membership columns the pairs name in pair order, for the
+/// rows naming the caller.
+///
+/// The subject rides ahead of the values because a caller holding several of
+/// them needs to know which one grants a row, or a membership disappearing
+/// under one subject would withdraw what another still grants.
 ///
 /// `None` when `query` is not the recognized form, which `resolve` reports as
 /// a shape that lost its seed read.
@@ -2339,11 +2348,9 @@ pub(crate) fn exists_seed_select<B: crate::backend::Backend, DB: DatabaseLike>(
     database: &DB,
 ) -> Option<String> {
     let parts = membership_exists_parts::<B, DB>(query, table_id, database).ok()?;
-    let mut projection = String::new();
-    for (position, pair) in parts.pairs.iter().enumerate() {
-        if position > 0 {
-            projection.push_str(", ");
-        }
+    let mut projection = parts.subject.to_string();
+    for pair in &parts.pairs {
+        projection.push_str(", ");
         projection.push_str(&pair.inner_expr.to_string());
     }
     Some(alloc::format!(
@@ -2351,6 +2358,32 @@ pub(crate) fn exists_seed_select<B: crate::backend::Backend, DB: DatabaseLike>(
         parts.from,
         parts.caller
     ))
+}
+
+/// The seed read of a bounded membership `IN (SELECT ...)`: the subquery
+/// itself, projecting the membership column naming the subject ahead of the
+/// value it grants.
+///
+/// The subquery's own text is what the snapshot runs, so it is kept verbatim
+/// down to its WHERE, and only the projection grows.
+///
+/// `None` when the body is not the single `SELECT` the bound already enforced.
+pub(crate) fn subquery_seed_select(
+    query: &Query,
+    subject: &str,
+    dialect: &dyn sqlparser::dialect::Dialect,
+) -> Option<String> {
+    let mut query = query.clone();
+    let SetExpr::Select(select) = query.body.as_mut() else {
+        return None;
+    };
+    select.projection.insert(
+        0,
+        SelectItem::UnnamedExpr(Expr::Identifier(crate::compiler::quoted_ident(
+            dialect, subject,
+        ))),
+    );
+    Some(query.to_string())
 }
 
 /// Derive the follow-subscription SELECT from an UPDATE statement:

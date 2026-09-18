@@ -13,7 +13,7 @@
 //!
 //! [`ScalarCore`]: crate::backend::ScalarCore
 
-use alloc::string::{String, ToString};
+use alloc::string::String;
 use alloc::vec::Vec;
 use core::hash::{Hash, Hasher};
 use core::mem::discriminant;
@@ -126,18 +126,20 @@ pub enum TermDescription {
 pub struct MembershipTermDescription {
     /// The compared columns and the membership columns they pair with, in the
     /// order the filter wrote them, which is also the order
-    /// [`seed_sql`](Self::seed_sql) projects and each stated row follows.
+    /// [`seed_sql`](Self::seed_sql) projects them and each stated row's values
+    /// follow, after the subject it projects first.
     pub pairs: Vec<TermColumnPair>,
     /// The table whose changed rows move which subscribers the term admits, by
     /// catalog name.
     pub member_table: String,
     /// The column of `member_table` naming the subscriber a row admits.
     pub member_subject: String,
-    /// The kind the subscriber value has to be built at.
+    /// The kind every subject in the set has to be built at, and the kind
+    /// [`seed_sql`](Self::seed_sql)'s first column decodes as.
     ///
-    /// [`TermKey`] keys a string and a UUID under different variants, so an
-    /// identity supplied at another kind matches no membership row and admits
-    /// nobody in silence.
+    /// [`TermKey`] keys a string and a UUID under different variants, so a
+    /// subject supplied at another kind could match no membership row, and is
+    /// refused at registration rather than admitting nobody in silence.
     pub subject_kind: ScalarFamily,
     /// The custom type [`subject_kind`](Self::subject_kind) carries, when the
     /// compared column is one, as it prints.
@@ -146,8 +148,9 @@ pub struct MembershipTermDescription {
     /// that is what the database hands them and the conversion into the
     /// custom type is subql's to run. This names what it means.
     pub subject_custom: Option<String>,
-    /// The seed read: the membership columns, the values this subscriber
-    /// currently matches, one projected column per pair and in pair order.
+    /// The seed read: the subject granting each row, then the membership
+    /// columns, the values this caller's subjects currently match, one
+    /// projected column per pair and in pair order.
     ///
     /// Run it as the caller, because it names the caller the way the snapshot
     /// does, then state what came back under the pairs' compared columns.
@@ -155,6 +158,10 @@ pub struct MembershipTermDescription {
     /// snapshot of the subscribed table omits every value whose rows do not
     /// exist yet, and no later membership change repairs that, because the
     /// membership did not change.
+    ///
+    /// The subject rides first because a caller is a set: a value two of its
+    /// subjects grant has to survive either one of them losing its membership,
+    /// and only the row's own subject says which withdrawal touches it.
     pub seed_sql: String,
 }
 
@@ -206,9 +213,10 @@ impl TermDescription {
         term: &CompiledTerm,
         table: TableId,
         database: &DB,
+        dialect: &dyn sqlparser::dialect::Dialect,
     ) -> Result<Self, RegisterError> {
-        // A caller comparison seeds itself from the subscriber, so it has no
-        // read. What it does have is the kind the identity must be built at.
+        // A caller comparison seeds itself from the one value it admits, so the
+        // kind that value must be built at is all it needs.
         let Some(movement) = &plan.moved_by else {
             let compared = kind::<B, DB>(database, table, plan.columns[0])?;
             return Ok(Self::Caller(CallerTermDescription {
@@ -222,8 +230,18 @@ impl TermDescription {
         // whose shapes the compiler already checked. A shape a later compiler
         // lifts a term from is refused rather than served with no seed read,
         // since an unseeded term admits nobody in silence.
+        let member_subject = name(database, movement.member_table, movement.member_subject)?;
         let seed_sql = match &term.expr {
-            Expr::InSubquery { subquery, .. } => subquery.to_string(),
+            Expr::InSubquery { subquery, .. } => {
+                crate::compiler::sql_shape::subquery_seed_select(subquery, &member_subject, dialect)
+                    .ok_or_else(|| {
+                        RegisterError::MembershipTermRefused(
+                            "this membership term's subquery lost its recognized shape, so SubQL \
+                             cannot say which read seeds it"
+                                .into(),
+                        )
+                    })?
+            }
             Expr::Exists { subquery, .. } => {
                 crate::compiler::sql_shape::exists_seed_select::<B, DB>(subquery, table, database)
                     .ok_or_else(|| {
@@ -257,7 +275,7 @@ impl TermDescription {
         Ok(Self::Membership(MembershipTermDescription {
             pairs,
             member_table: table_name_of(database, movement.member_table)?,
-            member_subject: name(database, movement.member_table, movement.member_subject)?,
+            member_subject,
             subject_kind: carrier_of::<B>(subject),
             subject_custom: custom_name::<B>(subject),
             seed_sql,

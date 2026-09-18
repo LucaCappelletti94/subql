@@ -127,11 +127,13 @@ struct CompiledSpec<I: IdTypes, B: Backend> {
     /// What registration settled about each membership term the filter names,
     /// one per slot, empty for a filter naming none.
     term_plans: Vec<TermPlan>,
-    /// The subscriber this subscription filters for, in the form the term lookup
-    /// is keyed by. `Some` exactly when the filter names a term.
-    term_subscriber: Option<TermKey<B>>,
-    /// Per term slot, the value rows the subscription states it matches today.
-    term_seeds: Vec<Vec<crate::term::TermRow<B>>>,
+    /// The subjects this subscription's membership terms filter for, in the
+    /// form the term lookup is keyed by. Empty for a filter naming none, and
+    /// for one naming only a caller comparison.
+    term_subjects: Vec<TermKey<B>>,
+    /// Per term slot, the value rows the subscription states it matches today,
+    /// each with the subject granting it. Empty for a filter naming no term.
+    term_seeds: Vec<Vec<(TermKey<B>, crate::term::TermRow<B>)>>,
 }
 
 struct AggregateRegistration<I: IdTypes, B: Backend> {
@@ -410,9 +412,9 @@ enum TermAction<B: Backend> {
 struct PendingSeed<B: Backend> {
     table: TableId,
     subscription: SubscriptionId,
-    subscriber: TermKey<B>,
+    subjects: Vec<TermKey<B>>,
     plans: Vec<TermPlan>,
-    seeds: Vec<Vec<crate::term::TermRow<B>>>,
+    seeds: Vec<Vec<(TermKey<B>, crate::term::TermRow<B>)>>,
 }
 
 /// The subscriptions bound to `predicate` for each ordinal in `ordinals`.
@@ -564,13 +566,13 @@ where
     /// registering anything.
     ///
     /// A caller comparison appears in no description: it seeds itself from the
-    /// subscriber the request states, so there is nothing to read for it.
+    /// one value the request states, so there is nothing to read for it.
     ///
     /// [`Self::register`] consumes the seed and an absent one admits nobody, so
     /// the caller's obligation runs before registration, and this is the only
     /// thing that runs the classification `register` runs. Describe the request,
     /// read each [`MembershipTermDescription::seed_sql`](crate::term::MembershipTermDescription::seed_sql) as the caller, state what came
-    /// back through [`SubscriptionRequest::subscriber`] and
+    /// back through [`SubscriptionRequest::subjects`] and
     /// [`SubscriptionRequest::term_values`], then register that same request.
     ///
     /// Empty for a filter naming no membership subquery, which is every filter
@@ -597,6 +599,7 @@ where
                     term,
                     compiled.table_id,
                     &self.database,
+                    &self.dialect,
                 )
             })
             .collect()
@@ -627,7 +630,8 @@ where
                 .map_err(RegisterError::NotServedInProcess)?;
         }
 
-        let (term_subscriber, term_seeds) = self.settle_term_seeds(&terms, table_id, &spec)?;
+        let (term_subjects, term_seeds) =
+            self.settle_term_seeds(&terms, &term_plans, table_id, &spec)?;
 
         // Disambiguate hash: same WHERE clause with different projection
         // kind must map to distinct predicates.
@@ -656,7 +660,7 @@ where
             hash,
             bootstrap,
             term_plans,
-            term_subscriber,
+            term_subjects,
             term_seeds,
         })
     }
@@ -746,14 +750,15 @@ where
     /// Turn what the subscription stated into the keys the term lookup stores,
     /// or refuse the registration.
     ///
-    /// Returns the subscriber's key and, per term slot, the value rows it
-    /// states it matches today. Both are empty for a filter naming no term.
-    /// This runs before anything is bound, so seeding afterwards cannot fail
-    /// halfway and leave a subscription registered against a term it was never
-    /// added to.
+    /// Returns the subjects a changed membership row is matched against and,
+    /// per term slot, the value rows the subscription states it matches today,
+    /// each under the subject granting it. Both are empty for a filter naming
+    /// no term. This runs before anything is bound, so seeding afterwards
+    /// cannot fail halfway and leave a subscription registered against a term
+    /// it was never added to.
     #[allow(
         clippy::type_complexity,
-        reason = "the return pairs the subscriber key with per-slot seed rows, and a name \
+        reason = "the return pairs the claimed subjects with per-slot seed rows, and a name \
                   would hide which side is which"
     )]
     #[allow(
@@ -764,62 +769,103 @@ where
     fn settle_term_seeds(
         &self,
         terms: &[CompiledTerm],
+        plans: &[TermPlan],
         table_id: TableId,
         spec: &SubscriptionRequest<I, E::Backend>,
     ) -> Result<
         (
-            Option<TermKey<E::Backend>>,
-            Vec<Vec<crate::term::TermRow<E::Backend>>>,
+            Vec<TermKey<E::Backend>>,
+            Vec<Vec<(TermKey<E::Backend>, crate::term::TermRow<E::Backend>)>>,
         ),
         RegisterError,
     > {
         if terms.is_empty() {
-            return Ok((None, Vec::new()));
+            return Ok((Vec::new(), Vec::new()));
         }
 
-        let subscriber = spec.subscriber.clone().ok_or_else(|| {
-            RegisterError::MembershipTermRefused(
-                "a filter naming a membership term has to say which subscriber it filters \
-                 for. SubQL matches a changed membership row against that identity to move who \
-                 the filter admits, and a caller comparison admits exactly that identity, so \
-                 without one the subscription could never deliver."
-                    .to_string(),
-            )
-        })?;
-        let TermLookup::Key(subscriber) = TermLookup::of(subscriber) else {
+        let mut subjects: Vec<TermKey<E::Backend>> = Vec::new();
+        for stated in &spec.subjects {
+            let TermLookup::Key(subject) = TermLookup::of(stated.clone()) else {
+                return Err(RegisterError::MembershipTermRefused(
+                    "one of the subjects this subscription filters for is null, or of a kind \
+                     SubQL cannot look up. A subject has to be a value equal to itself for a \
+                     membership row to be matched against it."
+                        .to_string(),
+                ));
+            };
+            if !subjects.contains(&subject) {
+                subjects.push(subject);
+            }
+        }
+
+        let matches_membership = plans.iter().any(|plan| plan.moved_by.is_some());
+        if matches_membership && subjects.is_empty() {
             return Err(RegisterError::MembershipTermRefused(
-                "the subscriber this subscription filters for is null, or of a kind SubQL cannot \
-                 look up. An identity has to be a value equal to itself for a membership row to \
-                 be matched against it."
+                "a filter naming a membership subquery has to say which subjects it filters \
+                 for. SubQL matches a changed membership row against them to move who the \
+                 filter admits, so with none the subscription could never deliver."
                     .to_string(),
             ));
-        };
+        }
 
-        // A caller comparison seeds itself: the one value it admits is the
-        // subscriber, and it has to be of the compared column's kind, or the
-        // lookup would store a key no row's cell can ever equal and serve the
-        // subscription dead.
-        let mut seeds: Vec<Vec<crate::term::TermRow<E::Backend>>> =
-            alloc::vec![Vec::new(); terms.len()];
-        for term in terms.iter().filter(|term| term.compares_the_caller()) {
-            // Compared as values, not as declared types: a subscriber value
-            // carries no declaration, so the shared fact is the family. A
-            // `char(5)` column and a text subscriber name the same rows.
-            let compared = catalog_helpers::column_scalar_kind::<E::Backend, _>(
+        for movement in plans.iter().filter_map(|plan| plan.moved_by.as_ref()) {
+            let named = catalog_helpers::column_scalar_kind::<E::Backend, _>(
                 &self.database,
-                table_id,
-                term.columns[0],
+                movement.member_table,
+                movement.member_subject,
             )
             .map(|kind| kind.value_kind());
-            let stated = subscriber.scalar_kind();
-            if compared != Some(stated) {
-                return Err(RegisterError::MembershipTermRefused(format!(
-                    "the subscriber this subscription filters for is of kind {stated:?}, and its \
-                     caller comparison reads a column of kind {compared:?}, so no row could ever \
-                     name it. Build the identity at the compared column's kind."
-                )));
+            for subject in &subjects {
+                let stated = subject.scalar_kind();
+                if named != Some(stated) {
+                    return Err(RegisterError::MembershipTermRefused(format!(
+                        "a subject this subscription filters for is of kind {stated:?}, and the \
+                         membership column naming subjects holds kind {named:?}, so no \
+                         membership row could ever name it. Build every subject at the subject \
+                         column's kind."
+                    )));
+                }
             }
-            seeds[usize::from(term.slot)].push(alloc::vec![subscriber.clone()]);
+        }
+
+        let mut seeds: Vec<Vec<(TermKey<E::Backend>, crate::term::TermRow<E::Backend>)>> =
+            alloc::vec![Vec::new(); terms.len()];
+        if terms.iter().any(CompiledTerm::compares_the_caller) {
+            let stated = spec.subscriber.clone().ok_or_else(|| {
+                RegisterError::MembershipTermRefused(
+                    "a filter comparing a column to the caller has to say which value that \
+                     comparison admits. It admits exactly that one value and no other, so \
+                     without it the subscription could never deliver."
+                        .to_string(),
+                )
+            })?;
+            let TermLookup::Key(caller) = TermLookup::of(stated) else {
+                return Err(RegisterError::MembershipTermRefused(
+                    "the value this subscription's caller comparison admits is null, or of a \
+                     kind SubQL cannot look up. It has to be a value equal to itself for a row \
+                     to be matched against it."
+                        .to_string(),
+                ));
+            };
+            for term in terms.iter().filter(|term| term.compares_the_caller()) {
+                // Compared as values rather than declared types, so a `char(5)` column and a
+                // text value name the same rows.
+                let compared = catalog_helpers::column_scalar_kind::<E::Backend, _>(
+                    &self.database,
+                    table_id,
+                    term.columns[0],
+                )
+                .map(|kind| kind.value_kind());
+                let stated = caller.scalar_kind();
+                if compared != Some(stated) {
+                    return Err(RegisterError::MembershipTermRefused(format!(
+                        "the value this subscription's caller comparison admits is of kind \
+                         {stated:?}, and the comparison reads a column of kind {compared:?}, so \
+                         no row could ever name it. Build it at the compared column's kind."
+                    )));
+                }
+                seeds[usize::from(term.slot)].push((caller.clone(), alloc::vec![caller.clone()]));
+            }
         }
 
         for (column_names, rows) in &spec.term_values {
@@ -857,8 +903,8 @@ where
                 return Err(RegisterError::MembershipTermRefused(format!(
                     "this subscription states values for columns {column_names:?}, which its \
                      filter compares to the caller directly. A caller comparison seeds itself \
-                     from the subscriber, and stated values would admit rows the filter's text \
-                     never names."
+                     from the one value it admits, and stated values would admit rows the \
+                     filter's text never names."
                 )));
             }
             let order: Vec<usize> = term
@@ -872,7 +918,21 @@ where
                 })
                 .collect();
             let slot = usize::from(term.slot);
-            for row in rows {
+            for (granted_by, row) in rows {
+                let TermLookup::Key(granted_by) = TermLookup::of(granted_by.clone()) else {
+                    return Err(RegisterError::MembershipTermRefused(format!(
+                        "a value row stated for columns {column_names:?} names a subject that is \
+                         null, or of a kind SubQL cannot look up. The subject granting a row is \
+                         what a later membership change is matched against."
+                    )));
+                };
+                if !subjects.contains(&granted_by) {
+                    return Err(RegisterError::MembershipTermRefused(format!(
+                        "a value row stated for columns {column_names:?} is granted by a subject \
+                         this subscription does not filter for. Only a subject the caller holds \
+                         admits rows to it."
+                    )));
+                }
                 if row.len() != order.len() {
                     return Err(RegisterError::MembershipTermRefused(format!(
                         "a value row stated for columns {column_names:?} carries {got} values \
@@ -887,17 +947,17 @@ where
                     let TermLookup::Key(key) = TermLookup::of(row[position].clone()) else {
                         return Err(RegisterError::MembershipTermRefused(format!(
                             "one of the values stated for columns {column_names:?} is null, or \
-                             of a kind SubQL cannot look up. A value the subscriber matches has \
-                             to be equal to itself, and SQL never admits a row through a null."
+                             of a kind SubQL cannot look up. A value a subject matches has to be \
+                             equal to itself, and SQL never admits a row through a null."
                         )));
                     };
                     keys.push(key);
                 }
-                seeds[slot].push(keys);
+                seeds[slot].push((granted_by, keys));
             }
         }
 
-        Ok((Some(subscriber), seeds))
+        Ok((subjects, seeds))
     }
 
     /// Seed one newly bound subscription into its predicate's term lookups, and
@@ -911,10 +971,15 @@ where
         pred_id: PredicateId,
         ordinal: ConsumerOrdinal,
     ) -> Vec<TermWatch> {
-        let Some(subscriber) = compiled.term_subscriber.as_ref() else {
+        if compiled.term_seeds.is_empty() {
             return Vec::new();
-        };
-        txn.seed_terms(pred_id, ordinal, subscriber, &compiled.term_seeds);
+        }
+        txn.seed_terms(
+            pred_id,
+            ordinal,
+            &compiled.term_subjects,
+            &compiled.term_seeds,
+        );
 
         compiled
             .term_plans
@@ -3066,9 +3131,9 @@ where
 
         for (i, entry) in compiled.into_iter().enumerate() {
             let Some(mut c) = entry else { continue };
-            let pending_terms = c.term_subscriber.take().map(|subscriber| {
+            let pending_terms = (!c.term_seeds.is_empty()).then(|| {
                 (
-                    subscriber,
+                    core::mem::take(&mut c.term_subjects),
                     core::mem::take(&mut c.term_plans),
                     core::mem::take(&mut c.term_seeds),
                 )
@@ -3122,11 +3187,11 @@ where
                 .entry(c.table_id)
                 .or_default()
                 .push(subscription_id);
-            if let Some((subscriber, plans, seeds)) = pending_terms {
+            if let Some((subjects, plans, seeds)) = pending_terms {
                 pending_seeds.push(PendingSeed {
                     table: c.table_id,
                     subscription: subscription_id,
-                    subscriber,
+                    subjects,
                     plans,
                     seeds,
                 });
@@ -3268,7 +3333,7 @@ where
                 txn.seed_terms(
                     binding.predicate_id,
                     binding.consumer_ordinal,
-                    &pending.subscriber,
+                    &pending.subjects,
                     &pending.seeds,
                 );
             });
@@ -3855,23 +3920,25 @@ where
                     if before == after {
                         continue;
                     }
-                    if let Some((values, subject)) = before {
+                    // The gained half first, so a row moving between two subjects one
+                    // caller holds never reports a withdrawal it takes back.
+                    if let Some((values, subject)) = after {
                         actions.push((
                             watch.clone(),
                             TermAction::Move {
                                 values,
                                 subject,
-                                entered: false,
+                                entered: true,
                             },
                         ));
                     }
-                    if let Some((values, subject)) = after {
+                    if let Some((values, subject)) = before {
                         actions.push((
                             watch,
                             TermAction::Move {
                                 values,
                                 subject,
-                                entered: true,
+                                entered: false,
                             },
                         ));
                     }
@@ -3942,7 +4009,11 @@ where
     }
 
     /// Add or remove the subscribers claiming `subscriber` from what `values`
-    /// admit, and report the subscriptions moved.
+    /// admit, and report the subscriptions whose admission changed.
+    ///
+    /// A caller holding several subjects keeps the row while another of them
+    /// still grants it, so what moved is what the lookup answers rather than
+    /// everything the deleted row named.
     fn move_term(
         txn: &mut PartitionTxn<'_, I, E::Backend>,
         watch: &TermWatch,
@@ -3968,8 +4039,18 @@ where
             return;
         }
 
-        let subscriptions = subscriptions_for(store, watch.predicate, &moved);
-        txn.move_term_members(watch.predicate, watch.slot, values.clone(), &moved, entered);
+        let changed = txn.move_term_members(
+            watch.predicate,
+            watch.slot,
+            values.clone(),
+            subscriber,
+            &moved,
+            entered,
+        );
+        if changed.is_empty() {
+            return;
+        }
+        let subscriptions = subscriptions_for(txn.store(), watch.predicate, &changed);
 
         let values: Vec<_> = values.into_iter().map(TermKey::into_value).collect();
         out.extend(
@@ -5868,10 +5949,10 @@ mod tests {
                      (SELECT project_id FROM project_members \
                       WHERE user_id = current_setting('app.user_id', true))",
                 )
-                .subscriber(Value::String("alice".into()))
+                .subjects([Value::String("alice".into())])
                 .term_values(
                     alloc::vec!["project_id"],
-                    alloc::vec![alloc::vec![Value::Int(7)]],
+                    alloc::vec![(Value::String("alice".into()), alloc::vec![Value::Int(7)])],
                 ),
             )
             .expect("term subscription registers");

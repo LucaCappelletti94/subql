@@ -341,14 +341,15 @@ impl<I: IdTypes, B: Backend> PartitionTxn<'_, I, B> {
     /// Record which subscribers each of a predicate's terms admits, for one
     /// newly bound subscription.
     ///
-    /// `seeds` is indexed by term slot: `seeds[i]` is what this subscriber
-    /// states it matches through slot `i` today.
+    /// `seeds` is indexed by term slot: `seeds[i]` is what this subscription
+    /// states it matches through slot `i` today, each row paired with the
+    /// subject granting it.
     pub fn seed_terms(
         &mut self,
         pred_id: PredicateId,
         ordinal: ConsumerOrdinal,
-        subscriber: &TermKey<B>,
-        seeds: &[Vec<crate::term::TermRow<B>>],
+        subjects: &[TermKey<B>],
+        seeds: &[Vec<(TermKey<B>, crate::term::TermRow<B>)>],
     ) {
         if seeds.is_empty() {
             return;
@@ -358,12 +359,13 @@ impl<I: IdTypes, B: Backend> PartitionTxn<'_, I, B> {
             let Ok(slot) = u16::try_from(slot) else {
                 continue;
             };
-            store.seed_term(pred_id, slot, ordinal, subscriber.clone(), values.clone());
+            store.seed_term(pred_id, slot, ordinal, subjects, values.clone());
         }
         self.dirty = true;
     }
 
-    /// Move who one term admits, as a changed membership row does.
+    /// Move who one term admits, as a changed membership row naming `subject`
+    /// does, and report the ordinals whose admission actually changed.
     ///
     /// `values` is what the row keys, and `ordinals` are the subscribers it
     /// names. Nothing moves when the term is not tracked here, which is
@@ -373,22 +375,24 @@ impl<I: IdTypes, B: Backend> PartitionTxn<'_, I, B> {
         pred_id: PredicateId,
         slot: u16,
         values: crate::term::TermRow<B>,
+        subject: &TermKey<B>,
         ordinals: &RoaringBitmap,
         widen: bool,
-    ) {
+    ) -> RoaringBitmap {
         if !self.store().term_members.contains_key(&(pred_id, slot)) {
-            return;
+            return RoaringBitmap::new();
         }
         let store = self.store_mut();
         let Some(members) = store.term_members.get_mut(&(pred_id, slot)) else {
-            return;
+            return RoaringBitmap::new();
         };
-        if widen {
-            members.widen(values, ordinals);
+        let changed = if widen {
+            members.widen(values, subject, ordinals)
         } else {
-            members.narrow(&values, ordinals);
-        }
+            members.narrow(&values, subject, ordinals)
+        };
         self.dirty = true;
+        changed
     }
 
     /// Withdraw every value one term admits, and report what was withdrawn.
@@ -795,6 +799,7 @@ mod tests {
                 PredicateId::from_slab_index(0),
                 0,
                 Vec::new(),
+                &TermKey::String("alice".into()),
                 &RoaringBitmap::new(),
                 true,
             );

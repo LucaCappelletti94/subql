@@ -409,16 +409,21 @@ term_columns_tuple!(C1, C2, C3, C4, C5, C6, C7);
 term_columns_tuple!(C1, C2, C3, C4, C5, C6, C7, C8);
 
 impl<I: IdTypes, B: crate::backend::Backend> SubscriptionRequest<I, B> {
-    /// State the value rows this subscriber currently matches, naming the
+    /// State the value rows this caller's subjects currently match, naming the
     /// compared columns as diesel columns rather than as strings.
     ///
     /// The typed spelling of [`SubscriptionRequest::term_values`], and the
     /// preferred one wherever a static `table!` schema exists: the names come
-    /// from the schema and cannot be misspelled. Each row follows the tuple's
-    /// order, which may differ from the filter's own, since the engine
-    /// matches by name.
+    /// from the schema and cannot be misspelled. Each row is the subject
+    /// granting it and the values it grants, which follow the tuple's order,
+    /// and that may differ from the filter's own since the engine matches by
+    /// name.
     #[must_use]
-    pub fn term_values_for<T: TermColumns>(self, _columns: T, rows: Vec<Vec<Value<B>>>) -> Self {
+    pub fn term_values_for<T: TermColumns>(
+        self,
+        _columns: T,
+        rows: Vec<(Value<B>, Vec<Value<B>>)>,
+    ) -> Self {
         self.term_values(T::names(), rows)
     }
 }
@@ -452,7 +457,10 @@ mod term_columns_tests {
             "a tuple keeps its order"
         );
 
-        let rows = vec![vec![Value::<Postgres>::Int(1), Value::<Postgres>::Int(5)]];
+        let rows = vec![(
+            Value::<Postgres>::String("alice".into()),
+            vec![Value::<Postgres>::Int(1), Value::<Postgres>::Int(5)],
+        )];
         let typed: SubscriptionRequest<DefaultIds, Postgres> =
             SubscriptionRequest::new(1u64, "SELECT 1")
                 .term_values_for((docs::tenant_id, docs::id), rows.clone());

@@ -377,8 +377,11 @@ fn an_absent_membership_term_column_is_reported() {
     let subscription = engine
         .register(
             SubscriptionRequest::new(1u64, TERM)
-                .subscriber(Value::String("alice".into()))
-                .term_values(vec!["project_id"], vec![vec![Value::Int(7)]]),
+                .subjects([Value::String("alice".into())])
+                .term_values(
+                    vec!["project_id"],
+                    vec![(Value::String("alice".into()), vec![Value::Int(7)])],
+                ),
         )
         .expect("the term registers")
         .subscription_id;
