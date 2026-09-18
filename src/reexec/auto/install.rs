@@ -76,10 +76,13 @@ where
     M: ResolverMode<E::Backend> + Send,
     M::AuthContext: Send,
 {
-    type Notifications = crate::reexec::Dispatched<I, E::Backend, E::Checkpoint>;
+    type Notifications<'engine>
+        = crate::reexec::Dispatch<'engine, E, I, DB, M>
+    where
+        Self: 'engine;
     type Error = crate::DispatchError;
 
-    fn consumers(&mut self, event: &E) -> Result<Self::Notifications, Self::Error> {
+    fn consumers(&mut self, event: &E) -> Result<Self::Notifications<'_>, Self::Error> {
         self.apply(event)
     }
 }

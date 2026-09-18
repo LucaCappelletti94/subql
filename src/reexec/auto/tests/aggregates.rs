@@ -32,7 +32,9 @@ fn ungrouped_aggregate_folds_through_the_wrapper() {
     )
     .unwrap();
     // The seeded fold updates through the facade rather than being absorbed.
-    let n = e.apply(&insert_event(tid, 1, 5.0)).unwrap();
+    let n = e
+        .apply_leaving_reads_queued(&insert_event(tid, 1, 5.0))
+        .unwrap();
     assert_eq!(
         n.aggregate_updates.len(),
         1,
@@ -79,7 +81,7 @@ fn ungrouped_aggregate_folds_across_an_applied_burst() {
     let events = &[insert_event(tid, 1, 5.0), insert_event(tid, 2, 6.0)];
     let folds: alloc::vec::Vec<_> = events
         .iter()
-        .flat_map(|ev| e.apply(ev).unwrap().aggregate_updates)
+        .flat_map(|ev| e.apply_leaving_reads_queued(ev).unwrap().aggregate_updates)
         .collect();
     let last_fold = folds.last();
     assert_eq!(
@@ -124,8 +126,8 @@ fn ungrouped_aggregate_demotion_resolves_through_the_wrapper() {
         .with_changed_columns([3u16]);
     // The mock connector holds no cursor, so the demoted whole re-read
     // surfaces as a Cursor error naming the aggregate rather than a panic.
-    e.apply(&missing_old).unwrap();
-    match e.resolve_collect() {
+    let settled = e.apply(&missing_old).unwrap().resolve_collect();
+    match settled.reads {
         Err(ReExecError::Cursor { subscription, .. }) => {
             assert_eq!(
                 subscription, count_id,

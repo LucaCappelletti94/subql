@@ -33,13 +33,19 @@ fn async_engine_dispatch_round_trip() {
     assert_eq!(e.connector().call_count(), 1);
 
     // Insert above the extreme: in-process Unchanged, no connector call.
-    let n = e.apply(&insert_event(tid, 2, 9.0)).unwrap();
+    let n = e
+        .apply_leaving_reads_queued(&insert_event(tid, 2, 9.0))
+        .unwrap();
     assert!(n.scalar_updates.is_empty());
     assert_eq!(e.connector().call_count(), 1);
 
     // Delete the extreme: trigger -> connector -> ScalarUpdate.
-    e.apply(&delete_event(tid, 1, 5.0)).unwrap();
-    let n = block_on(e.resolve_collect()).unwrap();
+    let settled = block_on(
+        e.apply(&delete_event(tid, 1, 5.0))
+            .unwrap()
+            .resolve_collect(),
+    );
+    let n = settled.reads.unwrap();
     assert_eq!(n.scalar_updates.len(), 1);
     assert_eq!(n.scalar_updates[0].subscription_id, qid);
     assert_eq!(n.scalar_updates[0].value, Value::Float(9.0));
@@ -60,7 +66,7 @@ fn async_engine_unrelated_column_update_skips_connector() {
 
     let event = update_status_only(tid, 1, 10.0);
 
-    let n = e.apply(&event).unwrap();
+    let n = e.apply_leaving_reads_queued(&event).unwrap();
     assert!(n.scalar_updates.is_empty());
     assert_eq!(n.outstanding, 0, "nothing was queued either");
     assert_eq!(e.connector().call_count(), 0);
@@ -85,8 +91,13 @@ fn async_engine_connector_error_aborts_batch() {
         5.0,
     );
 
-    e.apply(&delete_event(tid, 1, 5.0)).unwrap();
-    match block_on(e.resolve_collect()) {
+    match block_on(
+        e.apply(&delete_event(tid, 1, 5.0))
+            .unwrap()
+            .resolve_collect(),
+    )
+    .reads
+    {
         Ok(_) => panic!("expected Connector error, got Ok"),
         Err(ReExecError::Connector {
             error: MockError::Unstaged(msg),
@@ -113,8 +124,13 @@ fn async_connector_error_names_its_subscription() {
         },
     )
     .unwrap();
-    e.apply(&delete_event(tid, 1, 5.0)).unwrap();
-    match block_on(e.resolve_collect()) {
+    match block_on(
+        e.apply(&delete_event(tid, 1, 5.0))
+            .unwrap()
+            .resolve_collect(),
+    )
+    .reads
+    {
         Ok(_) => panic!("expected the triggered read to fail"),
         Err(ReExecError::Connector {
             subscription,

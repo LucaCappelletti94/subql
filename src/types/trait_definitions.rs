@@ -43,11 +43,17 @@ pub trait SubscriptionRegistration<I: IdTypes, B: Backend>: Send {
 /// Parameterised on the observed `E: CdcEvent` so `consumers` accepts a
 /// backend-typed event and returns notifications carrying `E::Checkpoint`.
 /// Each engine layer chooses its own [`Notifications`](Self::Notifications)
-/// shape: the base engine yields [`ConsumerNotifications`], while the
-/// re-execution wrappers yield their richer `ReExecNotifications`.
+/// shape. The base engine yields [`ConsumerNotifications`], owning nothing of
+/// the engine, while the re-execution wrappers yield a
+/// [`Dispatch`](crate::reexec::Dispatch) that borrows it until its queued
+/// reads are drained, which is why the associated type is generic over the
+/// borrow.
 pub trait SubscriptionDispatch<I: IdTypes, E: CdcEvent>: Send {
-    /// Notifications produced for a dispatched event.
-    type Notifications;
+    /// Notifications produced for a dispatched event, for as long as they
+    /// borrow the engine that produced them.
+    type Notifications<'engine>
+    where
+        Self: 'engine;
     /// Error returned when dispatch fails.
     type Error;
 
@@ -55,7 +61,7 @@ pub trait SubscriptionDispatch<I: IdTypes, E: CdcEvent>: Send {
     ///
     /// Returns view-relative notifications: each consumer sees
     /// INSERT / DELETE / UPDATE relative to their own result set.
-    fn consumers(&mut self, event: &E) -> Result<Self::Notifications, Self::Error>;
+    fn consumers(&mut self, event: &E) -> Result<Self::Notifications<'_>, Self::Error>;
 }
 
 /// Async counterpart of [`SubscriptionDispatch`].
@@ -65,16 +71,28 @@ pub trait SubscriptionDispatch<I: IdTypes, E: CdcEvent>: Send {
 /// out as return-position `impl Future` rather than `async fn` (same
 /// idiom as [`crate::reexec::AsyncConnector`]).
 pub trait AsyncSubscriptionDispatch<I: IdTypes, E: CdcEvent>: Send {
-    /// Notifications produced for a dispatched event.
-    type Notifications;
+    /// Notifications produced for a dispatched event, for as long as they
+    /// borrow the engine that produced them.
+    type Notifications<'engine>
+    where
+        Self: 'engine,
+        E: 'engine;
     /// Error returned when dispatch fails.
     type Error;
 
     /// Get interested consumers for a CDC event.
-    fn consumers(
-        &mut self,
-        event: &E,
-    ) -> impl core::future::Future<Output = Result<Self::Notifications, Self::Error>> + Send;
+    ///
+    /// The event is borrowed for the future alone, not for the notifications,
+    /// so a caller may drop the event and keep draining.
+    fn consumers<'engine, 'event>(
+        &'engine mut self,
+        event: &'event E,
+    ) -> impl core::future::Future<Output = Result<Self::Notifications<'engine>, Self::Error>>
+           + Send
+           + 'event
+    where
+        'engine: 'event,
+        E: 'engine;
 }
 
 /// Session lifecycle operations

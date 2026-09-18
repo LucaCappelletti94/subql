@@ -72,8 +72,8 @@ fn match_rows_replays_without_reading_or_folding() {
     // The live dispatch of the same delete is still the first read, which
     // proves match_rows left the re-execution model untouched: it resolves
     // MIN once, to 7.0.
-    e.apply(&ev).unwrap();
-    let live = e.resolve_collect().unwrap();
+    let settled = e.apply(&ev).unwrap().resolve_collect();
+    let live = settled.reads.expect("the re-execution resolves");
     assert_eq!(
         e.connector().call_count(),
         1,
@@ -122,7 +122,9 @@ fn ordered_row_query_folds_in_process() {
         } => {}
         other => panic!("expected InProcess for an ordered row query, got {other:?}"),
     }
-    let n = e.apply(&insert_event(tid, 1, 5.0)).unwrap();
+    let n = e
+        .apply_leaving_reads_queued(&insert_event(tid, 1, 5.0))
+        .unwrap();
     assert!(
         n.engine.inserted().contains(&1),
         "the ordered row list is notified of the insert"
@@ -174,7 +176,8 @@ fn pages_reach_the_sink_before_the_next_fetch() {
             more: false,
         },
     ]);
-    e.apply(&insert_event(tid, 1, 5.0)).unwrap();
+    e.apply_leaving_reads_queued(&insert_event(tid, 1, 5.0))
+        .unwrap();
     assert_eq!(e.pending_read_count(), 1);
 
     let log = alloc::rc::Rc::clone(&e.connector().log);
@@ -222,7 +225,8 @@ fn sync_whole_read_bumps_the_generation_like_the_async_path() {
             more: false,
         },
     ]);
-    e.apply(&insert_event(tid, 1, 5.0)).unwrap();
+    e.apply_leaving_reads_queued(&insert_event(tid, 1, 5.0))
+        .unwrap();
 
     // The second fetch raises, so one partial page was delivered and
     // the generation it carried has no final page.
@@ -249,8 +253,11 @@ fn sync_whole_read_bumps_the_generation_like_the_async_path() {
             rows: alloc::vec![alloc::vec![Value::String("paid".into())]],
             more: false,
         });
-    e.apply(&insert_event(tid, 2, 6.0)).unwrap();
-    let retried = e.resolve_collect().expect("the retry reads");
+    let settled = e
+        .apply(&insert_event(tid, 2, 6.0))
+        .unwrap()
+        .resolve_collect();
+    let retried = settled.reads.expect("the retry reads");
     assert!(!retried.rows_updates.is_empty(), "the retry delivered rows");
     let partial_generation = partial.borrow()[0];
     assert!(

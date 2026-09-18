@@ -875,14 +875,24 @@ where
     X: AsyncConnector<Backend = E::Backend>,
     X::AuthContext: Send + Sync,
 {
-    type Notifications = super::Dispatched<I, E::Backend, E::Checkpoint>;
+    type Notifications<'engine>
+        = super::Dispatch<'engine, E, I, DB, AsyncMode<X>>
+    where
+        Self: 'engine,
+        E: 'engine;
     type Error = crate::DispatchError;
 
     #[allow(clippy::manual_async_fn)]
-    fn consumers(
-        &mut self,
-        event: &E,
-    ) -> impl core::future::Future<Output = Result<Self::Notifications, Self::Error>> + Send {
+    fn consumers<'engine, 'event>(
+        &'engine mut self,
+        event: &'event E,
+    ) -> impl core::future::Future<Output = Result<Self::Notifications<'engine>, Self::Error>>
+           + Send
+           + 'event
+    where
+        'engine: 'event,
+        E: 'engine,
+    {
         core::future::ready(self.apply(event))
     }
 }

@@ -184,7 +184,9 @@ fn engine_and_captured_paths_coexist_through_pg_async_connector() {
         let mut total_scalar_updates = Vec::new();
         let mut peak_outstanding = 0usize;
         for event in &events {
-            let notifs = engine.apply(event).expect("apply dispatch");
+            let notifs = engine
+                .apply_leaving_reads_queued(event)
+                .expect("apply dispatch");
             total_inserted.extend(notifs.engine.inserted().iter().copied());
             peak_outstanding = peak_outstanding.max(notifs.outstanding);
         }
@@ -671,7 +673,9 @@ fn the_keyed_tier_delivers_row_deltas_through_the_async_engine() {
 
         let mut deltas = Vec::new();
         for event in &events {
-            let notifs = engine.apply(event).expect("apply dispatch");
+            let notifs = engine
+                .apply_leaving_reads_queued(event)
+                .expect("apply dispatch");
             // `row_deltas` was structurally empty here, so asserting it
             // proved nothing. That the read was queued rather than run is
             // the claim the assertion meant to make.
@@ -779,7 +783,9 @@ fn the_whole_reread_tier_delivers_pages_through_the_async_engine() {
 
         let mut pages = Vec::new();
         for event in &events {
-            let notifs = engine.apply(event).expect("apply dispatch");
+            let notifs = engine
+                .apply_leaving_reads_queued(event)
+                .expect("apply dispatch");
             assert!(
                 notifs.outstanding > 0,
                 "apply queues the read rather than executing it"
@@ -868,7 +874,7 @@ fn the_async_batch_path_delivers_row_deltas_and_transitions_a_keyless_change() {
         assert!(events.len() >= 3, "the slot must carry all three updates");
 
         for event in &events {
-            engine.apply(event).expect("apply dispatch");
+            engine.apply_leaving_reads_queued(event).expect("dispatch");
         }
         let outcome = engine.resolve_collect().await.expect("batch");
         assert!(
@@ -910,7 +916,7 @@ fn the_async_batch_path_delivers_row_deltas_and_transitions_a_keyless_change() {
         let keyless = parse_message(r#"{"action":"U","schema":"public","table":"orders"}"#);
         assert_eq!(keyless.len(), 1, "the probe must parse as one message");
         let output = engine
-            .apply(&keyless[0])
+            .apply_leaving_reads_queued(&keyless[0])
             .expect("keyless change transitions");
         let resolved = engine
             .resolve_collect()
@@ -1218,8 +1224,12 @@ fn grouped_min_snapshots_and_rereads_one_group_async() {
             .iter()
             .flat_map(|message| parse_message(message))
             .collect();
-        engine.apply(&events[0]).expect("apply");
-        let output = engine.resolve_collect().await.expect("group re-read");
+        let settled = engine
+            .apply(&events[0])
+            .expect("apply")
+            .resolve_collect()
+            .await;
+        let output = settled.reads.expect("group re-read");
         assert_eq!(engine.pending_read_count(), 0, "all reads resolved");
         assert_eq!(output.aggregate_updates.len(), 1);
         assert_eq!(output.aggregate_updates[0].group.as_ref(), Some(&paid));

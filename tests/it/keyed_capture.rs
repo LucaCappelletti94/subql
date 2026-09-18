@@ -164,7 +164,7 @@ fn a_keyed_read_names_no_more_keys_per_statement_than_its_budget() {
         })
         .collect();
     for event in &events {
-        engine.apply(event).expect("apply");
+        engine.apply_leaving_reads_queued(event).expect("apply");
     }
     let outcome = engine.resolve_collect().expect("batch resolve");
 
@@ -261,7 +261,7 @@ fn a_changed_row_that_still_matches_arrives_as_itself() {
 
     let event =
         TestEvent::<SQLite>::update(table, row(1, "paid"), row(1, "paid")).with_pk_columns([0u16]);
-    engine.apply(&event).expect("apply");
+    engine.apply_leaving_reads_queued(&event).expect("apply");
     let notifications = engine.resolve_collect().expect("dispatch");
 
     assert_eq!(notifications.row_deltas.len(), 1);
@@ -286,7 +286,7 @@ fn a_row_that_stopped_matching_arrives_as_a_removal() {
 
     let event =
         TestEvent::<SQLite>::update(table, row(1, "paid"), row(1, "void")).with_pk_columns([0u16]);
-    engine.apply(&event).expect("apply");
+    engine.apply_leaving_reads_queued(&event).expect("apply");
     let notifications = engine.resolve_collect().expect("dispatch");
 
     assert_eq!(notifications.row_deltas.len(), 1);
@@ -306,7 +306,7 @@ fn a_deleted_row_arrives_as_a_removal() {
     let _ = register(&mut engine);
 
     let event = TestEvent::<SQLite>::delete(table, row(7, "paid")).with_pk_columns([0u16]);
-    engine.apply(&event).expect("apply");
+    engine.apply_leaving_reads_queued(&event).expect("apply");
     let notifications = engine.resolve_collect().expect("dispatch");
 
     assert_eq!(notifications.row_deltas.len(), 1);
@@ -328,7 +328,7 @@ fn several_changed_rows_are_answered_in_one_pass() {
         TestEvent::<SQLite>::update(table, row(3, "void"), row(3, "void")).with_pk_columns([0u16]),
     ];
     for event in &events {
-        engine.apply(event).expect("apply");
+        engine.apply_leaving_reads_queued(event).expect("apply");
     }
     let outcome = engine.resolve_collect().expect("batch dispatch");
 
@@ -429,7 +429,7 @@ fn an_explicit_projection_still_delivers_the_primary_key() {
 
     let event =
         TestEvent::<SQLite>::update(table, row(1, "paid"), row(1, "paid")).with_pk_columns([0u16]);
-    engine.apply(&event).expect("apply");
+    engine.apply_leaving_reads_queued(&event).expect("apply");
     let notifications = engine.resolve_collect().expect("dispatch");
 
     assert_eq!(
@@ -581,7 +581,7 @@ fn a_failed_read_keeps_the_keys_it_was_going_to_ask_about() {
         .expect("hide the table");
     let event =
         TestEvent::<SQLite>::update(table, row(1, "paid"), row(1, "paid")).with_pk_columns([0u16]);
-    engine.apply(&event).expect("apply");
+    engine.apply_leaving_reads_queued(&event).expect("apply");
     assert!(
         engine.resolve_collect().is_err(),
         "the read must fail while the table is missing"
@@ -594,7 +594,7 @@ fn a_failed_read_keeps_the_keys_it_was_going_to_ask_about() {
         .expect("restore the table");
     let other =
         TestEvent::<SQLite>::update(table, row(2, "paid"), row(2, "paid")).with_pk_columns([0u16]);
-    engine.apply(&other).expect("apply");
+    engine.apply_leaving_reads_queued(&other).expect("apply");
     let after = engine.resolve_collect().expect("second dispatch");
 
     let keys: Vec<_> = after.row_deltas.iter().map(|d| d.key.clone()).collect();
@@ -629,7 +629,7 @@ fn a_row_changed_twice_in_one_batch_is_asked_about_once() {
         TestEvent::<SQLite>::update(table, row(3, "void"), row(3, "void")).with_pk_columns([0u16]),
     ];
     for event in &events {
-        engine.apply(event).expect("apply");
+        engine.apply_leaving_reads_queued(event).expect("apply");
     }
     let outcome = engine.resolve_collect().expect("batch dispatch");
 
@@ -707,7 +707,7 @@ fn a_failure_on_a_later_batch_gives_back_every_key() {
     // Let the first batch through, fail the second.
     engine.connector().fail_after(1);
     for event in &events {
-        engine.apply(event).expect("apply");
+        engine.apply_leaving_reads_queued(event).expect("apply");
     }
     assert!(
         engine.resolve_collect().is_err(),
@@ -720,7 +720,7 @@ fn a_failure_on_a_later_batch_gives_back_every_key() {
     engine.connector().fail_after(usize::MAX);
     let extra =
         TestEvent::<SQLite>::update(table, row(0, "paid"), row(0, "paid")).with_pk_columns([0u16]);
-    engine.apply(&extra).expect("apply");
+    engine.apply_leaving_reads_queued(&extra).expect("apply");
     let after = engine.resolve_collect().expect("second dispatch");
 
     let mut keys: Vec<i64> = after
@@ -798,7 +798,7 @@ fn a_compound_key_is_delivered_in_key_column_order() {
             .with_pk_columns([0u16, 1u16]),
     ];
     for event in &events {
-        engine.apply(event).expect("apply");
+        engine.apply_leaving_reads_queued(event).expect("apply");
     }
     let outcome = engine.resolve_collect().expect("batch dispatch");
 
@@ -872,7 +872,7 @@ fn a_batch_spanning_several_pages_answers_every_key_once() {
         })
         .collect();
     for event in &events {
-        engine.apply(event).expect("apply");
+        engine.apply_leaving_reads_queued(event).expect("apply");
     }
     let outcome = engine.resolve_collect().expect("batch dispatch");
 

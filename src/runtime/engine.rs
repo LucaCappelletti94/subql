@@ -4985,10 +4985,13 @@ where
     I: IdTypes,
     DB: DatabaseLike + Send + Sync + 'static,
 {
-    type Notifications = crate::ConsumerNotifications<I, E::Checkpoint, E::Backend>;
+    type Notifications<'engine>
+        = crate::ConsumerNotifications<I, E::Checkpoint, E::Backend>
+    where
+        Self: 'engine;
     type Error = DispatchError;
 
-    fn consumers(&mut self, event: &E) -> Result<Self::Notifications, Self::Error> {
+    fn consumers(&mut self, event: &E) -> Result<Self::Notifications<'_>, Self::Error> {
         Self::consumers(self, event)
     }
 }

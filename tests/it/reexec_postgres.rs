@@ -216,7 +216,9 @@ fn engine_and_captured_paths_coexist_through_pg_connector() {
     let mut total_scalar_updates = Vec::new();
     let mut peak_outstanding = 0usize;
     for event in &events {
-        let notifs = engine.apply(event).expect("apply dispatch");
+        let notifs = engine
+            .apply_leaving_reads_queued(event)
+            .expect("apply dispatch");
         total_inserted.extend(notifs.engine.inserted().iter().copied());
         total_deleted.extend(notifs.engine.deleted().iter().copied());
         peak_outstanding = peak_outstanding.max(notifs.outstanding);
@@ -297,8 +299,11 @@ fn update_displacing_extreme_resolves_via_pg_connector() {
     }
     assert_eq!(events.len(), 1, "expected exactly one UPDATE event");
 
-    engine.apply(&events[0]).expect("apply dispatch");
-    let notifs = engine.resolve_collect().expect("consumers dispatch");
+    let settled = engine
+        .apply(&events[0])
+        .expect("apply dispatch")
+        .resolve_collect();
+    let notifs = settled.reads.expect("consumers dispatch");
     assert_eq!(notifs.scalar_updates.len(), 1, "expected one ScalarUpdate");
     assert_eq!(notifs.scalar_updates[0].subscription_id, captured_qid);
     assert_eq!(notifs.scalar_updates[0].value, Value::Float(20.0));
@@ -454,9 +459,12 @@ fn a_key_column_needing_quotes_is_still_readable() {
         vec![Value::Int(1), Value::String("paid".into())],
     )
     .with_pk_columns([0u16]);
-    engine.apply(&event).expect("apply dispatch");
-    let notifications = engine
-        .resolve_collect()
+    let settled = engine
+        .apply(&event)
+        .expect("apply dispatch")
+        .resolve_collect();
+    let notifications = settled
+        .reads
         .expect("a quoted key column must be readable, not fail on every change");
 
     assert_eq!(notifications.row_deltas.len(), 1);

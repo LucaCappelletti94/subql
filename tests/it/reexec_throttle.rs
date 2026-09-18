@@ -48,7 +48,7 @@ async fn run_peak_inflight_assertion(cap: usize) {
 
     let started = Instant::now();
     for event in &events {
-        engine.apply(event).unwrap();
+        engine.apply_leaving_reads_queued(event).unwrap();
     }
     let outcome = engine.resolve_collect().await.unwrap();
     let elapsed = started.elapsed();

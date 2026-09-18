@@ -331,20 +331,58 @@ where
         self.pending_reads.len()
     }
 
-    /// Fold one CDC event into in-memory state, exactly once.
+    /// Fold one CDC event into in-memory state, exactly once, and hand back a
+    /// [`Dispatch`](super::Dispatch) that gates its notifications on the
+    /// drain.
     ///
-    /// Returns the notifications that state produces: row matches, in-process
-    /// aggregate and scalar updates, and tier transitions. Reads the event
-    /// makes necessary are queued, deduplicated by subscription and group,
-    /// for `resolve` to execute. `apply` never touches the database, so its
-    /// effects commit exactly once however the later reads fare, and
-    /// retrying an applied event is never correct.
+    /// The notifications are row matches, in-process aggregate and scalar
+    /// updates, and tier transitions. Reads the event makes necessary are
+    /// queued, deduplicated by subscription and group, and
+    /// [`Dispatch::resolve`](super::Dispatch::resolve) is what executes them.
+    /// `apply` never touches the database, so its effects commit exactly once
+    /// however the later reads fare, and retrying an applied event is never
+    /// correct.
+    ///
+    /// The notifications are not readable off the returned value, because a
+    /// caller that took them and never drained would lose every queued read
+    /// with nothing said. [`Dispatch`](super::Dispatch) carries the worked
+    /// examples of what that refuses. A caller that means to drain on a
+    /// schedule of its own asks by name through
+    /// [`apply_leaving_reads_queued`](Self::apply_leaving_reads_queued).
     ///
     /// # Errors
     ///
     /// [`crate::DispatchError`] when the event cannot be dispatched. Nothing
     /// is applied in that case.
     pub fn apply(
+        &mut self,
+        event: &E,
+    ) -> Result<super::Dispatch<'_, E, I, DB, M>, crate::DispatchError> {
+        let notifications = self.apply_leaving_reads_queued(event)?;
+        Ok(super::Dispatch::new(self, notifications))
+    }
+
+    /// Fold one CDC event exactly as [`apply`](Self::apply) does and hand the
+    /// notifications straight back, leaving every read it queued queued.
+    ///
+    /// For a caller that drains on a schedule of its own rather than once per
+    /// event, which is the one case where taking the notifications without
+    /// draining is correct. Reads of one subscription and group coalesce while
+    /// they wait, so a caller applying a burst and draining once reads the
+    /// database fewer times than one draining per event.
+    ///
+    /// Nothing else offers these notifications again, and nothing reschedules
+    /// the queued reads, so a caller taking this owes a
+    /// [`resolve`](Self::resolve) or a
+    /// [`resolve_collect`](Self::resolve_collect) of its own. Forgetting it
+    /// loses every queued read, which is what [`apply`](Self::apply) exists to
+    /// make impossible.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::DispatchError`] when the event cannot be dispatched. Nothing
+    /// is applied in that case.
+    pub fn apply_leaving_reads_queued(
         &mut self,
         event: &E,
     ) -> Result<super::Dispatched<I, E::Backend, E::Checkpoint>, crate::DispatchError> {

@@ -25,7 +25,8 @@ fn unregister_subscription_drops_the_queued_read() {
         },
     )
     .unwrap();
-    e.apply(&delete_event(tid, 1, 5.0)).unwrap();
+    e.apply_leaving_reads_queued(&delete_event(tid, 1, 5.0))
+        .unwrap();
     assert_eq!(
         e.pending_read_count(),
         1,
@@ -115,7 +116,9 @@ fn async_unregister_subscription_drops_the_resolve_context() {
     assert_eq!(e.contexts.len(), 1);
     assert!(e.unregister_subscription(captured));
     assert_eq!(e.contexts.len(), 0, "the resolve context is dropped");
-    let n = e.apply(&delete_event(tid, 1, 5.0)).unwrap();
+    let n = e
+        .apply_leaving_reads_queued(&delete_event(tid, 1, 5.0))
+        .unwrap();
     assert!(n.scalar_updates.is_empty());
     assert_eq!(
         e.connector().call_count(),

@@ -36,7 +36,7 @@ fn a_failed_install_drops_the_read_instead_of_requeueing_it() {
     )
     .expect("group map installs");
     engine
-        .apply(
+        .apply_leaving_reads_queued(
             &TestEvent::<Postgres>::delete(
                 table,
                 vec![
@@ -77,6 +77,78 @@ fn a_failed_install_drops_the_read_instead_of_requeueing_it() {
     block_on(engine.resolve_collect()).expect("the next resolve is a clean no-op");
 }
 
+/// The async twin: one drain hands back both halves, what the event
+/// answered in process and what its queued reads answered.
+#[test]
+fn the_drain_hands_back_the_notifications_with_the_resolved_reads() {
+    let (mut e, tid) = engine_with_values(vec![Value::Float(7.0)]);
+    let min_id = crate::reexec::test_fixtures::bootstrap_scalar_query(
+        &mut e,
+        1u64,
+        "SELECT MIN(price) FROM orders",
+        5.0,
+    );
+    e.register(
+        SubscriptionRequest::new(2u64, "SELECT * FROM orders WHERE price < 100"),
+        (),
+    )
+    .expect("an in-process row subscription registers");
+
+    let settled = block_on(
+        e.apply(&delete_event(tid, 1, 5.0))
+            .expect("the event applies")
+            .resolve_collect(),
+    );
+    let reads = settled.reads.expect("the queued read runs");
+
+    assert_eq!(
+        settled.dispatched.engine.deleted(),
+        &[2],
+        "the in-process subscription is answered without a read"
+    );
+    assert_eq!(
+        settled.dispatched.outstanding, 1,
+        "the displaced extreme queued one read"
+    );
+    assert_eq!(
+        reads.scalar_updates.len(),
+        1,
+        "and the same drain delivered its answer"
+    );
+    assert_eq!(reads.scalar_updates[0].subscription_id, min_id);
+    assert_eq!(reads.scalar_updates[0].value, Value::Float(7.0));
+    assert_eq!(e.pending_read_count(), 0, "the drain emptied the queue");
+}
+
+/// The gate holds on the trait surface a downstream crate actually calls,
+/// not only on the inherent method.
+#[test]
+fn the_trait_method_gates_its_notifications_too() {
+    use crate::AsyncSubscriptionDispatch;
+
+    let (mut e, tid) = engine_with_values(vec![Value::Float(7.0)]);
+    let min_id = crate::reexec::test_fixtures::bootstrap_scalar_query(
+        &mut e,
+        1u64,
+        "SELECT MIN(price) FROM orders",
+        5.0,
+    );
+    let event = delete_event(tid, 1, 5.0);
+
+    let settled = block_on(async {
+        e.consumers(&event)
+            .await
+            .expect("the event dispatches")
+            .resolve_collect()
+            .await
+    });
+    let reads = settled.reads.expect("the queued read runs");
+
+    assert_eq!(reads.scalar_updates.len(), 1);
+    assert_eq!(reads.scalar_updates[0].subscription_id, min_id);
+    assert_eq!(reads.scalar_updates[0].value, Value::Float(7.0));
+}
+
 /// Mirrors `auto::tests::a_dispatch_reports_the_reads_it_queued`,
 /// because a shared line tested on one side only is correct for the
 /// other by luck.
@@ -90,7 +162,7 @@ fn async_dispatch_reports_the_reads_it_queued() {
     .expect("whole read registers");
 
     let queued = e
-        .apply(&insert_event(tid, 1, 5.0))
+        .apply_leaving_reads_queued(&insert_event(tid, 1, 5.0))
         .expect("the event applies");
     assert_eq!(
         queued.outstanding,
@@ -103,7 +175,7 @@ fn async_dispatch_reports_the_reads_it_queued() {
     );
 
     let again = e
-        .apply(&insert_event(tid, 2, 6.0))
+        .apply_leaving_reads_queued(&insert_event(tid, 2, 6.0))
         .expect("the event applies");
     assert_eq!(
         again.outstanding, queued.outstanding,
@@ -117,7 +189,7 @@ fn async_dispatch_reports_the_reads_it_queued() {
     )
     .expect("a second whole read registers");
     let two = e
-        .apply(&insert_event(tid, 4, 8.0))
+        .apply_leaving_reads_queued(&insert_event(tid, 4, 8.0))
         .expect("the event applies");
     assert_eq!(
         two.outstanding, 2,
@@ -139,7 +211,7 @@ fn async_dispatch_reports_the_reads_it_queued() {
     ]);
     block_on(e.resolve_collect()).expect("the reads run");
     let settled = e
-        .apply(&update_status_only(tid, 3, 7.0))
+        .apply_leaving_reads_queued(&update_status_only(tid, 3, 7.0))
         .expect("the event applies");
     assert_eq!(
         e.pending_read_count(),
@@ -166,7 +238,10 @@ fn async_applied_burst_coalesces_repeated_triggers() {
         delete_event(tid, 3, 5.0),
     ];
 
-    let per_event: Vec<_> = events.iter().map(|ev| e.apply(ev).unwrap()).collect();
+    let per_event: Vec<_> = events
+        .iter()
+        .map(|ev| e.apply_leaving_reads_queued(ev).unwrap())
+        .collect();
     assert_eq!(per_event.len(), 3, "per_event positional alignment");
     let outcome = block_on(e.resolve_collect()).unwrap();
     assert_eq!(
@@ -198,7 +273,9 @@ fn dropped_resolve_keeps_the_read_queued() {
     )
     .unwrap();
 
-    let applied = e.apply(&delete_event(tid, 1, 5.0)).unwrap();
+    let applied = e
+        .apply_leaving_reads_queued(&delete_event(tid, 1, 5.0))
+        .unwrap();
     assert!(
         applied.scalar_updates.is_empty(),
         "the read is queued, not run"

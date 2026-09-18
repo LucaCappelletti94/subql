@@ -23,13 +23,18 @@ fn delete_of_extreme_resolves_via_connector() {
     );
 
     // Insert price=9.0 (>5.0): in-process Unchanged, no scalar update, no trigger.
-    let n = e.apply(&insert_event(tid, 2, 9.0)).unwrap();
+    let n = e
+        .apply_leaving_reads_queued(&insert_event(tid, 2, 9.0))
+        .unwrap();
     assert!(n.scalar_updates.is_empty(), "insert above extreme");
     assert_eq!(e.connector().call_count(), 0, "no re-execution yet");
 
     // Delete id=1, price=5.0 (the current extreme): trigger -> connector -> 7.0.
-    e.apply(&delete_event(tid, 1, 5.0)).unwrap();
-    let n = e.resolve_collect().unwrap();
+    let settled = e
+        .apply(&delete_event(tid, 1, 5.0))
+        .unwrap()
+        .resolve_collect();
+    let n = settled.reads.expect("reads resolve");
     assert_eq!(n.scalar_updates.len(), 1);
     assert_eq!(n.scalar_updates[0].subscription_id, qid);
     assert_eq!(n.scalar_updates[0].value, Value::Float(7.0));
@@ -49,7 +54,9 @@ fn unrelated_column_update_does_not_call_connector() {
         10.0,
     );
 
-    let n = e.apply(&update_status_only(tid, 1, 10.0)).unwrap();
+    let n = e
+        .apply_leaving_reads_queued(&update_status_only(tid, 1, 10.0))
+        .unwrap();
     assert!(n.scalar_updates.is_empty());
     assert_eq!(e.connector().call_count(), 0);
 }
@@ -65,8 +72,11 @@ fn connector_error_aborts_batch() {
         5.0,
     );
 
-    e.apply(&delete_event(tid, 1, 5.0)).unwrap();
-    match e.resolve_collect() {
+    let settled = e
+        .apply(&delete_event(tid, 1, 5.0))
+        .unwrap()
+        .resolve_collect();
+    match settled.reads {
         Ok(_) => panic!("expected Connector error, got Ok"),
         Err(ReExecError::Connector {
             error: MockError::Unstaged(msg),
@@ -101,7 +111,9 @@ fn snapshot_installs_via_connector() {
 
     // After snapshot, the engine treats 12.5 as the current MIN.
     // An insert below it (e.g. 9.0) becomes the new in-process MIN.
-    let n = e.apply(&insert_event(tid, 2, 9.0)).unwrap();
+    let n = e
+        .apply_leaving_reads_queued(&insert_event(tid, 2, 9.0))
+        .unwrap();
     assert_eq!(n.scalar_updates.len(), 1);
     assert_eq!(n.scalar_updates[0].value, Value::Float(9.0));
     assert_eq!(e.connector().call_count(), 1);
@@ -135,8 +147,11 @@ fn connector_error_names_its_subscription() {
         },
     )
     .unwrap();
-    e.apply(&delete_event(tid, 1, 5.0)).unwrap();
-    match e.resolve_collect() {
+    let settled = e
+        .apply(&delete_event(tid, 1, 5.0))
+        .unwrap()
+        .resolve_collect();
+    match settled.reads {
         Ok(_) => panic!("expected the triggered read to fail"),
         Err(ReExecError::Connector {
             subscription,
@@ -184,7 +199,8 @@ fn cursor_error_names_its_subscription() {
 /// The two-stage contract: one event applies exactly once however its
 /// reads fare. The fused dispatch this replaced could only retry a
 /// failed read by redispatching the event, which folded the delete into
-/// the count a second time.
+/// the count a second time. So a drain that fails still owes the caller
+/// what the fold produced, since nothing offers it a second time.
 #[test]
 fn applied_event_survives_failed_resolve() {
     let (mut e, tid) = engine_with_values(alloc::vec![]);
@@ -221,21 +237,26 @@ fn applied_event_survives_failed_resolve() {
     )
     .unwrap();
 
-    // The delete folds the count in memory and queues the MIN re-read.
-    let applied = e.apply(&delete_event(tid, 1, 5.0)).unwrap();
-    assert_eq!(applied.aggregate_updates.len(), 1);
-    assert_eq!(
-        applied.aggregate_updates[0].folded_value(),
-        Some(crate::AggValue::CountStar(4)),
-        "the delete folds exactly once, at apply time"
-    );
-    assert_eq!(e.pending_read_count(), 1, "the displaced MIN queues a read");
-
-    // The read fails: the fold stands, the read stays queued.
+    // The delete folds the count in memory and queues the MIN re-read, and
+    // the read fails because the connector has no value staged.
+    let settled = e
+        .apply(&delete_event(tid, 1, 5.0))
+        .unwrap()
+        .resolve_collect();
     assert!(matches!(
-        e.resolve_collect(),
+        settled.reads,
         Err(ReExecError::Connector { subscription, .. }) if subscription == minimum
     ));
+    assert_eq!(
+        settled.dispatched.outstanding, 1,
+        "the displaced MIN queued a read"
+    );
+    assert_eq!(settled.dispatched.aggregate_updates.len(), 1);
+    assert_eq!(
+        settled.dispatched.aggregate_updates[0].folded_value(),
+        Some(crate::AggValue::CountStar(4)),
+        "the fold arrives with the failure, not instead of it"
+    );
     assert_eq!(e.pending_read_count(), 1, "a failed read stays queued");
 
     // Retrying resolves the read alone: no second application.
@@ -284,7 +305,9 @@ fn an_unanswered_cell_is_re_executed_by_the_auto_engine() {
         .with_pk_columns([0u16])
         .with_changed_columns([1u16]);
 
-    let applied = e.apply(&event).expect("the event applies");
+    let applied = e
+        .apply_leaving_reads_queued(&event)
+        .expect("the event applies");
     assert_eq!(
         applied.engine.unanswered().len(),
         1,

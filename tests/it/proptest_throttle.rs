@@ -53,7 +53,7 @@ proptest! {
             .build()
             .unwrap();
         for event in &events {
-            engine.apply(event).unwrap();
+            engine.apply_leaving_reads_queued(event).unwrap();
         }
         let outcome = runtime.block_on(engine.resolve_collect()).unwrap();
 
