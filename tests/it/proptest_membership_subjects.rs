@@ -7,6 +7,12 @@
 //! silent, so the whole index is driven here against the naive reading of what
 //! it means, that a caller is admitted to a value exactly while one of the
 //! subjects it holds grants that value.
+//!
+//! What it reads is delivery, so it settles the admission state and nothing
+//! about the narrowings reported on the way there. Reporting each change once
+//! and only when the answer moved is what
+//! `changed_membership::a_row_moving_between_two_held_subjects_reports_nothing`
+//! covers, and that one fails where this property still passes.
 
 use proptest::prelude::*;
 use rls2fga::translator::{Translator, TranslatorBuilder};
