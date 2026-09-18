@@ -30,21 +30,34 @@ pub struct SubscriptionRequest<I: IdTypes, B: Backend = crate::backend::Postgres
     /// binds are empty the `B` parameter is inferred from context; the
     /// default `B = Postgres` covers the common Postgres-backed use.
     pub(crate) binds: alloc::vec::Vec<Value<B>>,
-    /// Which subscriber this subscription filters for.
+    /// The one value a comparison of a column to the caller admits.
     ///
-    /// Required by a filter naming a membership term: a membership subquery, or
-    /// a comparison of a column to the caller, both written against
-    /// `current_setting('app.user_id')` in SQL and resolved per connection by
-    /// Postgres. SubQL has neither a connection nor a session, so the
-    /// subscription states it. A membership subquery matches changed membership
-    /// rows against the identity to move who the filter admits, and a caller
-    /// comparison admits exactly the rows naming it. Trusting it is safe because
-    /// visibility gates every delivery afterwards: a subscription claiming
-    /// another identity receives nothing it is not permitted to see, it only
-    /// fails to receive its own rows.
+    /// Required by a filter carrying one, written
+    /// `owner = current_setting('app.user_id')` in SQL and resolved per
+    /// connection by Postgres. SubQL has neither a connection nor a session, so
+    /// the subscription states it. One value rather than a set, because that
+    /// SQL reads one session value, and admitting a union would deliver rows
+    /// the registered query does not return.
+    ///
+    /// Trusting it is safe because visibility gates every delivery afterwards:
+    /// a subscription claiming another identity receives nothing it is not
+    /// permitted to see, it only fails to receive its own rows.
     pub(crate) subscriber: Option<Value<B>>,
-    /// The value rows this subscriber currently matches, grouped by the columns
-    /// each membership subquery compares.
+    /// The subjects a membership subquery matches this caller by.
+    ///
+    /// A caller is a set. A login, a capability key, or several at once, and a
+    /// membership table names them in the column it names user ids in. A
+    /// changed membership row naming any of them moves what the filter admits,
+    /// which is what the same subquery does in the database, where it reads the
+    /// whole set out of its own session setting.
+    ///
+    /// Required by a filter naming a membership subquery, and empty is refused
+    /// for the same reason an absent one is: the subscription could never
+    /// deliver.
+    pub(crate) subjects: alloc::vec::Vec<Value<B>>,
+    /// The value rows this caller's subjects currently match, grouped by the
+    /// columns each membership subquery compares, each row carrying the subject
+    /// that grants it.
     ///
     /// Read them from the membership table, which
     /// [`SubscriptionEngine::describe_terms`](crate::SubscriptionEngine::describe_terms)
@@ -64,10 +77,11 @@ pub struct SubscriptionRequest<I: IdTypes, B: Backend = crate::backend::Postgres
 }
 
 /// Value rows stated per membership term: the compared column names, then the
-/// rows, each following the names' order.
+/// rows, each one the subject granting it and the values following the names'
+/// order.
 pub type StatedTermValues<B> = alloc::vec::Vec<(
     alloc::vec::Vec<String>,
-    alloc::vec::Vec<alloc::vec::Vec<Value<B>>>,
+    alloc::vec::Vec<(Value<B>, alloc::vec::Vec<Value<B>>)>,
 )>;
 
 impl<I: IdTypes, B: Backend> SubscriptionRequest<I, B> {
@@ -81,6 +95,7 @@ impl<I: IdTypes, B: Backend> SubscriptionRequest<I, B> {
             updated_at_unix_ms: 0,
             binds: alloc::vec::Vec::new(),
             subscriber: None,
+            subjects: alloc::vec::Vec::new(),
             term_values: alloc::vec::Vec::new(),
         }
     }
@@ -109,43 +124,69 @@ impl<I: IdTypes, B: Backend> SubscriptionRequest<I, B> {
         self
     }
 
-    /// State which subscriber this subscription filters for (default: none).
+    /// State the one value this subscription's caller comparison admits
+    /// (default: none).
     ///
-    /// A filter naming a membership term is refused without it: for a
-    /// membership subquery the identity is what a changed membership row is
-    /// matched against, and for a caller comparison it is the one value the
-    /// comparison admits. Build it at
-    /// [`MembershipTermDescription::subject_kind`](crate::term::MembershipTermDescription::subject_kind):
-    /// the lookup keys a string and a UUID under different variants, so an
-    /// identity of another kind matches no membership row and admits nobody in
-    /// silence. A caller comparison checks instead of trusting, since the
-    /// compared column's kind is in the catalog: a mismatched identity is
-    /// refused at registration.
+    /// A filter comparing a column to the caller is refused without it, since
+    /// that comparison admits exactly this value and nothing else. Build it at
+    /// [`CallerTermDescription::kind`](crate::term::CallerTermDescription::kind):
+    /// the compared column's kind is in the catalog, so a value of another kind
+    /// is refused at registration rather than serving the subscription dead.
+    ///
+    /// A membership subquery reads [`subjects`](Self::subjects) instead. The
+    /// two are separate because the database holds them separately, one session
+    /// value for the caller and the subject set the membership rows are matched
+    /// against, and a caller whose identity is also a subject states it in both.
     #[must_use]
     pub fn subscriber(mut self, subscriber: Value<B>) -> Self {
         self.subscriber = Some(subscriber);
         self
     }
 
-    /// State the value rows this subscriber currently matches for `columns`,
-    /// the columns one of the filter's membership subqueries compares (default:
-    /// none for every term).
+    /// State the subjects this subscription's membership subqueries match it by
+    /// (default: none).
     ///
-    /// One name and one value per row entry for the ordinary single-column
-    /// term, several for a term whose `EXISTS` pairs span a composite key. Each
-    /// row follows the order of `columns`, which may differ from the filter's
-    /// own order: the engine matches by name. With a static diesel schema,
-    /// prefer `term_values_for` (feature `diesel-typed`), which takes the
-    /// columns themselves and cannot misspell a name.
+    /// A caller is a set: an identity, the capability keys it holds, or both,
+    /// and a membership row naming any of them reaches it. A filter naming a
+    /// membership subquery is refused with none, since nothing would ever move
+    /// what it admits.
+    ///
+    /// Build every member at
+    /// [`MembershipTermDescription::subject_kind`](crate::term::MembershipTermDescription::subject_kind).
+    /// The lookup keys a string and a UUID under different variants, so a
+    /// member of another kind is refused rather than left matching no row in
+    /// silence.
+    ///
+    /// Adds to what is already stated rather than replacing it.
+    #[must_use]
+    pub fn subjects(mut self, subjects: impl IntoIterator<Item = Value<B>>) -> Self {
+        self.subjects.extend(subjects);
+        self
+    }
+
+    /// State the value rows this caller's subjects currently match for
+    /// `columns`, the columns one of the filter's membership subqueries
+    /// compares (default: none for every term).
+    ///
+    /// Each row is the subject that grants it and the values it grants, one
+    /// value per name for the ordinary single-column term and several for a
+    /// term whose `EXISTS` pairs span a composite key. That is the shape
+    /// [`MembershipTermDescription::seed_sql`](crate::term::MembershipTermDescription::seed_sql)
+    /// projects, subject first, because a row two of the caller's subjects
+    /// grant has to survive either one of them losing its membership. The
+    /// values follow the order of `columns`, which may differ from the filter's
+    /// own: the engine matches by name. With a static diesel schema, prefer
+    /// `term_values_for` (feature `diesel-typed`), which takes the columns
+    /// themselves and cannot misspell a name.
     ///
     /// Both the columns and the read that yields the rows come from
     /// [`SubscriptionEngine::describe_terms`](crate::SubscriptionEngine::describe_terms),
     /// which reads the membership table. Deriving them from the snapshot rows
     /// instead loses every value whose rows do not exist yet, permanently.
     ///
-    /// A row the subscriber does not match is trusted just as readily, and
-    /// keeps admitting rows to it until a membership row naming those values is
-    /// deleted. A membership that never existed has none to delete.
+    /// A row the subject does not match is trusted just as readily, and keeps
+    /// admitting rows until a membership row naming those values is deleted. A
+    /// membership that never existed has none to delete.
     ///
     /// Called once per term. Calling it twice for one term's columns adds to
     /// what those columns already carry rather than replacing it.
@@ -153,12 +194,13 @@ impl<I: IdTypes, B: Backend> SubscriptionRequest<I, B> {
     pub fn term_values<C: Into<String>>(
         mut self,
         columns: alloc::vec::Vec<C>,
-        rows: alloc::vec::Vec<alloc::vec::Vec<Value<B>>>,
+        rows: alloc::vec::Vec<(Value<B>, alloc::vec::Vec<Value<B>>)>,
     ) -> Self {
         self.term_values
             .push((columns.into_iter().map(Into::into).collect(), rows));
         self
     }
+
     /// Declare that downstream Rust code executes database reads under this
     /// consumer's database identity.
     ///

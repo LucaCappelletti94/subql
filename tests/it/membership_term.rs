@@ -17,10 +17,16 @@ use subql::{
     catalog_helpers, DefaultIds, RegisterError, SubscriptionEngine, SubscriptionRequest, TableId,
 };
 
-/// One-wide value rows, the shape the tuple-stating API takes for the
-/// ordinary single-column term.
-fn rows_of(values: Vec<Value<Postgres>>) -> Vec<Vec<Value<Postgres>>> {
-    values.into_iter().map(|value| vec![value]).collect()
+/// One-wide value rows granted by `subject`, the shape the tuple-stating API
+/// takes for the ordinary single-column term.
+fn rows_of(
+    subject: &str,
+    values: Vec<Value<Postgres>>,
+) -> Vec<(Value<Postgres>, Vec<Value<Postgres>>)> {
+    values
+        .into_iter()
+        .map(|value| (Value::String(subject.into()), vec![value]))
+        .collect()
 }
 
 const DDL: &str = "CREATE TABLE projects(id INTEGER PRIMARY KEY, name TEXT);
@@ -56,11 +62,33 @@ fn subscribe(
     projects: &[i64],
 ) -> SubscriptionRequest<DefaultIds, Postgres> {
     SubscriptionRequest::new(consumer, TERM)
-        .subscriber(Value::String(user.into()))
+        .subjects([Value::String(user.into())])
         .term_values(
             vec!["project_id"],
-            rows_of(projects.iter().copied().map(Value::Int).collect()),
+            rows_of(user, projects.iter().copied().map(Value::Int).collect()),
         )
+}
+
+/// One subscription for `consumer`, filtering for a set of subjects, stating
+/// which project each of them grants today.
+fn subscribe_as(
+    consumer: u64,
+    grants: &[(&str, i64)],
+) -> SubscriptionRequest<DefaultIds, Postgres> {
+    let mut subjects: Vec<Value<Postgres>> = Vec::new();
+    for (subject, _) in grants {
+        let subject = Value::String((*subject).into());
+        if !subjects.contains(&subject) {
+            subjects.push(subject);
+        }
+    }
+    let rows = grants
+        .iter()
+        .map(|(subject, project)| (Value::String((*subject).into()), vec![Value::Int(*project)]))
+        .collect();
+    SubscriptionRequest::new(consumer, TERM)
+        .subjects(subjects)
+        .term_values(vec!["project_id"], rows)
 }
 
 /// A `docs` row: `(id, project_id, title, score)`.
@@ -177,8 +205,8 @@ fn a_row_test_and_a_term_both_have_to_hold() {
     engine
         .register(
             SubscriptionRequest::new(1u64, and_filter)
-                .subscriber(Value::String("alice".into()))
-                .term_values(vec!["project_id"], rows_of(vec![Value::Int(7)])),
+                .subjects([Value::String("alice".into())])
+                .term_values(vec!["project_id"], rows_of("alice", vec![Value::Int(7)])),
         )
         .unwrap();
 
@@ -214,8 +242,8 @@ fn a_term_under_or_admits_everybody_the_other_side_admits() {
          (SELECT project_id FROM project_members WHERE user_id = current_setting('app.user_id', true))";
     let subscribe_or = |consumer: u64, user: &str, project: i64| {
         SubscriptionRequest::new(consumer, or_filter)
-            .subscriber(Value::String(user.into()))
-            .term_values(vec!["project_id"], rows_of(vec![Value::Int(project)]))
+            .subjects([Value::String(user.into())])
+            .term_values(vec!["project_id"], rows_of(user, vec![Value::Int(project)]))
     };
     engine.register(subscribe_or(1, "alice", 7)).unwrap();
     engine.register(subscribe_or(2, "bob", 9)).unwrap();
@@ -246,7 +274,7 @@ fn a_term_under_or_admits_everybody_the_other_side_admits() {
 fn a_subscription_stating_no_values_admits_nobody() {
     let (mut engine, docs) = engine();
     engine
-        .register(SubscriptionRequest::new(1u64, TERM).subscriber(Value::String("alice".into())))
+        .register(SubscriptionRequest::new(1u64, TERM).subjects([Value::String("alice".into())]))
         .unwrap();
 
     let notifs = engine
@@ -367,17 +395,17 @@ fn a_reversed_spelling_binds_its_values_to_the_columns_they_name() {
     engine
         .register(
             SubscriptionRequest::new(1u64, forward)
-                .subscriber(Value::String("alice".into()))
-                .term_values(vec!["project_id"], rows_of(vec![Value::Int(7)]))
-                .term_values(vec!["a"], rows_of(vec![Value::Int(70)])),
+                .subjects([Value::String("alice".into())])
+                .term_values(vec!["project_id"], rows_of("alice", vec![Value::Int(7)]))
+                .term_values(vec!["a"], rows_of("alice", vec![Value::Int(70)])),
         )
         .unwrap();
     engine
         .register(
             SubscriptionRequest::new(2u64, reversed)
-                .subscriber(Value::String("bob".into()))
-                .term_values(vec!["project_id"], rows_of(vec![Value::Int(9)]))
-                .term_values(vec!["a"], rows_of(vec![Value::Int(90)])),
+                .subjects([Value::String("bob".into())])
+                .term_values(vec!["project_id"], rows_of("bob", vec![Value::Int(9)]))
+                .term_values(vec!["a"], rows_of("bob", vec![Value::Int(90)])),
         )
         .unwrap();
 
@@ -447,15 +475,15 @@ mod refusals {
         );
     }
 
-    /// A term needs to know who it filters for, because that identity is what a
-    /// changed membership row is matched against.
+    /// A term needs to know which subjects it filters for, because those are
+    /// what a changed membership row is matched against.
     #[test]
-    fn a_term_is_refused_without_a_subscriber() {
+    fn a_term_is_refused_without_a_subject() {
         let (mut engine, _) = engine();
         let reason = refusal(&mut engine, SubscriptionRequest::new(1u64, TERM));
         assert!(
-            reason.contains("which subscriber"),
-            "the refusal should ask for the subscriber, got {reason:?}"
+            reason.contains("which subjects"),
+            "the refusal should ask for the subjects, got {reason:?}"
         );
     }
 
@@ -468,7 +496,7 @@ mod refusals {
          (SELECT project_id FROM project_members WHERE user_id = current_setting('app.user_id', true))";
         let reason = refusal(
             &mut engine,
-            SubscriptionRequest::new(1u64, sql).subscriber(Value::String("alice".into())),
+            SubscriptionRequest::new(1u64, sql).subjects([Value::String("alice".into())]),
         );
         assert!(
             reason.contains("accumulator"),
@@ -485,7 +513,7 @@ mod refusals {
          (SELECT project_id FROM project_members WHERE user_id = current_setting('app.user_id', true))";
         let reason = refusal(
             &mut engine,
-            SubscriptionRequest::new(1u64, sql).subscriber(Value::String("alice".into())),
+            SubscriptionRequest::new(1u64, sql).subjects([Value::String("alice".into())]),
         );
         assert!(
             reason.contains("not equal to itself"),
@@ -503,7 +531,7 @@ mod refusals {
          AND project_id IN (SELECT project_id FROM project_members WHERE user_id = 'x')";
         let reason = refusal(
             &mut engine,
-            SubscriptionRequest::new(1u64, sql).subscriber(Value::String("alice".into())),
+            SubscriptionRequest::new(1u64, sql).subjects([Value::String("alice".into())]),
         );
         assert!(
             reason.contains("two membership terms"),
@@ -520,8 +548,11 @@ mod refusals {
         let reason = refusal(
             &mut engine,
             SubscriptionRequest::new(1u64, TERM)
-                .subscriber(Value::String("alice".into()))
-                .term_values(vec!["title"], rows_of(vec![Value::String("x".into())])),
+                .subjects([Value::String("alice".into())])
+                .term_values(
+                    vec!["title"],
+                    rows_of("alice", vec![Value::String("x".into())]),
+                ),
         );
         assert!(
             reason.contains("no membership subquery"),
@@ -539,7 +570,7 @@ mod refusals {
          (SELECT project_id FROM project_members WHERE user_id = 'someone-else')";
         let reason = refusal(
             &mut engine,
-            SubscriptionRequest::new(1u64, sql).subscriber(Value::String("alice".into())),
+            SubscriptionRequest::new(1u64, sql).subjects([Value::String("alice".into())]),
         );
         assert!(
             !reason.contains("SubQL"),
@@ -562,17 +593,55 @@ mod refusals {
          (SELECT project_id FROM project_members WHERE user_id = current_setting('app.user_id', true))";
         let reason = refusal(
             &mut engine,
-            SubscriptionRequest::new(1u64, sql).subscriber(Value::String("alice".into())),
+            SubscriptionRequest::new(1u64, sql).subjects([Value::String("alice".into())]),
         );
         assert!(
             !reason.is_empty(),
             "a filter comparing text against an integer key must not be served"
         );
     }
+
+    /// A stated row has to name a subject the caller holds, because that is
+    /// what a later membership change withdraws it through. A row granted by
+    /// nobody the caller holds could never be taken away.
+    #[test]
+    fn a_stated_row_granted_by_an_unheld_subject_is_refused() {
+        let (mut engine, _) = engine();
+        let reason = refusal(
+            &mut engine,
+            SubscriptionRequest::new(1u64, TERM)
+                .subjects([Value::String("alice".into())])
+                .term_values(
+                    vec!["project_id"],
+                    vec![(Value::String("bob".into()), vec![Value::Int(7)])],
+                ),
+        );
+        assert!(
+            reason.contains("does not filter for"),
+            "the refusal should name the subject the caller does not hold, got {reason:?}"
+        );
+    }
+
+    /// The lookup matches by variant before value, so a subject of another kind
+    /// than the membership column holds is refused rather than left matching no
+    /// row in silence.
+    #[test]
+    fn a_subject_of_another_kind_than_the_membership_column_is_refused() {
+        let (mut engine, _) = engine();
+        let reason = refusal(
+            &mut engine,
+            SubscriptionRequest::new(1u64, TERM)
+                .subjects([Value::String("alice".into()), Value::Int(7)]),
+        );
+        assert!(
+            reason.contains("membership column naming subjects"),
+            "the refusal should name the column's kind, got {reason:?}"
+        );
+    }
 }
 
 mod changed_membership {
-    use super::{doc, engine, refusal, subscribe, Engine};
+    use super::{doc, engine, refusal, subscribe, subscribe_as, Engine};
     use subql::backend::{Postgres, Value};
     use subql::compiler::MAX_TERMS_PER_FILTER;
     use subql::testing::TestEvent;
@@ -903,7 +972,7 @@ mod changed_membership {
 
         let reason = refusal(
             &mut engine,
-            SubscriptionRequest::new(1u64, sql).subscriber(Value::String("alice".into())),
+            SubscriptionRequest::new(1u64, sql).subjects([Value::String("alice".into())]),
         );
         assert!(
             reason.contains(&format!("at most {MAX_TERMS_PER_FILTER}")),
@@ -918,9 +987,98 @@ mod changed_membership {
         );
         assert!(engine
             .register(
-                SubscriptionRequest::new(2u64, under).subscriber(Value::String("alice".into()))
+                SubscriptionRequest::new(2u64, under).subjects([Value::String("alice".into())])
             )
             .is_ok());
+    }
+
+    /// The case a caller holding several subjects exists for: two of them grant
+    /// the same project, and one of them losing its membership must not take
+    /// the project away, because the other still grants it. Nothing would ever
+    /// give it back, so the loss would be permanent.
+    #[test]
+    fn a_value_two_subjects_grant_survives_one_of_them_leaving() {
+        let (mut engine, docs) = engine();
+        let members = members_table(&engine);
+        let caller = engine
+            .register(subscribe_as(1, &[("key:a", 7), ("key:b", 7)]))
+            .unwrap();
+
+        let notifs = engine
+            .consumers(&TestEvent::delete(members, membership(7, "key:a")))
+            .unwrap();
+        assert!(
+            notifs.narrowings().is_empty(),
+            "key:b still grants project 7, so nothing about the answer changed"
+        );
+        assert_eq!(
+            engine
+                .consumers(&TestEvent::insert(docs, doc(1, 7, "spec")))
+                .unwrap()
+                .inserted(),
+            &[1],
+            "the caller still reaches project 7 through the subject it kept"
+        );
+
+        let notifs = engine
+            .consumers(&TestEvent::delete(members, membership(7, "key:b")))
+            .unwrap();
+        let narrowings = notifs.narrowings();
+        assert_eq!(narrowings.len(), 1, "the last grant leaving is the change");
+        assert_eq!(narrowings[0].subscription, caller.subscription_id);
+        assert_eq!(narrowings[0].values, vec![Value::Int(7)]);
+        assert!(!narrowings[0].entered, "the value left the caller's set");
+        assert!(
+            engine
+                .consumers(&TestEvent::insert(docs, doc(2, 7, "spec")))
+                .unwrap()
+                .inserted()
+                .is_empty(),
+            "no subject grants project 7 any more"
+        );
+    }
+
+    /// A membership row naming any subject the caller holds moves it, which is
+    /// what the same subquery does in the database, where it reads the whole
+    /// set.
+    #[test]
+    fn a_membership_row_naming_any_held_subject_moves_the_caller() {
+        let (mut engine, docs) = engine();
+        let members = members_table(&engine);
+        let first = engine.register(subscribe_as(1, &[("key:a", 7)])).unwrap();
+
+        let notifs = engine
+            .consumers(&TestEvent::insert(members, membership(11, "key:b")))
+            .unwrap();
+        assert!(
+            notifs.narrowings().is_empty(),
+            "key:b is not one of this caller's subjects"
+        );
+
+        let second = engine
+            .register(subscribe_as(2, &[("key:a", 7), ("key:b", 7)]))
+            .unwrap();
+        let notifs = engine
+            .consumers(&TestEvent::insert(members, membership(12, "key:b")))
+            .unwrap();
+        let narrowings = notifs.narrowings();
+        assert_eq!(narrowings.len(), 1, "only the caller holding key:b moves");
+        assert_eq!(narrowings[0].subscription, second.subscription_id);
+        assert_eq!(narrowings[0].values, vec![Value::Int(12)]);
+        assert!(narrowings[0].entered);
+
+        assert_eq!(
+            engine
+                .consumers(&TestEvent::insert(docs, doc(1, 12, "spec")))
+                .unwrap()
+                .inserted(),
+            &[2],
+            "the second caller reaches project 12 through its key, the first does not"
+        );
+        assert_ne!(
+            first.subscription_id, second.subscription_id,
+            "two subscriptions, one predicate"
+        );
     }
 }
 
@@ -964,9 +1122,9 @@ mod describe_terms {
         );
         assert_eq!(
             term.seed_sql,
-            "SELECT project_id FROM project_members WHERE user_id = \
+            "SELECT \"user_id\", project_id FROM project_members WHERE user_id = \
          current_setting('app.user_id', true)",
-            "the seed read is the subquery itself, so it cannot disagree with the filter"
+            "the seed read is the subquery itself, projecting the subject granting each row"
         );
     }
 
@@ -1032,7 +1190,7 @@ mod describe_terms {
     fn refuses_alike(sql: &str) {
         let (mut engine, _) = engine();
         let request =
-            || SubscriptionRequest::new(1u64, sql).subscriber(Value::String("alice".into()));
+            || SubscriptionRequest::new(1u64, sql).subjects([Value::String("alice".into())]);
         let described = engine
             .describe_terms(&request())
             .err()
@@ -1159,8 +1317,8 @@ mod describe_terms {
         engine
             .register(
                 SubscriptionRequest::new(1u64, CROSS_TERM)
-                    .subscriber(Value::String("alice".into()))
-                    .term_values(vec!["proj"], rows_of(vec![Value::Int(7)])),
+                    .subjects([Value::String("alice".into())])
+                    .term_values(vec!["proj"], rows_of("alice", vec![Value::Int(7)])),
             )
             .expect("a cross-named correlation registers");
 

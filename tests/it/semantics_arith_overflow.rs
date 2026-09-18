@@ -327,13 +327,18 @@ fn a_term_that_short_circuits_the_overflow_keeps_its_subscriber_answered() {
 
     let subscribe = |consumer: u64, projects: &[i64]| {
         SubscriptionRequest::new(consumer, PREDICATE)
-            .subscriber(Value::String(format!("user{consumer}")))
+            .subjects([Value::String(format!("user{consumer}"))])
             .term_values(
                 vec!["project_id"],
                 projects
                     .iter()
                     .copied()
-                    .map(|project| vec![Value::Int(project)])
+                    .map(|project| {
+                        (
+                            Value::String(format!("user{consumer}")),
+                            vec![Value::Int(project)],
+                        )
+                    })
                     .collect(),
             )
     };

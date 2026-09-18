@@ -20,10 +20,16 @@ use subql::{
     catalog_helpers, DefaultIds, RegisterError, SubscriptionEngine, SubscriptionRequest, TableId,
 };
 
-/// One-wide value rows, the shape the tuple-stating API takes for the
-/// ordinary single-column term.
-fn rows_of(values: Vec<Value<Postgres>>) -> Vec<Vec<Value<Postgres>>> {
-    values.into_iter().map(|value| vec![value]).collect()
+/// One-wide value rows granted by `subject`, the shape the tuple-stating API
+/// takes for the ordinary single-column term.
+fn rows_of(
+    subject: &str,
+    values: Vec<Value<Postgres>>,
+) -> Vec<(Value<Postgres>, Vec<Value<Postgres>>)> {
+    values
+        .into_iter()
+        .map(|value| (Value::String(subject.into()), vec![value]))
+        .collect()
 }
 
 const DDL: &str = "CREATE TABLE projects(id INTEGER PRIMARY KEY, name TEXT);
@@ -260,7 +266,8 @@ fn a_caller_comparison_composes_with_a_membership_subquery() {
         .register(
             SubscriptionRequest::new(1u64, mixed)
                 .subscriber(Value::String("alice".into()))
-                .term_values(vec!["project_id"], rows_of(vec![Value::Int(7)])),
+                .subjects([Value::String("alice".into())])
+                .term_values(vec!["project_id"], rows_of("alice", vec![Value::Int(7)])),
         )
         .unwrap();
 
@@ -331,15 +338,15 @@ mod refusals {
     use subql::backend::{Postgres, Value};
     use subql::{DefaultIds, SubscriptionEngine, SubscriptionRequest, Tier};
 
-    /// The refusal the finding asked for by name: without a subscriber the
-    /// registration is refused with a message naming the missing subscriber,
+    /// The refusal the finding asked for by name: without the value the
+    /// comparison admits the registration is refused with a message naming it,
     /// rather than as unsupported SQL.
     #[test]
-    fn without_a_subscriber_the_refusal_names_the_subscriber() {
+    fn without_a_subscriber_the_refusal_names_what_the_comparison_admits() {
         let (mut engine, _) = engine();
         let reason = refusal(&mut engine, SubscriptionRequest::new(1u64, CALLER));
         assert!(
-            reason.contains("subscriber"),
+            reason.contains("which value that comparison admits"),
             "the refusal names what is missing: {reason}"
         );
     }
@@ -383,8 +390,10 @@ mod refusals {
         let (mut engine, _) = engine();
         let reason = refusal(
             &mut engine,
-            subscribe(1, "alice")
-                .term_values(vec!["owner"], rows_of(vec![Value::String("bob".into())])),
+            subscribe(1, "alice").term_values(
+                vec!["owner"],
+                rows_of("alice", vec![Value::String("bob".into())]),
+            ),
         );
         assert!(
             reason.contains("owner"),
