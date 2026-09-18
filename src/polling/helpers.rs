@@ -7,6 +7,11 @@ pub(super) fn sql_string_literal(s: &str) -> String {
     format!("'{}'", s.replace('\'', "''"))
 }
 
+/// Render a raw LSN the way Postgres spells one, for a `pg_lsn` literal.
+pub(super) fn render_lsn(lsn: u64) -> String {
+    format!("{:X}/{:X}", lsn >> 32, lsn & 0xFFFF_FFFF)
+}
+
 /// Decode lowercase ASCII hex bytes into raw bytes. Rejects odd-length
 /// or non-hex inputs with a structured error message.
 pub(super) fn hex_decode(bytes: &[u8]) -> Result<Vec<u8>, String> {
@@ -37,7 +42,7 @@ fn hex_nibble(b: u8) -> Result<u8, String> {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
-    use super::{hex_decode, sql_string_literal};
+    use super::{hex_decode, render_lsn, sql_string_literal};
     use alloc::vec::Vec;
 
     #[test]
@@ -65,5 +70,18 @@ mod tests {
     fn sql_string_literal_escapes_quotes() {
         assert_eq!(sql_string_literal("foo'bar"), "'foo''bar'");
         assert_eq!(sql_string_literal("ok_slot"), "'ok_slot'");
+    }
+
+    #[test]
+    fn render_lsn_is_read_back_by_the_parser() {
+        for lsn in [0u64, 1, 0xFFFF_FFFF, 0x1_0000_0000, 0x16B3_7480_0000_00FF] {
+            let rendered = render_lsn(lsn);
+            assert_eq!(
+                pg_walstream::parse_lsn(&rendered).unwrap(),
+                lsn,
+                "{rendered} did not read back"
+            );
+        }
+        assert_eq!(render_lsn(0), "0/0");
     }
 }
