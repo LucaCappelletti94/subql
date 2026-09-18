@@ -532,7 +532,7 @@ where
 {
     let snapshot = partition.load_snapshot();
     let mut ordinals = RoaringBitmap::new();
-    for (pred_id, consumers) in &snapshot.predicates.predicate_consumers {
+    for (pred_id, consumers) in snapshot.predicates.predicate_consumers.iter() {
         let Some(pred) = snapshot.predicates.get_predicate(*pred_id) else {
             continue;
         };

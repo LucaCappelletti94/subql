@@ -382,8 +382,7 @@ impl<I: IdTypes, B: Backend> PartitionTxn<'_, I, B> {
         if !self.store().term_members.contains_key(&(pred_id, slot)) {
             return RoaringBitmap::new();
         }
-        let store = self.store_mut();
-        let Some(members) = store.term_members.get_mut(&(pred_id, slot)) else {
+        let Some(members) = self.store_mut().term_members_mut(pred_id, slot) else {
             return RoaringBitmap::new();
         };
         let changed = if widen {
@@ -408,8 +407,7 @@ impl<I: IdTypes, B: Backend> PartitionTxn<'_, I, B> {
         if !self.store().term_members.contains_key(&(pred_id, slot)) {
             return Vec::new();
         }
-        let store = self.store_mut();
-        let Some(members) = store.term_members.get_mut(&(pred_id, slot)) else {
+        let Some(members) = self.store_mut().term_members_mut(pred_id, slot) else {
             return Vec::new();
         };
         let withdrawn = members.clear_admissions();
@@ -452,7 +450,7 @@ impl<I: IdTypes, B: Backend> PartitionTxn<'_, I, B> {
         }
         let indexes = if self.rebuild_all {
             let mut rebuilt = HybridIndexes::new();
-            for (idx, pred) in &self.partition.mutable_predicates.predicates {
+            for (idx, pred) in self.partition.mutable_predicates.predicates.iter() {
                 rebuilt.add_predicate(
                     PredicateId::from_slab_index(idx),
                     &pred.index_atoms,

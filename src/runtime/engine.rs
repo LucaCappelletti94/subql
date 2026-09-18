@@ -4569,7 +4569,7 @@ where
 
         // Convert predicates to serializable format
         let mut predicate_data_vec = Vec::new();
-        for (_idx, pred) in &snapshot.predicates.predicates {
+        for (_idx, pred) in snapshot.predicates.predicates.iter() {
             let pred_data = PredicateData {
                 hash: pred.hash,
                 normalized_sql: pred.normalized_sql.to_string(),

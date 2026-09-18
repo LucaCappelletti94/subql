@@ -365,17 +365,28 @@ impl<B: Backend> TermMembers<B> {
 /// Manages predicates with slab allocation and hash-based deduplication.
 /// Tracks refcounts and automatically removes predicates when refcount
 /// reaches 0.
+/// Which subscribers each of a predicate's term slots admits, one shared entry
+/// per slot.
+pub type TermSlots<B> = HashMap<(PredicateId, u16), Arc<TermMembers<B>>>;
+
+/// Every index is shared rather than inline.
+///
+/// A snapshot is published after each mutation, and the next mutation clones
+/// whatever it finds shared. Inline, that was the whole store on every
+/// membership event, including the bindings and predicates the event never
+/// reads. Shared, the clone copies seven pointers and deepens only into the
+/// index the mutation reaches.
 pub struct PredicateStore<I: IdTypes, B: Backend> {
     /// Slab-allocated predicates (stable IDs).
-    pub predicates: Slab<Predicate<B>>,
+    pub predicates: Arc<Slab<Predicate<B>>>,
     /// Hash -> candidate PredicateIds (for deduplication with collision checks).
-    pub hash_index: HashMap<PredicateHash, Vec<PredicateId>>,
+    pub hash_index: Arc<HashMap<PredicateHash, Vec<PredicateId>>>,
     /// SubscriptionId -> SubscriptionBinding.
-    pub bindings: HashMap<SubscriptionId, SubscriptionBinding<I>>,
+    pub bindings: Arc<HashMap<SubscriptionId, SubscriptionBinding<I>>>,
     /// SessionId -> `Vec<SubscriptionId>` (for session cleanup).
-    pub scope_index: HashMap<I::SessionId, Vec<SubscriptionId>>,
+    pub scope_index: Arc<HashMap<I::SessionId, Vec<SubscriptionId>>>,
     /// PredicateId -> `RoaringBitmap<ConsumerOrdinal>` (consumers interested in this predicate).
-    pub predicate_consumers: HashMap<PredicateId, RoaringBitmap>,
+    pub predicate_consumers: Arc<HashMap<PredicateId, RoaringBitmap>>,
     /// (PredicateId, ConsumerOrdinal) -> SubscriptionIds bound to that pair.
     ///
     /// A single (predicate, consumer) pair may carry multiple subscription
@@ -384,25 +395,32 @@ pub struct PredicateStore<I: IdTypes, B: Backend> {
     /// eviction policies to stamp the matched subscriptions after
     /// dispatch in O(1) per matched pair instead of an O(B) scan over
     /// `bindings`.
-    pub binding_lookup: HashMap<(PredicateId, ConsumerOrdinal), Vec<SubscriptionId>>,
+    pub binding_lookup: Arc<HashMap<(PredicateId, ConsumerOrdinal), Vec<SubscriptionId>>>,
     /// (PredicateId, term slot) -> which subscribers that term admits.
     ///
     /// Empty for every predicate carrying no membership term, which is every
     /// predicate until one is registered, so a term-free engine pays one absent
     /// hash lookup per event and nothing else.
-    pub term_members: HashMap<(PredicateId, u16), TermMembers<B>>,
+    ///
+    /// Each slot is shared on its own, so a membership row touching one term
+    /// copies that term's members and leaves every other slot's pointer alone.
+    pub term_members: Arc<TermSlots<B>>,
 }
 
+// Every field is shared, so this is seven pointer copies. It stays hand-written
+// for the same reason `TermMembers`'s is, to keep the bounds off the backend
+// marker, and every mutation below goes through `Arc::make_mut` so the sharing
+// stays invisible to a reader.
 impl<I: IdTypes, B: Backend> Clone for PredicateStore<I, B> {
     fn clone(&self) -> Self {
         Self {
-            predicates: self.predicates.clone(),
-            hash_index: self.hash_index.clone(),
-            bindings: self.bindings.clone(),
-            scope_index: self.scope_index.clone(),
-            predicate_consumers: self.predicate_consumers.clone(),
-            binding_lookup: self.binding_lookup.clone(),
-            term_members: self.term_members.clone(),
+            predicates: Arc::clone(&self.predicates),
+            hash_index: Arc::clone(&self.hash_index),
+            bindings: Arc::clone(&self.bindings),
+            scope_index: Arc::clone(&self.scope_index),
+            predicate_consumers: Arc::clone(&self.predicate_consumers),
+            binding_lookup: Arc::clone(&self.binding_lookup),
+            term_members: Arc::clone(&self.term_members),
         }
     }
 }
@@ -412,13 +430,13 @@ impl<I: IdTypes, B: Backend> PredicateStore<I, B> {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            predicates: Slab::new(),
-            hash_index: HashMap::new(),
-            bindings: HashMap::new(),
-            scope_index: HashMap::new(),
-            predicate_consumers: HashMap::new(),
-            binding_lookup: HashMap::new(),
-            term_members: HashMap::new(),
+            predicates: Arc::new(Slab::new()),
+            hash_index: Arc::new(HashMap::new()),
+            bindings: Arc::new(HashMap::new()),
+            scope_index: Arc::new(HashMap::new()),
+            predicate_consumers: Arc::new(HashMap::new()),
+            binding_lookup: Arc::new(HashMap::new()),
+            term_members: Arc::new(HashMap::new()),
         }
     }
 
@@ -453,20 +471,37 @@ impl<I: IdTypes, B: Backend> PredicateStore<I, B> {
     /// Get mutable predicate by ID
     #[must_use]
     pub fn get_predicate_mut(&mut self, id: PredicateId) -> Option<&mut Predicate<B>> {
-        self.predicates.get_mut(id.to_slab_index())
+        Arc::make_mut(&mut self.predicates).get_mut(id.to_slab_index())
+    }
+
+    /// The members of one term slot, ready to be changed.
+    ///
+    /// Deepens the sharing exactly twice, once for the slot table and once for
+    /// the slot itself, so a membership row leaves every other slot shared.
+    pub(super) fn term_members_mut(
+        &mut self,
+        pred: PredicateId,
+        slot: u16,
+    ) -> Option<&mut TermMembers<B>> {
+        Arc::make_mut(&mut self.term_members)
+            .get_mut(&(pred, slot))
+            .map(Arc::make_mut)
     }
 
     /// Add new predicate
     ///
     /// Returns allocated `PredicateId` from slab insertion.
     pub fn add_predicate(&mut self, mut predicate: Predicate<B>) -> PredicateId {
-        let entry = self.predicates.vacant_entry();
+        let entry = Arc::make_mut(&mut self.predicates).vacant_entry();
         let id = PredicateId::from_slab_index(entry.key());
         let hash = predicate.hash;
         predicate.id = id;
 
         entry.insert(predicate);
-        self.hash_index.entry(hash).or_default().push(id);
+        Arc::make_mut(&mut self.hash_index)
+            .entry(hash)
+            .or_default()
+            .push(id);
 
         id
     }
@@ -504,15 +539,16 @@ impl<I: IdTypes, B: Backend> PredicateStore<I, B> {
 
     /// Remove predicate completely
     fn remove_predicate(&mut self, id: PredicateId) {
-        if let Some(pred) = self.predicates.try_remove(id.to_slab_index()) {
-            if let Some(ids) = self.hash_index.get_mut(&pred.hash) {
+        if let Some(pred) = Arc::make_mut(&mut self.predicates).try_remove(id.to_slab_index()) {
+            let hash_index = Arc::make_mut(&mut self.hash_index);
+            if let Some(ids) = hash_index.get_mut(&pred.hash) {
                 ids.retain(|existing| *existing != id);
                 if ids.is_empty() {
-                    self.hash_index.remove(&pred.hash);
+                    hash_index.remove(&pred.hash);
                 }
             }
-            self.predicate_consumers.remove(&id);
-            self.term_members.retain(|(pred, _), _| *pred != id);
+            Arc::make_mut(&mut self.predicate_consumers).remove(&id);
+            Arc::make_mut(&mut self.term_members).retain(|(pred, _), _| *pred != id);
         }
     }
 
@@ -522,7 +558,7 @@ impl<I: IdTypes, B: Backend> PredicateStore<I, B> {
 
         // Overwrite-safe upsert: remove previous secondary index entries when
         // replacing an existing subscription ID.
-        if let Some(previous) = self.bindings.insert(sub_id, binding) {
+        if let Some(previous) = Arc::make_mut(&mut self.bindings).insert(sub_id, binding) {
             self.remove_binding_indexes(previous);
         }
 
@@ -533,7 +569,7 @@ impl<I: IdTypes, B: Backend> PredicateStore<I, B> {
     ///
     /// Returns the removed binding if it existed.
     pub fn remove_binding(&mut self, sub_id: SubscriptionId) -> Option<SubscriptionBinding<I>> {
-        let binding = self.bindings.remove(&sub_id)?;
+        let binding = Arc::make_mut(&mut self.bindings).remove(&sub_id)?;
 
         self.remove_binding_indexes(binding);
 
@@ -566,16 +602,18 @@ impl<I: IdTypes, B: Backend> PredicateStore<I, B> {
         let consumer_ord = binding.consumer_ordinal;
 
         if let SubscriptionScope::Session(sid) = binding.scope {
-            self.scope_index.entry(sid).or_default().push(sub_id);
+            Arc::make_mut(&mut self.scope_index)
+                .entry(sid)
+                .or_default()
+                .push(sub_id);
         }
 
-        self.predicate_consumers
+        Arc::make_mut(&mut self.predicate_consumers)
             .entry(pred_id)
             .or_default()
             .insert(consumer_ord.get());
 
-        let subs = self
-            .binding_lookup
+        let subs = Arc::make_mut(&mut self.binding_lookup)
             .entry((pred_id, consumer_ord))
             .or_default();
         if !subs.contains(&sub_id) {
@@ -592,35 +630,38 @@ impl<I: IdTypes, B: Backend> PredicateStore<I, B> {
         });
 
         if !has_other_same_consumer_binding {
-            if let Some(bitmap) = self.predicate_consumers.get_mut(&binding.predicate_id) {
+            let consumers = Arc::make_mut(&mut self.predicate_consumers);
+            if let Some(bitmap) = consumers.get_mut(&binding.predicate_id) {
                 bitmap.remove(binding.consumer_ordinal.get());
                 if bitmap.is_empty() {
-                    self.predicate_consumers.remove(&binding.predicate_id);
+                    consumers.remove(&binding.predicate_id);
                 }
             }
             // Under the same guard as the bitmap: the ordinal is what a term
             // admits, so it stays while any binding still holds it, and a
             // stale ordinal would admit rows to a subscription that is gone.
-            for ((pred, _), members) in &mut self.term_members {
+            for ((pred, _), members) in Arc::make_mut(&mut self.term_members) {
                 if *pred == binding.predicate_id {
-                    members.forget(binding.consumer_ordinal);
+                    Arc::make_mut(members).forget(binding.consumer_ordinal);
                 }
             }
         }
 
         let lookup_key = (binding.predicate_id, binding.consumer_ordinal);
-        if let Some(subs) = self.binding_lookup.get_mut(&lookup_key) {
+        let lookup = Arc::make_mut(&mut self.binding_lookup);
+        if let Some(subs) = lookup.get_mut(&lookup_key) {
             subs.retain(|&id| id != sub_id);
             if subs.is_empty() {
-                self.binding_lookup.remove(&lookup_key);
+                lookup.remove(&lookup_key);
             }
         }
 
         if let SubscriptionScope::Session(session_id) = binding.scope {
-            if let Some(subs) = self.scope_index.get_mut(&session_id) {
+            let scopes = Arc::make_mut(&mut self.scope_index);
+            if let Some(subs) = scopes.get_mut(&session_id) {
                 subs.retain(|&id| id != sub_id);
                 if subs.is_empty() {
-                    self.scope_index.remove(&session_id);
+                    scopes.remove(&session_id);
                 }
             }
         }
@@ -642,7 +683,11 @@ impl<I: IdTypes, B: Backend> PredicateStore<I, B> {
         subjects: &[TermKey<B>],
         rows: Vec<(TermKey<B>, TermRow<B>)>,
     ) {
-        let members = self.term_members.entry((pred, slot)).or_default();
+        let members = Arc::make_mut(
+            Arc::make_mut(&mut self.term_members)
+                .entry((pred, slot))
+                .or_default(),
+        );
         members.claim(subjects, ordinal);
         for (subject, row) in rows {
             members.admit(&subject, row, ordinal);
@@ -653,7 +698,7 @@ impl<I: IdTypes, B: Backend> PredicateStore<I, B> {
     /// no term in that slot.
     #[must_use]
     pub fn term_members(&self, pred: PredicateId, slot: u16) -> Option<&TermMembers<B>> {
-        self.term_members.get(&(pred, slot))
+        self.term_members.get(&(pred, slot)).map(|slot| &**slot)
     }
 }
 
