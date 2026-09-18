@@ -3920,23 +3920,25 @@ where
                     if before == after {
                         continue;
                     }
-                    if let Some((values, subject)) = before {
+                    // The gained half first, so a row moving between two subjects one
+                    // caller holds never reports a withdrawal it takes back.
+                    if let Some((values, subject)) = after {
                         actions.push((
                             watch.clone(),
                             TermAction::Move {
                                 values,
                                 subject,
-                                entered: false,
+                                entered: true,
                             },
                         ));
                     }
-                    if let Some((values, subject)) = after {
+                    if let Some((values, subject)) = before {
                         actions.push((
                             watch,
                             TermAction::Move {
                                 values,
                                 subject,
-                                entered: true,
+                                entered: false,
                             },
                         ));
                     }

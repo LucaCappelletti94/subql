@@ -1120,6 +1120,39 @@ mod changed_membership {
             "project 7 is still granted by key:a, which the caller claimed before key:b"
         );
     }
+
+    /// A membership row handed from one of a caller's subjects to another
+    /// changes nothing the caller can see, so it reports nothing. The halves of
+    /// an update arrive separately, and reporting the withdrawal would make a
+    /// consumer drop rows it still holds and read them back.
+    #[test]
+    fn a_row_moving_between_two_held_subjects_reports_nothing() {
+        let (mut engine, docs) = engine();
+        let members = members_table(&engine);
+        engine
+            .register(subscribe_as(1, &[("key:a", 7), ("key:b", 11)]))
+            .unwrap();
+
+        let notifs = engine
+            .consumers(&TestEvent::update(
+                members,
+                membership(7, "key:a"),
+                membership(7, "key:b"),
+            ))
+            .unwrap();
+        assert!(
+            notifs.narrowings().is_empty(),
+            "project 7 was granted before and after, by two subjects the caller holds"
+        );
+        assert_eq!(
+            engine
+                .consumers(&TestEvent::insert(docs, doc(1, 7, "spec")))
+                .unwrap()
+                .inserted(),
+            &[1],
+            "and it still reaches the caller"
+        );
+    }
 }
 
 mod describe_terms {
