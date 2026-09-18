@@ -32,6 +32,8 @@ fn acknowledged(ack_rx: &std::sync::mpsc::Receiver<u64>) -> Option<u64> {
 /// Postgres reports every row of a transaction at the transaction's own
 /// position, so an acknowledgement names a transaction and never a record,
 /// and the position that releases it is the `end_lsn` its commit states.
+/// A transaction is keyed on its last change, so acknowledging one change of
+/// a multi-statement transaction does not release the rest of it.
 fn release_for(
     pending: &mut alloc::vec::Vec<(u64, u64)>,
     delivered: &mut alloc::collections::BTreeSet<u64>,

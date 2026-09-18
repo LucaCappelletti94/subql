@@ -12,7 +12,7 @@ use crate::common;
 
 use std::time::Duration;
 
-use diesel::{sql_query, PgConnection, QueryableByName, RunQueryDsl};
+use diesel::{sql_query, Connection, PgConnection, QueryableByName, RunQueryDsl};
 use sql_traits::structs::ParserDB;
 use sqlparser::dialect::PostgreSqlDialect;
 use subql::backend::{CdcEvent, RowKind};
@@ -319,6 +319,59 @@ fn a_long_lived_source_keeps_delivering_later_transactions() {
                 "each transaction arrives in turn"
             );
         }
+    });
+
+    common::drop_slot(&mut setup, &slot);
+}
+
+/// Every change of a multi-statement transaction arrives.
+///
+/// The rows of one transaction all carry its position, so marking that
+/// position delivered on the first row would swallow the rest.
+#[test]
+#[ignore = "requires Docker; run with --ignored"]
+fn every_change_of_one_transaction_is_delivered() {
+    common::assert_docker_available();
+    let db = common::pg_database();
+    let mut setup = db.connect();
+    let mut dml = db.connect();
+    let slot = db.slot("subql_polling_multi");
+    let publication = "subql_polling_multi_pub";
+    fixture(&mut setup, "multi statement", publication, &slot);
+
+    common::multi_thread_rt().block_on(async {
+        let mut source =
+            PollingPgCdcSource::connect(config(db.url(), &slot, publication), catalog())
+                .await
+                .expect("connect polling source");
+        dml.transaction::<_, diesel::result::Error, _>(|conn| {
+            for id in 1..=3 {
+                sql_query(format!("INSERT INTO orders VALUES ({id}, {id}.0)")).execute(conn)?;
+            }
+            Ok(())
+        })
+        .expect("three inserts in one transaction");
+
+        let mut seen = Vec::new();
+        for _ in 0..3 {
+            let event = tokio::time::timeout(Duration::from_secs(5), source.next_event())
+                .await
+                .unwrap_or_else(|_| panic!("all three changes arrive, got {seen:?}"))
+                .expect("no source error")
+                .expect("the source is open");
+            let id = event
+                .value_at(&catalog(), RowKind::New, 0)
+                .expect("the new image carries the key");
+            seen.push(id);
+        }
+        assert_eq!(
+            seen,
+            vec![
+                subql::backend::Value::Int(1),
+                subql::backend::Value::Int(2),
+                subql::backend::Value::Int(3)
+            ]
+        );
     });
 
     common::drop_slot(&mut setup, &slot);

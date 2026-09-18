@@ -33,12 +33,12 @@
 //! Polling adds roughly `poll_interval / 2` average latency on top of
 //! the wire RTT. At 100 ms polling cadence this is ~50 ms per event.
 //!
-//! # Ack semantics differ from push
+//! # Acknowledging releases the slot
 //!
-//! Polling uses `pg_logical_slot_get_binary_changes`, which
-//! auto-advances the slot's `confirmed_flush_lsn` as a side effect of
-//! the drain. Consequently, the `ack` method on the [`CdcSource`] impl
-//! for [`PollingPgCdcSource`] is a **no-op**.
+//! Polling reads through `pg_logical_slot_peek_binary_changes`, which does
+//! not consume, so the slot's `confirmed_flush_lsn` moves only when
+//! [`crate::CdcSource::ack`] says a transaction is applied. That is the same
+//! contract the push source answers.
 //!
 //! [`CdcSource`]: crate::CdcSource
 
