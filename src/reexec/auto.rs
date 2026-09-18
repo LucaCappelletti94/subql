@@ -351,7 +351,9 @@ where
     ///
     /// `None` whenever no drain was abandoned, which is the ordinary case.
     #[must_use]
-    pub fn take_undelivered(&mut self) -> Option<super::Dispatched<I, E::Backend, E::Checkpoint>> {
+    pub const fn take_undelivered(
+        &mut self,
+    ) -> Option<super::Dispatched<I, E::Backend, E::Checkpoint>> {
         self.undelivered.take()
     }
 
@@ -366,7 +368,9 @@ where
 
     /// Reclaim what [`park_undelivered`](Self::park_undelivered) held, for a
     /// drain that ran to completion.
-    pub(super) fn claim_undelivered(&mut self) -> super::Dispatched<I, E::Backend, E::Checkpoint> {
+    pub(super) const fn claim_undelivered(
+        &mut self,
+    ) -> super::Dispatched<I, E::Backend, E::Checkpoint> {
         self.undelivered.take().expect(
             "a drain parks its notifications before its first await and nothing \
              between that and this claim touches the park",
