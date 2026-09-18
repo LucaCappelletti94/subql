@@ -14,10 +14,16 @@ use crate::visibility::transition::is_key_only;
 use crate::visibility::{EventRow, RowView};
 use crate::{ColumnId, EventKind};
 
-use super::{KeyedRequery, Requery, StoreDiff, StoreDiffError, Uncovered, UncoveredReason};
+use super::{
+    KeyedRequery, Requeries, Requery, StoreDiff, StoreDiffError, Uncovered, UncoveredReason,
+};
 
 impl<DB: DatabaseLike> Shapes<DB> {
-    /// What `event` moved.
+    /// What `event` moved, and the queries it obliged.
+    ///
+    /// The queries come back as their own [`Requeries`] value rather than a
+    /// field of the difference, so a caller cannot take the facts without
+    /// also taking them.
     ///
     /// # Errors
     ///
@@ -27,7 +33,10 @@ impl<DB: DatabaseLike> Shapes<DB> {
     /// shape had to read a previous image that carries only its key, and
     /// [`StoreDiffError::Row`] when an image could not be read. None yields
     /// a partial difference.
-    pub fn diff<E>(&self, event: &E) -> Result<StoreDiff<'_, E::Backend>, StoreDiffError>
+    pub fn diff<E>(
+        &self,
+        event: &E,
+    ) -> Result<(StoreDiff, Requeries<'_, E::Backend>), StoreDiffError>
     where
         E: CdcEvent,
     {
@@ -45,7 +54,7 @@ impl<DB: DatabaseLike> Shapes<DB> {
             return Err(StoreDiffError::UnknownTable);
         };
         let Some(shapes) = self.table_shapes(table) else {
-            return Ok(StoreDiff::empty());
+            return Ok((StoreDiff::default(), Requeries::new(Vec::new())));
         };
 
         // Only a differenced shape has to read the row, so a key-only previous
@@ -63,11 +72,18 @@ impl<DB: DatabaseLike> Shapes<DB> {
             None => BTreeSet::new(),
         };
 
-        Ok(StoreDiff {
-            added: after.difference(&before).cloned().collect(),
-            removed: before.difference(&after).cloned().collect(),
-            requeries: requeries(self, shapes, current.as_ref(), previous.as_ref())?,
-        })
+        Ok((
+            StoreDiff {
+                added: after.difference(&before).cloned().collect(),
+                removed: before.difference(&after).cloned().collect(),
+            },
+            Requeries::new(requeries(
+                self,
+                shapes,
+                current.as_ref(),
+                previous.as_ref(),
+            )?),
+        ))
     }
 }
 
@@ -391,7 +407,7 @@ CREATE TABLE readings(tenant_id INTEGER, reading_id INTEGER, starts_at TIMESTAMP
         )
         .with_pk_columns([0u16]);
 
-        let diff = store.diff(&event).unwrap();
+        let (diff, _requeries) = store.diff(&event).unwrap();
 
         assert_eq!(
             diff.added,
@@ -420,7 +436,7 @@ CREATE TABLE readings(tenant_id INTEGER, reading_id INTEGER, starts_at TIMESTAMP
         )
         .with_pk_columns([0u16]);
 
-        let diff = store.diff(&event).unwrap();
+        let (diff, _requeries) = store.diff(&event).unwrap();
 
         assert!(diff.added.is_empty(), "{:?}", diff.added);
         assert!(diff.removed.is_empty(), "{:?}", diff.removed);
@@ -435,7 +451,7 @@ CREATE TABLE readings(tenant_id INTEGER, reading_id INTEGER, starts_at TIMESTAMP
             TestEvent::<Postgres>::insert(docs, vec![Value::Int(4), text("alice"), text("body")])
                 .with_pk_columns([0u16]);
 
-        let diff = store.diff(&event).unwrap();
+        let (diff, _requeries) = store.diff(&event).unwrap();
 
         assert_eq!(
             diff.added,
@@ -460,7 +476,7 @@ CREATE TABLE readings(tenant_id INTEGER, reading_id INTEGER, starts_at TIMESTAMP
             TestEvent::<Postgres>::delete(docs, vec![Value::Int(4), text("alice"), text("body")])
                 .with_pk_columns([0u16]);
 
-        let diff = store.diff(&event).unwrap();
+        let (diff, _requeries) = store.diff(&event).unwrap();
 
         assert!(
             diff.added.is_empty(),
@@ -489,7 +505,7 @@ CREATE TABLE readings(tenant_id INTEGER, reading_id INTEGER, starts_at TIMESTAMP
         )
         .with_pk_columns([0u16]);
 
-        let diff = store.diff(&event).unwrap();
+        let (diff, _requeries) = store.diff(&event).unwrap();
 
         assert_eq!(
             diff.added,
@@ -553,7 +569,7 @@ CREATE TABLE readings(tenant_id INTEGER, reading_id INTEGER, starts_at TIMESTAMP
         let event = TestEvent::<Postgres>::insert(notes, vec![Value::Int(1), text("hi")])
             .with_pk_columns([0u16]);
 
-        let diff = store.diff(&event).unwrap();
+        let (diff, requeries) = store.diff(&event).unwrap();
 
         assert!(
             diff.added.is_empty(),
@@ -564,7 +580,7 @@ CREATE TABLE readings(tenant_id INTEGER, reading_id INTEGER, starts_at TIMESTAMP
             "no shape reads the notes table so nothing is removed"
         );
         assert!(
-            diff.requeries.is_empty(),
+            requeries.is_empty(),
             "no shape reads the notes table so nothing is requeried"
         );
     }
@@ -585,7 +601,7 @@ CREATE TABLE readings(tenant_id INTEGER, reading_id INTEGER, starts_at TIMESTAMP
             vec![Value::Int(3), text("bob")],
         );
 
-        let diff = store.diff(&event).unwrap();
+        let (diff, _requeries) = store.diff(&event).unwrap();
 
         assert_eq!(
             diff.added,
@@ -611,16 +627,16 @@ CREATE TABLE readings(tenant_id INTEGER, reading_id INTEGER, starts_at TIMESTAMP
             vec![Value::Int(3), text("alice"), text("2027-01-01T00:00:00Z")],
         );
 
-        let diff = store.diff(&event).unwrap();
+        let (diff, requeries) = store.diff(&event).unwrap();
 
         assert!(diff.added.is_empty(), "no shape settles this table");
         assert!(
             diff.removed.is_empty(),
             "an insert into a two-table shape removes nothing"
         );
-        assert_eq!(diff.requeries.len(), 1);
-        let Requery::Keyed(keyed) = &diff.requeries[0] else {
-            panic!("expected Keyed requery, got {:?}", diff.requeries[0]);
+        assert_eq!(requeries.len(), 1);
+        let Requery::Keyed(keyed) = &requeries.as_slice()[0] else {
+            panic!("expected Keyed requery, got {:?}", requeries.as_slice()[0]);
         };
         assert_eq!(keyed.query.table().name(), "team_members");
         assert_eq!(keyed.query.key_columns(), ["team_id"]);
@@ -640,10 +656,10 @@ CREATE TABLE readings(tenant_id INTEGER, reading_id INTEGER, starts_at TIMESTAMP
             vec![Value::Int(4), text("alice"), text("2027-01-01T00:00:00Z")],
         );
 
-        let diff = store.diff(&event).unwrap();
+        let (_diff, requeries) = store.diff(&event).unwrap();
 
-        let keys: Vec<_> = diff
-            .requeries
+        let keys: Vec<_> = requeries
+            .as_slice()
             .iter()
             .filter_map(|r| match r {
                 Requery::Keyed(keyed) => Some(keyed.key.clone()),
@@ -664,10 +680,10 @@ CREATE TABLE readings(tenant_id INTEGER, reading_id INTEGER, starts_at TIMESTAMP
             vec![Value::Int(3), text("alice"), text("2027-01-01T00:00:00Z")],
         );
 
-        let diff = store.diff(&event).unwrap();
+        let (_diff, requeries) = store.diff(&event).unwrap();
 
-        assert_eq!(diff.requeries.len(), 1);
-        let Requery::Keyed(keyed) = &diff.requeries[0] else {
+        assert_eq!(requeries.len(), 1);
+        let Requery::Keyed(keyed) = &requeries.as_slice()[0] else {
             panic!("expected Keyed requery");
         };
         assert_eq!(keyed.key, [Value::Int(3)]);
@@ -687,10 +703,10 @@ CREATE TABLE readings(tenant_id INTEGER, reading_id INTEGER, starts_at TIMESTAMP
         )
         .with_pk_columns([0u16]);
 
-        let diff = store.diff(&event).unwrap();
+        let (_diff, requeries) = store.diff(&event).unwrap();
 
-        assert_eq!(diff.requeries.len(), 1);
-        let Requery::Keyed(keyed) = &diff.requeries[0] else {
+        assert_eq!(requeries.len(), 1);
+        let Requery::Keyed(keyed) = &requeries.as_slice()[0] else {
             panic!("expected Keyed requery");
         };
         assert_eq!(keyed.key, [Value::Int(3)]);
@@ -708,7 +724,7 @@ CREATE TABLE readings(tenant_id INTEGER, reading_id INTEGER, starts_at TIMESTAMP
             vec![Value::Int(3), text("alice"), Value::Bool(true)],
         );
 
-        let diff = store.diff(&event).unwrap();
+        let (diff, requeries) = store.diff(&event).unwrap();
         assert!(diff.added.is_empty(), "{:?}", diff.added);
         assert_eq!(
             diff.removed,
@@ -716,7 +732,7 @@ CREATE TABLE readings(tenant_id INTEGER, reading_id INTEGER, starts_at TIMESTAMP
             "alice's membership is gone, so the fact it carried has to be removed"
         );
         assert!(
-            diff.requeries.is_empty(),
+            requeries.is_empty(),
             "the row settles the shape, so nothing is left to replay"
         );
     }
@@ -732,7 +748,7 @@ CREATE TABLE readings(tenant_id INTEGER, reading_id INTEGER, starts_at TIMESTAMP
             vec![Value::Int(3), text("alice"), Value::Bool(false)],
         );
 
-        let diff = store.diff(&event).unwrap();
+        let (diff, _requeries) = store.diff(&event).unwrap();
         assert!(diff.added.is_empty(), "{:?}", diff.added);
     }
 
@@ -749,14 +765,14 @@ CREATE TABLE readings(tenant_id INTEGER, reading_id INTEGER, starts_at TIMESTAMP
             vec![Value::Int(3), text("alice"), text("2027-01-01T00:00:00Z")],
         );
 
-        let diff = store.diff(&event).unwrap();
+        let (diff, requeries) = store.diff(&event).unwrap();
         assert!(diff.added.is_empty(), "{:?}", diff.added);
         assert!(
             diff.removed.is_empty(),
             "no row image evaluates the clock, so the replay is the remover"
         );
-        assert_eq!(diff.requeries.len(), 1);
-        let Requery::Keyed(keyed) = &diff.requeries[0] else {
+        assert_eq!(requeries.len(), 1);
+        let Requery::Keyed(keyed) = &requeries.as_slice()[0] else {
             panic!("expected Keyed requery");
         };
         assert_eq!(keyed.key, [Value::Int(3)]);
@@ -786,10 +802,10 @@ CREATE TABLE readings(tenant_id INTEGER, reading_id INTEGER, starts_at TIMESTAMP
             vec![Value::Int(7), Value::Int(9), text("2026-01-01T00:00:00Z")],
         );
 
-        let diff = store.diff(&event).unwrap();
+        let (_diff, requeries) = store.diff(&event).unwrap();
 
-        assert_eq!(diff.requeries.len(), 1, "{:?}", diff.requeries);
-        let Requery::Keyed(keyed) = &diff.requeries[0] else {
+        assert_eq!(requeries.len(), 1, "{requeries:?}");
+        let Requery::Keyed(keyed) = &requeries.as_slice()[0] else {
             panic!("expected Keyed requery");
         };
         assert_eq!(keyed.query.key_columns(), ["tenant_id", "reading_id"]);
@@ -823,7 +839,7 @@ CREATE TABLE readings(tenant_id INTEGER, reading_id INTEGER, starts_at TIMESTAMP
         // And it is refused rather than reported as a row granting nobody.
         let event = TestEvent::<Postgres>::insert(docs, vec![Value::Int(4), Value::Missing])
             .with_pk_columns([0u16]);
-        let diff = store.diff(&event).unwrap();
+        let (diff, _requeries) = store.diff(&event).unwrap();
         assert!(
             diff.added.is_empty(),
             "the unreadable column produces no grants to add"
@@ -974,9 +990,9 @@ CREATE TABLE readings(tenant_id INTEGER, reading_id INTEGER, starts_at TIMESTAMP
             vec![Value::Null, text("alice"), text("2027-01-01T00:00:00Z")],
         );
 
-        let diff = store.diff(&event).unwrap();
+        let (_diff, requeries) = store.diff(&event).unwrap();
 
-        assert!(diff.requeries.is_empty(), "{:?}", diff.requeries);
+        assert!(requeries.is_empty(), "{requeries:?}");
     }
 
     /// A NULL in any column of the key names no row, not only in the first.
@@ -989,9 +1005,9 @@ CREATE TABLE readings(tenant_id INTEGER, reading_id INTEGER, starts_at TIMESTAMP
             vec![Value::Int(7), Value::Null, text("2026-01-01T00:00:00Z")],
         );
 
-        let diff = store.diff(&event).unwrap();
+        let (_diff, requeries) = store.diff(&event).unwrap();
 
-        assert!(diff.requeries.is_empty(), "{:?}", diff.requeries);
+        assert!(requeries.is_empty(), "{requeries:?}");
     }
 
     /// A key the source did not carry is a different answer from a NULL one.
@@ -1058,10 +1074,10 @@ CREATE TABLE readings(tenant_id INTEGER, reading_id INTEGER, starts_at TIMESTAMP
         let docs = table(&store, "docs");
         let event = TestEvent::<Postgres>::insert(docs, vec![Value::Int(4), text("alice")])
             .with_pk_columns([0u16]);
-        let diff = store.diff(&event).unwrap();
+        let (_diff, requeries) = store.diff(&event).unwrap();
 
-        let [Requery::Keyed(keyed)] = diff.requeries.as_slice() else {
-            panic!("only the resolvable query: {:?}", diff.requeries);
+        let [Requery::Keyed(keyed)] = requeries.as_slice() else {
+            panic!("only the resolvable query: {requeries:?}");
         };
         assert_eq!(keyed.query.key_columns(), ["id"]);
     }
@@ -1096,8 +1112,8 @@ CREATE TABLE readings(tenant_id INTEGER, reading_id INTEGER, starts_at TIMESTAMP
         let docs = table(&store, "docs");
         let event = TestEvent::<Postgres>::insert(docs, vec![Value::Int(4), text("alice")])
             .with_pk_columns([0u16]);
-        let diff = store.diff(&event).unwrap();
-        assert!(diff.requeries.is_empty(), "{:?}", diff.requeries);
+        let (_diff, requeries) = store.diff(&event).unwrap();
+        assert!(requeries.is_empty(), "{requeries:?}");
     }
 
     /// One shape per relation, both binding the same table on the same
@@ -1126,10 +1142,10 @@ CREATE TABLE readings(tenant_id INTEGER, reading_id INTEGER, starts_at TIMESTAMP
         let event = TestEvent::<Postgres>::insert(docs, vec![Value::Int(4), text("alice")])
             .with_pk_columns([0u16]);
 
-        let diff = store.diff(&event).unwrap();
+        let (_diff, requeries) = store.diff(&event).unwrap();
 
-        let mut sql: Vec<&str> = diff
-            .requeries
+        let mut sql: Vec<&str> = requeries
+            .as_slice()
             .iter()
             .filter_map(|r| match r {
                 Requery::Keyed(keyed) => Some(keyed.query.sql()),
@@ -1144,7 +1160,7 @@ CREATE TABLE readings(tenant_id INTEGER, reading_id INTEGER, starts_at TIMESTAMP
                 "SELECT 'read' WHERE id = $1;"
             ]
         );
-        assert!(diff.requeries.iter().all(|r| match r {
+        assert!(requeries.as_slice().iter().all(|r| match r {
             Requery::Keyed(keyed) => keyed.key == [Value::Int(4)],
             Requery::Whole(_) => false,
         }));
@@ -1176,9 +1192,9 @@ CREATE TABLE readings(tenant_id INTEGER, reading_id INTEGER, starts_at TIMESTAMP
         let event = TestEvent::<Postgres>::insert(docs, vec![Value::Int(4), text("alice")])
             .with_pk_columns([0u16]);
 
-        let diff = store.diff(&event).unwrap();
+        let (_diff, requeries) = store.diff(&event).unwrap();
 
-        assert_eq!(diff.requeries.len(), 1);
+        assert_eq!(requeries.len(), 1);
     }
 
     /// One relation filled by a joining shape whose query binds `docs.id`,
@@ -1325,10 +1341,10 @@ CREATE TABLE readings(tenant_id INTEGER, reading_id INTEGER, starts_at TIMESTAMP
         let event =
             TestEvent::<Postgres>::insert(shares, vec![Value::Int(7), text("alice"), text("5")])
                 .with_pk_columns([0u16, 1u16]);
-        let diff = store.diff(&event).unwrap();
+        let (_diff, requeries) = store.diff(&event).unwrap();
 
-        let [Requery::Whole(group)] = diff.requeries.as_slice() else {
-            panic!("one group, and no keyed replay: {:?}", diff.requeries);
+        let [Requery::Whole(group)] = requeries.as_slice() else {
+            panic!("one group, and no keyed replay: {requeries:?}");
         };
         let [part] = group.region().parts() else {
             panic!("one relation on one type: {group:?}");
@@ -1368,10 +1384,10 @@ CREATE TABLE readings(tenant_id INTEGER, reading_id INTEGER, starts_at TIMESTAMP
             guests,
             vec![Value::Int(3), text("alice"), text("2027-01-01T00:00:00Z")],
         );
-        let diff = store.diff(&event).unwrap();
+        let (diff, requeries) = store.diff(&event).unwrap();
 
-        let [Requery::Whole(group)] = diff.requeries.as_slice() else {
-            panic!("one group over the shared region: {:?}", diff.requeries);
+        let [Requery::Whole(group)] = requeries.as_slice() else {
+            panic!("one group over the shared region: {requeries:?}");
         };
         assert_eq!(
             group.members().len(),
@@ -1409,10 +1425,10 @@ CREATE TABLE readings(tenant_id INTEGER, reading_id INTEGER, starts_at TIMESTAMP
 
         let leads = table(&store, "team_leads");
         let event = TestEvent::<Postgres>::delete(leads, vec![Value::Int(3), text("alice")]);
-        let diff = store.diff(&event).unwrap();
+        let (diff, requeries) = store.diff(&event).unwrap();
 
-        let [Requery::Whole(group)] = diff.requeries.as_slice() else {
-            panic!("one group over the shared region: {:?}", diff.requeries);
+        let [Requery::Whole(group)] = requeries.as_slice() else {
+            panic!("one group over the shared region: {requeries:?}");
         };
         assert_eq!(group.members().len(), 2, "{group:?}");
         assert!(
@@ -1560,7 +1576,7 @@ CREATE TABLE readings(tenant_id INTEGER, reading_id INTEGER, starts_at TIMESTAMP
         let event =
             TestEvent::<Postgres>::insert(docs, vec![Value::Int(4), text("alice"), text("b")])
                 .with_pk_columns([0u16]);
-        let diff = store.diff(&event).unwrap();
+        let (diff, _requeries) = store.diff(&event).unwrap();
         assert_eq!(
             diff.added,
             [record(
@@ -1682,8 +1698,8 @@ CREATE TABLE readings(tenant_id INTEGER, reading_id INTEGER, starts_at TIMESTAMP
         let docs = table(&store, "docs");
         let event =
             TestEvent::<Postgres>::delete(docs, vec![Value::Int(4), text("alice"), text("b")]);
-        let diff = store.diff(&event).unwrap();
-        let [Requery::Whole(scheduled)] = diff.requeries.as_slice() else {
+        let (diff, requeries) = store.diff(&event).unwrap();
+        let [Requery::Whole(scheduled)] = requeries.as_slice() else {
             panic!("the change schedules the group: {diff:?}");
         };
         assert_eq!(scheduled.region(), group.region());
@@ -1796,7 +1812,7 @@ CREATE TABLE readings(tenant_id INTEGER, reading_id INTEGER, starts_at TIMESTAMP
         let docs = table(&store, "docs");
         let event =
             TestEvent::<Postgres>::delete(docs, vec![Value::Int(4), text("alice"), text("b")]);
-        let diff = store.diff(&event).unwrap();
+        let (diff, requeries) = store.diff(&event).unwrap();
 
         assert!(
             diff.removed.is_empty(),
@@ -1804,7 +1820,7 @@ CREATE TABLE readings(tenant_id INTEGER, reading_id INTEGER, starts_at TIMESTAMP
              place, so nothing may remove it: {diff:?}"
         );
         assert!(
-            diff.added.is_empty() && diff.requeries.is_empty(),
+            diff.added.is_empty() && requeries.is_empty(),
             "and nothing is maintained at all: {diff:?}"
         );
         assert!(
