@@ -380,3 +380,76 @@ fn every_change_of_one_transaction_is_delivered() {
 
     common::drop_slot(&mut setup, &slot);
 }
+
+/// The streaming source says how much WAL its slot is holding.
+///
+/// Acknowledging is what releases a slot, so a consumer that never
+/// acknowledges retains WAL until the server's volume fills, and the only
+/// symptom is a transport error at a layer with no visible connection to the
+/// cause. The distance between what has arrived and what has been
+/// acknowledged is what makes that alertable before the disk answers for it.
+#[test]
+#[ignore = "requires Docker; run with --ignored"]
+fn the_streaming_source_reports_what_its_slot_is_holding() {
+    common::assert_docker_available();
+    let db = common::pg_database();
+    let mut setup = db.connect();
+    let mut dml = db.connect();
+    let slot = db.slot("subql_streaming_retention");
+    let publication = "subql_streaming_retention_pub";
+    fixture(&mut setup, "streaming retention", publication, &slot);
+
+    common::multi_thread_rt().block_on(async {
+        let mut source = subql::PgStreamingCdcSource::connect(
+            subql::PgStreamingConfig::new(db.url(), &slot, publication),
+            catalog(),
+        )
+        .await
+        .expect("connect streaming source");
+        assert_eq!(
+            source.unacknowledged_bytes(),
+            0,
+            "nothing has arrived yet, so nothing is held"
+        );
+        assert!(source.acknowledged_position().is_none());
+
+        sql_query("INSERT INTO orders VALUES (1, 5.0)")
+            .execute(&mut dml)
+            .expect("insert");
+        let event = tokio::time::timeout(Duration::from_secs(5), source.next_event())
+            .await
+            .expect("the insert arrives")
+            .expect("no source error")
+            .expect("the source is open");
+
+        assert!(
+            source.unacknowledged_bytes() > 0,
+            "an unacknowledged event is WAL the slot cannot release"
+        );
+        assert!(
+            source.acknowledged_position().is_none(),
+            "nothing has been acknowledged yet"
+        );
+
+        let held = source.unacknowledged_bytes();
+        let upto = event.checkpoint().expect("the event carries its position");
+        source.ack(upto).await.expect("the ack reaches the source");
+        for _ in 0..40 {
+            if source.unacknowledged_bytes() < held {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        // Not zero, since the server reports a WAL end that runs past the
+        // event's own position, so what is held falls rather than empties.
+        assert!(
+            source.unacknowledged_bytes() < held,
+            "the acknowledgement released part of what the slot was holding, \
+             still {} of {held}",
+            source.unacknowledged_bytes()
+        );
+        assert_eq!(source.acknowledged_position(), Some(upto));
+    });
+
+    common::drop_slot(&mut setup, &slot);
+}

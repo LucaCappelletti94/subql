@@ -124,6 +124,10 @@ pub struct PgStreamingCdcSource {
     ack_tx: tokio::sync::mpsc::UnboundedSender<PgLsn>,
     status_updates_sent: Arc<AtomicU64>,
     events_received: Arc<AtomicU64>,
+    /// Latest position the server has sent, and the latest one reported back
+    /// as flushed. Their difference is how much WAL the slot is holding.
+    received_lsn: Arc<AtomicU64>,
+    acked_lsn: Arc<AtomicU64>,
     /// Cancellation handle shared with the inner task's
     /// `get_copy_data_async` arm so the task wakes promptly on shutdown.
     shutdown_token: CancellationToken,
@@ -193,6 +197,10 @@ impl PgStreamingCdcSource {
         let task_status_counter = Arc::clone(&status_updates_sent);
         let events_received = Arc::new(AtomicU64::new(0));
         let task_events_counter = Arc::clone(&events_received);
+        let received_lsn = Arc::new(AtomicU64::new(0));
+        let task_received_lsn = Arc::clone(&received_lsn);
+        let acked_lsn = Arc::new(AtomicU64::new(0));
+        let task_acked_lsn = Arc::clone(&acked_lsn);
         let task_exited = Arc::new(AtomicBool::new(false));
         let task_exited_for_task = Arc::clone(&task_exited);
         let status_interval = config.status_interval;
@@ -203,6 +211,8 @@ impl PgStreamingCdcSource {
             ack_rx,
             task_status_counter,
             task_events_counter,
+            task_received_lsn,
+            task_acked_lsn,
             status_interval,
             task_token,
             task_exited_for_task,
@@ -214,6 +224,8 @@ impl PgStreamingCdcSource {
             ack_tx,
             status_updates_sent,
             events_received,
+            received_lsn,
+            acked_lsn,
             shutdown_token,
             task_exited,
             task,
@@ -250,6 +262,32 @@ impl PgStreamingCdcSource {
     #[must_use]
     pub fn task_exited_handle(&self) -> Arc<AtomicBool> {
         Arc::clone(&self.task_exited)
+    }
+
+    /// Latest position reported back to the server as flushed.
+    ///
+    /// `None` until the first [`CdcSource::ack`](crate::CdcSource::ack),
+    /// which is also the state in which the slot has released nothing.
+    #[must_use]
+    pub fn acknowledged_position(&self) -> Option<PgLsn> {
+        match self.acked_lsn.load(Ordering::Relaxed) {
+            0 => None,
+            lsn => Some(PgLsn(lsn)),
+        }
+    }
+
+    /// How much WAL the slot is holding on this source's behalf, in bytes.
+    ///
+    /// The distance between what the server has sent and what has been
+    /// acknowledged. A consumer that never acknowledges sees this grow
+    /// without bound, and so does the server's WAL volume, until it fills.
+    /// Alerting on a sustained rise is how that is caught before the disk
+    /// answers for it.
+    #[must_use]
+    pub fn unacknowledged_bytes(&self) -> u64 {
+        self.received_lsn
+            .load(Ordering::Relaxed)
+            .saturating_sub(self.acked_lsn.load(Ordering::Relaxed))
     }
 
     /// Borrow the configuration the source was built with.
@@ -306,6 +344,8 @@ async fn streaming_task(
     mut ack_rx: tokio::sync::mpsc::UnboundedReceiver<PgLsn>,
     status_counter: Arc<AtomicU64>,
     events_counter: Arc<AtomicU64>,
+    received_gauge: Arc<AtomicU64>,
+    acked_gauge: Arc<AtomicU64>,
     status_interval: Duration,
     shutdown_token: CancellationToken,
     task_exited: Arc<AtomicBool>,
@@ -367,6 +407,7 @@ async fn streaming_task(
                         );
                         let payload = bytes.slice(XLOG_DATA_HEADER_LEN..);
                         latest_received_lsn = latest_received_lsn.max(wal_end);
+                        received_gauge.store(latest_received_lsn, Ordering::Relaxed);
 
                         match decoder.decode_message(payload, Lsn::new(start_lsn)) {
                             Ok(Some(change)) => {
@@ -416,6 +457,7 @@ async fn streaming_task(
             ack = ack_rx.recv() => {
                 let Some(upto) = ack else { continue; };
                 latest_acked_lsn = latest_acked_lsn.max(upto.0);
+                acked_gauge.store(latest_acked_lsn, Ordering::Relaxed);
                 if send_status_update(
                     &mut conn,
                     &status_counter,
