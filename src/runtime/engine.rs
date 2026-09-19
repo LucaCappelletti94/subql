@@ -5166,6 +5166,37 @@ where
             .merge_shards_background(table_id, shard_bytes, fingerprint)
     }
 
+    /// Every merge this engine started and has not swapped in.
+    ///
+    /// A [`MergeJobId`] is the only way to reach a merge, so a caller that
+    /// dropped one recovers it here rather than leaving the work finished,
+    /// held in memory and never applied.
+    #[cfg(feature = "std")]
+    #[must_use]
+    pub fn pending_merges(&self) -> Vec<MergeJobId> {
+        self.merge_manager.pending_merges()
+    }
+
+    /// Swap in every merge that has finished, leaving the rest running.
+    ///
+    /// The reports come back in job order. A merge that failed stops the
+    /// drain and is reported, leaving the merges after it outstanding for
+    /// the next call.
+    ///
+    /// # Errors
+    ///
+    /// [`MergeError`] from the first merge that failed to build or swap in.
+    #[cfg(feature = "std")]
+    pub fn complete_ready_merges(&mut self) -> Result<Vec<MergeReport>, MergeError> {
+        let mut reports = Vec::new();
+        for job_id in self.pending_merges() {
+            if let Some(report) = self.try_complete_merge(job_id)? {
+                reports.push(report);
+            }
+        }
+        Ok(reports)
+    }
+
     /// Poll for merge completion and swap the result into the live partition
     ///
     /// Returns `Some(report)` if the merge finished and was swapped in,

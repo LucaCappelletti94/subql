@@ -605,7 +605,7 @@ mod tests {
     #[test]
     fn test_merge_error_display() {
         assert_eq!(
-            MergeError::UnknownJob(11).to_string(),
+            MergeError::UnknownJob(crate::MergeJobId::new(11)).to_string(),
             "Unknown merge job: 11"
         );
         assert_eq!(
