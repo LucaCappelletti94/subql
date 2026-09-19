@@ -881,6 +881,18 @@ mod tests {
             "nor the consumer bitmaps"
         );
         assert!(
+            Arc::ptr_eq(&before.hash_index, &now.hash_index),
+            "nor the hash index"
+        );
+        assert!(
+            Arc::ptr_eq(&before.scope_index, &now.scope_index),
+            "nor the session index"
+        );
+        assert!(
+            Arc::ptr_eq(&before.binding_lookup, &now.binding_lookup),
+            "nor the binding lookup"
+        );
+        assert!(
             Arc::ptr_eq(
                 before
                     .term_members
