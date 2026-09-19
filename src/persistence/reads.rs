@@ -540,4 +540,80 @@ mod tests {
             .expect_err("length is checked");
         assert!(alloc::format!("{refused}").contains("length"), "{refused}");
     }
+
+    /// The header check refuses one byte short and admits exactly enough.
+    ///
+    /// Both sides matter: refusing a file that is exactly a header long
+    /// would reject a store holding no answers, and admitting one byte
+    /// less would index past the end while reading the length.
+    #[test]
+    fn the_header_boundary_is_the_header_length() {
+        let bytes = serialize(&payload()).expect("serialize");
+
+        let short = deserialize::<DefaultIds, Postgres>(&bytes[..HEADER_LEN - 1])
+            .expect_err("a byte short of a header is not a file");
+        assert!(
+            alloc::format!("{short}").contains("shorter than its header"),
+            "{short}"
+        );
+
+        let header_only = deserialize::<DefaultIds, Postgres>(&bytes[..HEADER_LEN])
+            .expect_err("a header claiming a body it does not carry");
+        assert!(
+            !alloc::format!("{header_only}").contains("shorter than its header"),
+            "a file exactly a header long is past that check, got {header_only}"
+        );
+    }
+
+    /// The payload ceiling refuses what is past it and admits what is on it.
+    #[test]
+    fn the_payload_ceiling_is_the_ceiling_itself() {
+        let mut bytes = serialize(&payload()).expect("serialize");
+
+        #[allow(clippy::cast_possible_truncation)]
+        let write_len = |bytes: &mut [u8], len: u64| {
+            bytes[11..15].copy_from_slice(&(len as u32).to_le_bytes());
+        };
+
+        // The ceiling does not fit in the header's four bytes, so the
+        // check above it is reached with the largest length that does.
+        write_len(&mut bytes, u64::from(u32::MAX));
+        let over = deserialize::<DefaultIds, Postgres>(&bytes)
+            .expect_err("a claim past the ceiling is refused");
+        assert!(alloc::format!("{over}").contains("claims"), "{over}");
+
+        write_len(&mut bytes, MAX_PAYLOAD_LEN);
+        let on_it = deserialize::<DefaultIds, Postgres>(&bytes)
+            .expect_err("the body does not match that claim");
+        assert!(
+            !alloc::format!("{on_it}").contains("claims"),
+            "a claim of exactly the ceiling is not past it, got {on_it}"
+        );
+    }
+
+    /// The ceiling admits a store of ordinary size.
+    ///
+    /// It exists to stop a tampered length making the loader allocate
+    /// wildly, so it has to sit far above what a real store weighs. A
+    /// ceiling low enough to refuse one is a store that cannot reopen.
+    #[test]
+    fn an_ordinary_store_is_under_the_ceiling() {
+        let mut big = payload();
+        let entry = big.entries[0].clone();
+        for id in 0..40_000 {
+            let mut next = entry.clone();
+            next.subscription_id = id;
+            big.entries.push(next);
+        }
+        let bytes = serialize(&big).expect("serialize");
+        // Past every ceiling a single arithmetic slip would leave behind,
+        // the largest of which is a megabyte.
+        assert!(
+            bytes.len() > 2 * 1024 * 1024,
+            "the fixture has to outweigh a shrunken ceiling to test one, got {}",
+            bytes.len()
+        );
+        let back = deserialize::<DefaultIds, Postgres>(&bytes).expect("a real store reopens");
+        assert_eq!(back.entries.len(), big.entries.len());
+    }
 }
