@@ -30,30 +30,31 @@ pub struct SubscriptionRequest<I: IdTypes, B: Backend = crate::backend::Postgres
     /// binds are empty the `B` parameter is inferred from context; the
     /// default `B = Postgres` covers the common Postgres-backed use.
     pub(crate) binds: alloc::vec::Vec<Value<B>>,
-    /// The one value a comparison of a column to the caller admits.
+    /// The one value a term naming the caller's identity admits.
     ///
     /// Required by a filter carrying one, written
-    /// `owner = current_setting('app.user_id')` in SQL and resolved per
-    /// connection by Postgres. SubQL has neither a connection nor a session, so
-    /// the subscription states it. One value rather than a set, because that
-    /// SQL reads one session value, and admitting a union would deliver rows
-    /// the registered query does not return.
+    /// `owner = current_setting('app.user_id')` or
+    /// `user_id = current_setting('app.user_id')` inside a membership subquery,
+    /// and resolved per connection by Postgres. SubQL has neither a connection
+    /// nor a session, so the subscription states it. One value rather than a
+    /// set, because that SQL reads one session value, and admitting a union
+    /// would deliver rows the registered query does not return.
     ///
     /// Trusting it is safe because visibility gates every delivery afterwards:
     /// a subscription claiming another identity receives nothing it is not
     /// permitted to see, it only fails to receive its own rows.
     pub(crate) subscriber: Option<Value<B>>,
-    /// The subjects a membership subquery matches this caller by.
+    /// The subjects a term naming the caller's set admits.
     ///
     /// A caller is a set. A login, a capability key, or several at once, and a
-    /// membership table names them in the column it names user ids in. A
-    /// changed membership row naming any of them moves what the filter admits,
-    /// which is what the same subquery does in the database, where it reads the
-    /// whole set out of its own session setting.
+    /// filter written `= ANY(string_to_array(current_setting('app.subjects'),
+    /// ','))` reads the whole set out of its own session setting, whether it
+    /// compares a column of the subscribed table or the subject column of a
+    /// membership table. A changed membership row naming any of them moves
+    /// what the filter admits.
     ///
-    /// Required by a filter naming a membership subquery, and empty is refused
-    /// for the same reason an absent one is: the subscription could never
-    /// deliver.
+    /// Required by a filter naming the set, and empty is refused for the same
+    /// reason an absent one is: the subscription could never deliver.
     pub(crate) subjects: alloc::vec::Vec<Value<B>>,
     /// The value rows this caller's subjects currently match, grouped by the
     /// columns each membership subquery compares, each row carrying the subject
@@ -124,35 +125,36 @@ impl<I: IdTypes, B: Backend> SubscriptionRequest<I, B> {
         self
     }
 
-    /// State the one value this subscription's caller comparison admits
-    /// (default: none).
+    /// State the one value this subscription's identity terms admit (default:
+    /// none).
     ///
-    /// A filter comparing a column to the caller is refused without it, since
-    /// that comparison admits exactly this value and nothing else. Build it at
-    /// [`CallerTermDescription::kind`](crate::term::CallerTermDescription::kind):
-    /// the compared column's kind is in the catalog, so a value of another kind
-    /// is refused at registration rather than serving the subscription dead.
+    /// A filter naming the caller's identity is refused without it, since that
+    /// comparison admits exactly this value and nothing else. Build it at the
+    /// kind [`describe_terms`](crate::SubscriptionEngine::describe_terms)
+    /// names: the compared column's kind is in the catalog, so a value of
+    /// another kind is refused at registration rather than serving the
+    /// subscription dead.
     ///
-    /// A membership subquery reads [`subjects`](Self::subjects) instead. The
-    /// two are separate because the database holds them separately, one session
-    /// value for the caller and the subject set the membership rows are matched
-    /// against, and a caller whose identity is also a subject states it in both.
+    /// A filter naming the caller's set reads [`subjects`](Self::subjects)
+    /// instead. Which one a term reads is what
+    /// [`TermCaller`](crate::term::TermCaller) says on its description. The
+    /// two are separate because the database holds them separately, one
+    /// session value for the caller and the subject set beside it, and a
+    /// caller whose identity is also a subject states it in both.
     #[must_use]
     pub fn subscriber(mut self, subscriber: Value<B>) -> Self {
         self.subscriber = Some(subscriber);
         self
     }
 
-    /// State the subjects this subscription's membership subqueries match it by
-    /// (default: none).
+    /// State the subjects this subscription's set terms admit (default: none).
     ///
     /// A caller is a set: an identity, the capability keys it holds, or both,
-    /// and a membership row naming any of them reaches it. A filter naming a
-    /// membership subquery is refused with none, since nothing would ever move
-    /// what it admits.
+    /// and a row naming any of them reaches it. A filter naming the caller's
+    /// set is refused with none, since nothing would ever move what it admits.
     ///
-    /// Build every member at
-    /// [`MembershipTermDescription::subject_kind`](crate::term::MembershipTermDescription::subject_kind).
+    /// Build every member at the kind
+    /// [`describe_terms`](crate::SubscriptionEngine::describe_terms) names.
     /// The lookup keys a string and a UUID under different variants, so a
     /// member of another kind is refused rather than left matching no row in
     /// silence.

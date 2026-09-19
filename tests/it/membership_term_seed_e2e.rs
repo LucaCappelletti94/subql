@@ -22,12 +22,13 @@ use crate::common;
 use diesel::prelude::*;
 use diesel::sql_types::{Integer, Text};
 use diesel::{sql_query, PgConnection, QueryableByName};
+use rls2fga::classifier::function_registry::{SessionAttribute, SessionAttributeKind};
 use rls2fga::translator::{Translator, TranslatorBuilder};
 use rls2fga::types::ConfidenceLevel;
 use sql_traits::structs::ParserDB;
 use sqlparser::dialect::PostgreSqlDialect;
 use subql::backend::{Postgres, ScalarFamily, Value};
-use subql::term::{MembershipTermDescription, TermDescription};
+use subql::term::{MembershipTermDescription, TermCaller, TermDescription};
 use subql::testing::TestEvent;
 use subql::{catalog_helpers, DefaultIds, SubscriptionEngine, SubscriptionRequest, TableId};
 
@@ -189,7 +190,7 @@ fn snapshot_seed(conn: &mut PgConnection) -> Vec<(String, i64)> {
 /// inserted under `project` reaches it.
 fn delivers(granted: &[(String, i64)], project: i64) -> bool {
     let (mut engine, docs_id) = engine();
-    let mut request = SubscriptionRequest::new(1u64, TERM).subjects([Value::String(CALLER.into())]);
+    let mut request = SubscriptionRequest::new(1u64, TERM).subscriber(Value::String(CALLER.into()));
     let TermDescription::Membership(description) =
         engine.describe_terms(&request).unwrap().remove(0)
     else {
@@ -279,5 +280,74 @@ fn the_described_seed_read_runs_and_admits_a_parent_with_no_rows_yet() {
     assert!(
         delivers(&from_snapshot, 1),
         "and it loses only the value it omitted, not the filter altogether"
+    );
+}
+
+/// The set spelling's seed read, run as a caller holding two subjects: every
+/// row either subject grants comes back naming the one that granted it, and a
+/// row a third subject grants does not.
+#[test]
+#[ignore = "requires Docker"]
+fn the_set_spelled_seed_read_returns_every_held_subjects_rows() {
+    const SET_TERM: &str = "SELECT * FROM docs WHERE project_id IN \
+         (SELECT project_id FROM project_members \
+          WHERE user_id = ANY(string_to_array(current_setting('app.subjects', true), ',')))";
+    common::assert_docker_available();
+    let db = common::pg_database();
+    let mut pg = db.connect();
+
+    create_schema(&mut pg);
+    seed_data(&mut pg);
+    diesel::insert_into(projects::table)
+        .values([
+            (projects::id.eq(3), projects::name.eq("shared")),
+            (projects::id.eq(4), projects::name.eq("elsewhere")),
+        ])
+        .execute(&mut pg)
+        .unwrap();
+    diesel::insert_into(project_members::table)
+        .values([
+            (
+                project_members::project_id.eq(3),
+                project_members::user_id.eq("key:b"),
+            ),
+            (
+                project_members::project_id.eq(4),
+                project_members::user_id.eq("key:c"),
+            ),
+        ])
+        .execute(&mut pg)
+        .unwrap();
+    // `SET` is a session command the query DSL does not express.
+    sql_query(format!("SET app.subjects = '{CALLER},key:b'"))
+        .execute(&mut pg)
+        .unwrap();
+
+    let db = ParserDB::parse::<PostgreSqlDialect>(SCHEMA).unwrap();
+    let translator = TranslatorBuilder::new()
+        .with_min_confidence(ConfidenceLevel::B)
+        .with_session_attributes([SessionAttribute::setting(
+            "app.subjects",
+            SessionAttributeKind::SetAttribute,
+        )])
+        .build();
+    let engine: Engine =
+        SubscriptionEngine::new(db, PostgreSqlDialect {}).with_translator(translator);
+    let described = engine
+        .describe_terms(&SubscriptionRequest::new(1u64, SET_TERM))
+        .unwrap();
+    let [TermDescription::Membership(description)] = described.as_slice() else {
+        panic!("one membership subquery, got {described:?}");
+    };
+    assert_eq!(description.caller, TermCaller::Subjects);
+
+    assert_eq!(
+        run_seed(&mut pg, description),
+        [
+            (CALLER.to_string(), 1),
+            (CALLER.to_string(), 2),
+            ("key:b".to_string(), 3),
+        ],
+        "each held subject's grants come back under that subject, and key:c's do not"
     );
 }

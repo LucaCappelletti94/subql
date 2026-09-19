@@ -16,7 +16,7 @@ use super::{
     prefilter::build_prefilter_plan,
     sql_shape, BytecodeProgram, Instruction, PredicateHash, PrefilterPlan,
 };
-use crate::backend::{Backend, ScalarFamily, Value};
+use crate::backend::{Backend, ScalarFamily, ScalarTruth, Value};
 use crate::compiler::bytecode::ComparisonRef;
 use crate::compiler::sql_shape::{AggSpec, QueryProjection};
 use crate::table_resolution::{resolve_table_reference, TableResolutionError};
@@ -574,7 +574,7 @@ fn extract_table_and_where(
 /// had written the literal inline.
 ///
 /// Handles the scalars commonly bound through placeholders (Int, Float,
-/// String, Null) plus Bytes, whose canonical `X'...'` hex spelling round
+/// String, Bool, Null) plus Bytes, whose canonical `X'...'` hex spelling round
 /// trips through [`SqlLiteralParse::parse_literal`]. Every other scalar
 /// returns [`RegisterError::BindResolution`] until a downstream test
 /// exercises it and pins a canonical round-trip format.
@@ -588,6 +588,7 @@ pub(crate) fn value_to_sql_value<B: Backend>(v: &Value<B>) -> Result<SqlValue, R
             "bind value is Missing (not a concrete value)".to_string(),
         )),
         Value::Null => Ok(SqlValue::Null),
+        Value::Bool(b) => Ok(SqlValue::Boolean(b.scalar_truth())),
         Value::Int(i) => Ok(SqlValue::Number(format!("{i:?}"), false)),
         Value::Float(f) => Ok(SqlValue::Number(format!("{f:?}"), false)),
         Value::String(s) => Ok(SqlValue::SingleQuotedString(s.as_ref().to_string())),
@@ -595,8 +596,7 @@ pub(crate) fn value_to_sql_value<B: Backend>(v: &Value<B>) -> Result<SqlValue, R
         // leg (`parse_literal` -> `parse_hex_bytes`) accepts either case,
         // so `parse_literal(value_to_sql_value(Bytes(v))) == Bytes(v)`.
         Value::Bytes(b) => Ok(SqlValue::HexStringLiteral(hex_upper(b.as_ref()))),
-        Value::Bool(_)
-        | Value::Uuid(_)
+        Value::Uuid(_)
         | Value::Timestamp(_)
         | Value::TimestampTz(_)
         | Value::Date(_)
@@ -639,52 +639,39 @@ fn placeholder_index(
     Ok(idx)
 }
 
-/// Recursively replace `Value::Placeholder` leaves with their literal bind
-/// values, in placeholder order. Walks only the expression shapes the compiler
-/// supports; a placeholder in an unsupported position is left untouched and
-/// rejected later by the compiler.
+/// Replace every `Value::Placeholder` leaf of `expr` with its literal bind
+/// value, in written order, wherever the derived walk finds one.
+///
+/// Written order is what a positional `?` is numbered by, and the derived
+/// visitor walks each node's fields in declaration order, which is the
+/// written order for every shape the compiler serves.
 fn resolve_expr_placeholders<B: Backend>(
     expr: &mut Expr,
     binds: &[Value<B>],
     next_positional: &mut usize,
 ) -> Result<(), RegisterError> {
-    match expr {
-        Expr::Value(val) => {
-            if let SqlValue::Placeholder(token) = &val.value {
-                let idx = placeholder_index(token, binds.len(), next_positional)?;
-                val.value = value_to_sql_value(&binds[idx])?;
+    let mut failure = None;
+    let _: core::ops::ControlFlow<()> = sqlparser::ast::visit_expressions_mut(expr, |inner| {
+        let Expr::Value(val) = inner else {
+            return core::ops::ControlFlow::Continue(());
+        };
+        let SqlValue::Placeholder(token) = &val.value else {
+            return core::ops::ControlFlow::Continue(());
+        };
+        match placeholder_index(token, binds.len(), next_positional)
+            .and_then(|idx| value_to_sql_value(&binds[idx]))
+        {
+            Ok(literal) => {
+                val.value = literal;
+                core::ops::ControlFlow::Continue(())
+            }
+            Err(error) => {
+                failure = Some(error);
+                core::ops::ControlFlow::Break(())
             }
         }
-        Expr::BinaryOp { left, right, .. } => {
-            resolve_expr_placeholders(left, binds, next_positional)?;
-            resolve_expr_placeholders(right, binds, next_positional)?;
-        }
-        Expr::UnaryOp { expr, .. }
-        | Expr::IsNull(expr)
-        | Expr::IsNotNull(expr)
-        | Expr::Nested(expr) => {
-            resolve_expr_placeholders(expr, binds, next_positional)?;
-        }
-        Expr::InList { expr, list, .. } => {
-            resolve_expr_placeholders(expr, binds, next_positional)?;
-            for item in list.iter_mut() {
-                resolve_expr_placeholders(item, binds, next_positional)?;
-            }
-        }
-        Expr::Between {
-            expr, low, high, ..
-        } => {
-            resolve_expr_placeholders(expr, binds, next_positional)?;
-            resolve_expr_placeholders(low, binds, next_positional)?;
-            resolve_expr_placeholders(high, binds, next_positional)?;
-        }
-        Expr::Like { expr, pattern, .. } | Expr::ILike { expr, pattern, .. } => {
-            resolve_expr_placeholders(expr, binds, next_positional)?;
-            resolve_expr_placeholders(pattern, binds, next_positional)?;
-        }
-        _ => {}
-    }
-    Ok(())
+    });
+    failure.map_or(Ok(()), Err)
 }
 
 /// Resolve `$N`/`?` placeholders in the optional WHERE clause against `binds`.
@@ -889,17 +876,69 @@ mod tests {
         }
     }
 
-    /// The untouched arms still reject: a `Missing` bind and a `Bool` bind
-    /// both surface `RegisterError::BindResolution`.
+    /// A `Missing` bind surfaces `RegisterError::BindResolution`, and a bool
+    /// bind round-trips as the boolean literal, which is what
+    /// `current_setting($1, $2)` under the typed API needs.
     #[test]
-    fn missing_and_bool_binds_stay_rejected() {
+    fn missing_binds_stay_rejected_and_bools_round_trip() {
         assert!(matches!(
             value_to_sql_value(&Value::<Postgres>::Missing),
             Err(RegisterError::BindResolution(_))
         ));
-        assert!(matches!(
-            value_to_sql_value(&Value::<Postgres>::Bool(true)),
-            Err(RegisterError::BindResolution(_))
-        ));
+        for bool in [true, false] {
+            let sql = value_to_sql_value(&Value::<Postgres>::Bool(bool)).unwrap();
+            assert_eq!(sql, SqlValue::Boolean(bool));
+            assert_eq!(
+                Postgres::parse_literal(&sql, ScalarFamily::Bool.into()).unwrap(),
+                Value::<Postgres>::Bool(bool)
+            );
+        }
+    }
+
+    /// A placeholder inside a call, an `ANY` or a membership subquery is a
+    /// placeholder like any other: the follow derivation counts and renumbers
+    /// it past the SET binds, and resolution then reads the right bind.
+    #[test]
+    fn placeholders_inside_calls_and_subqueries_are_counted_renumbered_and_resolved() {
+        use crate::compiler::sql_shape::extract_single_table_and_where;
+        use sqlparser::dialect::PostgreSqlDialect;
+
+        let (select, set_binds) = super::derive_update_follow_select_with_set_binds(
+            "UPDATE notes SET title = $1 WHERE owner = ANY(string_to_array(current_setting($2, \
+             $3), $4)) AND project_id IN (SELECT project_id FROM project_members WHERE user_id \
+             = current_setting($5, $6))",
+            &PostgreSqlDialect {},
+        )
+        .unwrap();
+        assert_eq!(set_binds, 1);
+        assert_eq!(
+            select,
+            "SELECT * FROM notes WHERE owner = ANY(string_to_array(current_setting($1, $2), $3)) \
+             AND project_id IN (SELECT project_id FROM project_members WHERE user_id = \
+             current_setting($4, $5))"
+        );
+
+        let stmt =
+            crate::compiler::sql_shape::parse_single_statement(&select, &PostgreSqlDialect {})
+                .unwrap();
+        let (_, where_clause) = extract_single_table_and_where(&stmt).unwrap();
+        let resolved = super::resolve_where_placeholders::<Postgres>(
+            where_clause,
+            &[
+                Value::String("app.subjects".into()),
+                Value::Bool(true),
+                Value::String(",".into()),
+                Value::String("app.user_id".into()),
+                Value::Bool(true),
+            ],
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            resolved.to_string(),
+            "owner = ANY(string_to_array(current_setting('app.subjects', true), ',')) AND \
+             project_id IN (SELECT project_id FROM project_members WHERE user_id = \
+             current_setting('app.user_id', true))"
+        );
     }
 }

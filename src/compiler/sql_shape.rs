@@ -1941,12 +1941,13 @@ pub(super) fn contains_membership_subquery(expr: &Expr) -> bool {
     })
 }
 
-/// Whether `expr` is a call carrying no column reference: a bare keyword
-/// function, or a function of literal arguments only.
+/// Whether `expr` is a call carrying no column reference, which is a bare
+/// keyword function or a function whose arguments are literals or such calls.
 ///
 /// The shape a session accessor takes (`current_setting('app.user_id', true)`,
-/// `current_user`), recognised structurally. Which calls actually name the
-/// caller is registration's question, answered by `rls2fga`'s registry.
+/// `current_user`, `string_to_array(current_setting('app.subjects', true), ',')`),
+/// recognised structurally. Which calls actually name the caller is
+/// registration's question, answered by `rls2fga`'s registry.
 fn is_columnless_call(expr: &Expr) -> bool {
     let Expr::Function(function) = expr else {
         return false;
@@ -1966,36 +1967,53 @@ fn is_columnless_call(expr: &Expr) -> bool {
         FunctionArguments::List(list) => {
             list.duplicate_treatment.is_none()
                 && list.clauses.is_empty()
-                && list.args.iter().all(|arg| {
-                    matches!(
-                        arg,
-                        FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::Value(_)))
-                    )
+                && list.args.iter().all(|arg| match arg {
+                    FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::Value(_))) => true,
+                    FunctionArg::Unnamed(FunctionArgExpr::Expr(inner)) => is_columnless_call(inner),
+                    _ => false,
                 })
         }
     }
 }
 
-/// Is `expr` a comparison of a column to the caller, structurally: equality
-/// between an identifier and a columnless call, in either operand order?
+/// The column and the call of a comparison of a column to the caller, when
+/// `expr` is one structurally. That is `<column> = <columnless call>` in either
+/// operand order, or `<column> = ANY(<columnless call>)`, the set-valued form
+/// of the same question.
 ///
-/// Structural on purpose, mirroring the membership subquery: the form is
-/// recognised in every build, and whether the call names the caller is
-/// registration's question.
+/// Structural on purpose, mirroring the membership subquery. The form is
+/// recognised in every build, and whether the call names the caller, and
+/// whether the set is one the deployment declared, is registration's question.
+pub(crate) fn caller_comparison_sides(expr: &Expr) -> Option<(&Expr, &Expr)> {
+    let is_column = |expr: &Expr| matches!(expr, Expr::Identifier(_) | Expr::CompoundIdentifier(_));
+    match expr {
+        Expr::BinaryOp {
+            left,
+            op: BinaryOperator::Eq,
+            right,
+        } => {
+            if is_column(left) && is_columnless_call(right) {
+                Some((left, right))
+            } else if is_column(right) && is_columnless_call(left) {
+                Some((right, left))
+            } else {
+                None
+            }
+        }
+        Expr::AnyOp {
+            left,
+            compare_op: BinaryOperator::Eq,
+            right,
+            ..
+        } if is_column(left) && is_columnless_call(right) => Some((left, right)),
+        _ => None,
+    }
+}
+
+/// Is `expr` a comparison of a column to the caller, structurally? See
+/// [`caller_comparison_sides`].
 pub(crate) fn is_caller_comparison(expr: &Expr) -> bool {
-    let Expr::BinaryOp {
-        left,
-        op: BinaryOperator::Eq,
-        right,
-    } = expr
-    else {
-        return false;
-    };
-    let column_beside_call = |column: &Expr, call: &Expr| {
-        matches!(column, Expr::Identifier(_) | Expr::CompoundIdentifier(_))
-            && is_columnless_call(call)
-    };
-    column_beside_call(left, right) || column_beside_call(right, left)
+    caller_comparison_sides(expr).is_some()
 }
 
 /// Is there a caller comparison anywhere in `expr`?
@@ -2262,18 +2280,10 @@ pub(crate) fn membership_exists_parts<'a, B: crate::backend::Backend, DB: Databa
     let mut pairs = Vec::new();
     let mut caller: Option<(&Expr, &Expr)> = None;
     for conjunct in flat {
-        if is_caller_comparison(conjunct) {
+        if let Some((column_side, _)) = caller_comparison_sides(conjunct) {
             if caller.is_some() {
                 return Err(exists_refusal("compares the caller twice"));
             }
-            let Expr::BinaryOp { left, right, .. } = conjunct else {
-                unreachable!("a caller comparison is a binary comparison by construction");
-            };
-            let column_side = if qualified_parts(left).is_some() {
-                left
-            } else {
-                right
-            };
             if member_column(column_side).is_none() {
                 return Err(exists_refusal(
                     "compares the caller against something other than a membership column",
@@ -2450,38 +2460,18 @@ pub(super) fn derive_update_follow_sql_and_set_binds(
     ))
 }
 
-/// Walk `expr` and count every `SqlValue::Placeholder` leaf (positional `?`
-/// and numbered `$N` alike). Recurses through the same expression shapes the
-/// compiler already supports.
+/// Count every `SqlValue::Placeholder` leaf of `expr` (positional `?` and
+/// numbered `$N` alike), wherever the derived walk finds one.
 pub(crate) fn count_placeholders_in_expr(expr: &Expr) -> usize {
     use sqlparser::ast::Value as SqlValue;
-    match expr {
-        Expr::Value(v) => usize::from(matches!(&v.value, SqlValue::Placeholder(_))),
-        Expr::BinaryOp { left, right, .. } => {
-            count_placeholders_in_expr(left) + count_placeholders_in_expr(right)
+    let mut count = 0;
+    let _: core::ops::ControlFlow<()> = sqlparser::ast::visit_expressions(expr, |inner| {
+        if let Expr::Value(v) = inner {
+            count += usize::from(matches!(&v.value, SqlValue::Placeholder(_)));
         }
-        Expr::UnaryOp { expr, .. }
-        | Expr::IsNull(expr)
-        | Expr::IsNotNull(expr)
-        | Expr::IsTrue(expr)
-        | Expr::IsFalse(expr)
-        | Expr::Nested(expr) => count_placeholders_in_expr(expr),
-        Expr::InList { expr, list, .. } => {
-            count_placeholders_in_expr(expr)
-                + list.iter().map(count_placeholders_in_expr).sum::<usize>()
-        }
-        Expr::Between {
-            expr, low, high, ..
-        } => {
-            count_placeholders_in_expr(expr)
-                + count_placeholders_in_expr(low)
-                + count_placeholders_in_expr(high)
-        }
-        Expr::Like { expr, pattern, .. } | Expr::ILike { expr, pattern, .. } => {
-            count_placeholders_in_expr(expr) + count_placeholders_in_expr(pattern)
-        }
-        _ => 0,
-    }
+        core::ops::ControlFlow::Continue(())
+    });
+    count
 }
 
 /// Renumber numbered (`$N`) placeholders in `expr` so the smallest surviving
@@ -2490,46 +2480,19 @@ pub(crate) fn count_placeholders_in_expr(expr: &Expr) -> usize {
 /// caller trims the bind vector from the front to match.
 fn renumber_placeholders(expr: &mut Expr, set_bind_count: usize) {
     use sqlparser::ast::Value as SqlValue;
-    match expr {
-        Expr::Value(v) => {
+    let _: core::ops::ControlFlow<()> = sqlparser::ast::visit_expressions_mut(expr, |inner| {
+        if let Expr::Value(v) = inner {
             if let SqlValue::Placeholder(token) = &mut v.value {
-                if let Some(rest) = token.strip_prefix('$') {
-                    if let Ok(idx) = rest.parse::<usize>() {
-                        let new_idx = idx.saturating_sub(set_bind_count);
-                        *token = alloc::format!("${new_idx}");
-                    }
+                if let Some(idx) = token
+                    .strip_prefix('$')
+                    .and_then(|rest| rest.parse::<usize>().ok())
+                {
+                    *token = alloc::format!("${}", idx.saturating_sub(set_bind_count));
                 }
             }
         }
-        Expr::BinaryOp { left, right, .. } => {
-            renumber_placeholders(left, set_bind_count);
-            renumber_placeholders(right, set_bind_count);
-        }
-        Expr::UnaryOp { expr, .. }
-        | Expr::IsNull(expr)
-        | Expr::IsNotNull(expr)
-        | Expr::IsTrue(expr)
-        | Expr::IsFalse(expr)
-        | Expr::Nested(expr) => renumber_placeholders(expr, set_bind_count),
-        Expr::InList { expr, list, .. } => {
-            renumber_placeholders(expr, set_bind_count);
-            for item in list {
-                renumber_placeholders(item, set_bind_count);
-            }
-        }
-        Expr::Between {
-            expr, low, high, ..
-        } => {
-            renumber_placeholders(expr, set_bind_count);
-            renumber_placeholders(low, set_bind_count);
-            renumber_placeholders(high, set_bind_count);
-        }
-        Expr::Like { expr, pattern, .. } | Expr::ILike { expr, pattern, .. } => {
-            renumber_placeholders(expr, set_bind_count);
-            renumber_placeholders(pattern, set_bind_count);
-        }
-        _ => {}
-    }
+        core::ops::ControlFlow::Continue(())
+    });
 }
 
 #[cfg(test)]
@@ -2640,6 +2603,42 @@ mod membership_naming_tests {
         let parts = membership_exists_parts::<crate::backend::Postgres, _>(&subquery, docs, &db)
             .expect("the catalog knows `app.\"Shares\"`");
         assert_eq!(parts.pairs.len(), 1);
+    }
+
+    /// The set spelling of the caller conjunct is the caller conjunct, kept
+    /// verbatim as the seed's WHERE, and a call nesting a column is not.
+    #[test]
+    fn a_set_valued_caller_conjunct_is_the_caller_conjunct() {
+        let db = ParserDB::parse::<PostgreSqlDialect>(DDL).unwrap();
+        let docs = catalog_helpers::table_id::<crate::backend::Postgres, _>(&db, "docs").unwrap();
+        let subquery = exists_subquery(
+            r#"SELECT * FROM docs WHERE EXISTS (SELECT 1 FROM "my.shares" s
+               WHERE s.doc_id = docs.id
+                 AND s.viewer = ANY(string_to_array(current_setting('app.subjects', true), ',')))"#,
+        );
+
+        let parts = membership_exists_parts::<crate::backend::Postgres, _>(&subquery, docs, &db)
+            .expect("the set spelling names the caller");
+        assert_eq!(parts.pairs.len(), 1);
+        assert_eq!(parts.subject.to_string(), "s.viewer");
+        assert_eq!(
+            parts.caller.to_string(),
+            "s.viewer = ANY(string_to_array(current_setting('app.subjects', true), ','))"
+        );
+
+        let subquery = exists_subquery(
+            r#"SELECT * FROM docs WHERE EXISTS (SELECT 1 FROM "my.shares" s
+               WHERE s.doc_id = docs.id
+                 AND s.viewer = ANY(string_to_array(s.grants, ',')))"#,
+        );
+        let Err(error) =
+            membership_exists_parts::<crate::backend::Postgres, _>(&subquery, docs, &db)
+        else {
+            panic!("a call reading a column is not the caller");
+        };
+        assert!(error
+            .to_string()
+            .contains("neither a pair equality nor a caller comparison"));
     }
 
     /// A three-part name is refused rather than read as its last two parts.

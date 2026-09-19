@@ -7,6 +7,7 @@
 //! discriminating value lives on neither the subscribed row nor the subscriber.
 #![allow(clippy::unwrap_used)]
 
+use rls2fga::classifier::function_registry::{SessionAttribute, SessionAttributeKind};
 use rls2fga::translator::{Translator, TranslatorBuilder};
 use rls2fga::types::ConfidenceLevel;
 use sql_traits::structs::ParserDB;
@@ -38,11 +39,21 @@ const DDL: &str = "CREATE TABLE projects(id INTEGER PRIMARY KEY, name TEXT);
 const TERM: &str = "SELECT * FROM docs WHERE project_id IN \
      (SELECT project_id FROM project_members WHERE user_id = current_setting('app.user_id', true))";
 
+/// The same membership for a caller that is a set, the spelling a Postgres
+/// policy uses for the subjects a session holds.
+const SET_TERM: &str = "SELECT * FROM docs WHERE project_id IN \
+     (SELECT project_id FROM project_members \
+      WHERE user_id = ANY(string_to_array(current_setting('app.subjects', true), ',')))";
+
 type Engine = SubscriptionEngine<TestEvent<Postgres>, DefaultIds, ParserDB>;
 
 fn translator() -> Translator {
     TranslatorBuilder::new()
         .with_min_confidence(ConfidenceLevel::B)
+        .with_session_attributes([SessionAttribute::setting(
+            "app.subjects",
+            SessionAttributeKind::SetAttribute,
+        )])
         .build()
 }
 
@@ -54,15 +65,15 @@ fn engine() -> (Engine, TableId) {
     (engine, docs)
 }
 
-/// One subscription for `consumer`, filtering for `user`, stating the projects
-/// it currently belongs to.
+/// One subscription for `consumer`, filtering for `user`'s identity, stating
+/// the projects it currently belongs to.
 fn subscribe(
     consumer: u64,
     user: &str,
     projects: &[i64],
 ) -> SubscriptionRequest<DefaultIds, Postgres> {
     SubscriptionRequest::new(consumer, TERM)
-        .subjects([Value::String(user.into())])
+        .subscriber(Value::String(user.into()))
         .term_values(
             vec!["project_id"],
             rows_of(user, projects.iter().copied().map(Value::Int).collect()),
@@ -86,7 +97,7 @@ fn subscribe_as(
         .iter()
         .map(|(subject, project)| (Value::String((*subject).into()), vec![Value::Int(*project)]))
         .collect();
-    SubscriptionRequest::new(consumer, TERM)
+    SubscriptionRequest::new(consumer, SET_TERM)
         .subjects(subjects)
         .term_values(vec!["project_id"], rows)
 }
@@ -205,7 +216,7 @@ fn a_row_test_and_a_term_both_have_to_hold() {
     engine
         .register(
             SubscriptionRequest::new(1u64, and_filter)
-                .subjects([Value::String("alice".into())])
+                .subscriber(Value::String("alice".into()))
                 .term_values(vec!["project_id"], rows_of("alice", vec![Value::Int(7)])),
         )
         .unwrap();
@@ -242,7 +253,7 @@ fn a_term_under_or_admits_everybody_the_other_side_admits() {
          (SELECT project_id FROM project_members WHERE user_id = current_setting('app.user_id', true))";
     let subscribe_or = |consumer: u64, user: &str, project: i64| {
         SubscriptionRequest::new(consumer, or_filter)
-            .subjects([Value::String(user.into())])
+            .subscriber(Value::String(user.into()))
             .term_values(vec!["project_id"], rows_of(user, vec![Value::Int(project)]))
     };
     engine.register(subscribe_or(1, "alice", 7)).unwrap();
@@ -274,7 +285,7 @@ fn a_term_under_or_admits_everybody_the_other_side_admits() {
 fn a_subscription_stating_no_values_admits_nobody() {
     let (mut engine, docs) = engine();
     engine
-        .register(SubscriptionRequest::new(1u64, TERM).subjects([Value::String("alice".into())]))
+        .register(SubscriptionRequest::new(1u64, TERM).subscriber(Value::String("alice".into())))
         .unwrap();
 
     let notifs = engine
@@ -395,7 +406,7 @@ fn a_reversed_spelling_binds_its_values_to_the_columns_they_name() {
     engine
         .register(
             SubscriptionRequest::new(1u64, forward)
-                .subjects([Value::String("alice".into())])
+                .subscriber(Value::String("alice".into()))
                 .term_values(vec!["project_id"], rows_of("alice", vec![Value::Int(7)]))
                 .term_values(vec!["a"], rows_of("alice", vec![Value::Int(70)])),
         )
@@ -403,7 +414,7 @@ fn a_reversed_spelling_binds_its_values_to_the_columns_they_name() {
     engine
         .register(
             SubscriptionRequest::new(2u64, reversed)
-                .subjects([Value::String("bob".into())])
+                .subscriber(Value::String("bob".into()))
                 .term_values(vec!["project_id"], rows_of("bob", vec![Value::Int(9)]))
                 .term_values(vec!["a"], rows_of("bob", vec![Value::Int(90)])),
         )
@@ -455,7 +466,7 @@ fn a_reversed_spelling_binds_its_values_to_the_columns_they_name() {
 }
 
 mod refusals {
-    use super::{engine, refusal, rows_of, subscribe, Engine, DDL, TERM};
+    use super::{engine, refusal, rows_of, subscribe, Engine, DDL, SET_TERM, TERM};
     use sql_traits::structs::ParserDB;
     use sqlparser::dialect::PostgreSqlDialect;
     use subql::backend::Value;
@@ -475,14 +486,19 @@ mod refusals {
         );
     }
 
-    /// A term needs to know which subjects it filters for, because those are
-    /// what a changed membership row is matched against.
+    /// A term needs to know which caller values it filters for, because those
+    /// are what a changed membership row is matched against.
     #[test]
     fn a_term_is_refused_without_a_subject() {
         let (mut engine, _) = engine();
         let reason = refusal(&mut engine, SubscriptionRequest::new(1u64, TERM));
         assert!(
-            reason.contains("which subjects"),
+            reason.contains("state its subscriber"),
+            "the refusal should ask for the subscriber, got {reason:?}"
+        );
+        let reason = refusal(&mut engine, SubscriptionRequest::new(1u64, SET_TERM));
+        assert!(
+            reason.contains("state its subjects"),
             "the refusal should ask for the subjects, got {reason:?}"
         );
     }
@@ -496,7 +512,7 @@ mod refusals {
          (SELECT project_id FROM project_members WHERE user_id = current_setting('app.user_id', true))";
         let reason = refusal(
             &mut engine,
-            SubscriptionRequest::new(1u64, sql).subjects([Value::String("alice".into())]),
+            SubscriptionRequest::new(1u64, sql).subscriber(Value::String("alice".into())),
         );
         assert!(
             reason.contains("accumulator"),
@@ -513,7 +529,7 @@ mod refusals {
          (SELECT project_id FROM project_members WHERE user_id = current_setting('app.user_id', true))";
         let reason = refusal(
             &mut engine,
-            SubscriptionRequest::new(1u64, sql).subjects([Value::String("alice".into())]),
+            SubscriptionRequest::new(1u64, sql).subscriber(Value::String("alice".into())),
         );
         assert!(
             reason.contains("not equal to itself"),
@@ -531,7 +547,7 @@ mod refusals {
          AND project_id IN (SELECT project_id FROM project_members WHERE user_id = 'x')";
         let reason = refusal(
             &mut engine,
-            SubscriptionRequest::new(1u64, sql).subjects([Value::String("alice".into())]),
+            SubscriptionRequest::new(1u64, sql).subscriber(Value::String("alice".into())),
         );
         assert!(
             reason.contains("two membership terms"),
@@ -548,7 +564,7 @@ mod refusals {
         let reason = refusal(
             &mut engine,
             SubscriptionRequest::new(1u64, TERM)
-                .subjects([Value::String("alice".into())])
+                .subscriber(Value::String("alice".into()))
                 .term_values(
                     vec!["title"],
                     rows_of("alice", vec![Value::String("x".into())]),
@@ -570,7 +586,7 @@ mod refusals {
          (SELECT project_id FROM project_members WHERE user_id = 'someone-else')";
         let reason = refusal(
             &mut engine,
-            SubscriptionRequest::new(1u64, sql).subjects([Value::String("alice".into())]),
+            SubscriptionRequest::new(1u64, sql).subscriber(Value::String("alice".into())),
         );
         assert!(
             !reason.contains("SubQL"),
@@ -593,7 +609,7 @@ mod refusals {
          (SELECT project_id FROM project_members WHERE user_id = current_setting('app.user_id', true))";
         let reason = refusal(
             &mut engine,
-            SubscriptionRequest::new(1u64, sql).subjects([Value::String("alice".into())]),
+            SubscriptionRequest::new(1u64, sql).subscriber(Value::String("alice".into())),
         );
         assert!(
             !reason.is_empty(),
@@ -610,14 +626,14 @@ mod refusals {
         let reason = refusal(
             &mut engine,
             SubscriptionRequest::new(1u64, TERM)
-                .subjects([Value::String("alice".into())])
+                .subscriber(Value::String("alice".into()))
                 .term_values(
                     vec!["project_id"],
                     vec![(Value::String("bob".into()), vec![Value::Int(7)])],
                 ),
         );
         assert!(
-            reason.contains("does not filter for"),
+            reason.contains("does not name the caller by"),
             "the refusal should name the subject the caller does not hold, got {reason:?}"
         );
     }
@@ -630,7 +646,7 @@ mod refusals {
         let (mut engine, _) = engine();
         let reason = refusal(
             &mut engine,
-            SubscriptionRequest::new(1u64, TERM)
+            SubscriptionRequest::new(1u64, SET_TERM)
                 .subjects([Value::String("alice".into()), Value::Int(7)]),
         );
         assert!(
@@ -638,10 +654,45 @@ mod refusals {
             "the refusal should name the column's kind, got {reason:?}"
         );
     }
+
+    /// A membership spelled against the caller's identity reads one session
+    /// value, so the subject set is not what it matches, however many members
+    /// the set has.
+    #[test]
+    fn an_identity_membership_ignores_the_subject_set() {
+        let (mut engine, _) = engine();
+        let reason = refusal(
+            &mut engine,
+            SubscriptionRequest::new(1u64, TERM)
+                .subjects([Value::String("alice".into())])
+                .term_values(vec!["project_id"], rows_of("alice", vec![Value::Int(7)])),
+        );
+        assert!(
+            reason.contains("state its subscriber"),
+            "the refusal should ask for the subscriber, got {reason:?}"
+        );
+    }
+
+    /// The mirror: a membership spelled against the caller's set reads the
+    /// whole set, and the one identity is not it.
+    #[test]
+    fn a_set_membership_ignores_the_subscriber() {
+        let (mut engine, _) = engine();
+        let reason = refusal(
+            &mut engine,
+            SubscriptionRequest::new(1u64, SET_TERM)
+                .subscriber(Value::String("alice".into()))
+                .term_values(vec!["project_id"], rows_of("alice", vec![Value::Int(7)])),
+        );
+        assert!(
+            reason.contains("state its subjects"),
+            "the refusal should ask for the subjects, got {reason:?}"
+        );
+    }
 }
 
 mod changed_membership {
-    use super::{doc, engine, refusal, subscribe, subscribe_as, Engine, TERM};
+    use super::{doc, engine, refusal, subscribe, subscribe_as, Engine, SET_TERM};
     use subql::backend::{Postgres, Value};
     use subql::compiler::MAX_TERMS_PER_FILTER;
     use subql::testing::TestEvent;
@@ -972,7 +1023,7 @@ mod changed_membership {
 
         let reason = refusal(
             &mut engine,
-            SubscriptionRequest::new(1u64, sql).subjects([Value::String("alice".into())]),
+            SubscriptionRequest::new(1u64, sql).subscriber(Value::String("alice".into())),
         );
         assert!(
             reason.contains(&format!("at most {MAX_TERMS_PER_FILTER}")),
@@ -987,7 +1038,7 @@ mod changed_membership {
         );
         assert!(engine
             .register(
-                SubscriptionRequest::new(2u64, under).subjects([Value::String("alice".into())])
+                SubscriptionRequest::new(2u64, under).subscriber(Value::String("alice".into()))
             )
             .is_ok());
     }
@@ -1094,7 +1145,7 @@ mod changed_membership {
         engine.register(subscribe_as(1, &[("key:a", 7)])).unwrap();
         engine
             .register(
-                SubscriptionRequest::new(1u64, TERM)
+                SubscriptionRequest::new(1u64, SET_TERM)
                     .scope(SubscriptionScope::Session(9))
                     .subjects([Value::String("key:a".into()), Value::String("key:b".into())])
                     .term_values(
@@ -1156,10 +1207,11 @@ mod changed_membership {
 }
 
 mod describe_terms {
-    use super::{engine, rows_of, subscribe, translator, Engine, TERM};
+    use super::{engine, rows_of, subscribe, translator, Engine, SET_TERM, TERM};
     use sql_traits::structs::ParserDB;
     use sqlparser::dialect::PostgreSqlDialect;
     use subql::backend::{ScalarFamily, Value};
+    use subql::term::TermCaller;
     use subql::testing::TestEvent;
     use subql::{catalog_helpers, RegisterError, SubscriptionEngine, SubscriptionRequest, Tier};
 
@@ -1198,6 +1250,33 @@ mod describe_terms {
             "SELECT \"user_id\", project_id FROM project_members WHERE user_id = \
          current_setting('app.user_id', true)",
             "the seed read is the subquery itself, projecting the subject granting each row"
+        );
+        assert_eq!(
+            term.caller,
+            TermCaller::Identity,
+            "one session value, so the subscriber is what to state"
+        );
+    }
+
+    /// The set spelling describes the same read with the set predicate kept
+    /// verbatim, so the seed returns every row any of the caller's subjects
+    /// grants and says which one, and it names the subject set as what to state.
+    #[test]
+    fn describe_terms_keeps_the_set_predicate_in_the_seed_read() {
+        let (engine, _) = engine();
+        let described = engine
+            .describe_terms(&SubscriptionRequest::new(1u64, SET_TERM))
+            .expect("the set spelling is describable");
+        let [subql::term::TermDescription::Membership(term)] = described.as_slice() else {
+            panic!("one membership subquery, got {described:?}");
+        };
+        assert_eq!(term.caller, TermCaller::Subjects);
+        assert_eq!(term.member_subject, "user_id");
+        assert_eq!(term.subject_kind, ScalarFamily::String);
+        assert_eq!(
+            term.seed_sql,
+            "SELECT \"user_id\", project_id FROM project_members WHERE user_id = \
+             ANY(string_to_array(current_setting('app.subjects', true), ','))"
         );
     }
 
@@ -1263,7 +1342,7 @@ mod describe_terms {
     fn refuses_alike(sql: &str) {
         let (mut engine, _) = engine();
         let request =
-            || SubscriptionRequest::new(1u64, sql).subjects([Value::String("alice".into())]);
+            || SubscriptionRequest::new(1u64, sql).subscriber(Value::String("alice".into()));
         let described = engine
             .describe_terms(&request())
             .err()
@@ -1390,7 +1469,7 @@ mod describe_terms {
         engine
             .register(
                 SubscriptionRequest::new(1u64, CROSS_TERM)
-                    .subjects([Value::String("alice".into())])
+                    .subscriber(Value::String("alice".into()))
                     .term_values(vec!["proj"], rows_of("alice", vec![Value::Int(7)])),
             )
             .expect("a cross-named correlation registers");

@@ -10,6 +10,7 @@
 //! nothing ever moves the set, because an identity does not change.
 #![allow(clippy::unwrap_used)]
 
+use rls2fga::classifier::function_registry::{SessionAttribute, SessionAttributeKind};
 use rls2fga::translator::{Translator, TranslatorBuilder};
 use rls2fga::types::ConfidenceLevel;
 use sql_traits::structs::ParserDB;
@@ -39,11 +40,19 @@ const DDL: &str = "CREATE TABLE projects(id INTEGER PRIMARY KEY, name TEXT);
 /// The caller comparison in the column-first spelling.
 const CALLER: &str = "SELECT * FROM notes WHERE owner = current_setting('app.user_id', true)";
 
+/// The same comparison against the set of subjects the session holds.
+const SET_CALLER: &str = "SELECT * FROM notes \
+     WHERE owner = ANY(string_to_array(current_setting('app.subjects', true), ','))";
+
 type Engine = SubscriptionEngine<TestEvent<Postgres>, DefaultIds, ParserDB>;
 
 fn translator() -> Translator {
     TranslatorBuilder::new()
         .with_min_confidence(ConfidenceLevel::B)
+        .with_session_attributes([SessionAttribute::setting(
+            "app.subjects",
+            SessionAttributeKind::SetAttribute,
+        )])
         .build()
 }
 
@@ -266,7 +275,6 @@ fn a_caller_comparison_composes_with_a_membership_subquery() {
         .register(
             SubscriptionRequest::new(1u64, mixed)
                 .subscriber(Value::String("alice".into()))
-                .subjects([Value::String("alice".into())])
                 .term_values(vec!["project_id"], rows_of("alice", vec![Value::Int(7)])),
         )
         .unwrap();
@@ -291,6 +299,121 @@ fn a_caller_comparison_composes_with_a_membership_subquery() {
         notifs.inserted().is_empty(),
         "in her project, but owned by bob"
     );
+}
+
+/// The set spelling, `owner = ANY(<the caller's set>)`, admits a row any held
+/// subject owns, and the identity spelling beside it keeps admitting the one.
+#[test]
+fn a_set_spelled_caller_comparison_admits_any_held_subject() {
+    let (mut engine, notes) = engine();
+    let described = engine
+        .describe_terms(&SubscriptionRequest::new(1u64, SET_CALLER))
+        .unwrap();
+    let [subql::term::TermDescription::Caller(caller)] = described.as_slice() else {
+        panic!("one caller comparison, got {described:?}");
+    };
+    assert_eq!(caller.caller, subql::term::TermCaller::Subjects);
+    assert_eq!(caller.column, "owner");
+
+    engine
+        .register(
+            SubscriptionRequest::new(1u64, SET_CALLER)
+                .subjects([Value::String("alice".into()), Value::String("key:a".into())]),
+        )
+        .unwrap();
+    engine.register(subscribe(2, "alice")).unwrap();
+
+    let notifs = engine
+        .consumers(&TestEvent::insert(notes, note(1, "key:a", 7)))
+        .unwrap();
+    assert_eq!(notifs.inserted(), &[1], "a key the set holds owns the row");
+
+    let notifs = engine
+        .consumers(&TestEvent::insert(notes, note(2, "alice", 7)))
+        .unwrap();
+    assert_eq!(
+        notifs.inserted(),
+        &[1, 2],
+        "the identity is in the set and is the subscriber"
+    );
+
+    let notifs = engine
+        .consumers(&TestEvent::insert(notes, note(3, "key:b", 7)))
+        .unwrap();
+    assert!(notifs.inserted().is_empty(), "a key nobody holds");
+}
+
+/// The set spelling as diesel renders it, with the setting key and the
+/// separator arriving as binds rather than literals, registers and filters.
+#[cfg(feature = "diesel-typed")]
+mod typed {
+    use super::{engine, note};
+    use diesel::prelude::*;
+    use diesel::sql_types::{Array, Bool, Text};
+    use subql::backend::{Postgres, Value};
+    use subql::diesel_api::render_typed;
+    use subql::term::{TermCaller, TermDescription};
+    use subql::testing::TestEvent;
+    use subql::SubscriptionRequest;
+
+    diesel::table! {
+        notes (id) {
+            id -> Integer,
+            owner -> Text,
+            project_id -> Integer,
+            title -> Text,
+        }
+    }
+
+    diesel::define_sql_function! {
+        fn current_setting(name: Text, missing_ok: Bool) -> Text
+    }
+
+    diesel::define_sql_function! {
+        fn string_to_array(text: Text, separator: Text) -> Array<Text>
+    }
+
+    #[test]
+    fn the_typed_api_reaches_the_set_spelling() {
+        #[expect(
+            deprecated,
+            reason = "eq_any takes a list or a subquery, not an array expression"
+        )]
+        let query = notes::table.filter(notes::owner.eq(diesel::dsl::any(string_to_array(
+            current_setting("app.subjects", true),
+            ",",
+        ))));
+        let (sql, binds) = render_typed::<Postgres, diesel::pg::Pg, _>(&query).unwrap();
+        assert!(
+            sql.contains("= ANY(string_to_array(current_setting($1, $2), $3))"),
+            "{sql}"
+        );
+
+        let (mut engine, notes_id) = engine();
+        let request = || {
+            SubscriptionRequest::new(1u64, sql.clone())
+                .binds(binds.clone())
+                .subjects([Value::String("key:a".into())])
+        };
+        let described = engine.describe_terms(&request()).unwrap();
+        let [TermDescription::Caller(caller)] = described.as_slice() else {
+            panic!("one caller comparison, got {described:?}");
+        };
+        assert_eq!(caller.caller, TermCaller::Subjects);
+
+        engine.register(request()).unwrap();
+        let notifs = engine
+            .consumers(&TestEvent::insert(notes_id, note(1, "key:a", 7)))
+            .unwrap();
+        assert_eq!(notifs.inserted(), &[1]);
+        let notifs = engine
+            .consumers(&TestEvent::insert(notes_id, note(2, "alice", 7)))
+            .unwrap();
+        assert!(
+            notifs.inserted().is_empty(),
+            "the identity is not in the set"
+        );
+    }
 }
 
 /// Unregistering takes the identity out of the set: re-registering the same
@@ -332,7 +455,7 @@ fn the_batch_path_seeds_the_identity_as_the_single_path_does() {
 }
 
 mod refusals {
-    use super::{engine, refusal, rows_of, subscribe, Engine, CALLER, DDL};
+    use super::{engine, refusal, rows_of, subscribe, Engine, CALLER, DDL, SET_CALLER};
     use sql_traits::structs::ParserDB;
     use sqlparser::dialect::PostgreSqlDialect;
     use subql::backend::{Postgres, Value};
@@ -346,7 +469,7 @@ mod refusals {
         let (mut engine, _) = engine();
         let reason = refusal(&mut engine, SubscriptionRequest::new(1u64, CALLER));
         assert!(
-            reason.contains("which value that comparison admits"),
+            reason.contains("state its subscriber"),
             "the refusal names what is missing: {reason}"
         );
     }
@@ -406,27 +529,46 @@ mod refusals {
     /// says so rather than the engine quietly serving different semantics.
     #[test]
     fn a_negated_caller_comparison_is_not_served_in_process() {
-        let (mut engine, _) = engine();
-        let spec = SubscriptionRequest::<DefaultIds, Postgres>::new(
-            1u64,
+        for sql in [
             "SELECT * FROM notes WHERE NOT (owner = current_setting('app.user_id', true))",
-        )
-        .subscriber(Value::String("alice".into()));
-        let registered = engine
-            .register(spec)
-            .expect("a shape the evaluator refuses is re-read, not turned away");
-        assert!(
-            !matches!(registered.tier, Tier::InProcess(_)),
-            "got {:?}",
-            registered.tier
+            "SELECT * FROM notes WHERE NOT (owner = ANY(string_to_array(\
+             current_setting('app.subjects', true), ',')))",
+        ] {
+            let (mut engine, _) = engine();
+            let spec = SubscriptionRequest::<DefaultIds, Postgres>::new(1u64, sql)
+                .subscriber(Value::String("alice".into()))
+                .subjects([Value::String("alice".into())]);
+            let registered = engine
+                .register(spec)
+                .expect("a shape the evaluator refuses is re-read, not turned away");
+            assert!(
+                !matches!(registered.tier, Tier::InProcess(_)),
+                "got {:?}",
+                registered.tier
+            );
+            let reason = registered
+                .not_served_because
+                .map(|reason| reason.to_string())
+                .expect("a read tier says why it is one");
+            assert!(
+                reason.contains("caller"),
+                "the reason names the shape: {reason}"
+            );
+        }
+    }
+
+    /// The set spelling reads the subject set and nothing else, so a subscriber
+    /// alone, or no subjects, leaves it nothing to admit.
+    #[test]
+    fn a_set_comparison_without_subjects_is_refused() {
+        let (mut engine, _) = engine();
+        let reason = refusal(
+            &mut engine,
+            SubscriptionRequest::new(1u64, SET_CALLER).subscriber(Value::String("alice".into())),
         );
-        let reason = registered
-            .not_served_because
-            .map(|reason| reason.to_string())
-            .expect("a read tier says why it is one");
         assert!(
-            reason.contains("caller"),
-            "the reason names the shape: {reason}"
+            reason.contains("state its subjects"),
+            "the refusal names what is missing: {reason}"
         );
     }
 
@@ -496,6 +638,7 @@ mod describe_terms {
             panic!("one caller comparison, got {described:?}");
         };
         assert_eq!(caller.column, "owner", "the compared column");
+        assert_eq!(caller.caller, subql::term::TermCaller::Identity);
         assert_eq!(
             caller.kind,
             ScalarFamily::String,

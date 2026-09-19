@@ -327,7 +327,7 @@ fn a_term_that_short_circuits_the_overflow_keeps_its_subscriber_answered() {
 
     let subscribe = |consumer: u64, projects: &[i64]| {
         SubscriptionRequest::new(consumer, PREDICATE)
-            .subjects([Value::String(format!("user{consumer}"))])
+            .subscriber(Value::String(format!("user{consumer}")))
             .term_values(
                 vec!["project_id"],
                 projects
