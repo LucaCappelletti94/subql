@@ -27,6 +27,22 @@ struct SlotPosition {
     confirmed_flush_lsn: Option<String>,
 }
 
+#[derive(QueryableByName, Debug)]
+struct WalDistance {
+    #[diesel(sql_type = diesel::sql_types::BigInt)]
+    distance: i64,
+}
+
+/// Bytes of WAL the server has written since `from`.
+fn wal_since(conn: &mut PgConnection, from: &str) -> u64 {
+    let rows: Vec<WalDistance> = sql_query(format!(
+        "SELECT pg_wal_lsn_diff(pg_current_wal_lsn(), '{from}')::int8 AS distance"
+    ))
+    .load(conn)
+    .expect("read the WAL distance");
+    u64::try_from(rows[0].distance).expect("the server does not run backwards")
+}
+
 /// `pg_replication_slots` is a server catalog view, which the typed DSL has
 /// no schema for in this suite, and the slot position is the very thing
 /// under test.
@@ -399,6 +415,8 @@ fn the_streaming_source_reports_what_its_slot_is_holding() {
     let publication = "subql_streaming_retention_pub";
     fixture(&mut setup, "streaming retention", publication, &slot);
 
+    let start = confirmed_flush(&mut setup, &slot).expect("the slot has a position");
+
     common::multi_thread_rt().block_on(async {
         let mut source = subql::PgStreamingCdcSource::connect(
             subql::PgStreamingConfig::new(db.url(), &slot, publication),
@@ -434,6 +452,16 @@ fn the_streaming_source_reports_what_its_slot_is_holding() {
             held > base,
             "an unacknowledged event leaves the source behind the server's \
              WAL end, {held} against {base}"
+        );
+        // Read after the figure, so the server can only have moved further
+        // on. A gauge reporting an absolute position rather than a distance
+        // blows past this, however busy the rest of the cluster is.
+        let written = wal_since(&mut setup, &start);
+        assert!(
+            held <= written,
+            "the figure is a distance from the position this slot started \
+             at, so it cannot exceed the {written} bytes written since, \
+             got {held}"
         );
         assert!(
             source.acknowledged_position().is_none(),
