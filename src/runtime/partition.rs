@@ -427,13 +427,29 @@ impl<I: IdTypes, B: Backend> PartitionTxn<'_, I, B> {
         }
         let store = self.store_mut();
         let binding = store.remove_binding(sub_id)?;
+        // Read before the count drops, since what decided where the
+        // predicate's bits went is gone with the predicate.
+        let bits = store.get_predicate(binding.predicate_id).map(|pred| {
+            (
+                Arc::clone(&pred.index_atoms),
+                Arc::clone(&pred.dependency_columns),
+                pred.projection.clone(),
+            )
+        });
         let removed = store.decrement_refcount(binding.predicate_id);
         self.dirty = true;
-        if removed {
-            // The predicate is gone, so any incremental patches are moot:
-            // commit rebuilds from the final store.
-            self.rebuild_all = true;
-            self.indexes = None;
+        if removed && !self.rebuild_all {
+            if let Some((atoms, deps, projection)) = bits {
+                let patched = self
+                    .indexes
+                    .get_or_insert_with(|| self.partition.load_snapshot().indexes.clone());
+                patched.remove_predicate(binding.predicate_id, &atoms, &deps, &projection);
+            } else {
+                // Nothing to patch from, so the indexes come back from the
+                // final store instead.
+                self.rebuild_all = true;
+                self.indexes = None;
+            }
         }
         Some(BindingRemoval {
             predicate_removed: removed,
@@ -449,9 +465,9 @@ impl<I: IdTypes, B: Backend> PartitionTxn<'_, I, B> {
         }
         let indexes = if self.rebuild_all {
             let mut rebuilt = HybridIndexes::new();
-            for (idx, pred) in self.partition.mutable_predicates.predicates.iter() {
+            for (id, pred) in self.partition.mutable_predicates.predicates.iter() {
                 rebuilt.add_predicate(
-                    PredicateId::from_slab_index(idx),
+                    *id,
                     &pred.index_atoms,
                     &pred.dependency_columns,
                     &pred.projection,
@@ -523,7 +539,6 @@ mod tests {
             prefilter_plan: Arc::new(PrefilterPlan::default()),
             projection: QueryProjection::Rows,
             group_key_encoder: None,
-            refcount: 1,
             updated_at_unix_ms: 0,
         }
     }
@@ -724,8 +739,7 @@ mod tests {
                 value: IndexableCell::Int(42),
             }],
         );
-        let mut removed = make_predicate(1, 0x5678);
-        removed.refcount = 0;
+        let removed = make_predicate(1, 0x5678);
         let removed_id = add_predicate(
             &mut partition,
             removed,
@@ -812,6 +826,25 @@ mod tests {
         );
     }
 
+    /// Whether both maps hold the same entries at the same addresses.
+    ///
+    /// A persistent map shares its nodes, so an untouched index answers with
+    /// the values the published snapshot handed out, and one rebuilt by a
+    /// mutation answers with copies.
+    fn same_entries<K, V>(
+        before: &rpds::HashTrieMapSync<K, V>,
+        now: &rpds::HashTrieMapSync<K, V>,
+    ) -> bool
+    where
+        K: Eq + core::hash::Hash,
+    {
+        before.size() == now.size()
+            && before.iter().all(|(key, value)| {
+                now.get(key)
+                    .is_some_and(|current| core::ptr::eq(value, current))
+            })
+    }
+
     /// What the copy-on-write clone is worth: a mutation deepens the index it
     /// touches and leaves every other one the allocation the published
     /// snapshot holds. An index put back inline, or a `make_mut` turned into
@@ -835,7 +868,7 @@ mod tests {
                         predicate_id: pred_id,
                         consumer_id: u64::from(ordinal.get()),
                         consumer_ordinal: ordinal,
-                        scope: SubscriptionScope::Durable,
+                        scope: SubscriptionScope::Session(7),
                         updated_at_unix_ms: 0,
                     },
                     pred_id,
@@ -869,28 +902,31 @@ mod tests {
 
         let before = &published.predicates;
         let now = &after.predicates;
+        // The four indexes a membership row never reads are persistent maps,
+        // which expose no node identity, so what is asserted is that every
+        // entry they hold is still the same allocation.
         assert!(
-            Arc::ptr_eq(&before.bindings, &now.bindings),
+            same_entries(&before.bindings, &now.bindings),
             "a membership row reads no binding, so it may not copy them"
         );
         assert!(
-            Arc::ptr_eq(&before.predicates, &now.predicates),
+            same_entries(&before.predicates, &now.predicates),
             "nor the predicates"
         );
         assert!(
-            Arc::ptr_eq(&before.predicate_consumers, &now.predicate_consumers),
+            same_entries(&before.predicate_consumers, &now.predicate_consumers),
             "nor the consumer bitmaps"
         );
         assert!(
-            Arc::ptr_eq(&before.hash_index, &now.hash_index),
+            same_entries(&before.hash_index, &now.hash_index),
             "nor the hash index"
         );
         assert!(
-            Arc::ptr_eq(&before.scope_index, &now.scope_index),
+            same_entries(&before.scope_index, &now.scope_index),
             "nor the session index"
         );
         assert!(
-            Arc::ptr_eq(&before.binding_lookup, &now.binding_lookup),
+            same_entries(&before.binding_lookup, &now.binding_lookup),
             "nor the binding lookup"
         );
         assert!(
@@ -914,6 +950,165 @@ mod tests {
             partition.publication_count(),
             2,
             "the seeding and the movement publish one snapshot each"
+        );
+    }
+
+    /// Every field of two index sets, compared as the query paths read them.
+    ///
+    /// Range entries are compared as a set, because both paths keep them
+    /// sorted by lower bound and neither promises an order among equal ones.
+    fn indexes_agree(left: &HybridIndexes, right: &HybridIndexes) {
+        assert_eq!(left.equality, right.equality, "equality");
+        assert_eq!(left.null_checks, right.null_checks, "null checks");
+        assert_eq!(left.fallback, right.fallback, "fallback");
+        assert_eq!(left.dependency, right.dependency, "dependency");
+        assert_eq!(left.full_row, right.full_row, "full row");
+        assert_eq!(left.agg_fallback, right.agg_fallback, "aggregate fallback");
+        assert_eq!(
+            left.agg_dependency, right.agg_dependency,
+            "aggregate dependency"
+        );
+        assert_eq!(
+            left.agg_dependency_free, right.agg_dependency_free,
+            "aggregate dependency free"
+        );
+        let ranges = |indexes: &HybridIndexes| {
+            let mut flattened: Vec<(ColumnId, u32, Option<i64>, Option<i64>)> = indexes
+                .range
+                .iter()
+                .flat_map(|(column, entries)| {
+                    entries.iter().map(|entry| {
+                        (
+                            *column,
+                            entry.predicate_id.as_u32(),
+                            entry.lower,
+                            entry.upper,
+                        )
+                    })
+                })
+                .collect();
+            flattened.sort_unstable();
+            flattened
+        };
+        assert_eq!(ranges(left), ranges(right), "ranges");
+    }
+
+    /// Dropping a predicate patches the indexes in place now, where it used to
+    /// rebuild them from every survivor. The patch mirrors `add_predicate` by
+    /// hand across nine structures, and a bit left behind only widens the
+    /// candidate set, which the VM then rejects, so nothing else in the suite
+    /// would notice. This compares the patch against the rebuild it replaced.
+    #[test]
+    fn dropping_a_predicate_patches_the_index_the_rebuild_would_have_built() {
+        let mut partition = TablePartition::<DefaultIds, Postgres>::new(1);
+        let shapes: Vec<(Predicate<Postgres>, Vec<IndexableAtom>)> = alloc::vec![
+            (
+                make_predicate_on_col(0, 0x1001, 1),
+                alloc::vec![IndexableAtom::Equality {
+                    column_id: 1,
+                    value: IndexableCell::Int(42),
+                }],
+            ),
+            (
+                make_predicate_on_col(1, 0x1002, 1),
+                alloc::vec![IndexableAtom::Range {
+                    column_id: 1,
+                    lower: Some(0),
+                    upper: Some(100),
+                }],
+            ),
+            (
+                make_predicate_on_col(2, 0x1003, 2),
+                alloc::vec![IndexableAtom::Null {
+                    column_id: 2,
+                    kind: NullKind::IsNull,
+                }],
+            ),
+            (
+                make_predicate_on_col(3, 0x1004, 2),
+                alloc::vec![IndexableAtom::Fallback],
+            ),
+            (
+                make_agg_predicate_on_col(4, 0x1005, 1),
+                alloc::vec![IndexableAtom::Fallback],
+            ),
+        ];
+        let mut bound = Vec::new();
+        for (nth, (predicate, atoms)) in shapes.into_iter().enumerate() {
+            let pred_id = add_predicate(&mut partition, predicate, &atoms);
+            let subscription_id = 100 + u64::try_from(nth).expect("five shapes fit");
+            add_binding(
+                &mut partition,
+                SubscriptionBinding {
+                    subscription_id,
+                    predicate_id: pred_id,
+                    consumer_id: 1,
+                    consumer_ordinal: ConsumerOrdinal::new(0),
+                    scope: SubscriptionScope::Durable,
+                    updated_at_unix_ms: 0,
+                },
+                pred_id,
+            );
+            bound.push(subscription_id);
+        }
+
+        // One shape at a time, so a missed prune is attributed to the shape
+        // whose predicate just left rather than to the last one standing.
+        for subscription_id in bound {
+            assert!(
+                remove_binding(&mut partition, subscription_id),
+                "the only binding takes its predicate with it"
+            );
+            let snapshot = partition.load_snapshot();
+            let mut rebuilt = HybridIndexes::new();
+            for (id, pred) in snapshot.predicates.predicates.iter() {
+                rebuilt.add_predicate(
+                    *id,
+                    &pred.index_atoms,
+                    &pred.dependency_columns,
+                    &pred.projection,
+                );
+            }
+            indexes_agree(&snapshot.indexes, &rebuilt);
+        }
+    }
+
+    /// A binding takes a reference on its predicate, and the count for that
+    /// lives in the store rather than in the predicate, so binding one leaves
+    /// the predicates exactly where the published snapshot has them. Put the
+    /// count back inside and every registration copies them again.
+    #[test]
+    fn taking_a_reference_leaves_the_predicates_where_they_were() {
+        let mut partition = TablePartition::<DefaultIds, Postgres>::new(1);
+        let pred_id = partition.mutate(|txn| txn.add_predicate(make_predicate(0, 0x3333)));
+        let published = partition.load_snapshot();
+
+        partition.mutate(|txn| {
+            txn.add_binding(
+                SubscriptionBinding {
+                    subscription_id: 100,
+                    predicate_id: pred_id,
+                    consumer_id: 1,
+                    consumer_ordinal: ConsumerOrdinal::new(0),
+                    scope: SubscriptionScope::Durable,
+                    updated_at_unix_ms: 0,
+                },
+                pred_id,
+            );
+        });
+        let after = partition.load_snapshot();
+
+        assert!(
+            same_entries(
+                &published.predicates.predicates,
+                &after.predicates.predicates
+            ),
+            "binding a subscription reads no predicate, so it may not copy them"
+        );
+        assert_eq!(
+            after.predicates.refcount(pred_id),
+            1,
+            "and the reference it took is counted"
         );
     }
 

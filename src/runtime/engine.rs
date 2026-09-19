@@ -1182,7 +1182,6 @@ where
             prefilter_plan: Arc::new(compiled.prefilter_plan.clone()),
             projection: compiled.projection.clone(),
             group_key_encoder,
-            refcount: 0, // Will be incremented via binding
             updated_at_unix_ms: compiled.spec.updated_at_unix_ms,
         }
     }
@@ -4748,7 +4747,7 @@ where
     pub fn predicate_count(&self, table_id: TableId) -> usize {
         self.partitions.get(&table_id).map_or(0, |p| {
             let snapshot = p.load_snapshot();
-            snapshot.predicates.predicates.len()
+            snapshot.predicates.predicates.size()
         })
     }
 
@@ -4759,7 +4758,7 @@ where
             .values()
             .map(|p| {
                 let snapshot = p.load_snapshot();
-                snapshot.predicates.bindings.len()
+                snapshot.predicates.bindings.size()
             })
             .sum()
     }
@@ -4931,11 +4930,18 @@ where
                     .map_err(|e| StorageError::Codec(format!("Prefilter serialize error: {e}")))?,
                 dependency_columns: pred.dependency_columns.to_vec(),
                 projection: pred.projection.clone(),
-                refcount: pred.refcount,
+                refcount: snapshot.predicates.refcount(pred.id),
                 updated_at_unix_ms: pred.updated_at_unix_ms,
             };
             predicate_data_vec.push(pred_data);
         }
+        // Sorted so the shard's bytes depend on the partition's contents
+        // rather than on the predicate map's iteration order.
+        predicate_data_vec.sort_unstable_by(|left, right| {
+            left.hash
+                .cmp(&right.hash)
+                .then_with(|| left.normalized_sql.cmp(&right.normalized_sql))
+        });
 
         // Convert bindings to serializable format
         let mut binding_data_vec = Vec::new();
@@ -5087,7 +5093,6 @@ where
                 prefilter_plan: Arc::new(prefilter_plan),
                 projection: pred_data.projection,
                 group_key_encoder,
-                refcount: 0, // incremented via bindings in add_batch
                 updated_at_unix_ms: pred_data.updated_at_unix_ms,
             };
             entries.push((pred, bindings));
@@ -5251,7 +5256,6 @@ where
         for (table_id, path) in shard_files {
             self.load_shard(table_id, &path)?;
         }
-
         Ok(())
     }
 
@@ -5266,8 +5270,8 @@ where
         let snapshot = partition.load_snapshot();
 
         // Estimate size (rough approximation)
-        let estimated_size = snapshot.predicates.predicates.len() * 1024 + // ~1KB per predicate (bytecode + metadata)
-            snapshot.predicates.bindings.len() * 128; // ~128B per binding
+        let estimated_size = snapshot.predicates.predicates.size() * 1024 + // ~1KB per predicate (bytecode + metadata)
+            snapshot.predicates.bindings.size() * 128; // ~128B per binding
 
         Ok(estimated_size > self.rotation_threshold)
     }
