@@ -524,7 +524,6 @@ mod tests {
             prefilter_plan: Arc::new(PrefilterPlan::default()),
             projection: QueryProjection::Rows,
             group_key_encoder: None,
-            refcount: 1,
             updated_at_unix_ms: 0,
         }
     }
@@ -725,8 +724,7 @@ mod tests {
                 value: IndexableCell::Int(42),
             }],
         );
-        let mut removed = make_predicate(1, 0x5678);
-        removed.refcount = 0;
+        let removed = make_predicate(1, 0x5678);
         let removed_id = add_predicate(
             &mut partition,
             removed,
