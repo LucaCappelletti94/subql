@@ -284,10 +284,14 @@ impl PgStreamingCdcSource {
         Arc::clone(&self.task_exited)
     }
 
-    /// Latest position reported back to the server as flushed.
+    /// Latest position this source has reported to the server as flushed.
     ///
     /// `None` until the first [`CdcSource::ack`](crate::CdcSource::ack),
     /// which is also the state in which the slot has released nothing.
+    ///
+    /// What the streaming task has sent, not what a caller has asked for.
+    /// `ack` returns once the position is queued for the task, so a read
+    /// taken immediately after it can still report the previous position.
     #[must_use]
     pub fn acknowledged_position(&self) -> Option<PgLsn> {
         self.acked_seen
@@ -295,13 +299,20 @@ impl PgStreamingCdcSource {
             .then(|| PgLsn(self.acked_lsn.load(Ordering::Relaxed)))
     }
 
-    /// How much WAL the slot is holding on this source's behalf, in bytes.
+    /// Bytes this source has been sent and has not acknowledged.
     ///
-    /// The distance between what the server has sent and what has been
-    /// acknowledged. A consumer that never acknowledges sees this grow
-    /// without bound, and so does the server's WAL volume, until it fills.
-    /// Alerting on a sustained rise is how that is caught before the disk
-    /// answers for it.
+    /// The distance between the position the server has sent and the
+    /// position reported back as flushed. A consumer that never
+    /// acknowledges sees this grow without bound, and so does the server's
+    /// WAL volume, until it fills, so a sustained rise is what catches that
+    /// before the disk answers for it.
+    ///
+    /// A lower bound on what the slot retains rather than a measure of it.
+    /// The server also holds WAL it has not streamed yet, and holds back to
+    /// the slot's `restart_lsn` rather than to its confirmed flush
+    /// position, neither of which this can see. Alert on this figure
+    /// rising, and read `pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)`
+    /// from `pg_replication_slots` for the size itself.
     #[must_use]
     pub fn unacknowledged_bytes(&self) -> u64 {
         self.received_lsn
