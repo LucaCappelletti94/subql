@@ -190,12 +190,18 @@ where
     }
 }
 
+/// Drains spelled `+ Send` like `consumers`, since a leaked auto trait does
+/// not reach a caller through the trait's associated type.
 impl<'engine, E, I, DB, X> Dispatch<'engine, E, I, DB, AsyncMode<X>>
 where
-    E: CdcEvent + Sync,
+    E: CdcEvent + Send + Sync,
     E::Backend: SqlLiteralParse,
+    <E::Backend as Backend>::Dialect: Send + Sync,
+    E::Checkpoint: Send + Sync,
     I: IdTypes,
-    DB: DatabaseLike + 'static,
+    I::ConsumerId: Send,
+    I::SessionId: Send,
+    DB: DatabaseLike + Send + Sync + 'static,
     X: AsyncConnector<Backend = E::Backend>,
 {
     /// Async twin of the synchronous `resolve`, with the concurrency the
@@ -212,11 +218,12 @@ where
     /// The parking happens in the call rather than in the future, because an
     /// `async fn` body waits for its first poll and a future may be dropped
     /// before ever being polled.
-    #[allow(clippy::manual_async_fn)]
     pub fn resolve<S>(
         self,
         sink: S,
-    ) -> impl core::future::Future<Output = Settled<I, E::Backend, E::Checkpoint, X::Error, ()>> + 'engine
+    ) -> impl core::future::Future<Output = Settled<I, E::Backend, E::Checkpoint, X::Error, ()>>
+           + Send
+           + 'engine
     where
         S: FnMut(ReadDelivery<I, E::Backend, E::Checkpoint>) + Send + 'engine,
     {
@@ -237,11 +244,11 @@ where
     /// Async twin of the synchronous `resolve_collect`, abandoned as safely
     /// as [`resolve`](Self::resolve) and parking in the call for the same
     /// reason.
-    #[allow(clippy::manual_async_fn)]
     pub fn resolve_collect(
         self,
-    ) -> impl core::future::Future<Output = Settled<I, E::Backend, E::Checkpoint, X::Error>> + 'engine
-    {
+    ) -> impl core::future::Future<Output = Settled<I, E::Backend, E::Checkpoint, X::Error>>
+           + Send
+           + 'engine {
         let Self {
             engine,
             notifications,
