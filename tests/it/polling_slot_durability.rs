@@ -326,8 +326,10 @@ fn a_long_lived_source_keeps_delivering_later_transactions() {
 
 /// Every change of a multi-statement transaction arrives.
 ///
-/// The rows of one transaction all carry its position, so marking that
-/// position delivered on the first row would swallow the rest.
+/// Both shapes are covered, three rows in one statement and three statements
+/// in one transaction. A transaction's first change shares the position its
+/// `begin` carries, so anything keyed on that position alone could swallow a
+/// sibling row.
 #[test]
 #[ignore = "requires Docker; run with --ignored"]
 fn every_change_of_one_transaction_is_delivered() {
@@ -344,16 +346,19 @@ fn every_change_of_one_transaction_is_delivered() {
             PollingPgCdcSource::connect(config(db.url(), &slot, publication), catalog())
                 .await
                 .expect("connect polling source");
+        sql_query("INSERT INTO orders VALUES (1, 1.0), (2, 2.0), (3, 3.0)")
+            .execute(&mut dml)
+            .expect("three rows in one statement");
         dml.transaction::<_, diesel::result::Error, _>(|conn| {
-            for id in 1..=3 {
+            for id in 4..=6 {
                 sql_query(format!("INSERT INTO orders VALUES ({id}, {id}.0)")).execute(conn)?;
             }
             Ok(())
         })
-        .expect("three inserts in one transaction");
+        .expect("three statements in one transaction");
 
         let mut seen = Vec::new();
-        for _ in 0..3 {
+        for _ in 0..6 {
             let event = tokio::time::timeout(Duration::from_secs(5), source.next_event())
                 .await
                 .unwrap_or_else(|_| panic!("all three changes arrive, got {seen:?}"))
@@ -366,11 +371,87 @@ fn every_change_of_one_transaction_is_delivered() {
         }
         assert_eq!(
             seen,
-            vec![
-                subql::backend::Value::Int(1),
-                subql::backend::Value::Int(2),
-                subql::backend::Value::Int(3)
-            ]
+            (1..=6)
+                .map(|id| subql::backend::Value::Int(i64::from(id)))
+                .collect::<Vec<_>>(),
+            "one statement of three rows and one transaction of three statements"
+        );
+    });
+
+    common::drop_slot(&mut setup, &slot);
+}
+
+/// The streaming source says how much WAL its slot is holding.
+///
+/// Acknowledging is what releases a slot, so a consumer that never
+/// acknowledges retains WAL until the server's volume fills, and the only
+/// symptom is a transport error at a layer with no visible connection to the
+/// cause. The distance between what has arrived and what has been
+/// acknowledged is what makes that alertable before the disk answers for it.
+#[test]
+#[ignore = "requires Docker; run with --ignored"]
+fn the_streaming_source_reports_what_its_slot_is_holding() {
+    common::assert_docker_available();
+    let db = common::pg_database();
+    let mut setup = db.connect();
+    let mut dml = db.connect();
+    let slot = db.slot("subql_streaming_retention");
+    let publication = "subql_streaming_retention_pub";
+    fixture(&mut setup, "streaming retention", publication, &slot);
+
+    common::multi_thread_rt().block_on(async {
+        let mut source = subql::PgStreamingCdcSource::connect(
+            subql::PgStreamingConfig::new(db.url(), &slot, publication),
+            catalog(),
+        )
+        .await
+        .expect("connect streaming source");
+        assert_eq!(
+            source.unacknowledged_bytes(),
+            0,
+            "nothing has arrived yet, so nothing is held"
+        );
+        assert!(source.acknowledged_position().is_none());
+
+        sql_query("INSERT INTO orders VALUES (1, 5.0)")
+            .execute(&mut dml)
+            .expect("insert");
+        let event = tokio::time::timeout(Duration::from_secs(5), source.next_event())
+            .await
+            .expect("the insert arrives")
+            .expect("no source error")
+            .expect("the source is open");
+
+        let held = source.unacknowledged_bytes();
+        assert!(
+            held > 0,
+            "an unacknowledged event is WAL the slot cannot release"
+        );
+        assert!(
+            held < 1_000_000,
+            "the figure is a distance from the slot's own position, not an \
+             absolute one, got {held}"
+        );
+        assert!(
+            source.acknowledged_position().is_none(),
+            "nothing has been acknowledged yet"
+        );
+
+        let upto = event.checkpoint().expect("the event carries its position");
+        source.ack(upto).await.expect("the ack reaches the source");
+        // The held figure is a distance to the server's WAL end, which every
+        // other database on a shared server also moves, so the acknowledged
+        // position is what this can assert rather than a fall in the figure.
+        for _ in 0..40 {
+            if source.acknowledged_position().is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(
+            source.acknowledged_position(),
+            Some(upto),
+            "the acknowledgement is what releases the slot, and it is reported"
         );
     });
 
