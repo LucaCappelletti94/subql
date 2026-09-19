@@ -2677,6 +2677,29 @@ where
         Ok(())
     }
 
+    /// Rewrite a table's shard after an answer on it ends.
+    ///
+    /// The shard is what brings a maintained answer back, so a removal
+    /// left out of it revives the answer and it notifies consumers the
+    /// caller already ended. Logged rather than raised for the same reason
+    /// the reads file is.
+    #[cfg(feature = "std")]
+    fn persist_table_after_removal(&self, table_id: TableId) {
+        if self.storage_path.is_none() {
+            return;
+        }
+        if let Err(e) = self.snapshot_table_only(table_id) {
+            Self::log_best_effort_durability(&format!(
+                "Shard for table {table_id} not rewritten after an answer ended: {e}"
+            ));
+        }
+    }
+
+    /// Without the standard library there is no file to write.
+    #[cfg(not(feature = "std"))]
+    #[allow(clippy::unused_self)]
+    fn persist_table_after_removal(&self, _table_id: TableId) {}
+
     /// Rewrite the reads file after an answer ends.
     ///
     /// The file is what a restart believes, so an answer dropped without
@@ -3661,12 +3684,19 @@ where
     /// Also drops every per-session resume cursor associated with this
     /// `subscription_id` so cursors never outlive their owning subscription.
     pub fn unregister_subscription(&mut self, subscription_id: SubscriptionId) -> bool {
+        // Read before the removal takes the index entry with it.
+        #[cfg(feature = "std")]
+        let table = self.subscription_to_table.get(&subscription_id).copied();
         let removed = self
             .unregister_subscription_internal(subscription_id)
             .is_some();
         self.resume_cursors
             .retain(|(_, sub_id), _| *sub_id != subscription_id);
         if removed {
+            #[cfg(feature = "std")]
+            if let Some(table_id) = table {
+                self.persist_table_after_removal(table_id);
+            }
             self.persist_reads_after_removal();
         }
         removed
@@ -4511,11 +4541,24 @@ where
             }
         }
 
-        // Remove subscriptions
+        // Remove subscriptions, keeping the tables they were on so their
+        // shards stop naming them.
+        #[cfg(feature = "std")]
+        let mut touched: Vec<TableId> = Vec::new();
         for sub_id in to_remove {
+            #[cfg(feature = "std")]
+            if let Some(table_id) = self.subscription_to_table.get(&sub_id).copied() {
+                if !touched.contains(&table_id) {
+                    touched.push(table_id);
+                }
+            }
             if self.unregister_subscription_internal(sub_id) == Some(true) {
                 removed_predicates += 1;
             }
+        }
+        #[cfg(feature = "std")]
+        for table_id in touched {
+            self.persist_table_after_removal(table_id);
         }
 
         for (table_id, consumers) in removed_consumer_candidates {
@@ -4633,9 +4676,16 @@ where
             1
         };
 
+        #[cfg(feature = "std")]
+        {
+            self.persist_table_after_removal(table_id);
+            self.persist_reads_after_removal();
+        }
+
         Ok(UnregisterReport {
-            // Unregistering by statement touches predicates only, never the
-            // re-read answers, which are dropped by id.
+            // Unregistering by statement ends the maintained answers that
+            // share the predicate, and never a re-read answer, which is
+            // dropped by id.
             removed_reads: 0,
             removed_bindings,
             removed_predicates,

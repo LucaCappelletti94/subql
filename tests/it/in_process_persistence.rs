@@ -157,9 +157,34 @@ fn an_ended_in_process_answer_leaves_no_statement() {
     assert!(engine.unregister_subscription(answer), "the caller ends it");
     drop(engine);
 
-    let restored = Engine::with_storage(catalog(), PostgreSqlDialect {}, path).expect("reopen");
+    let (mut restored, reads) = Engine::with_storage(catalog(), PostgreSqlDialect {}, path)
+        .expect("reopen")
+        .into_parts();
     assert!(
-        restored.reads().in_process.is_empty(),
+        reads.in_process.is_empty(),
         "an ended answer keeps no statement"
+    );
+    // What a caller feels, rather than what the report says: the shard
+    // brings maintained answers back, so a removal left out of it revives
+    // one and it notifies a consumer that ended it.
+    assert_eq!(
+        restored.subscription_count(),
+        0,
+        "the shard does not bring the ended answer back"
+    );
+    let notified = restored
+        .consumers(&TestEvent::insert(
+            table("orders"),
+            vec![
+                subql::backend::Value::Int(1),
+                subql::backend::Value::Float(5.0),
+                subql::backend::Value::String("paid".into()),
+            ],
+        ))
+        .expect("the event dispatches");
+    assert!(
+        notified.inserted().is_empty(),
+        "nobody is notified for an answer the caller ended, got {:?}",
+        notified.inserted()
     );
 }
