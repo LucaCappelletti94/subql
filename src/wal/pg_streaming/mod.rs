@@ -124,8 +124,8 @@ pub struct PgStreamingCdcSource {
     ack_tx: tokio::sync::mpsc::UnboundedSender<PgLsn>,
     status_updates_sent: Arc<AtomicU64>,
     events_received: Arc<AtomicU64>,
-    /// Latest position the server has sent, and the latest one reported back
-    /// as flushed. Their difference is how much WAL the slot is holding.
+    /// The furthest position seen on a frame, and the position last
+    /// reported back as flushed.
     received_lsn: Arc<AtomicU64>,
     acked_lsn: Arc<AtomicU64>,
     /// Whether a caller has acknowledged anything, which the position alone
@@ -284,10 +284,14 @@ impl PgStreamingCdcSource {
         Arc::clone(&self.task_exited)
     }
 
-    /// Latest position reported back to the server as flushed.
+    /// Latest position this source has reported to the server as flushed.
     ///
     /// `None` until the first [`CdcSource::ack`](crate::CdcSource::ack),
     /// which is also the state in which the slot has released nothing.
+    ///
+    /// What the streaming task has sent, not what a caller has asked for.
+    /// `ack` returns once the position is queued for the task, so a read
+    /// taken immediately after it can still report the previous position.
     #[must_use]
     pub fn acknowledged_position(&self) -> Option<PgLsn> {
         self.acked_seen
@@ -295,13 +299,22 @@ impl PgStreamingCdcSource {
             .then(|| PgLsn(self.acked_lsn.load(Ordering::Relaxed)))
     }
 
-    /// How much WAL the slot is holding on this source's behalf, in bytes.
+    /// Distance between the furthest position this source has seen and the
+    /// one it last reported as flushed.
     ///
-    /// The distance between what the server has sent and what has been
-    /// acknowledged. A consumer that never acknowledges sees this grow
-    /// without bound, and so does the server's WAL volume, until it fills.
-    /// Alerting on a sustained rise is how that is caught before the disk
-    /// answers for it.
+    /// A keepalive carries the server's own WAL end, and a data frame
+    /// carries the position of the record it holds, so the figure counts
+    /// WAL this publication never carries and rises on activity elsewhere
+    /// in the cluster. A consumer that never acknowledges sees it grow
+    /// without bound, and so does the server's WAL volume, until it fills,
+    /// so a sustained rise is what catches that before the disk answers
+    /// for it.
+    ///
+    /// Close to what the slot retains without being it. The server retains
+    /// to the slot's `restart_lsn`, which lags the confirmed flush
+    /// position, and the end here is only as fresh as the last frame
+    /// received. Read `pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)`
+    /// from `pg_replication_slots` for the size itself.
     #[must_use]
     pub fn unacknowledged_bytes(&self) -> u64 {
         self.received_lsn
@@ -414,11 +427,13 @@ async fn streaming_task(
                         }
                         // The XLogData header is `'w'` + `start_lsn` (u64
                         // big-endian) + `wal_end` (u64 big-endian) + send time.
-                        // `wal_end` is the server's WAL end position at send
-                        // time, which is what `StandbyStatusUpdate` expects in
-                        // `received_lsn`. The payload byte count is NOT a
-                        // WAL-space distance: pgoutput payloads are
-                        // protocol-encoded, not raw WAL.
+                        // Under logical decoding `wal_end` is the end of the
+                        // record in this message, measured equal to
+                        // `start_lsn` on every frame of the suite, and a
+                        // keepalive is what carries the server's own WAL end.
+                        // The payload byte count is NOT a WAL-space distance,
+                        // since pgoutput payloads are protocol-encoded rather
+                        // than raw WAL.
                         let start_lsn = u64::from_be_bytes(
                             bytes[1..9].try_into().expect("slice is exactly 8 bytes"),
                         );
