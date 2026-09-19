@@ -13,7 +13,6 @@ use alloc::vec::Vec;
 use hashbrown::{HashMap, HashSet};
 use roaring::RoaringBitmap;
 use rpds::HashTrieMapSync;
-use slab::Slab;
 
 /// Compiled predicate with metadata.
 ///
@@ -399,6 +398,9 @@ where
     kept
 }
 
+/// Every predicate of one table, by id.
+pub type PredicateMap<B> = HashTrieMapSync<PredicateId, Predicate<B>>;
+
 /// Which subscribers each of a predicate's term slots admits, one shared entry
 /// per slot.
 pub type TermSlots<B> = HashMap<(PredicateId, u16), Arc<TermMembers<B>>>;
@@ -411,10 +413,16 @@ pub type TermSlots<B> = HashMap<(PredicateId, u16), Arc<TermMembers<B>>>;
 /// reads. Shared, the clone copies seven pointers and deepens only into the
 /// index the mutation reaches.
 pub struct PredicateStore<I: IdTypes, B: Backend> {
-    /// Slab-allocated predicates (stable IDs).
-    pub predicates: Arc<Slab<Predicate<B>>>,
+    /// Every predicate on this table, by id.
+    ///
+    /// Ids are handed out in order and never reused, so an id names one
+    /// predicate for the life of the partition. The table would have to hold
+    /// more than `u32::MAX` predicates over its lifetime for that to run out.
+    pub predicates: PredicateMap<B>,
+    /// The next id to hand out.
+    next_predicate: usize,
     /// Hash -> candidate PredicateIds (for deduplication with collision checks).
-    pub hash_index: Arc<HashMap<PredicateHash, Vec<PredicateId>>>,
+    pub hash_index: HashTrieMapSync<PredicateHash, Vec<PredicateId>>,
     /// SubscriptionId -> SubscriptionBinding.
     pub bindings: HashTrieMapSync<SubscriptionId, SubscriptionBinding<I>>,
     /// SessionId -> `Vec<SubscriptionId>` (for session cleanup).
@@ -458,8 +466,9 @@ pub struct PredicateStore<I: IdTypes, B: Backend> {
 impl<I: IdTypes, B: Backend> Clone for PredicateStore<I, B> {
     fn clone(&self) -> Self {
         Self {
-            predicates: Arc::clone(&self.predicates),
-            hash_index: Arc::clone(&self.hash_index),
+            predicates: self.predicates.clone(),
+            next_predicate: self.next_predicate,
+            hash_index: self.hash_index.clone(),
             bindings: self.bindings.clone(),
             scope_index: self.scope_index.clone(),
             predicate_consumers: self.predicate_consumers.clone(),
@@ -476,8 +485,9 @@ impl<I: IdTypes, B: Backend> PredicateStore<I, B> {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            predicates: Arc::new(Slab::new()),
-            hash_index: Arc::new(HashMap::new()),
+            predicates: PredicateMap::new_sync(),
+            next_predicate: 0,
+            hash_index: HashTrieMapSync::new_sync(),
             bindings: HashTrieMapSync::new_sync(),
             scope_index: HashTrieMapSync::new_sync(),
             predicate_consumers: HashTrieMapSync::new_sync(),
@@ -513,13 +523,7 @@ impl<I: IdTypes, B: Backend> PredicateStore<I, B> {
     /// Get predicate by ID
     #[must_use]
     pub fn get_predicate(&self, id: PredicateId) -> Option<&Predicate<B>> {
-        self.predicates.get(id.to_slab_index())
-    }
-
-    /// Get mutable predicate by ID
-    #[must_use]
-    pub fn get_predicate_mut(&mut self, id: PredicateId) -> Option<&mut Predicate<B>> {
-        Arc::make_mut(&mut self.predicates).get_mut(id.to_slab_index())
+        self.predicates.get(&id)
     }
 
     /// The members of one term slot, ready to be changed.
@@ -540,16 +544,15 @@ impl<I: IdTypes, B: Backend> PredicateStore<I, B> {
     ///
     /// Returns allocated `PredicateId` from slab insertion.
     pub fn add_predicate(&mut self, mut predicate: Predicate<B>) -> PredicateId {
-        let entry = Arc::make_mut(&mut self.predicates).vacant_entry();
-        let id = PredicateId::from_slab_index(entry.key());
+        let id = PredicateId::from_slab_index(self.next_predicate);
+        self.next_predicate += 1;
         let hash = predicate.hash;
         predicate.id = id;
 
-        entry.insert(predicate);
-        Arc::make_mut(&mut self.hash_index)
-            .entry(hash)
-            .or_default()
-            .push(id);
+        self.predicates.insert_mut(id, predicate);
+        let mut candidates = self.hash_index.get(&hash).cloned().unwrap_or_default();
+        candidates.push(id);
+        self.hash_index.insert_mut(hash, candidates);
 
         id
     }
@@ -593,12 +596,18 @@ impl<I: IdTypes, B: Backend> PredicateStore<I, B> {
 
     /// Remove predicate completely
     fn remove_predicate(&mut self, id: PredicateId) {
-        if let Some(pred) = Arc::make_mut(&mut self.predicates).try_remove(id.to_slab_index()) {
-            let hash_index = Arc::make_mut(&mut self.hash_index);
-            if let Some(ids) = hash_index.get_mut(&pred.hash) {
+        let Some(hash) = self.predicates.get(&id).map(|pred| pred.hash) else {
+            return;
+        };
+        self.predicates.remove_mut(&id);
+        {
+            if let Some(ids) = self.hash_index.get(&hash) {
+                let mut ids = ids.clone();
                 ids.retain(|existing| *existing != id);
                 if ids.is_empty() {
-                    hash_index.remove(&pred.hash);
+                    self.hash_index.remove_mut(&hash);
+                } else {
+                    self.hash_index.insert_mut(hash, ids);
                 }
             }
             self.predicate_consumers.remove_mut(&id);

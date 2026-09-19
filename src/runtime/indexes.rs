@@ -318,6 +318,92 @@ impl HybridIndexes {
         }
     }
 
+    /// Take a predicate out of the indexes, by the same routing that put it
+    /// in.
+    ///
+    /// The caller states the atoms, dependencies and projection the predicate
+    /// was added with, because those are what decided where its bit went, and
+    /// reading them back off a store that no longer holds it is not possible.
+    pub fn remove_predicate(
+        &mut self,
+        pred_id: PredicateId,
+        atoms: &[IndexableAtom],
+        deps: &[ColumnId],
+        projection: &QueryProjection,
+    ) {
+        let pred_id_u32 = pred_id.as_u32();
+
+        if matches!(
+            projection,
+            QueryProjection::Aggregate(_) | QueryProjection::GroupedAggregate { .. }
+        ) {
+            if deps.is_empty() {
+                self.agg_dependency_free.remove(pred_id_u32);
+            } else {
+                for &col_id in deps {
+                    if let Some(bitmap) = self.agg_dependency.get_mut(&col_id) {
+                        bitmap.remove(pred_id_u32);
+                        if bitmap.is_empty() {
+                            self.agg_dependency.remove(&col_id);
+                        }
+                    }
+                }
+            }
+            self.agg_fallback.remove(pred_id_u32);
+            return;
+        }
+
+        for &col_id in deps {
+            if let Some(bitmap) = self.dependency.get_mut(&col_id) {
+                bitmap.remove(pred_id_u32);
+                if bitmap.is_empty() {
+                    self.dependency.remove(&col_id);
+                }
+            }
+        }
+        self.full_row.remove(pred_id_u32);
+
+        for atom in atoms {
+            match atom {
+                IndexableAtom::Equality { column_id, value } => {
+                    if let Some(values) = self.equality.get_mut(column_id) {
+                        if let Some(bitmap) = values.get_mut(value) {
+                            bitmap.remove(pred_id_u32);
+                            if bitmap.is_empty() {
+                                values.remove(value);
+                            }
+                        }
+                        if values.is_empty() {
+                            self.equality.remove(column_id);
+                        }
+                    }
+                }
+
+                IndexableAtom::Range { column_id, .. } => {
+                    if let Some(entries) = self.range.get_mut(column_id) {
+                        entries.retain(|entry| entry.predicate_id != pred_id);
+                        if entries.is_empty() {
+                            self.range.remove(column_id);
+                        }
+                    }
+                }
+
+                IndexableAtom::Null { column_id, kind } => {
+                    if let Some(bitmap) = self.null_checks.get_mut(&(*column_id, *kind)) {
+                        bitmap.remove(pred_id_u32);
+                        if bitmap.is_empty() {
+                            self.null_checks.remove(&(*column_id, *kind));
+                        }
+                    }
+                }
+
+                IndexableAtom::Fallback => {
+                    self.fallback.remove(pred_id_u32);
+                }
+            }
+        }
+    }
+
     /// Select candidate agg predicates for a row/event.
     ///
     /// For UPDATE events with non-empty `changed_cols`: returns the union of

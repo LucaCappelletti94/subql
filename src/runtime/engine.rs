@@ -4714,7 +4714,7 @@ where
     pub fn predicate_count(&self, table_id: TableId) -> usize {
         self.partitions.get(&table_id).map_or(0, |p| {
             let snapshot = p.load_snapshot();
-            snapshot.predicates.predicates.len()
+            snapshot.predicates.predicates.size()
         })
     }
 
@@ -4902,6 +4902,13 @@ where
             };
             predicate_data_vec.push(pred_data);
         }
+        // Sorted so the shard's bytes depend on the partition's contents
+        // rather than on the predicate map's iteration order.
+        predicate_data_vec.sort_unstable_by(|left, right| {
+            left.hash
+                .cmp(&right.hash)
+                .then_with(|| left.normalized_sql.cmp(&right.normalized_sql))
+        });
 
         // Convert bindings to serializable format
         let mut binding_data_vec = Vec::new();
@@ -5216,7 +5223,6 @@ where
         for (table_id, path) in shard_files {
             self.load_shard(table_id, &path)?;
         }
-
         Ok(())
     }
 
@@ -5231,7 +5237,7 @@ where
         let snapshot = partition.load_snapshot();
 
         // Estimate size (rough approximation)
-        let estimated_size = snapshot.predicates.predicates.len() * 1024 + // ~1KB per predicate (bytecode + metadata)
+        let estimated_size = snapshot.predicates.predicates.size() * 1024 + // ~1KB per predicate (bytecode + metadata)
             snapshot.predicates.bindings.size() * 128; // ~128B per binding
 
         Ok(estimated_size > self.rotation_threshold)
