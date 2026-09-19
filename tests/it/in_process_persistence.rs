@@ -102,3 +102,64 @@ fn a_statement_without_its_predicate_is_not_reported() {
         "only the answer whose predicate came back is reported"
     );
 }
+
+/// An answer the caller ended does not come back.
+///
+/// The reads file was written when an answer was captured and never when
+/// one was dropped, so a restart revived subscriptions the caller had
+/// already been told were gone.
+#[test]
+fn an_ended_read_does_not_come_back() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().to_path_buf();
+
+    let mut engine = Engine::with_storage(catalog(), PostgreSqlDialect {}, path.clone())
+        .expect("open store")
+        .into_parts()
+        .0;
+    let answer = engine
+        .register(SubscriptionRequest::new(
+            1u64,
+            "SELECT MIN(price) FROM orders",
+        ))
+        .expect("the extreme registers")
+        .subscription_id;
+    assert_eq!(engine.reread_count(), 1);
+    assert!(engine.unregister_reread(answer), "the caller ends it");
+    drop(engine);
+
+    let restored = Engine::with_storage(catalog(), PostgreSqlDialect {}, path).expect("reopen");
+    assert!(
+        restored.reads().restored.is_empty(),
+        "an ended answer stays ended, got {:?}",
+        restored.reads().restored
+    );
+}
+
+/// Ending a maintained answer drops its statement too.
+#[test]
+fn an_ended_in_process_answer_leaves_no_statement() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().to_path_buf();
+
+    let mut engine = Engine::with_storage(catalog(), PostgreSqlDialect {}, path.clone())
+        .expect("open store")
+        .into_parts()
+        .0;
+    let answer = engine
+        .register(SubscriptionRequest::new(
+            1u64,
+            "SELECT * FROM orders WHERE status = 'paid'",
+        ))
+        .expect("the filter registers")
+        .subscription_id;
+    engine.snapshot_table(table("orders")).expect("snapshot");
+    assert!(engine.unregister_subscription(answer), "the caller ends it");
+    drop(engine);
+
+    let restored = Engine::with_storage(catalog(), PostgreSqlDialect {}, path).expect("reopen");
+    assert!(
+        restored.reads().in_process.is_empty(),
+        "an ended answer keeps no statement"
+    );
+}
