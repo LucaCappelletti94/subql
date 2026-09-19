@@ -13,7 +13,8 @@ jobs:
   refresh:
     name: refresh the resolved pins
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    # Monday's cache is cold, because the pins the cache keys on just moved.
+    timeout-minutes: 240
     steps:
       # A manual dispatch may select another ref, and only main's tree belongs here.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -26,6 +27,7 @@ jobs:
         with:
           toolchain: "1.88.0"
           components: rustfmt, clippy
+          targets: wasm32-unknown-unknown, wasm32-wasip1
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - run: cargo update
       - run: cargo update --manifest-path fuzz/Cargo.toml
@@ -37,8 +39,32 @@ jobs:
         run: cargo fmt --check
       - if: steps.moved.outputs.moved == 'yes'
         run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+      # The same rows the feature matrix carries, since an all-features build
+      # masks a missing gate in any one of them.
+      - if: steps.moved.outputs.moved == 'yes'
+        run: |
+          set -euo pipefail
+          cargo check --workspace --all-targets --locked
+          cargo check --lib --no-default-features --locked
+          cargo check --workspace --all-targets --locked --features sqlite-cdc
+          cargo check --workspace --all-targets --locked --features executor-diesel-async-postgres
+          cargo check --workspace --all-targets --locked --features executor-diesel-async-mysql
+          cargo check --workspace --all-targets --locked --features apply-patchset-postgres-async
+          cargo check --workspace --all-targets --locked --features apply-patchset-mysql-async
+      - if: steps.moved.outputs.moved == 'yes'
+        run: cargo check --lib --no-default-features --locked --target wasm32-unknown-unknown
+      - if: steps.moved.outputs.moved == 'yes'
+        run: cargo check --lib --no-default-features --locked --target wasm32-wasip1
+      - if: steps.moved.outputs.moved == 'yes'
+        run: cargo check --manifest-path fuzz/Cargo.toml --all-targets --locked
+      - if: steps.moved.outputs.moved == 'yes'
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --workspace --no-deps --all-features --locked --release
       - if: steps.moved.outputs.moved == 'yes'
         run: cargo test --workspace --lib --tests --release --locked
+      - if: steps.moved.outputs.moved == 'yes'
+        run: cargo test --workspace --doc --all-features --release --locked
       - if: steps.moved.outputs.moved == 'yes'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -62,4 +88,4 @@ jobs:
             --body "$(printf '%s\n' \
               'Weekly refresh of the committed lockfiles, resolved by the 1.88 toolchain so the MSRV job stays satisfiable.' \
               '' \
-              'The scheduled job that produced this ran the format check, clippy over every target with all features and warnings denied, and the release unit tests against these pins. Checks do not start by themselves on a pull request a workflow opened, so close and reopen this one to run the full suite.')"
+              'The scheduled job that produced this ran, against these pins, the format check, clippy over every target with all features and warnings denied, the workspace and fuzz checks, both wasm targets under no default features, the documentation build with warnings denied, and the release unit tests and doctests. Checks do not start by themselves on a pull request a workflow opened, so close and reopen this one to run the full suite, including the container groups this job cannot reach.')"
