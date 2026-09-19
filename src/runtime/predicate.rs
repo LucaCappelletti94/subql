@@ -414,13 +414,16 @@ pub type TermSlots<B> = HashMap<(PredicateId, u16), Arc<TermMembers<B>>>;
 /// index the mutation reaches.
 pub struct PredicateStore<I: IdTypes, B: Backend> {
     /// Every predicate on this table, by id.
-    ///
-    /// Ids are handed out in order and never reused, so an id names one
-    /// predicate for the life of the partition. The table would have to hold
-    /// more than `u32::MAX` predicates over its lifetime for that to run out.
     pub predicates: PredicateMap<B>,
-    /// The next id to hand out.
+    /// The next id to hand out when nothing has been released.
     next_predicate: usize,
+    /// Ids released by removed predicates, newest first.
+    ///
+    /// An id is a bit in every candidate bitmap, so handing them out fresh
+    /// forever would spread those bitmaps over an ever higher range and walk
+    /// a churning partition towards the `u32` ceiling. Reusing the last
+    /// released id keeps the space as dense as the slab this replaced.
+    released: Vec<PredicateId>,
     /// Hash -> candidate PredicateIds (for deduplication with collision checks).
     pub hash_index: HashTrieMapSync<PredicateHash, Vec<PredicateId>>,
     /// SubscriptionId -> SubscriptionBinding.
@@ -468,6 +471,7 @@ impl<I: IdTypes, B: Backend> Clone for PredicateStore<I, B> {
         Self {
             predicates: self.predicates.clone(),
             next_predicate: self.next_predicate,
+            released: self.released.clone(),
             hash_index: self.hash_index.clone(),
             bindings: self.bindings.clone(),
             scope_index: self.scope_index.clone(),
@@ -487,6 +491,7 @@ impl<I: IdTypes, B: Backend> PredicateStore<I, B> {
         Self {
             predicates: PredicateMap::new_sync(),
             next_predicate: 0,
+            released: Vec::new(),
             hash_index: HashTrieMapSync::new_sync(),
             bindings: HashTrieMapSync::new_sync(),
             scope_index: HashTrieMapSync::new_sync(),
@@ -544,8 +549,11 @@ impl<I: IdTypes, B: Backend> PredicateStore<I, B> {
     ///
     /// Returns allocated `PredicateId` from slab insertion.
     pub fn add_predicate(&mut self, mut predicate: Predicate<B>) -> PredicateId {
-        let id = PredicateId::from_slab_index(self.next_predicate);
-        self.next_predicate += 1;
+        let id = self.released.pop().unwrap_or_else(|| {
+            let id = PredicateId::from_slab_index(self.next_predicate);
+            self.next_predicate += 1;
+            id
+        });
         let hash = predicate.hash;
         predicate.id = id;
 
@@ -600,6 +608,7 @@ impl<I: IdTypes, B: Backend> PredicateStore<I, B> {
             return;
         };
         self.predicates.remove_mut(&id);
+        self.released.push(id);
         {
             if let Some(ids) = self.hash_index.get(&hash) {
                 let mut ids = ids.clone();
