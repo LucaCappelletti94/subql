@@ -275,13 +275,23 @@ fn ending_a_session_stops_its_answers_coming_back() {
     assert_eq!(report.removed_reads, 1, "and one answer a read served");
     drop(engine);
 
-    let (mut restored, _reads) = Engine::with_storage(catalog(), PostgreSqlDialect {}, path)
+    let (mut restored, reads) = Engine::with_storage(catalog(), PostgreSqlDialect {}, path)
         .expect("reopen")
         .into_parts();
     assert_eq!(
         restored.subscription_count(),
         0,
-        "the session's answer does not come back"
+        "the session's maintained answer does not come back"
+    );
+    assert!(
+        reads.restored.is_empty(),
+        "nor the one a read served, got {:?}",
+        reads.restored
+    );
+    assert_eq!(
+        restored.reread_count(),
+        0,
+        "and the read registry is empty, not merely unreported"
     );
     let notified = restored
         .consumers(&TestEvent::insert(
