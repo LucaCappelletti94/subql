@@ -43,8 +43,8 @@ pub trait SubscriptionRegistration<I: IdTypes, B: Backend>: Send {
 /// Parameterised on the observed `E: CdcEvent` so `consumers` accepts a
 /// backend-typed event and returns notifications carrying `E::Checkpoint`.
 /// Each engine layer chooses its own [`Notifications`](Self::Notifications)
-/// shape. The base engine yields [`ConsumerNotifications`], owning nothing of
-/// the engine, while the re-execution wrappers yield a
+/// shape. The base engine yields a [`DispatchOutput`](crate::DispatchOutput),
+/// owning nothing of the engine, while the re-execution wrappers yield a
 /// [`Dispatch`](crate::reexec::Dispatch) that borrows it until its queued
 /// reads are drained, which is why the associated type is generic over the
 /// borrow.
@@ -57,9 +57,17 @@ pub trait SubscriptionDispatch<I: IdTypes, E: CdcEvent>: Send {
     /// Error returned when dispatch fails.
     type Error;
 
-    /// Get interested consumers for a CDC event.
+    /// Answer a CDC event for every subscription the implementor holds.
     ///
-    /// Returns view-relative notifications: each consumer sees
+    /// The whole event, not the part one layer happens to serve cheaply.
+    /// Row filters answer from the event, aggregates fold, and answers a
+    /// read serves report the read they need, so a caller holding this
+    /// trait rather than a concrete engine is not silently served a
+    /// subset. An implementation that leaves a class of subscription to a
+    /// second call breaks this contract, since nobody behind the bound
+    /// can know to make that call.
+    ///
+    /// Notifications are view-relative: each consumer sees
     /// INSERT / DELETE / UPDATE relative to their own result set.
     fn consumers(&mut self, event: &E) -> Result<Self::Notifications<'_>, Self::Error>;
 }
@@ -80,7 +88,9 @@ pub trait AsyncSubscriptionDispatch<I: IdTypes, E: CdcEvent>: Send {
     /// Error returned when dispatch fails.
     type Error;
 
-    /// Get interested consumers for a CDC event.
+    /// Answer a CDC event for every subscription the implementor holds,
+    /// under the same whole-event contract as
+    /// [`SubscriptionDispatch::consumers`].
     ///
     /// The event is borrowed for the future alone, not for the notifications,
     /// so a caller may drop the event and keep draining.

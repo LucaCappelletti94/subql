@@ -222,6 +222,7 @@ mod proptest_row_set_delta;
 mod proptest_throttle;
 
 #[cfg(feature = "std")]
+mod dispatch_contract;
 mod in_process_persistence;
 mod merge_jobs;
 mod reads_persist;
