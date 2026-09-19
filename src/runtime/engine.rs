@@ -234,6 +234,21 @@ impl core::fmt::Display for RebuildPayloadError {
     }
 }
 
+/// What an in-process answer would read if the stream ever cannot answer
+/// it, kept because only registration sees the statement.
+///
+/// A re-read answer keeps its own statement on its
+/// [`ReExecEntry`](crate::reexec::ReExecEntry). An in-process one keeps
+/// only a compiled predicate, which is a `WHERE` expression and not a
+/// statement, so nothing else could rebuild the read after a restart.
+#[cfg(feature = "std")]
+#[derive(Debug, Clone)]
+pub(crate) struct InProcessSource<I: IdTypes, B: Backend> {
+    pub(crate) consumer_id: I::ConsumerId,
+    pub(crate) scope: SubscriptionScope<I>,
+    pub(crate) source_query: crate::reexec::BoundQuery<B>,
+}
+
 /// An engine reopened from storage, holding the answers that came back.
 ///
 /// A restored answer comes back knowing neither its value nor the context
@@ -291,6 +306,10 @@ where
     consumer_dictionaries: HashMap<TableId, ConsumerDictionary<I>>,
     /// Subscription index for O(1) unregister / upsert lookup.
     subscription_to_table: HashMap<SubscriptionId, TableId>,
+    /// Statements of the answers the engine maintains itself, for rebuilding
+    /// their read context after a restart.
+    #[cfg(feature = "std")]
+    in_process_sources: HashMap<SubscriptionId, InProcessSource<I, E::Backend>>,
     /// Monotonic counter for auto-assigning subscription IDs (starts at 1).
     next_subscription_id: u64,
     /// Dedup index: (consumer_id, predicate_hash, scope) -> existing SubscriptionId.
@@ -1286,6 +1305,8 @@ where
             partitions: HashMap::new(),
             consumer_dictionaries: HashMap::new(),
             subscription_to_table: HashMap::new(),
+            #[cfg(feature = "std")]
+            in_process_sources: HashMap::new(),
             next_subscription_id: 1,
             binding_dedup: HashMap::new(),
             vm: Vm::new(),
@@ -1583,8 +1604,35 @@ where
         self.register_request(spec.into_request(), R::DATABASE_READS_PER_CONSUMER)
     }
 
-    #[allow(clippy::too_many_lines)]
     pub(crate) fn register_request(
+        &mut self,
+        spec: SubscriptionRequest<I, E::Backend>,
+        database_reads_per_consumer: bool,
+    ) -> Result<Registered<E::Backend>, RegisterError> {
+        #[cfg(feature = "std")]
+        let retained = (
+            spec.consumer_id,
+            spec.scope,
+            crate::reexec::BoundQuery::new(spec.sql.clone(), spec.binds.clone()),
+        );
+        let result = self.register_request_inner(spec, database_reads_per_consumer)?;
+        #[cfg(feature = "std")]
+        if matches!(result.tier, Tier::InProcess(_)) {
+            let (consumer_id, scope, source_query) = retained;
+            self.in_process_sources.insert(
+                result.subscription_id,
+                InProcessSource {
+                    consumer_id,
+                    scope,
+                    source_query,
+                },
+            );
+        }
+        Ok(result)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn register_request_inner(
         &mut self,
         spec: SubscriptionRequest<I, E::Backend>,
         database_reads_per_consumer: bool,
@@ -2492,6 +2540,17 @@ where
         self.reexec.get(&subscription_id).and_then(|e| e.session)
     }
 
+    /// The scope a maintained answer was registered under.
+    #[cfg(feature = "std")]
+    pub(crate) fn subscription_scope(
+        &self,
+        subscription_id: SubscriptionId,
+    ) -> Option<SubscriptionScope<I>> {
+        self.in_process_sources
+            .get(&subscription_id)
+            .map(|source| source.scope)
+    }
+
     /// How many re-read answers this engine holds.
     #[must_use]
     pub fn reread_count(&self) -> usize {
@@ -2651,8 +2710,25 @@ where
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as u64;
+        let mut in_process: Vec<_> = self
+            .in_process_sources
+            .iter()
+            .map(
+                |(subscription_id, source)| crate::persistence::reads::InProcessEntry::<
+                    I,
+                    E::Backend,
+                > {
+                    subscription_id: *subscription_id,
+                    consumer_id: source.consumer_id,
+                    scope: source.scope,
+                    source_query: source.source_query.clone(),
+                },
+            )
+            .collect();
+        in_process.sort_unstable_by_key(|e| e.subscription_id);
         let payload = crate::persistence::reads::ReadsPayload::<I, E::Backend> {
             entries,
+            in_process,
             created_at_unix_ms,
         };
         let bytes = crate::persistence::reads::serialize(&payload)?;
@@ -2696,6 +2772,34 @@ where
                     reason,
                 }),
             }
+        }
+        // The shards already brought these back as maintained answers. What
+        // is rebuilt here is only the statement each falls back to reading,
+        // which the shards do not hold.
+        for entry in payload.in_process {
+            let spec = crate::SubscriptionRequest::<I, E::Backend>::new(
+                entry.consumer_id,
+                entry.source_query.sql(),
+            )
+            .binds(entry.source_query.binds().to_vec())
+            .scope(entry.scope);
+            let aggregate_bootstrap = self
+                .compile_spec(spec, false)
+                .ok()
+                .and_then(|c| c.bootstrap);
+            report.in_process.push(crate::RestoredInProcess {
+                subscription_id: entry.subscription_id,
+                source_query: entry.source_query.clone(),
+                aggregate_bootstrap,
+            });
+            self.in_process_sources.insert(
+                entry.subscription_id,
+                InProcessSource {
+                    consumer_id: entry.consumer_id,
+                    scope: entry.scope,
+                    source_query: entry.source_query,
+                },
+            );
         }
         Ok(report)
     }
@@ -3037,8 +3141,42 @@ where
     /// assert_eq!(engine.subscription_count(), 3);
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
-    #[allow(clippy::too_many_lines, clippy::cognitive_complexity)]
     pub fn register_batch(
+        &mut self,
+        specs: Vec<SubscriptionRequest<I, E::Backend>>,
+    ) -> Vec<Result<Registered<E::Backend>, RegisterError>> {
+        #[cfg(feature = "std")]
+        let retained: Vec<_> = specs
+            .iter()
+            .map(|spec| {
+                (
+                    spec.consumer_id,
+                    spec.scope,
+                    crate::reexec::BoundQuery::new(spec.sql.clone(), spec.binds.clone()),
+                )
+            })
+            .collect();
+        let results = self.register_batch_inner(specs);
+        #[cfg(feature = "std")]
+        for (result, (consumer_id, scope, source_query)) in results.iter().zip(retained) {
+            if let Ok(registered) = result {
+                if matches!(registered.tier, Tier::InProcess(_)) {
+                    self.in_process_sources.insert(
+                        registered.subscription_id,
+                        InProcessSource {
+                            consumer_id,
+                            scope,
+                            source_query,
+                        },
+                    );
+                }
+            }
+        }
+        results
+    }
+
+    #[allow(clippy::too_many_lines, clippy::cognitive_complexity)]
+    fn register_batch_inner(
         &mut self,
         specs: Vec<SubscriptionRequest<I, E::Backend>>,
     ) -> Vec<Result<Registered<E::Backend>, RegisterError>> {
@@ -3718,6 +3856,8 @@ where
         subscription_id: SubscriptionId,
     ) -> Option<bool> {
         self.pk_follows.remove(&subscription_id);
+        #[cfg(feature = "std")]
+        self.in_process_sources.remove(&subscription_id);
         self.aggregates.remove(&subscription_id);
         self.grouped_aggregates.remove(&subscription_id);
         self.aggregate_registrations.remove(&subscription_id);

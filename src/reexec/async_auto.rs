@@ -344,20 +344,26 @@ where
                 .permits
                 .as_ref()
                 .map(|s| (Arc::clone(&s.sem), Arc::clone(&s.inflight)));
+            // Every read runs under its subscription's context, including a
+            // grouped one, whose job needs no context to plan.
+            let jobs = jobs
+                .into_iter()
+                .map(
+                    |(trigger, job)| match contexts.get(&trigger.subscription_id) {
+                        Some(ctx) => Ok((trigger, job, &ctx.auth)),
+                        None => Err(ReExecError::Unadopted {
+                            subscription: trigger.subscription_id,
+                        }),
+                    },
+                )
+                .collect::<Result<Vec<_>, _>>()?;
             let jobs_len = jobs.len();
             let resolved = {
                 // Whole reads stream their pages from inside the concurrent
                 // phase, so the sink is shared under an async lock for the
                 // duration and handed back exclusively afterwards.
                 let shared_sink = async_lock::Mutex::new(&mut sink);
-                futures_util::stream::iter(jobs.into_iter().map(|(trigger, job)| {
-                    let auth = &contexts
-                        .get(&trigger.subscription_id)
-                        .expect(
-                            "planning refuses a trigger whose context is missing, so every job \
-                             reaching this point has one",
-                        )
-                        .auth;
+                futures_util::stream::iter(jobs.into_iter().map(|(trigger, job, auth)| {
                     Self::run_one(
                         connector,
                         &shared_sink,

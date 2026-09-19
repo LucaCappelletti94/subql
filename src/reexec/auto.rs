@@ -186,9 +186,15 @@ where
     /// answers that could not come back. They are gone by the time this
     /// returns.
     #[cfg(feature = "std")]
-    pub fn adopt<F>(restored: crate::Restored<E, I, DB>, mode: M, mut auth: F) -> Self
+    pub fn adopt<F, G>(
+        restored: crate::Restored<E, I, DB>,
+        mode: M,
+        mut auth: F,
+        mut auth_in_process: G,
+    ) -> Self
     where
         F: FnMut(&crate::RestoredRead<E::Backend>) -> M::AuthContext,
+        G: FnMut(&crate::RestoredInProcess<E::Backend>) -> M::AuthContext,
     {
         let (inner, reads) = restored.into_parts();
         let mut engine = Self::new(inner, mode);
@@ -237,6 +243,44 @@ where
                 Tier::InProcess(_) => continue,
             };
             engine.contexts.insert(read.subscription_id, context);
+        }
+        // The engine maintains these itself, so they read only when the
+        // stream cannot answer them, and that read needs the same context.
+        for answer in &reads.in_process {
+            let session = match engine.inner.subscription_scope(answer.subscription_id) {
+                Some(crate::SubscriptionScope::Session(s)) => Some(s),
+                _ => None,
+            };
+            let (query, whole_result, kind) = answer.aggregate_bootstrap.as_ref().map_or_else(
+                || {
+                    (
+                        answer.source_query.clone(),
+                        true,
+                        InProcessKind::StreamServedFilter,
+                    )
+                },
+                |bootstrap| {
+                    (
+                        bootstrap.query.clone(),
+                        false,
+                        InProcessKind::FoldingAggregate,
+                    )
+                },
+            );
+            engine.contexts.insert(
+                answer.subscription_id,
+                ResolveContext {
+                    query,
+                    column_kind: ScalarFamily::String,
+                    grouped_bootstrap: None,
+                    whole_result,
+                    keyed: false,
+                    in_process: Some(kind),
+                    generation: 0,
+                    session,
+                    auth: auth_in_process(answer),
+                },
+            );
         }
         engine
     }

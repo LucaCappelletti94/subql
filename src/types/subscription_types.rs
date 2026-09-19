@@ -1273,6 +1273,21 @@ pub struct RestoredReads<B: Backend = crate::backend::Postgres> {
     pub restored: Vec<RestoredRead<B>>,
     /// Answers that could not come back, with the reason.
     pub dropped: Vec<DroppedRead>,
+    /// Answers the engine maintains itself, which read only when the
+    /// stream cannot answer them and so still need a context.
+    pub in_process: Vec<RestoredInProcess<B>>,
+}
+
+/// One answer the engine maintains itself, come back from the file.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RestoredInProcess<B: Backend = crate::backend::Postgres> {
+    /// The identity it had before the restart, which it keeps.
+    pub subscription_id: SubscriptionId,
+    /// The statement it was registered with, which is what it falls back
+    /// to reading.
+    pub source_query: crate::reexec::BoundQuery<B>,
+    /// Its initial grouped read, when the answer is a folding aggregate.
+    pub aggregate_bootstrap: Option<crate::AggregateBootstrap<B>>,
 }
 
 impl<B: Backend> Default for RestoredReads<B> {
@@ -1280,6 +1295,7 @@ impl<B: Backend> Default for RestoredReads<B> {
         Self {
             restored: Vec::new(),
             dropped: Vec::new(),
+            in_process: Vec::new(),
         }
     }
 }

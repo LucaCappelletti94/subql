@@ -51,6 +51,7 @@ fn an_adopted_answer_resolves_through_the_connector() {
         restored,
         SyncMode(MockConnector::new(alloc::vec![Value::Float(7.0)])),
         |_| (),
+        |_| (),
     );
 
     let settled = engine
@@ -110,4 +111,80 @@ fn an_unadopted_answer_refuses_its_read() {
         ),
         "the refusal names the answer that was never adopted, got {err:?}"
     );
+}
+
+/// A restored in-process filter can still fall back to a read.
+///
+/// The engine answers this one from the stream, so it has no saved read at
+/// all, and the shards hold its predicate rather than its statement. The
+/// fallback is what the statement is kept for: a row image missing a cell
+/// the filter reads has no answer in memory, and reading is the only way to
+/// give the subscriber one.
+#[test]
+fn an_adopted_in_process_filter_reads_when_the_stream_cannot_answer() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().to_path_buf();
+
+    let mut engine = SubscriptionEngine::<TestEvent<Postgres>, DefaultIds, ParserDB>::with_storage(
+        catalog(),
+        PostgreSqlDialect {},
+        path.clone(),
+    )
+    .expect("open store")
+    .into_parts()
+    .0;
+    let orders = crate::catalog_helpers::table_id::<Postgres, _>(&catalog(), "orders")
+        .expect("orders table exists");
+    let registered = engine
+        .register(crate::SubscriptionRequest::new(
+            1u64,
+            "SELECT * FROM orders WHERE status = 'paid'",
+        ))
+        .expect("the filter registers");
+    assert!(
+        matches!(registered.tier, Tier::InProcess(_)),
+        "the stream answers this one, so nothing is saved as a read"
+    );
+    engine.snapshot_table(orders).expect("snapshot the table");
+    engine.snapshot_reads().expect("snapshot the statements");
+    drop(engine);
+
+    let restored = SubscriptionEngine::<TestEvent<Postgres>, DefaultIds, ParserDB>::with_storage(
+        catalog(),
+        PostgreSqlDialect {},
+        path,
+    )
+    .expect("reopen store");
+    assert_eq!(
+        restored.reads().in_process.len(),
+        1,
+        "the maintained answer comes back with its statement"
+    );
+
+    let mut engine = AutoResolvingEngine::adopt(
+        restored,
+        SyncMode(MockConnector::new(alloc::vec![])),
+        |_| (),
+        |_| (),
+    );
+    engine
+        .connector()
+        .cursor_pages
+        .borrow_mut()
+        .push(crate::reexec::RowPage {
+            columns: alloc::vec![String::from("id"), String::from("status")],
+            rows: alloc::vec![alloc::vec![Value::Int(1), Value::String("paid".into())]],
+            more: false,
+        });
+
+    // The row image omits `status`, which the filter reads, so the event
+    // cannot answer it in memory.
+    let mut cells = row(1, 5.0);
+    cells[3] = Value::Missing;
+    let event = TestEvent::<Postgres>::update(orders, row(1, 5.0), cells)
+        .with_pk_columns([0u16])
+        .with_changed_columns([1u16]);
+
+    let settled = engine.apply(&event).unwrap().resolve_collect();
+    settled.reads.expect("the fallback read resolves");
 }
