@@ -4035,7 +4035,19 @@ where
         None
     }
 
-    /// Dispatch event to interested consumers.
+    /// Dispatch an event to the consumers this engine answers from the
+    /// event itself.
+    ///
+    /// The half served in process, which is every subscription for a
+    /// registry holding only row filters. An aggregate is not folded here
+    /// and a read is not triggered here, so an engine holding either wants
+    /// [`dispatch`](Self::dispatch), which answers all three and is what
+    /// the [`SubscriptionDispatch`] trait
+    /// gives a caller who cannot know which the engine holds.
+    ///
+    /// Membership sets and the eviction clock move here either way, so
+    /// this applies part of the event rather than asking a question about
+    /// it.
     ///
     /// # Examples
     /// ```
@@ -5442,13 +5454,20 @@ where
     DB: DatabaseLike + Send + Sync + 'static,
 {
     type Notifications<'engine>
-        = crate::ConsumerNotifications<I, E::Checkpoint, E::Backend>
+        = crate::DispatchOutput<I, E::Checkpoint, E::Backend>
     where
         Self: 'engine;
     type Error = DispatchError;
 
+    /// The whole event, as the other implementor of this trait answers it.
+    ///
+    /// The inherent [`consumers`](Self::consumers) answers the half this
+    /// engine serves from the event itself, which is a choice a caller
+    /// makes knowingly. Through the trait nobody can make it, since the
+    /// engine behind the bound is not theirs to pick, so the trait answers
+    /// everything.
     fn consumers(&mut self, event: &E) -> Result<Self::Notifications<'_>, Self::Error> {
-        Self::consumers(self, event)
+        self.dispatch(event)
     }
 }
 
