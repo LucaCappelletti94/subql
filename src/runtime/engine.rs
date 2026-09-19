@@ -1604,35 +1604,8 @@ where
         self.register_request(spec.into_request(), R::DATABASE_READS_PER_CONSUMER)
     }
 
-    pub(crate) fn register_request(
-        &mut self,
-        spec: SubscriptionRequest<I, E::Backend>,
-        database_reads_per_consumer: bool,
-    ) -> Result<Registered<E::Backend>, RegisterError> {
-        #[cfg(feature = "std")]
-        let retained = (
-            spec.consumer_id,
-            spec.scope,
-            crate::reexec::BoundQuery::new(spec.sql.clone(), spec.binds.clone()),
-        );
-        let result = self.register_request_inner(spec, database_reads_per_consumer)?;
-        #[cfg(feature = "std")]
-        if matches!(result.tier, Tier::InProcess(_)) {
-            let (consumer_id, scope, source_query) = retained;
-            self.in_process_sources.insert(
-                result.subscription_id,
-                InProcessSource {
-                    consumer_id,
-                    scope,
-                    source_query,
-                },
-            );
-        }
-        Ok(result)
-    }
-
     #[allow(clippy::too_many_lines)]
-    fn register_request_inner(
+    pub(crate) fn register_request(
         &mut self,
         spec: SubscriptionRequest<I, E::Backend>,
         database_reads_per_consumer: bool,
@@ -1749,7 +1722,17 @@ where
             &compiled.projection,
             database_reads_per_consumer,
         );
-        // 9. Enforce durability policy for this table.
+        // 9. Keep the statement before any snapshot that durability forces,
+        // so the snapshot carries this registration rather than missing it.
+        #[cfg(feature = "std")]
+        self.retain_in_process_source(
+            subscription_id,
+            compiled.spec.consumer_id,
+            compiled.spec.scope,
+            source_query,
+        );
+
+        // 10. Enforce durability policy for this table.
         #[cfg(feature = "std")]
         if let DurabilityCheckOutcome::RequiredFailure {
             message,
@@ -2534,6 +2517,29 @@ where
         self.table_deps.contains_key(&table_id)
     }
 
+    /// Keep the statement an in-process answer falls back to reading.
+    ///
+    /// Called before any durability enforcement for the same registration,
+    /// so a snapshot triggered by that enforcement carries the statement
+    /// of the registration that triggered it.
+    #[cfg(feature = "std")]
+    fn retain_in_process_source(
+        &mut self,
+        subscription_id: SubscriptionId,
+        consumer_id: I::ConsumerId,
+        scope: SubscriptionScope<I>,
+        source_query: crate::reexec::BoundQuery<E::Backend>,
+    ) {
+        self.in_process_sources.insert(
+            subscription_id,
+            InProcessSource {
+                consumer_id,
+                scope,
+                source_query,
+            },
+        );
+    }
+
     /// The session a restored re-read belongs to, for rebuilding its
     /// resolve context on adoption.
     pub(crate) fn reexec_session(&self, subscription_id: SubscriptionId) -> Option<I::SessionId> {
@@ -2777,6 +2783,17 @@ where
         // is rebuilt here is only the statement each falls back to reading,
         // which the shards do not hold.
         for entry in payload.in_process {
+            // The shards decide what is live. A statement whose
+            // subscription they did not bring back belongs to one ended
+            // before the restart, or to a table whose shard was never
+            // written, and reporting it would tell a caller an answer
+            // came back when nothing answers.
+            if !self
+                .subscription_to_table
+                .contains_key(&entry.subscription_id)
+            {
+                continue;
+            }
             let spec = crate::SubscriptionRequest::<I, E::Backend>::new(
                 entry.consumer_id,
                 entry.source_query.sql(),
@@ -3141,6 +3158,7 @@ where
     /// assert_eq!(engine.subscription_count(), 3);
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
+    #[allow(clippy::too_many_lines, clippy::cognitive_complexity)]
     pub fn register_batch(
         &mut self,
         specs: Vec<SubscriptionRequest<I, E::Backend>>,
@@ -3156,30 +3174,6 @@ where
                 )
             })
             .collect();
-        let results = self.register_batch_inner(specs);
-        #[cfg(feature = "std")]
-        for (result, (consumer_id, scope, source_query)) in results.iter().zip(retained) {
-            if let Ok(registered) = result {
-                if matches!(registered.tier, Tier::InProcess(_)) {
-                    self.in_process_sources.insert(
-                        registered.subscription_id,
-                        InProcessSource {
-                            consumer_id,
-                            scope,
-                            source_query,
-                        },
-                    );
-                }
-            }
-        }
-        results
-    }
-
-    #[allow(clippy::too_many_lines, clippy::cognitive_complexity)]
-    fn register_batch_inner(
-        &mut self,
-        specs: Vec<SubscriptionRequest<I, E::Backend>>,
-    ) -> Vec<Result<Registered<E::Backend>, RegisterError>> {
         // Eviction-aware fallback: when an active-eviction policy is
         // configured, within-batch eviction would have to consider
         // pending-but-not-yet-committed sub_ids that
@@ -3539,6 +3533,25 @@ where
             }));
         }
         self.watch_terms(watches);
+
+        // Keep every statement before the durability sweep below, so a
+        // snapshot it forces carries this batch rather than missing it.
+        #[cfg(feature = "std")]
+        for (result, (consumer_id, scope, source_query)) in
+            results.iter().zip(retained).collect::<Vec<_>>()
+        {
+            if let Ok(registered) = result {
+                if matches!(registered.tier, Tier::InProcess(_)) {
+                    let subscription_id = registered.subscription_id;
+                    self.retain_in_process_source(
+                        subscription_id,
+                        consumer_id,
+                        scope,
+                        source_query,
+                    );
+                }
+            }
+        }
 
         #[cfg(feature = "std")]
         {
@@ -4747,13 +4760,20 @@ where
     /// together. The reads file covers every subscription rather than this
     /// table's, which is why it is rewritten whole.
     ///
+    /// The reads file goes first, so a failure leaves nothing committed
+    /// and the caller is told the truth. The reverse order would commit
+    /// the shard and then report a failure the shard contradicts. A reads
+    /// file naming a subscription whose shard was never written costs
+    /// nothing, because restoring keeps only the statements of
+    /// subscriptions the shards brought back.
+    ///
     /// # Errors
     ///
     /// [`StorageError`] when either file cannot be written.
     #[cfg(feature = "std")]
     pub fn snapshot_table(&self, table_id: TableId) -> Result<(), StorageError> {
-        self.snapshot_table_only(table_id)?;
-        self.snapshot_reads()
+        self.snapshot_reads()?;
+        self.snapshot_table_only(table_id)
     }
 
     /// Write this table's shard, leaving the reads file alone.
