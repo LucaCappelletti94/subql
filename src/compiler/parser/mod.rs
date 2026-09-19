@@ -27,10 +27,7 @@ use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use compilation_helpers::{compile_expression, wrap_bare_value_as_tri};
 use sql_traits::prelude::DatabaseLike;
-use sqlparser::ast::{
-    Expr, FunctionArg, FunctionArgExpr, FunctionArguments, ObjectName, Query, SetExpr, Statement,
-    Value as SqlValue,
-};
+use sqlparser::ast::{Expr, ObjectName, Statement, Value as SqlValue};
 use sqlparser::dialect::Dialect;
 use sqlparser_canonicalize::Canonicalizer;
 
@@ -642,84 +639,39 @@ fn placeholder_index(
     Ok(idx)
 }
 
-/// Recursively replace `Value::Placeholder` leaves with their literal bind
-/// values, in placeholder order. Walks only the expression shapes the compiler
-/// supports; a placeholder in an unsupported position is left untouched and
-/// rejected later by the compiler.
+/// Replace every `Value::Placeholder` leaf of `expr` with its literal bind
+/// value, in written order, wherever the derived walk finds one.
+///
+/// Written order is what a positional `?` is numbered by, and the derived
+/// visitor walks each node's fields in declaration order, which is the
+/// written order for every shape the compiler serves.
 fn resolve_expr_placeholders<B: Backend>(
     expr: &mut Expr,
     binds: &[Value<B>],
     next_positional: &mut usize,
 ) -> Result<(), RegisterError> {
-    match expr {
-        Expr::Value(val) => {
-            if let SqlValue::Placeholder(token) = &val.value {
-                let idx = placeholder_index(token, binds.len(), next_positional)?;
-                val.value = value_to_sql_value(&binds[idx])?;
+    let mut failure = None;
+    let _: core::ops::ControlFlow<()> = sqlparser::ast::visit_expressions_mut(expr, |inner| {
+        let Expr::Value(val) = inner else {
+            return core::ops::ControlFlow::Continue(());
+        };
+        let SqlValue::Placeholder(token) = &val.value else {
+            return core::ops::ControlFlow::Continue(());
+        };
+        match placeholder_index(token, binds.len(), next_positional)
+            .and_then(|idx| value_to_sql_value(&binds[idx]))
+        {
+            Ok(literal) => {
+                val.value = literal;
+                core::ops::ControlFlow::Continue(())
+            }
+            Err(error) => {
+                failure = Some(error);
+                core::ops::ControlFlow::Break(())
             }
         }
-        Expr::BinaryOp { left, right, .. } | Expr::AnyOp { left, right, .. } => {
-            resolve_expr_placeholders(left, binds, next_positional)?;
-            resolve_expr_placeholders(right, binds, next_positional)?;
-        }
-        Expr::UnaryOp { expr, .. }
-        | Expr::IsNull(expr)
-        | Expr::IsNotNull(expr)
-        | Expr::Nested(expr) => {
-            resolve_expr_placeholders(expr, binds, next_positional)?;
-        }
-        Expr::InList { expr, list, .. } => {
-            resolve_expr_placeholders(expr, binds, next_positional)?;
-            for item in list.iter_mut() {
-                resolve_expr_placeholders(item, binds, next_positional)?;
-            }
-        }
-        Expr::Between {
-            expr, low, high, ..
-        } => {
-            resolve_expr_placeholders(expr, binds, next_positional)?;
-            resolve_expr_placeholders(low, binds, next_positional)?;
-            resolve_expr_placeholders(high, binds, next_positional)?;
-        }
-        Expr::Like { expr, pattern, .. } | Expr::ILike { expr, pattern, .. } => {
-            resolve_expr_placeholders(expr, binds, next_positional)?;
-            resolve_expr_placeholders(pattern, binds, next_positional)?;
-        }
-        // A caller accessor's arguments, `current_setting($1, $2)`, are binds under the typed API.
-        Expr::Function(function) => {
-            if let FunctionArguments::List(list) = &mut function.args {
-                for arg in &mut list.args {
-                    if let FunctionArg::Unnamed(FunctionArgExpr::Expr(inner)) = arg {
-                        resolve_expr_placeholders(inner, binds, next_positional)?;
-                    }
-                }
-            }
-        }
-        Expr::InSubquery { expr, subquery, .. } => {
-            resolve_expr_placeholders(expr, binds, next_positional)?;
-            resolve_query_placeholders(subquery, binds, next_positional)?;
-        }
-        Expr::Exists { subquery, .. } => {
-            resolve_query_placeholders(subquery, binds, next_positional)?;
-        }
-        _ => {}
-    }
-    Ok(())
-}
-
-/// Resolve the placeholders of a membership subquery's `WHERE`, the only part
-/// of it the compiler reads a value from.
-fn resolve_query_placeholders<B: Backend>(
-    query: &mut Query,
-    binds: &[Value<B>],
-    next_positional: &mut usize,
-) -> Result<(), RegisterError> {
-    if let SetExpr::Select(select) = query.body.as_mut() {
-        if let Some(selection) = select.selection.as_mut() {
-            resolve_expr_placeholders(selection, binds, next_positional)?;
-        }
-    }
-    Ok(())
+    });
+    failure.map_or(Ok(()), Err)
 }
 
 /// Resolve `$N`/`?` placeholders in the optional WHERE clause against `binds`.
@@ -941,5 +893,52 @@ mod tests {
                 Value::<Postgres>::Bool(bool)
             );
         }
+    }
+
+    /// A placeholder inside a call, an `ANY` or a membership subquery is a
+    /// placeholder like any other: the follow derivation counts and renumbers
+    /// it past the SET binds, and resolution then reads the right bind.
+    #[test]
+    fn placeholders_inside_calls_and_subqueries_are_counted_renumbered_and_resolved() {
+        use crate::compiler::sql_shape::extract_single_table_and_where;
+        use sqlparser::dialect::PostgreSqlDialect;
+
+        let (select, set_binds) = super::derive_update_follow_select_with_set_binds(
+            "UPDATE notes SET title = $1 WHERE owner = ANY(string_to_array(current_setting($2, \
+             $3), $4)) AND project_id IN (SELECT project_id FROM project_members WHERE user_id \
+             = current_setting($5, $6))",
+            &PostgreSqlDialect {},
+        )
+        .unwrap();
+        assert_eq!(set_binds, 1);
+        assert_eq!(
+            select,
+            "SELECT * FROM notes WHERE owner = ANY(string_to_array(current_setting($1, $2), $3)) \
+             AND project_id IN (SELECT project_id FROM project_members WHERE user_id = \
+             current_setting($4, $5))"
+        );
+
+        let stmt =
+            crate::compiler::sql_shape::parse_single_statement(&select, &PostgreSqlDialect {})
+                .unwrap();
+        let (_, where_clause) = extract_single_table_and_where(&stmt).unwrap();
+        let resolved = super::resolve_where_placeholders::<Postgres>(
+            where_clause,
+            &[
+                Value::String("app.subjects".into()),
+                Value::Bool(true),
+                Value::String(",".into()),
+                Value::String("app.user_id".into()),
+                Value::Bool(true),
+            ],
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            resolved.to_string(),
+            "owner = ANY(string_to_array(current_setting('app.subjects', true), ',')) AND \
+             project_id IN (SELECT project_id FROM project_members WHERE user_id = \
+             current_setting('app.user_id', true))"
+        );
     }
 }

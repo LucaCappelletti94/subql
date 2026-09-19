@@ -2460,38 +2460,18 @@ pub(super) fn derive_update_follow_sql_and_set_binds(
     ))
 }
 
-/// Walk `expr` and count every `SqlValue::Placeholder` leaf (positional `?`
-/// and numbered `$N` alike). Recurses through the same expression shapes the
-/// compiler already supports.
+/// Count every `SqlValue::Placeholder` leaf of `expr` (positional `?` and
+/// numbered `$N` alike), wherever the derived walk finds one.
 pub(crate) fn count_placeholders_in_expr(expr: &Expr) -> usize {
     use sqlparser::ast::Value as SqlValue;
-    match expr {
-        Expr::Value(v) => usize::from(matches!(&v.value, SqlValue::Placeholder(_))),
-        Expr::BinaryOp { left, right, .. } => {
-            count_placeholders_in_expr(left) + count_placeholders_in_expr(right)
+    let mut count = 0;
+    let _: core::ops::ControlFlow<()> = sqlparser::ast::visit_expressions(expr, |inner| {
+        if let Expr::Value(v) = inner {
+            count += usize::from(matches!(&v.value, SqlValue::Placeholder(_)));
         }
-        Expr::UnaryOp { expr, .. }
-        | Expr::IsNull(expr)
-        | Expr::IsNotNull(expr)
-        | Expr::IsTrue(expr)
-        | Expr::IsFalse(expr)
-        | Expr::Nested(expr) => count_placeholders_in_expr(expr),
-        Expr::InList { expr, list, .. } => {
-            count_placeholders_in_expr(expr)
-                + list.iter().map(count_placeholders_in_expr).sum::<usize>()
-        }
-        Expr::Between {
-            expr, low, high, ..
-        } => {
-            count_placeholders_in_expr(expr)
-                + count_placeholders_in_expr(low)
-                + count_placeholders_in_expr(high)
-        }
-        Expr::Like { expr, pattern, .. } | Expr::ILike { expr, pattern, .. } => {
-            count_placeholders_in_expr(expr) + count_placeholders_in_expr(pattern)
-        }
-        _ => 0,
-    }
+        core::ops::ControlFlow::Continue(())
+    });
+    count
 }
 
 /// Renumber numbered (`$N`) placeholders in `expr` so the smallest surviving
@@ -2500,46 +2480,19 @@ pub(crate) fn count_placeholders_in_expr(expr: &Expr) -> usize {
 /// caller trims the bind vector from the front to match.
 fn renumber_placeholders(expr: &mut Expr, set_bind_count: usize) {
     use sqlparser::ast::Value as SqlValue;
-    match expr {
-        Expr::Value(v) => {
+    let _: core::ops::ControlFlow<()> = sqlparser::ast::visit_expressions_mut(expr, |inner| {
+        if let Expr::Value(v) = inner {
             if let SqlValue::Placeholder(token) = &mut v.value {
-                if let Some(rest) = token.strip_prefix('$') {
-                    if let Ok(idx) = rest.parse::<usize>() {
-                        let new_idx = idx.saturating_sub(set_bind_count);
-                        *token = alloc::format!("${new_idx}");
-                    }
+                if let Some(idx) = token
+                    .strip_prefix('$')
+                    .and_then(|rest| rest.parse::<usize>().ok())
+                {
+                    *token = alloc::format!("${}", idx.saturating_sub(set_bind_count));
                 }
             }
         }
-        Expr::BinaryOp { left, right, .. } => {
-            renumber_placeholders(left, set_bind_count);
-            renumber_placeholders(right, set_bind_count);
-        }
-        Expr::UnaryOp { expr, .. }
-        | Expr::IsNull(expr)
-        | Expr::IsNotNull(expr)
-        | Expr::IsTrue(expr)
-        | Expr::IsFalse(expr)
-        | Expr::Nested(expr) => renumber_placeholders(expr, set_bind_count),
-        Expr::InList { expr, list, .. } => {
-            renumber_placeholders(expr, set_bind_count);
-            for item in list {
-                renumber_placeholders(item, set_bind_count);
-            }
-        }
-        Expr::Between {
-            expr, low, high, ..
-        } => {
-            renumber_placeholders(expr, set_bind_count);
-            renumber_placeholders(low, set_bind_count);
-            renumber_placeholders(high, set_bind_count);
-        }
-        Expr::Like { expr, pattern, .. } | Expr::ILike { expr, pattern, .. } => {
-            renumber_placeholders(expr, set_bind_count);
-            renumber_placeholders(pattern, set_bind_count);
-        }
-        _ => {}
-    }
+        core::ops::ControlFlow::Continue(())
+    });
 }
 
 #[cfg(test)]
