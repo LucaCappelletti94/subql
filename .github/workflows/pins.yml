@@ -38,8 +38,18 @@ jobs:
         run: cargo fmt --check
       - if: steps.moved.outputs.moved == 'yes'
         run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+      # The same rows the feature matrix carries, since an all-features build
+      # masks a missing gate in any one of them.
       - if: steps.moved.outputs.moved == 'yes'
-        run: cargo check --workspace --all-targets --locked
+        run: |
+          set -euo pipefail
+          cargo check --workspace --all-targets --locked
+          cargo check --lib --no-default-features --locked
+          cargo check --workspace --all-targets --locked --features sqlite-cdc
+          cargo check --workspace --all-targets --locked --features executor-diesel-async-postgres
+          cargo check --workspace --all-targets --locked --features executor-diesel-async-mysql
+          cargo check --workspace --all-targets --locked --features apply-patchset-postgres-async
+          cargo check --workspace --all-targets --locked --features apply-patchset-mysql-async
       - if: steps.moved.outputs.moved == 'yes'
         run: cargo check --lib --no-default-features --locked --target wasm32-unknown-unknown
       - if: steps.moved.outputs.moved == 'yes'
