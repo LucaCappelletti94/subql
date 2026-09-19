@@ -124,8 +124,8 @@ pub struct PgStreamingCdcSource {
     ack_tx: tokio::sync::mpsc::UnboundedSender<PgLsn>,
     status_updates_sent: Arc<AtomicU64>,
     events_received: Arc<AtomicU64>,
-    /// Latest position the server has sent, and the latest one reported back
-    /// as flushed. Their difference is how much WAL the slot is holding.
+    /// The server's WAL end as last observed on a frame, and the position
+    /// last reported back as flushed.
     received_lsn: Arc<AtomicU64>,
     acked_lsn: Arc<AtomicU64>,
     /// Whether a caller has acknowledged anything, which the position alone
@@ -311,10 +311,9 @@ impl PgStreamingCdcSource {
     /// That end is the server's own, not the end of what this source was
     /// sent, so the figure also counts WAL this publication never carries
     /// and rises on activity elsewhere in the cluster. It is close to what
-    /// the slot retains without being it, since the server holds back to
-    /// the slot's `restart_lsn` rather than to its confirmed flush
-    /// position, and since the end here is only as fresh as the last frame
-    /// received. Read `pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)`
+    /// the slot retains without being it, since the server retains to the
+    /// slot's `restart_lsn`, which lags the confirmed flush position, and
+    /// since the end here is only as fresh as the last frame received. Read `pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)`
     /// from `pg_replication_slots` for the size itself.
     #[must_use]
     pub fn unacknowledged_bytes(&self) -> u64 {
