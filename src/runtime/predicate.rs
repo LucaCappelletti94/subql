@@ -42,7 +42,6 @@ pub struct Predicate<B: Backend> {
     /// Canonical group identity selected during planning.
     pub group_key_encoder: Option<crate::backend::GroupKeyEncoder<B>>,
     /// Reference count (number of subscriptions using this predicate).
-    pub refcount: u32,
     /// Timestamp for conflict resolution in merge (milliseconds since Unix epoch).
     pub updated_at_unix_ms: u64,
 }
@@ -65,7 +64,6 @@ impl<B: Backend> Clone for Predicate<B> {
             prefilter_plan: Arc::clone(&self.prefilter_plan),
             projection: self.projection.clone(),
             group_key_encoder: self.group_key_encoder.clone(),
-            refcount: self.refcount,
             updated_at_unix_ms: self.updated_at_unix_ms,
         }
     }
@@ -83,7 +81,6 @@ impl<B: Backend> core::fmt::Debug for Predicate<B> {
             .field("prefilter_plan", &self.prefilter_plan)
             .field("projection", &self.projection)
             .field("group_key_encoder", &self.group_key_encoder)
-            .field("refcount", &self.refcount)
             .field("updated_at_unix_ms", &self.updated_at_unix_ms)
             .finish()
     }
@@ -419,11 +416,11 @@ pub struct PredicateStore<I: IdTypes, B: Backend> {
     /// Hash -> candidate PredicateIds (for deduplication with collision checks).
     pub hash_index: Arc<HashMap<PredicateHash, Vec<PredicateId>>>,
     /// SubscriptionId -> SubscriptionBinding.
-    pub bindings: Arc<HashMap<SubscriptionId, SubscriptionBinding<I>>>,
+    pub bindings: HashTrieMapSync<SubscriptionId, SubscriptionBinding<I>>,
     /// SessionId -> `Vec<SubscriptionId>` (for session cleanup).
-    pub scope_index: Arc<HashMap<I::SessionId, Vec<SubscriptionId>>>,
+    pub scope_index: HashTrieMapSync<I::SessionId, Vec<SubscriptionId>>,
     /// PredicateId -> `RoaringBitmap<ConsumerOrdinal>` (consumers interested in this predicate).
-    pub predicate_consumers: Arc<HashMap<PredicateId, RoaringBitmap>>,
+    pub predicate_consumers: HashTrieMapSync<PredicateId, RoaringBitmap>,
     /// (PredicateId, ConsumerOrdinal) -> SubscriptionIds bound to that pair.
     ///
     /// A single (predicate, consumer) pair may carry multiple subscription
@@ -432,7 +429,17 @@ pub struct PredicateStore<I: IdTypes, B: Backend> {
     /// eviction policies to stamp the matched subscriptions after
     /// dispatch in O(1) per matched pair instead of an O(B) scan over
     /// `bindings`.
-    pub binding_lookup: Arc<HashMap<(PredicateId, ConsumerOrdinal), Vec<SubscriptionId>>>,
+    pub binding_lookup: HashTrieMapSync<(PredicateId, ConsumerOrdinal), Vec<SubscriptionId>>,
+    /// How many bindings each consumer holds on this table.
+    ///
+    /// Answers whether a consumer is still referenced without walking every
+    /// binding, which unbinding asked once per subscription.
+    pub consumer_bindings: HashTrieMapSync<I::ConsumerId, u32>,
+    /// How many bindings hold each predicate.
+    ///
+    /// Outside the slab because a binding taking or dropping a reference is
+    /// otherwise a copy of every predicate on the table to change one integer.
+    pub refcounts: HashTrieMapSync<PredicateId, u32>,
     /// (PredicateId, term slot) -> which subscribers that term admits.
     ///
     /// Empty for every predicate carrying no membership term, which is every
@@ -453,10 +460,12 @@ impl<I: IdTypes, B: Backend> Clone for PredicateStore<I, B> {
         Self {
             predicates: Arc::clone(&self.predicates),
             hash_index: Arc::clone(&self.hash_index),
-            bindings: Arc::clone(&self.bindings),
-            scope_index: Arc::clone(&self.scope_index),
-            predicate_consumers: Arc::clone(&self.predicate_consumers),
-            binding_lookup: Arc::clone(&self.binding_lookup),
+            bindings: self.bindings.clone(),
+            scope_index: self.scope_index.clone(),
+            predicate_consumers: self.predicate_consumers.clone(),
+            binding_lookup: self.binding_lookup.clone(),
+            refcounts: self.refcounts.clone(),
+            consumer_bindings: self.consumer_bindings.clone(),
             term_members: Arc::clone(&self.term_members),
         }
     }
@@ -469,10 +478,12 @@ impl<I: IdTypes, B: Backend> PredicateStore<I, B> {
         Self {
             predicates: Arc::new(Slab::new()),
             hash_index: Arc::new(HashMap::new()),
-            bindings: Arc::new(HashMap::new()),
-            scope_index: Arc::new(HashMap::new()),
-            predicate_consumers: Arc::new(HashMap::new()),
-            binding_lookup: Arc::new(HashMap::new()),
+            bindings: HashTrieMapSync::new_sync(),
+            scope_index: HashTrieMapSync::new_sync(),
+            predicate_consumers: HashTrieMapSync::new_sync(),
+            binding_lookup: HashTrieMapSync::new_sync(),
+            refcounts: HashTrieMapSync::new_sync(),
+            consumer_bindings: HashTrieMapSync::new_sync(),
             term_members: Arc::new(HashMap::new()),
         }
     }
@@ -543,25 +554,31 @@ impl<I: IdTypes, B: Backend> PredicateStore<I, B> {
         id
     }
 
+    /// How many bindings hold `id`.
+    #[must_use]
+    pub fn refcount(&self, id: PredicateId) -> u32 {
+        self.refcounts.get(&id).copied().unwrap_or_default()
+    }
+
     /// Increment predicate refcount
     ///
     /// Returns true if predicate exists.
     pub fn increment_refcount(&mut self, id: PredicateId) -> bool {
-        if let Some(pred) = self.get_predicate_mut(id) {
-            pred.refcount += 1;
-            true
-        } else {
-            false
+        if self.get_predicate(id).is_none() {
+            return false;
         }
+        self.refcounts.insert_mut(id, self.refcount(id) + 1);
+        true
     }
 
     /// Decrement predicate refcount, remove if reaches 0
     ///
     /// Returns true if predicate was removed.
     pub fn decrement_refcount(&mut self, id: PredicateId) -> bool {
-        let should_remove = if let Some(pred) = self.get_predicate_mut(id) {
-            pred.refcount = pred.refcount.saturating_sub(1);
-            pred.refcount == 0
+        let should_remove = if self.get_predicate(id).is_some() {
+            let left = self.refcount(id).saturating_sub(1);
+            self.refcounts.insert_mut(id, left);
+            left == 0
         } else {
             false
         };
@@ -584,7 +601,8 @@ impl<I: IdTypes, B: Backend> PredicateStore<I, B> {
                     hash_index.remove(&pred.hash);
                 }
             }
-            Arc::make_mut(&mut self.predicate_consumers).remove(&id);
+            self.predicate_consumers.remove_mut(&id);
+            self.refcounts.remove_mut(&id);
             Arc::make_mut(&mut self.term_members).retain(|(pred, _), _| *pred != id);
         }
     }
@@ -595,7 +613,9 @@ impl<I: IdTypes, B: Backend> PredicateStore<I, B> {
 
         // Overwrite-safe upsert: remove previous secondary index entries when
         // replacing an existing subscription ID.
-        if let Some(previous) = Arc::make_mut(&mut self.bindings).insert(sub_id, binding) {
+        let previous = self.bindings.get(&sub_id).copied();
+        self.bindings.insert_mut(sub_id, binding);
+        if let Some(previous) = previous {
             self.remove_binding_indexes(previous);
         }
 
@@ -606,7 +626,8 @@ impl<I: IdTypes, B: Backend> PredicateStore<I, B> {
     ///
     /// Returns the removed binding if it existed.
     pub fn remove_binding(&mut self, sub_id: SubscriptionId) -> Option<SubscriptionBinding<I>> {
-        let binding = Arc::make_mut(&mut self.bindings).remove(&sub_id)?;
+        let binding = self.bindings.get(&sub_id).copied()?;
+        self.bindings.remove_mut(&sub_id);
 
         self.remove_binding_indexes(binding);
 
@@ -624,13 +645,13 @@ impl<I: IdTypes, B: Backend> PredicateStore<I, B> {
     /// Returns `true` if any active binding references the given consumer.
     #[must_use]
     pub fn is_consumer_referenced(&self, consumer_id: I::ConsumerId) -> bool {
-        self.bindings.values().any(|b| b.consumer_id == consumer_id)
+        self.consumer_bindings.contains_key(&consumer_id)
     }
 
     /// Collect the set of distinct consumer IDs across all active bindings.
     #[must_use]
     pub fn active_consumer_ids(&self) -> HashSet<I::ConsumerId> {
-        self.bindings.values().map(|b| b.consumer_id).collect()
+        self.consumer_bindings.keys().copied().collect()
     }
 
     fn add_binding_indexes(&mut self, binding: SubscriptionBinding<I>) {
@@ -639,39 +660,71 @@ impl<I: IdTypes, B: Backend> PredicateStore<I, B> {
         let consumer_ord = binding.consumer_ordinal;
 
         if let SubscriptionScope::Session(sid) = binding.scope {
-            Arc::make_mut(&mut self.scope_index)
-                .entry(sid)
-                .or_default()
-                .push(sub_id);
+            let mut session = self.scope_index.get(&sid).cloned().unwrap_or_default();
+            session.push(sub_id);
+            self.scope_index.insert_mut(sid, session);
         }
 
-        Arc::make_mut(&mut self.predicate_consumers)
-            .entry(pred_id)
-            .or_default()
-            .insert(consumer_ord.get());
+        let mut consumers = self
+            .predicate_consumers
+            .get(&pred_id)
+            .cloned()
+            .unwrap_or_default();
+        consumers.insert(consumer_ord.get());
+        self.predicate_consumers.insert_mut(pred_id, consumers);
 
-        let subs = Arc::make_mut(&mut self.binding_lookup)
-            .entry((pred_id, consumer_ord))
-            .or_default();
-        if !subs.contains(&sub_id) {
-            subs.push(sub_id);
+        let held = self
+            .consumer_bindings
+            .get(&binding.consumer_id)
+            .copied()
+            .unwrap_or_default();
+        self.consumer_bindings
+            .insert_mut(binding.consumer_id, held + 1);
+
+        let pair = (pred_id, consumer_ord);
+        let mut bound = self.binding_lookup.get(&pair).cloned().unwrap_or_default();
+        if !bound.contains(&sub_id) {
+            bound.push(sub_id);
         }
+        self.binding_lookup.insert_mut(pair, bound);
     }
 
     fn remove_binding_indexes(&mut self, binding: SubscriptionBinding<I>) {
         let sub_id = binding.subscription_id;
 
-        let has_other_same_consumer_binding = self.bindings.values().any(|existing| {
-            existing.predicate_id == binding.predicate_id
-                && existing.consumer_ordinal == binding.consumer_ordinal
-        });
+        let held = self
+            .consumer_bindings
+            .get(&binding.consumer_id)
+            .copied()
+            .unwrap_or_default()
+            .saturating_sub(1);
+        if held == 0 {
+            self.consumer_bindings.remove_mut(&binding.consumer_id);
+        } else {
+            self.consumer_bindings.insert_mut(binding.consumer_id, held);
+        }
+
+        // `binding_lookup` is keyed by exactly this question, and the upsert
+        // path asks it while the replacement already sits under the same id.
+        let pair = (binding.predicate_id, binding.consumer_ordinal);
+        let has_other_same_consumer_binding = self
+            .binding_lookup
+            .get(&pair)
+            .is_some_and(|bound| bound.iter().any(|&id| id != sub_id))
+            || self.bindings.get(&sub_id).is_some_and(|replacement| {
+                replacement.predicate_id == binding.predicate_id
+                    && replacement.consumer_ordinal == binding.consumer_ordinal
+            });
 
         if !has_other_same_consumer_binding {
-            let consumers = Arc::make_mut(&mut self.predicate_consumers);
-            if let Some(bitmap) = consumers.get_mut(&binding.predicate_id) {
+            if let Some(bitmap) = self.predicate_consumers.get(&binding.predicate_id) {
+                let mut bitmap = bitmap.clone();
                 bitmap.remove(binding.consumer_ordinal.get());
                 if bitmap.is_empty() {
-                    consumers.remove(&binding.predicate_id);
+                    self.predicate_consumers.remove_mut(&binding.predicate_id);
+                } else {
+                    self.predicate_consumers
+                        .insert_mut(binding.predicate_id, bitmap);
                 }
             }
             // Under the same guard as the bitmap: the ordinal is what a term
@@ -684,21 +737,24 @@ impl<I: IdTypes, B: Backend> PredicateStore<I, B> {
             }
         }
 
-        let lookup_key = (binding.predicate_id, binding.consumer_ordinal);
-        let lookup = Arc::make_mut(&mut self.binding_lookup);
-        if let Some(subs) = lookup.get_mut(&lookup_key) {
-            subs.retain(|&id| id != sub_id);
-            if subs.is_empty() {
-                lookup.remove(&lookup_key);
+        if let Some(bound) = self.binding_lookup.get(&pair) {
+            let mut bound = bound.clone();
+            bound.retain(|&id| id != sub_id);
+            if bound.is_empty() {
+                self.binding_lookup.remove_mut(&pair);
+            } else {
+                self.binding_lookup.insert_mut(pair, bound);
             }
         }
 
         if let SubscriptionScope::Session(session_id) = binding.scope {
-            let scopes = Arc::make_mut(&mut self.scope_index);
-            if let Some(subs) = scopes.get_mut(&session_id) {
-                subs.retain(|&id| id != sub_id);
-                if subs.is_empty() {
-                    scopes.remove(&session_id);
+            if let Some(session) = self.scope_index.get(&session_id) {
+                let mut session = session.clone();
+                session.retain(|&id| id != sub_id);
+                if session.is_empty() {
+                    self.scope_index.remove_mut(&session_id);
+                } else {
+                    self.scope_index.insert_mut(session_id, session);
                 }
             }
         }
@@ -753,7 +809,7 @@ mod tests {
     use crate::compiler::{Instruction, PrefilterPlan};
     use crate::DefaultIds;
 
-    fn make_predicate(id: usize, hash: u128, refcount: u32) -> Predicate<Postgres> {
+    fn make_predicate(id: usize, hash: u128) -> Predicate<Postgres> {
         Predicate {
             id: PredicateId::from_slab_index(id),
             hash,
@@ -764,7 +820,6 @@ mod tests {
             prefilter_plan: Arc::new(PrefilterPlan::default()),
             projection: QueryProjection::Rows,
             group_key_encoder: None,
-            refcount,
             updated_at_unix_ms: 0,
         }
     }
@@ -773,7 +828,7 @@ mod tests {
     fn test_add_and_find_predicate() {
         let mut store = PredicateStore::<DefaultIds, Postgres>::new();
 
-        let pred = make_predicate(0, 0x1234, 1);
+        let pred = make_predicate(0, 0x1234);
         let id = store.add_predicate(pred);
 
         assert_eq!(store.find_by_hash(0x1234), Some(id));
@@ -784,25 +839,28 @@ mod tests {
     fn test_refcount_increment() {
         let mut store = PredicateStore::<DefaultIds, Postgres>::new();
 
-        let pred = make_predicate(0, 0x1234, 1);
+        let pred = make_predicate(0, 0x1234);
         let id = store.add_predicate(pred);
+        store.increment_refcount(id);
 
-        assert_eq!(store.get_predicate(id).unwrap().refcount, 1);
+        assert_eq!(store.refcount(id), 1);
 
         store.increment_refcount(id);
-        assert_eq!(store.get_predicate(id).unwrap().refcount, 2);
+        assert_eq!(store.refcount(id), 2);
     }
 
     #[test]
     fn test_refcount_decrement() {
         let mut store = PredicateStore::<DefaultIds, Postgres>::new();
 
-        let pred = make_predicate(0, 0x1234, 2);
+        let pred = make_predicate(0, 0x1234);
         let id = store.add_predicate(pred);
+        store.increment_refcount(id);
+        store.increment_refcount(id);
 
         let removed = store.decrement_refcount(id);
         assert!(!removed);
-        assert_eq!(store.get_predicate(id).unwrap().refcount, 1);
+        assert_eq!(store.refcount(id), 1);
 
         let removed = store.decrement_refcount(id);
         assert!(removed);
@@ -904,8 +962,8 @@ mod tests {
     fn test_add_binding_overwrite_cleans_secondary_indexes() {
         let mut store = PredicateStore::<DefaultIds, Postgres>::new();
 
-        let pred1 = make_predicate(0, 0x1111, 0);
-        let pred2 = make_predicate(1, 0x2222, 0);
+        let pred1 = make_predicate(0, 0x1111);
+        let pred2 = make_predicate(1, 0x2222);
         let pred1_id = store.add_predicate(pred1);
         let pred2_id = store.add_predicate(pred2);
 
@@ -942,7 +1000,7 @@ mod tests {
     fn test_remove_binding_keeps_bitmap_when_same_consumer_has_another_binding() {
         let mut store = PredicateStore::<DefaultIds, Postgres>::new();
 
-        let pred = make_predicate(0, 0x3333, 0);
+        let pred = make_predicate(0, 0x3333);
         let pred_id = store.add_predicate(pred);
 
         store.add_binding(SubscriptionBinding {
@@ -1007,7 +1065,7 @@ mod tests {
         let mut store = PredicateStore::<DefaultIds, Postgres>::new();
 
         // Intentionally provide an ID that does not match the first free slab slot.
-        let pred = make_predicate(99, 0xBEEF, 1);
+        let pred = make_predicate(99, 0xBEEF);
         let returned_id = store.add_predicate(pred);
 
         // Returned ID must point to a real predicate.
@@ -1028,11 +1086,11 @@ mod tests {
     fn test_hash_collision_lookup_uses_normalized_sql() {
         let mut store = PredicateStore::<DefaultIds, Postgres>::new();
 
-        let mut pred1 = make_predicate(0, 0x00C0_FFEE, 1);
+        let mut pred1 = make_predicate(0, 0x00C0_FFEE);
         pred1.normalized_sql = "amount > 100".into();
         let id1 = store.add_predicate(pred1);
 
-        let mut pred2 = make_predicate(1, 0x00C0_FFEE, 1);
+        let mut pred2 = make_predicate(1, 0x00C0_FFEE);
         pred2.normalized_sql = "status = 'paid'".into();
         let id2 = store.add_predicate(pred2);
 
@@ -1055,7 +1113,7 @@ mod tests {
     fn test_is_consumer_referenced() {
         let mut store = PredicateStore::<DefaultIds, Postgres>::new();
 
-        let pred = make_predicate(0, 0xAABB, 1);
+        let pred = make_predicate(0, 0xAABB);
         let pred_id = store.add_predicate(pred);
 
         assert!(!store.is_consumer_referenced(42));
@@ -1080,7 +1138,7 @@ mod tests {
     #[test]
     fn test_binding_lookup_resolves_subscription_id() {
         let mut store = PredicateStore::<DefaultIds, Postgres>::new();
-        let pred = make_predicate(0, 0xBEEF, 1);
+        let pred = make_predicate(0, 0xBEEF);
         let pred_id = store.add_predicate(pred);
         let ord = ConsumerOrdinal::new(7);
 
@@ -1111,7 +1169,7 @@ mod tests {
     #[test]
     fn test_binding_lookup_handles_multiple_scopes_per_pair() {
         let mut store = PredicateStore::<DefaultIds, Postgres>::new();
-        let pred = make_predicate(0, 0xCAFE, 1);
+        let pred = make_predicate(0, 0xCAFE);
         let pred_id = store.add_predicate(pred);
         let ord = ConsumerOrdinal::new(0);
 
@@ -1152,7 +1210,7 @@ mod tests {
     fn test_active_consumer_ids() {
         let mut store = PredicateStore::<DefaultIds, Postgres>::new();
 
-        let pred = make_predicate(0, 0xCCDD, 1);
+        let pred = make_predicate(0, 0xCCDD);
         let pred_id = store.add_predicate(pred);
 
         assert!(store.active_consumer_ids().is_empty());

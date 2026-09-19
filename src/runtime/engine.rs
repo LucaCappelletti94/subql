@@ -1182,7 +1182,6 @@ where
             prefilter_plan: Arc::new(compiled.prefilter_plan.clone()),
             projection: compiled.projection.clone(),
             group_key_encoder,
-            refcount: 0, // Will be incremented via binding
             updated_at_unix_ms: compiled.spec.updated_at_unix_ms,
         }
     }
@@ -4726,7 +4725,7 @@ where
             .values()
             .map(|p| {
                 let snapshot = p.load_snapshot();
-                snapshot.predicates.bindings.len()
+                snapshot.predicates.bindings.size()
             })
             .sum()
     }
@@ -4898,7 +4897,7 @@ where
                     .map_err(|e| StorageError::Codec(format!("Prefilter serialize error: {e}")))?,
                 dependency_columns: pred.dependency_columns.to_vec(),
                 projection: pred.projection.clone(),
-                refcount: pred.refcount,
+                refcount: snapshot.predicates.refcount(pred.id),
                 updated_at_unix_ms: pred.updated_at_unix_ms,
             };
             predicate_data_vec.push(pred_data);
@@ -5054,7 +5053,6 @@ where
                 prefilter_plan: Arc::new(prefilter_plan),
                 projection: pred_data.projection,
                 group_key_encoder,
-                refcount: 0, // incremented via bindings in add_batch
                 updated_at_unix_ms: pred_data.updated_at_unix_ms,
             };
             entries.push((pred, bindings));
@@ -5234,7 +5232,7 @@ where
 
         // Estimate size (rough approximation)
         let estimated_size = snapshot.predicates.predicates.len() * 1024 + // ~1KB per predicate (bytecode + metadata)
-            snapshot.predicates.bindings.len() * 128; // ~128B per binding
+            snapshot.predicates.bindings.size() * 128; // ~128B per binding
 
         Ok(estimated_size > self.rotation_threshold)
     }
