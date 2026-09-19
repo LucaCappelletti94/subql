@@ -659,6 +659,10 @@ codegen-units = 16
 # Local iteration profile: `cargo +1.88 nextest run --cargo-profile testfast`.
 # Workspace code at opt-level 1 cuts the touch rebuild by 13 to 19 percent
 # with no change to the run phase, dependencies stay at 3.
+[profile.mutants]
+inherits = "test"
+debug = "none"
+
 [profile.testfast]
 inherits = "release"
 lto = false
