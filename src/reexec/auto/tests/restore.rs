@@ -187,3 +187,75 @@ fn an_adopted_in_process_filter_reads_when_the_stream_cannot_answer() {
     let settled = engine.apply(&event).unwrap().resolve_collect();
     settled.reads.expect("the fallback read resolves");
 }
+
+/// An adopted answer remembers which session it belongs to.
+///
+/// A context outlives its subscription unless ending the session drops
+/// it, and ending a session finds contexts by the session they carry. An
+/// adopted answer that forgets its own session is one no logout reaches,
+/// so its stored auth and any queued read stay behind forever.
+#[test]
+fn adoption_keeps_the_session_an_answer_belongs_to() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().to_path_buf();
+
+    let mut engine = SubscriptionEngine::<TestEvent<Postgres>, DefaultIds, ParserDB>::with_storage(
+        catalog(),
+        PostgreSqlDialect {},
+        path.clone(),
+    )
+    .expect("open store")
+    .into_parts()
+    .0;
+    let orders = crate::catalog_helpers::table_id::<Postgres, _>(&catalog(), "orders")
+        .expect("orders table exists");
+    // One of each kind, both bound to the same session: an answer a read
+    // serves, and one the engine maintains itself.
+    engine
+        .register(
+            crate::SubscriptionRequest::new(1u64, EXTREME)
+                .scope(crate::SubscriptionScope::Session(7)),
+        )
+        .expect("the extreme registers");
+    engine
+        .register(
+            crate::SubscriptionRequest::new(2u64, "SELECT * FROM orders WHERE status = 'paid'")
+                .scope(crate::SubscriptionScope::Session(7)),
+        )
+        .expect("the filter registers");
+    engine.snapshot_table(orders).expect("snapshot the table");
+    drop(engine);
+
+    let restored = SubscriptionEngine::<TestEvent<Postgres>, DefaultIds, ParserDB>::with_storage(
+        catalog(),
+        PostgreSqlDialect {},
+        path,
+    )
+    .expect("reopen store");
+    assert_eq!(
+        restored.reads().restored.len(),
+        1,
+        "the read answer is back"
+    );
+    assert_eq!(
+        restored.reads().in_process.len(),
+        1,
+        "and so is the maintained one"
+    );
+
+    let mut engine = AutoResolvingEngine::adopt(
+        restored,
+        SyncMode(MockConnector::new(alloc::vec![])),
+        |_| (),
+        |_| (),
+    );
+    assert_eq!(engine.contexts.len(), 2, "both answers are adopted");
+
+    engine.unregister_session(7);
+    assert_eq!(
+        engine.contexts.len(),
+        0,
+        "ending the session reaches both, which it can only do if each \
+         context remembers the session it was adopted under"
+    );
+}

@@ -238,3 +238,110 @@ fn an_answer_ended_by_statement_does_not_come_back() {
         notified.inserted()
     );
 }
+
+/// Ending a session ends its answers on disk too.
+///
+/// A session's answers go through the same removal as any other, but the
+/// tables they were on are collected as the loop runs, and a collection
+/// that never fills leaves every shard naming answers the session took
+/// with it.
+#[test]
+fn ending_a_session_stops_its_answers_coming_back() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().to_path_buf();
+
+    let mut engine = Engine::with_storage(catalog(), PostgreSqlDialect {}, path.clone())
+        .expect("open store")
+        .into_parts()
+        .0;
+    engine
+        .register(
+            SubscriptionRequest::new(1u64, "SELECT * FROM orders WHERE status = 'paid'")
+                .scope(subql::SubscriptionScope::Session(7)),
+        )
+        .expect("the session's filter registers");
+    engine
+        .register(
+            SubscriptionRequest::new(2u64, "SELECT MIN(price) FROM orders")
+                .scope(subql::SubscriptionScope::Session(7)),
+        )
+        .expect("the session's read answer registers");
+    engine.snapshot_table(table("orders")).expect("snapshot");
+
+    let report = engine.unregister_session(7);
+    assert_eq!(report.removed_bindings, 1, "the session held one answer");
+    assert_eq!(report.removed_predicates, 1, "whose predicate went with it");
+    assert_eq!(report.removed_consumers, 1, "as did its consumer");
+    assert_eq!(report.removed_reads, 1, "and one answer a read served");
+    drop(engine);
+
+    let (mut restored, _reads) = Engine::with_storage(catalog(), PostgreSqlDialect {}, path)
+        .expect("reopen")
+        .into_parts();
+    assert_eq!(
+        restored.subscription_count(),
+        0,
+        "the session's answer does not come back"
+    );
+    let notified = restored
+        .consumers(&TestEvent::insert(
+            table("orders"),
+            vec![
+                subql::backend::Value::Int(1),
+                subql::backend::Value::Float(5.0),
+                subql::backend::Value::String("paid".into()),
+            ],
+        ))
+        .expect("the event dispatches");
+    assert!(
+        notified.inserted().is_empty(),
+        "and nobody is notified for it, got {:?}",
+        notified.inserted()
+    );
+}
+
+/// A session leaving does not disturb the answers that stay.
+///
+/// Ending a session trims the table's consumer dictionary to those still
+/// bound, and a name a table cannot resolve is a subscriber that stops
+/// being told anything. This holds the ordinary shape, one session
+/// leaving a table another answer stays on. It does not reach the case
+/// of one consumer holding both, where the trim has a candidate that is
+/// still active, which the removal count in the test above is what
+/// catches.
+#[test]
+fn ending_a_session_keeps_the_consumers_that_remain() {
+    const FILTER: &str = "SELECT * FROM orders WHERE status = 'paid'";
+    let dir = tempfile::tempdir().expect("temp dir");
+    let mut engine =
+        Engine::with_storage(catalog(), PostgreSqlDialect {}, dir.path().to_path_buf())
+            .expect("open store")
+            .into_parts()
+            .0;
+    engine
+        .register(
+            SubscriptionRequest::new(1u64, FILTER).scope(subql::SubscriptionScope::Session(7)),
+        )
+        .expect("the leaving session registers");
+    engine
+        .register(SubscriptionRequest::new(2u64, FILTER))
+        .expect("the durable answer registers");
+
+    engine.unregister_session(7);
+
+    let notified = engine
+        .consumers(&TestEvent::insert(
+            table("orders"),
+            vec![
+                subql::backend::Value::Int(1),
+                subql::backend::Value::Float(5.0),
+                subql::backend::Value::String("paid".into()),
+            ],
+        ))
+        .expect("the event dispatches");
+    assert_eq!(
+        notified.inserted(),
+        &[2],
+        "the consumer that stayed is still named and still told"
+    );
+}
