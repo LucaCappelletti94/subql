@@ -149,6 +149,68 @@ fn the_trait_method_gates_its_notifications_too() {
     assert_eq!(reads.scalar_updates[0].value, Value::Float(7.0));
 }
 
+/// A drain reached through the trait is `Send` while the connector is still
+/// generic, which is where a spawned downstream `async fn` needs it.
+#[test]
+fn the_drain_is_send_before_the_connector_is_chosen() {
+    use crate::AsyncSubscriptionDispatch;
+
+    async fn dispatch<X>(
+        engine: &mut AutoResolvingEngine<TestEvent<Postgres>, DefaultIds, ParserDB, AsyncMode<X>>,
+        event: &TestEvent<Postgres>,
+    ) -> crate::reexec::Settled<DefaultIds, Postgres, NoCheckpoint, X::Error>
+    where
+        X: AsyncConnector<Backend = Postgres>,
+    {
+        engine
+            .consumers(event)
+            .await
+            .expect("the event dispatches")
+            .resolve_collect()
+            .await
+    }
+
+    async fn deliver<X>(
+        engine: &mut AutoResolvingEngine<TestEvent<Postgres>, DefaultIds, ParserDB, AsyncMode<X>>,
+        event: &TestEvent<Postgres>,
+    ) -> crate::reexec::Settled<DefaultIds, Postgres, NoCheckpoint, X::Error, ()>
+    where
+        X: AsyncConnector<Backend = Postgres>,
+    {
+        engine
+            .consumers(event)
+            .await
+            .expect("the event dispatches")
+            .resolve(|_| {})
+            .await
+    }
+
+    fn assert_send<T: Send>(_: &T) {}
+
+    fn probe<X>(
+        engine: &mut AutoResolvingEngine<TestEvent<Postgres>, DefaultIds, ParserDB, AsyncMode<X>>,
+        event: &TestEvent<Postgres>,
+    ) where
+        X: AsyncConnector<Backend = Postgres>,
+    {
+        assert_send(&dispatch(engine, event));
+        assert_send(&deliver(engine, event));
+    }
+
+    let (mut e, tid) = engine_with_values(vec![Value::Float(7.0)]);
+    crate::reexec::test_fixtures::bootstrap_scalar_query(
+        &mut e,
+        1u64,
+        "SELECT MIN(price) FROM orders",
+        5.0,
+    );
+    let event = delete_event(tid, 1, 5.0);
+    probe(&mut e, &event);
+    let settled = block_on(dispatch(&mut e, &event));
+    let reads = settled.reads.expect("the queued read runs");
+    assert_eq!(reads.scalar_updates[0].value, Value::Float(7.0));
+}
+
 /// A drain abandoned mid-read keeps its in-process notifications reachable.
 ///
 /// The event folded exactly once before the read started and nothing offers

@@ -324,7 +324,7 @@ where
     where
         S: FnMut(super::ReadDelivery<I, E::Backend, E::Checkpoint>) + Send,
     {
-        use futures_util::stream::StreamExt;
+        use futures_util::stream::{FuturesUnordered, StreamExt};
 
         loop {
             if self.pending_reads.is_empty() {
@@ -357,14 +357,16 @@ where
                     },
                 )
                 .collect::<Result<Vec<_>, _>>()?;
-            let jobs_len = jobs.len();
             let resolved = {
                 // Whole reads stream their pages from inside the concurrent
                 // phase, so the sink is shared under an async lock for the
                 // duration and handed back exclusively afterwards.
                 let shared_sink = async_lock::Mutex::new(&mut sink);
-                futures_util::stream::iter(jobs.into_iter().map(|(trigger, job, auth)| {
-                    Self::run_one(
+                // Pushed in a loop, since a closure over `auth: &_` is
+                // higher-ranked and rustc cannot then prove the drain `Send`.
+                let reads = FuturesUnordered::new();
+                for (trigger, job, auth) in jobs {
+                    reads.push(Self::run_one(
                         connector,
                         &shared_sink,
                         trigger,
@@ -372,11 +374,9 @@ where
                         max_page_bytes,
                         auth,
                         throttle.clone(),
-                    )
-                }))
-                .buffer_unordered(jobs_len)
-                .collect::<Vec<_>>()
-                .await
+                    ));
+                }
+                reads.collect::<Vec<_>>().await
             };
 
             self.apply_outcomes(resolved, &mut sink)?;
