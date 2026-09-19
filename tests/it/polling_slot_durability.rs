@@ -326,8 +326,10 @@ fn a_long_lived_source_keeps_delivering_later_transactions() {
 
 /// Every change of a multi-statement transaction arrives.
 ///
-/// The rows of one transaction all carry its position, so marking that
-/// position delivered on the first row would swallow the rest.
+/// Both shapes are covered, three rows in one statement and three statements
+/// in one transaction. A transaction's first change shares the position its
+/// `begin` carries, so anything keyed on that position alone could swallow a
+/// sibling row.
 #[test]
 #[ignore = "requires Docker; run with --ignored"]
 fn every_change_of_one_transaction_is_delivered() {
@@ -344,16 +346,19 @@ fn every_change_of_one_transaction_is_delivered() {
             PollingPgCdcSource::connect(config(db.url(), &slot, publication), catalog())
                 .await
                 .expect("connect polling source");
+        sql_query("INSERT INTO orders VALUES (1, 1.0), (2, 2.0), (3, 3.0)")
+            .execute(&mut dml)
+            .expect("three rows in one statement");
         dml.transaction::<_, diesel::result::Error, _>(|conn| {
-            for id in 1..=3 {
+            for id in 4..=6 {
                 sql_query(format!("INSERT INTO orders VALUES ({id}, {id}.0)")).execute(conn)?;
             }
             Ok(())
         })
-        .expect("three inserts in one transaction");
+        .expect("three statements in one transaction");
 
         let mut seen = Vec::new();
-        for _ in 0..3 {
+        for _ in 0..6 {
             let event = tokio::time::timeout(Duration::from_secs(5), source.next_event())
                 .await
                 .unwrap_or_else(|_| panic!("all three changes arrive, got {seen:?}"))
@@ -366,11 +371,10 @@ fn every_change_of_one_transaction_is_delivered() {
         }
         assert_eq!(
             seen,
-            vec![
-                subql::backend::Value::Int(1),
-                subql::backend::Value::Int(2),
-                subql::backend::Value::Int(3)
-            ]
+            (1..=6)
+                .map(|id| subql::backend::Value::Int(i64::from(id)))
+                .collect::<Vec<_>>(),
+            "one statement of three rows and one transaction of three statements"
         );
     });
 
