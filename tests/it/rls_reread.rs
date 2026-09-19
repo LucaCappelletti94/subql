@@ -1109,8 +1109,9 @@ fn per_consumer_read_scope_survives_persistence() {
     let dir = tempfile::tempdir().expect("temp dir");
     let path = dir.path().to_path_buf();
     let catalog = ParserDB::parse::<PostgreSqlDialect>(DDL).expect("parse DDL");
-    let (mut registry, first) =
-        Registry::with_storage(catalog, PostgreSqlDialect {}, path.clone()).expect("open store");
+    let (mut registry, first) = Registry::with_storage(catalog, PostgreSqlDialect {}, path.clone())
+        .expect("open store")
+        .into_parts();
     assert_eq!(first.restored, [] as [subql::RestoredRead; 0]);
     let registered = registry
         .register(SubscriptionRequest::new(1u64, KEYED_SQL).database_reads_per_consumer())
@@ -1118,8 +1119,9 @@ fn per_consumer_read_scope_survives_persistence() {
     drop(registry);
 
     let catalog = ParserDB::parse::<PostgreSqlDialect>(DDL).expect("parse DDL");
-    let (restored, report) =
-        Registry::with_storage(catalog, PostgreSqlDialect {}, path).expect("restore store");
+    let (restored, report) = Registry::with_storage(catalog, PostgreSqlDialect {}, path)
+        .expect("restore store")
+        .into_parts();
     assert!(report.dropped.is_empty(), "{:?}", report.dropped);
     assert_eq!(restored.reread_count(), 1);
     assert_eq!(

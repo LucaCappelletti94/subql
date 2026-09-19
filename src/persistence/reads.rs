@@ -25,7 +25,7 @@ use crate::{IdTypes, ReadTier, StorageError, SubscriptionId, TableId};
 /// Magic bytes for the re-read file, distinct from a shard's.
 const MAGIC: [u8; 5] = *b"SUBQR";
 
-const VERSION: u16 = 4;
+const VERSION: u16 = 5;
 
 /// Header length in bytes.
 const HEADER_LEN: usize = 15;
@@ -231,12 +231,44 @@ impl<I: IdTypes, B: Backend> Clone for ReadEntry<I, B> {
     }
 }
 
+/// One stored answer the engine maintains itself.
+///
+/// Its predicate lives in the table's shard, which holds a `WHERE`
+/// expression rather than a statement. The statement is here, because a
+/// stream that cannot answer the filter falls back to reading it.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(bound = "")]
+pub struct InProcessEntry<I: IdTypes, B: Backend> {
+    /// Identity it had, and keeps.
+    pub subscription_id: SubscriptionId,
+    /// Consumer that registered it.
+    pub consumer_id: I::ConsumerId,
+    /// Durable, or bound to a session.
+    pub scope: crate::SubscriptionScope<I>,
+    /// The statement it was registered with.
+    #[serde(with = "bound_query_wire")]
+    pub source_query: crate::reexec::BoundQuery<B>,
+}
+
+impl<I: IdTypes, B: Backend> Clone for InProcessEntry<I, B> {
+    fn clone(&self) -> Self {
+        Self {
+            subscription_id: self.subscription_id,
+            consumer_id: self.consumer_id,
+            scope: self.scope,
+            source_query: self.source_query.clone(),
+        }
+    }
+}
+
 /// Everything the file holds.
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(bound = "")]
 pub struct ReadsPayload<I: IdTypes, B: Backend> {
     /// One per re-read answer.
     pub entries: Vec<ReadEntry<I, B>>,
+    /// One per answer the engine maintains itself.
+    pub in_process: Vec<InProcessEntry<I, B>>,
     /// When the file was written, milliseconds since the Unix epoch.
     pub created_at_unix_ms: u64,
 }
@@ -311,6 +343,7 @@ mod tests {
 
     fn payload_with_binds(binds: Vec<Value<Postgres>>) -> ReadsPayload<DefaultIds, Postgres> {
         ReadsPayload {
+            in_process: Vec::new(),
             entries: alloc::vec![ReadEntry::<DefaultIds, Postgres> {
                 subscription_id: 7,
                 consumer_id: 3,

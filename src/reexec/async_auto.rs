@@ -25,7 +25,7 @@ mod tests;
 mod throttle;
 
 use jobs::{
-    KeyedJob, KeyedRows, PlannedJob, ReadOutcome, ReadOutcomes, ReadPage, ResolveJob, Resolved,
+    KeyedJob, KeyedRows, PlannedJobs, ReadOutcome, ReadOutcomes, ReadPage, ResolveJob, Resolved,
 };
 use throttle::{acquire_permit, ThrottleState};
 
@@ -330,7 +330,7 @@ where
             if self.pending_reads.is_empty() {
                 return Ok(());
             }
-            let jobs = self.plan_pending_jobs();
+            let jobs = self.plan_pending_jobs()?;
             if jobs.is_empty() {
                 continue;
             }
@@ -344,20 +344,26 @@ where
                 .permits
                 .as_ref()
                 .map(|s| (Arc::clone(&s.sem), Arc::clone(&s.inflight)));
+            // Every read runs under its subscription's context, including a
+            // grouped one, whose job needs no context to plan.
+            let jobs = jobs
+                .into_iter()
+                .map(
+                    |(trigger, job)| match contexts.get(&trigger.subscription_id) {
+                        Some(ctx) => Ok((trigger, job, &ctx.auth)),
+                        None => Err(ReExecError::Unadopted {
+                            subscription: trigger.subscription_id,
+                        }),
+                    },
+                )
+                .collect::<Result<Vec<_>, _>>()?;
             let jobs_len = jobs.len();
             let resolved = {
                 // Whole reads stream their pages from inside the concurrent
                 // phase, so the sink is shared under an async lock for the
                 // duration and handed back exclusively afterwards.
                 let shared_sink = async_lock::Mutex::new(&mut sink);
-                futures_util::stream::iter(jobs.into_iter().map(|(trigger, job)| {
-                    let auth = &contexts
-                        .get(&trigger.subscription_id)
-                        .expect(
-                            "every captured query stores its resolve context at register time, \
-                             trigger.subscription_id must exist in `contexts`",
-                        )
-                        .auth;
+                futures_util::stream::iter(jobs.into_iter().map(|(trigger, job, auth)| {
                     Self::run_one(
                         connector,
                         &shared_sink,
@@ -383,18 +389,18 @@ where
     /// queued read's job against a snapshot. Keys are copied, never taken,
     /// so a dropped future loses nothing. A read with nothing to ask is
     /// dequeued with its debounce stamp moved, as if it had been read.
-    fn plan_pending_jobs(&mut self) -> Vec<PlannedJob<I, E::Checkpoint, E::Backend>> {
+    fn plan_pending_jobs(&mut self) -> PlannedJobs<I, E::Checkpoint, E::Backend, X::Error> {
         let snapshot = self.pending_reads.snapshot();
         let mut jobs = Vec::with_capacity(snapshot.len());
         for trigger in snapshot {
-            if let Some(job) = self.plan_job(&trigger) {
+            if let Some(job) = self.plan_job(&trigger)? {
                 jobs.push((trigger, job));
             } else {
                 self.dequeue_read(&trigger);
                 self.stamp_reexec(trigger.subscription_id, &trigger.read);
             }
         }
-        jobs
+        Ok(jobs)
     }
 
     /// One planned read, phase two: a whole read streams its pages into the
@@ -582,24 +588,25 @@ where
     fn plan_job(
         &mut self,
         trigger: &super::ReExecutionTrigger<I, E::Checkpoint, E::Backend>,
-    ) -> Option<ResolveJob<E::Backend>> {
+    ) -> Result<Option<ResolveJob<E::Backend>>, ReExecError<X::Error>> {
         let subscription_id = trigger.subscription_id;
         if let super::ReExecutionRead::GroupedScalar { group, query, .. } = &trigger.read {
-            return Some(ResolveJob::GroupedScalar {
+            return Ok(Some(ResolveJob::GroupedScalar {
                 group: group.clone(),
                 query: query.clone(),
-            });
+            }));
         }
-        let ctx = self.contexts.get(&subscription_id).expect(
-            "every captured query stores its resolve context at register time, \
-             subscription_id must exist in `contexts`",
-        );
+        let Some(ctx) = self.contexts.get(&subscription_id) else {
+            return Err(ReExecError::Unadopted {
+                subscription: subscription_id,
+            });
+        };
         if !ctx.keyed {
             if !ctx.whole_result {
-                return Some(ResolveJob::Scalar {
+                return Ok(Some(ResolveJob::Scalar {
                     query: ctx.query.clone(),
                     column_kind: ctx.column_kind,
-                });
+                }));
             }
             let ctx = self
                 .contexts
@@ -609,24 +616,26 @@ where
             // Bump first: a read that fails part way through must not let a
             // later one reuse the generation its partial pages carried.
             ctx.generation = ctx.generation.saturating_add(1);
-            return Some(ResolveJob::Whole {
+            return Ok(Some(ResolveJob::Whole {
                 query,
                 generation: ctx.generation,
-            });
+            }));
         }
 
         let keys = self.inner.clone_pending_keys(subscription_id);
         if keys.is_empty() {
-            return None;
+            return Ok(None);
         }
-        let plan = Arc::clone(self.inner.keyed_plan(subscription_id)?);
+        let Some(plan) = self.inner.keyed_plan(subscription_id).map(Arc::clone) else {
+            return Ok(None);
+        };
         let query = ctx.query.clone();
-        Some(ResolveJob::Keyed(alloc::boxed::Box::new(KeyedJob {
+        Ok(Some(ResolveJob::Keyed(alloc::boxed::Box::new(KeyedJob {
             plan,
             keys,
             query,
             max_keys: self.max_keys_per_read,
-        })))
+        }))))
     }
 
     /// Run one planned read. Holds no borrow of the engine, so callers can run

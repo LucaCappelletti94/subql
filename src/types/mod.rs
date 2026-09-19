@@ -11,9 +11,9 @@ pub use subscription_types::{
     AggregateBootstrap, AggregateInstallError, AggregateSeedInstall, DropReason, DroppedRead,
     EvictionPolicy, GroupedScalarInstall, GroupedScalarSeedInstall, Install, InstallError,
     InstalledPage, InstalledRowDelta, KeyedRowsInstall, NotServed, PerConsumerDatabaseReads,
-    ReadTier, Registered, RegistrationRequest, RestoredRead, RestoredReads, ScalarInstall, Served,
-    StatedTermValues, SubscriptionMetadata, SubscriptionRequest, SubscriptionsView, Tier, TierKind,
-    UnregisterReport, WholeRowsInstall,
+    ReadTier, Registered, RegistrationRequest, RestoredInProcess, RestoredRead, RestoredReads,
+    ScalarInstall, Served, StatedTermValues, SubscriptionMetadata, SubscriptionRequest,
+    SubscriptionsView, Tier, TierKind, UnregisterReport, WholeRowsInstall,
 };
 #[cfg(feature = "std")]
 pub use subscription_types::{DurabilityMode, MergeReport};

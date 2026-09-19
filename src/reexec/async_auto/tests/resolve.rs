@@ -172,3 +172,40 @@ fn async_cursor_error_names_its_subscription() {
         Err(other) => panic!("expected Cursor naming its subscription, got {other:?}"),
     }
 }
+
+/// A group read for an unadopted answer is refused, not aborted on.
+///
+/// Planning a grouped read needs no context, because the trigger carries
+/// its own query, but running one does: the connector is handed the auth
+/// the subscription registered under. An engine restored without adopting
+/// has neither, and the read has to say so.
+#[test]
+fn a_grouped_read_without_a_context_is_refused_async() {
+    let (mut e, _tid) = engine_with_values(Vec::new());
+    // One adopted answer alongside, so a lookup that ignores the trigger's
+    // own id finds a context anyway and the read wrongly proceeds.
+    crate::reexec::test_fixtures::register_scalar_query(
+        &mut e,
+        1u64,
+        "SELECT MIN(price) FROM orders",
+    );
+    e.enqueue_read(crate::reexec::ReExecutionTrigger {
+        subscription_id: 7,
+        consumer_id: 1u64,
+        read: crate::reexec::ReExecutionRead::GroupedScalar {
+            group: vec![1],
+            query: crate::reexec::BoundQuery::new(
+                "SELECT MIN(price) FROM orders GROUP BY status".to_string(),
+                Vec::new(),
+            ),
+            column_kinds: [ScalarFamily::String, ScalarFamily::Float],
+        },
+        checkpoint: None,
+    });
+
+    let err = block_on(e.resolve(|_| {})).expect_err("the read cannot run");
+    assert!(
+        matches!(err, ReExecError::Unadopted { subscription: 7 }),
+        "the refusal names the unadopted answer, got {err:?}"
+    );
+}

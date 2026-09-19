@@ -587,6 +587,15 @@ pub enum ReExecError<E> {
     /// missing required row image).
     #[error("dispatch failed: {0}")]
     Dispatch(#[from] DispatchError),
+    /// A subscription restored from storage was never adopted, so nothing
+    /// says what its reads run under. Registration supplies that context
+    /// and a restored answer does not pass through registration, so the
+    /// read is refused rather than run without the caller's auth.
+    #[error("subscription {subscription} was restored without being adopted")]
+    Unadopted {
+        /// The answer that came back unadopted.
+        subscription: crate::SubscriptionId,
+    },
     /// The [`Connector`] failed to execute the re-execution SQL for
     /// `subscription`. The whole batch is aborted. The id names the read that
     /// failed, so a caller whose read fails deterministically (a statement

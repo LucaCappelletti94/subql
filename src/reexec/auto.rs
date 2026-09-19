@@ -173,6 +173,118 @@ where
         }
     }
 
+    /// Wrap an engine reopened from storage, giving every answer that came
+    /// back the context its reads run under.
+    ///
+    /// Registration is what supplies that context, and a restored answer
+    /// never passes through it, so this is the other way in. `auth` is
+    /// asked once per restored answer for the value the connector is
+    /// handed on every read of that subscription, since auth is the one
+    /// part of a context that no store holds.
+    ///
+    /// Inspect [`Restored::reads`](crate::Restored::reads) first for the
+    /// answers that could not come back. They are gone by the time this
+    /// returns.
+    #[cfg(feature = "std")]
+    pub fn adopt<F, G>(
+        restored: crate::Restored<E, I, DB>,
+        mode: M,
+        mut auth: F,
+        mut auth_in_process: G,
+    ) -> Self
+    where
+        F: FnMut(&crate::RestoredRead<E::Backend>) -> M::AuthContext,
+        G: FnMut(&crate::RestoredInProcess<E::Backend>) -> M::AuthContext,
+    {
+        let (inner, reads) = restored.into_parts();
+        let mut engine = Self::new(inner, mode);
+        for read in &reads.restored {
+            let session = engine.inner.reexec_session(read.subscription_id);
+            let context = match &read.tier {
+                Tier::Scalar { query, column_kind } => ResolveContext {
+                    query: query.clone(),
+                    column_kind: *column_kind,
+                    grouped_bootstrap: None,
+                    whole_result: false,
+                    keyed: false,
+                    in_process: None,
+                    generation: 0,
+                    session,
+                    auth: auth(read),
+                },
+                Tier::GroupedScalar { bootstrap } => ResolveContext {
+                    query: bootstrap.query.clone(),
+                    column_kind: bootstrap
+                        .kinds
+                        .get(bootstrap.group_columns)
+                        .copied()
+                        .unwrap_or(ScalarFamily::String),
+                    grouped_bootstrap: Some(bootstrap.clone()),
+                    whole_result: false,
+                    keyed: false,
+                    in_process: None,
+                    generation: 0,
+                    session,
+                    auth: auth(read),
+                },
+                Tier::KeyedRows { query, .. } | Tier::WholeRows { query, .. } => ResolveContext {
+                    query: query.clone(),
+                    column_kind: ScalarFamily::String,
+                    grouped_bootstrap: None,
+                    whole_result: matches!(read.tier, Tier::WholeRows { .. }),
+                    keyed: matches!(read.tier, Tier::KeyedRows { .. }),
+                    in_process: None,
+                    generation: 0,
+                    session,
+                    auth: auth(read),
+                },
+                // Restoring plans afresh and only ever lands on a read tier,
+                // so there is no in-process answer here to give a context to.
+                Tier::InProcess(_) => continue,
+            };
+            engine.contexts.insert(read.subscription_id, context);
+        }
+        // The engine maintains these itself, so they read only when the
+        // stream cannot answer them, and that read needs the same context.
+        for answer in &reads.in_process {
+            let session = match engine.inner.subscription_scope(answer.subscription_id) {
+                Some(crate::SubscriptionScope::Session(s)) => Some(s),
+                _ => None,
+            };
+            let (query, whole_result, kind) = answer.aggregate_bootstrap.as_ref().map_or_else(
+                || {
+                    (
+                        answer.source_query.clone(),
+                        true,
+                        InProcessKind::StreamServedFilter,
+                    )
+                },
+                |bootstrap| {
+                    (
+                        bootstrap.query.clone(),
+                        false,
+                        InProcessKind::FoldingAggregate,
+                    )
+                },
+            );
+            engine.contexts.insert(
+                answer.subscription_id,
+                ResolveContext {
+                    query,
+                    column_kind: ScalarFamily::String,
+                    grouped_bootstrap: None,
+                    whole_result,
+                    keyed: false,
+                    in_process: Some(kind),
+                    generation: 0,
+                    session,
+                    auth: auth_in_process(answer),
+                },
+            );
+        }
+        engine
+    }
+
     /// Update connector-call metadata after the registry changes a subscription
     /// tier under the same identity.
     pub(super) fn apply_transitions(

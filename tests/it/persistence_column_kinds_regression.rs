@@ -46,6 +46,7 @@ fn restore_populates_column_kinds_cache() {
         let mut engine: SubscriptionEngine<TestEvent<Postgres>, DefaultIds, ParserDB> =
             SubscriptionEngine::with_storage(catalog(), PostgreSqlDialect {}, path.clone())
                 .expect("with_storage")
+                .into_parts()
                 .0;
         engine
             .register(SubscriptionRequest::<DefaultIds, Postgres>::new(
@@ -59,6 +60,7 @@ fn restore_populates_column_kinds_cache() {
     let mut restored: SubscriptionEngine<TestEvent<Postgres>, DefaultIds, ParserDB> =
         SubscriptionEngine::with_storage(catalog(), PostgreSqlDialect {}, path)
             .expect("restore with_storage")
+            .into_parts()
             .0;
 
     let notifs = restored.consumers(&insert_event(orders, 1, 250)).unwrap();
