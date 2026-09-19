@@ -108,21 +108,15 @@ fn a_failed_merge_keeps_the_reports_of_the_merges_already_applied() {
         .expect("the second merge starts");
     assert!(good < bad, "the drain runs in job order");
 
-    // Both workers are given time to finish, so one drain sees a ready
-    // merge followed by a failing one.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    let mut error = None;
-    while std::time::Instant::now() < deadline {
-        match engine.complete_ready_merges() {
-            Ok(_) => std::thread::sleep(std::time::Duration::from_millis(20)),
-            Err(e) => {
-                error = Some(e);
-                break;
-            }
-        }
-    }
-
-    let error = error.expect("the corrupt shard fails the drain");
+    // One drain, after both workers have certainly finished. Polling would
+    // decide nothing: the corrupt job is the cheaper worker and can finish
+    // first, and a poll that catches only the healthy one consumes it, so
+    // either way the failing drain would carry nothing through no fault of
+    // the code under test.
+    std::thread::sleep(std::time::Duration::from_secs(1));
+    let error = engine
+        .complete_ready_merges()
+        .expect_err("both merges are ready by now, and the corrupt one fails");
     assert_eq!(
         error.applied.len(),
         1,
