@@ -1206,6 +1206,73 @@ mod tests {
         );
     }
 
+    /// The count `is_consumer_referenced` reads has to say what a walk over
+    /// the bindings would. A scan cannot drift, a counter can, and this one
+    /// decides whether a live consumer is still addressed, so it is checked
+    /// against the walk it replaced through a register, an overwrite onto
+    /// another consumer, and an unbind.
+    #[test]
+    fn the_consumer_count_says_what_walking_the_bindings_says() {
+        let mut store = PredicateStore::<DefaultIds, Postgres>::new();
+        let pred_id = store.add_predicate(make_predicate(0, 0xAABB));
+        let bind = |store: &mut PredicateStore<DefaultIds, Postgres>,
+                    subscription_id: u64,
+                    consumer_id: u64| {
+            store.add_binding(SubscriptionBinding {
+                subscription_id,
+                predicate_id: pred_id,
+                consumer_id,
+                consumer_ordinal: ConsumerOrdinal::new(
+                    u32::try_from(consumer_id).expect("the fixture's consumers are small"),
+                ),
+                scope: SubscriptionScope::Durable,
+                updated_at_unix_ms: 0,
+            });
+        };
+        let agrees = |store: &PredicateStore<DefaultIds, Postgres>| {
+            (0..4u64).all(|consumer| {
+                let walked = store
+                    .bindings
+                    .values()
+                    .filter(|binding| binding.consumer_id == consumer)
+                    .count();
+                store.is_consumer_referenced(consumer) == (walked > 0)
+            })
+        };
+
+        bind(&mut store, 1, 1);
+        bind(&mut store, 2, 1);
+        bind(&mut store, 3, 2);
+        assert!(agrees(&store), "after registering three bindings");
+
+        // The same subscription id under another consumer: the replacement
+        // takes the reference the previous binding held.
+        bind(&mut store, 3, 3);
+        assert!(
+            agrees(&store),
+            "after overwriting one onto another consumer"
+        );
+        assert!(
+            !store.is_consumer_referenced(2),
+            "consumer 2 held only that one"
+        );
+
+        store.remove_binding(1);
+        assert!(agrees(&store), "after unbinding one of consumer 1's two");
+        assert!(
+            store.is_consumer_referenced(1),
+            "the other one still holds it"
+        );
+
+        store.remove_binding(2);
+        store.remove_binding(3);
+        assert!(agrees(&store), "after unbinding the rest");
+        assert!(
+            store.consumer_bindings.is_empty(),
+            "no binding left, so no consumer is counted"
+        );
+    }
+
     #[test]
     fn test_active_consumer_ids() {
         let mut store = PredicateStore::<DefaultIds, Postgres>::new();

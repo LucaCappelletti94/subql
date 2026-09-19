@@ -937,6 +937,45 @@ mod tests {
         );
     }
 
+    /// A binding takes a reference on its predicate, and the count for that
+    /// lives in the store rather than in the predicate, so binding one leaves
+    /// the predicates exactly where the published snapshot has them. Put the
+    /// count back inside and every registration copies them again.
+    #[test]
+    fn taking_a_reference_leaves_the_predicates_where_they_were() {
+        let mut partition = TablePartition::<DefaultIds, Postgres>::new(1);
+        let pred_id = partition.mutate(|txn| txn.add_predicate(make_predicate(0, 0x3333)));
+        let published = partition.load_snapshot();
+
+        partition.mutate(|txn| {
+            txn.add_binding(
+                SubscriptionBinding {
+                    subscription_id: 100,
+                    predicate_id: pred_id,
+                    consumer_id: 1,
+                    consumer_ordinal: ConsumerOrdinal::new(0),
+                    scope: SubscriptionScope::Durable,
+                    updated_at_unix_ms: 0,
+                },
+                pred_id,
+            );
+        });
+        let after = partition.load_snapshot();
+
+        assert!(
+            Arc::ptr_eq(
+                &published.predicates.predicates,
+                &after.predicates.predicates
+            ),
+            "binding a subscription reads no predicate, so it may not copy them"
+        );
+        assert_eq!(
+            after.predicates.refcount(pred_id),
+            1,
+            "and the reference it took is counted"
+        );
+    }
+
     #[test]
     fn test_select_candidates_null_cell_matches_is_null_index() {
         use super::super::indexes::{IndexableAtom, NullKind};
