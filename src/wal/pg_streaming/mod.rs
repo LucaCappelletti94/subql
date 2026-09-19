@@ -225,6 +225,7 @@ impl PgStreamingCdcSource {
 
         let task = tokio::spawn(streaming_task(
             conn,
+            base_lsn,
             event_tx,
             ack_rx,
             task_status_counter,
@@ -372,6 +373,7 @@ impl crate::CdcSource for PgStreamingCdcSource {
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 async fn streaming_task(
     mut conn: PgReplicationConnection,
+    base_lsn: u64,
     event_tx: tokio::sync::mpsc::Sender<Result<ChangeEvent, PgStreamingError>>,
     mut ack_rx: tokio::sync::mpsc::UnboundedReceiver<PgLsn>,
     status_counter: Arc<AtomicU64>,
@@ -386,9 +388,13 @@ async fn streaming_task(
     let _exit_guard = crate::wal::ExitFlagGuard(task_exited);
 
     let mut decoder = PgOutputDecoder::with_protocol_version(1);
-    let mut latest_received_lsn: u64 = 0;
+    // Both start where the slot already is, which is what the gauges
+    // published at connect. Starting at zero reports a client that has
+    // received nothing and lets the first frame store a position below the
+    // seed, since a frame can carry a zero WAL end.
+    let mut latest_received_lsn: u64 = base_lsn;
     // Never regress the reported flush_lsn; slots track `min(reported)`.
-    let mut latest_acked_lsn: u64 = 0;
+    let mut latest_acked_lsn: u64 = base_lsn;
 
     let mut interval = tokio::time::interval(status_interval);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
