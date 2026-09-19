@@ -2616,6 +2616,16 @@ where
 
     /// Drop a re-read answer by id, pruning its routing and session indexes.
     pub fn unregister_reread(&mut self, subscription_id: SubscriptionId) -> bool {
+        let removed = self.unregister_reread_only(subscription_id);
+        if removed {
+            self.persist_reads_after_removal();
+        }
+        removed
+    }
+
+    /// Drop a re-read answer without rewriting the reads file, for a caller
+    /// ending several at once that writes the file itself afterwards.
+    fn unregister_reread_only(&mut self, subscription_id: SubscriptionId) -> bool {
         let Some(entry) = self.reexec.remove(&subscription_id) else {
             return false;
         };
@@ -2636,7 +2646,6 @@ where
                 }
             }
         }
-        self.persist_reads_after_removal();
         true
     }
 
@@ -2660,7 +2669,9 @@ where
             Err(e) => match self.durability_mode {
                 DurabilityMode::BestEffort => Ok(()),
                 DurabilityMode::Required => {
-                    self.unregister_reread(subscription_id);
+                    // The file write is what just failed, so undoing the
+                    // registration does not try it again.
+                    self.unregister_reread_only(subscription_id);
                     Err(RegisterError::Storage(e.to_string()))
                 }
             },
@@ -4595,7 +4606,8 @@ where
             .cloned()
             .unwrap_or_default()
         {
-            if self.unregister_reread(subscription_id) {
+            // Not the persisting form: the whole session writes once below.
+            if self.unregister_reread_only(subscription_id) {
                 removed_reads += 1;
             }
         }
