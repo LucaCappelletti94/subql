@@ -1,0 +1,65 @@
+name: Pins
+
+on:
+  schedule:
+    - cron: "0 5 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  refresh:
+    name: refresh the resolved pins
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      # A manual dispatch may select another ref, and only main's tree belongs here.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+      - run: sudo apt-get update && sudo apt-get install -y libpq-dev default-libmysqlclient-dev
+      # The lockfile has to stay resolvable by the oldest toolchain the project
+      # supports, which a newer cargo would not guarantee.
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: "1.88.0"
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - run: cargo update
+      - run: cargo update --manifest-path fuzz/Cargo.toml
+      - id: moved
+        run: git diff --quiet -- Cargo.lock fuzz/Cargo.lock || echo "moved=yes" >> "$GITHUB_OUTPUT"
+      # A pull request opened with GITHUB_TOKEN starts no workflow, so the gate
+      # runs here and a failure is the signal that an upstream branch broke us.
+      - if: steps.moved.outputs.moved == 'yes'
+        run: cargo fmt --check
+      - if: steps.moved.outputs.moved == 'yes'
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+      - if: steps.moved.outputs.moved == 'yes'
+        run: cargo test --workspace --lib --tests --release --locked
+      - if: steps.moved.outputs.moved == 'yes'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          branch="chore/refresh-pins"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -b "$branch"
+          git add Cargo.lock fuzz/Cargo.lock
+          git commit -m "Advance the resolved pins to their branch tips"
+          if git ls-remote --exit-code --heads origin "$branch" >/dev/null; then
+            git fetch origin "$branch":refs/remotes/origin/"$branch"
+            git push --force-with-lease origin HEAD:refs/heads/"$branch"
+          else
+            git push origin HEAD:refs/heads/"$branch"
+          fi
+          gh pr view "$branch" --json number >/dev/null 2>&1 || gh pr create \
+            --base main --head "$branch" \
+            --title "Advance the resolved pins to their branch tips" \
+            --body "$(printf '%s\n' \
+              'Weekly refresh of the committed lockfiles, resolved by the 1.88 toolchain so the MSRV job stays satisfiable.' \
+              '' \
+              'The scheduled job that produced this ran the format check, clippy over every target with all features and warnings denied, and the release unit tests against these pins. Checks do not start by themselves on a pull request a workflow opened, so close and reopen this one to run the full suite.')"
