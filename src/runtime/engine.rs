@@ -3707,11 +3707,11 @@ where
     /// Also drops every per-session resume cursor associated with this
     /// `subscription_id` so cursors never outlive their owning subscription.
     pub fn unregister_subscription(&mut self, subscription_id: SubscriptionId) -> bool {
-        if self.unregister_reread(subscription_id) {
-            self.resume_cursors
-                .retain(|(_, sub_id), _| *sub_id != subscription_id);
-            return true;
-        }
+        // Both, rather than the first that answers. An id belongs to one
+        // registry as they are written, but a store whose two files were
+        // written either side of a tier change restores it into both, and
+        // ending it has to mean ended.
+        let read_ended = self.unregister_reread(subscription_id);
         // Read before the removal takes the index entry with it.
         #[cfg(feature = "std")]
         let table = self.subscription_to_table.get(&subscription_id).copied();
@@ -3727,7 +3727,7 @@ where
             }
             self.persist_reads_after_removal();
         }
-        removed
+        read_ended || removed
     }
 
     // Per-`(session, subscription)` resume cursor API. The cursor is the
