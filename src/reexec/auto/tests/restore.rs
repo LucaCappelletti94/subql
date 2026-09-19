@@ -146,7 +146,6 @@ fn an_adopted_in_process_filter_reads_when_the_stream_cannot_answer() {
         "the stream answers this one, so nothing is saved as a read"
     );
     engine.snapshot_table(orders).expect("snapshot the table");
-    engine.snapshot_reads().expect("snapshot the statements");
     drop(engine);
 
     let restored = SubscriptionEngine::<TestEvent<Postgres>, DefaultIds, ParserDB>::with_storage(

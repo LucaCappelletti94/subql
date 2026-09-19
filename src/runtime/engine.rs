@@ -4737,9 +4737,28 @@ where
 
     /// Snapshot table partition to disk
     ///
-    /// Serializes all predicates, bindings, and consumer dictionary to a shard file.
+    /// Serializes all predicates, bindings, and consumer dictionary to a
+    /// shard file, then rewrites the reads file.
+    ///
+    /// A shard holds each predicate as a `WHERE` expression, and an answer
+    /// the engine maintains itself falls back to reading its statement,
+    /// which only the reads file holds. Writing one without the other
+    /// leaves those answers unable to read after a restart, so both go
+    /// together. The reads file covers every subscription rather than this
+    /// table's, which is why it is rewritten whole.
+    ///
+    /// # Errors
+    ///
+    /// [`StorageError`] when either file cannot be written.
     #[cfg(feature = "std")]
     pub fn snapshot_table(&self, table_id: TableId) -> Result<(), StorageError> {
+        self.snapshot_table_only(table_id)?;
+        self.snapshot_reads()
+    }
+
+    /// Write this table's shard, leaving the reads file alone.
+    #[cfg(feature = "std")]
+    fn snapshot_table_only(&self, table_id: TableId) -> Result<(), StorageError> {
         let storage_path = self
             .storage_path
             .as_ref()
