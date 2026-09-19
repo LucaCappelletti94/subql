@@ -126,3 +126,45 @@ fn async_unregister_subscription_drops_the_resolve_context() {
         "no connector call after unregister"
     );
 }
+
+/// A read outlives nothing, the async twin.
+///
+/// The async planner refuses a read whose context is missing, which an
+/// orphaned context slips straight past, so ending by statement has to
+/// drop the context as well as the queued read.
+#[test]
+fn unregistering_by_statement_drops_the_queued_read_async() {
+    const SQL: &str = "SELECT * FROM orders WHERE status = 'paid'";
+    let (mut e, tid) = engine_with_values(vec![]);
+    e.register(SubscriptionRequest::new(1u64, SQL), ())
+        .expect("the filter is served in process");
+
+    let mut cells = row(1, 5.0);
+    cells[3] = Value::Missing;
+    let event = TestEvent::<Postgres>::update(tid, row(1, 5.0), cells)
+        .with_pk_columns([0u16])
+        .with_changed_columns([1u16]);
+    e.apply_leaving_reads_queued(&event)
+        .expect("the event applies");
+    assert_eq!(
+        e.pending_read_count(),
+        1,
+        "the unanswered cell queues a read"
+    );
+
+    e.unregister_query(1u64, SQL)
+        .expect("the statement names it");
+    assert_eq!(
+        e.pending_read_count(),
+        0,
+        "the queued read left with its subscription"
+    );
+    assert_eq!(e.contexts.len(), 0, "and so did its resolve context");
+
+    block_on(e.resolve_collect()).expect("the resolve is a clean no-op");
+    assert_eq!(
+        e.connector().call_count(),
+        0,
+        "no read runs for a subscription the caller ended"
+    );
+}

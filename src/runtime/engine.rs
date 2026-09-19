@@ -2539,6 +2539,16 @@ where
         );
     }
 
+    /// Whether either registry still holds `subscription_id`.
+    ///
+    /// One id counter serves the maintained answers and the read answers
+    /// alike, so a wrapper keeping state per subscription asks about both
+    /// rather than guessing which registry ended it.
+    pub(crate) fn holds_subscription(&self, subscription_id: SubscriptionId) -> bool {
+        self.subscription_to_table.contains_key(&subscription_id)
+            || self.reexec.contains_key(&subscription_id)
+    }
+
     /// The session a restored re-read belongs to, for rebuilding its
     /// resolve context on adoption.
     pub(crate) fn reexec_session(&self, subscription_id: SubscriptionId) -> Option<I::SessionId> {

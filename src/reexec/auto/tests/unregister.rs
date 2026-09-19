@@ -181,3 +181,53 @@ fn unregister_session_drops_the_queued_reads() {
         "no read runs for a dead session"
     );
 }
+
+/// A read outlives nothing, whichever way its subscription ended.
+///
+/// Ending by statement is the one removal path that dropped neither the
+/// resolve context nor the queued read. The context is what the refusal
+/// checks for, so an orphaned one is not refused: the next resolve runs a
+/// real read for a subscription the engine no longer holds, fails, and
+/// leaves the read queued for the next one to repeat.
+#[test]
+fn unregistering_by_statement_drops_the_queued_read() {
+    const SQL: &str = "SELECT * FROM orders WHERE status = 'paid'";
+    let (mut e, tid) = engine_with_values(alloc::vec![]);
+    e.register(SubscriptionRequest::new(1u64, SQL), ())
+        .expect("the filter is served in process");
+
+    // The row image omits `status`, which the filter reads, so the event
+    // cannot answer it and a read is queued.
+    let mut cells = row(1, 5.0);
+    cells[3] = Value::Missing;
+    let event = TestEvent::<Postgres>::update(tid, row(1, 5.0), cells)
+        .with_pk_columns([0u16])
+        .with_changed_columns([1u16]);
+    e.connector().push_page(crate::reexec::RowPage {
+        columns: alloc::vec![String::from("id"), String::from("status")],
+        rows: alloc::vec![alloc::vec![Value::Int(1), Value::String("paid".into())]],
+        more: false,
+    });
+    e.apply_leaving_reads_queued(&event)
+        .expect("the event applies");
+    assert_eq!(
+        e.pending_read_count(),
+        1,
+        "the unanswered cell queues a read"
+    );
+
+    e.unregister_query(1u64, SQL)
+        .expect("the statement names it");
+    assert_eq!(
+        e.pending_read_count(),
+        0,
+        "the queued read left with its subscription"
+    );
+    assert_eq!(e.contexts.len(), 0, "and so did its resolve context");
+
+    e.resolve_collect().expect("the resolve is a clean no-op");
+    assert!(
+        e.connector().cursor_queries.borrow().is_empty(),
+        "no read runs for a subscription the caller ended"
+    );
+}
