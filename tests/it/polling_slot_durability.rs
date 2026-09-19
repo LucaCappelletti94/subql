@@ -439,13 +439,19 @@ fn the_streaming_source_reports_what_its_slot_is_holding() {
             .expect("no source error")
             .expect("the source is open");
 
-        // The server's first frames can report a WAL end no further on than
-        // the position this slot started at, so growth is a bounded wait
-        // rather than a reading taken the instant an event lands.
+        // A data frame carries the position of the record in it, measured
+        // as equal to its start on every frame of this suite, and the first
+        // record of a transaction sits where the slot already was. Only the
+        // commit frame, or a keepalive, moves the figure, so growth is a
+        // bounded wait rather than a reading taken the instant one lands.
         let mut held = base;
         let started = std::time::Instant::now();
         while held <= base && started.elapsed() < Duration::from_secs(10) {
-            let _ = tokio::time::timeout(Duration::from_millis(100), source.next_event()).await;
+            if let Ok(polled) =
+                tokio::time::timeout(Duration::from_millis(100), source.next_event()).await
+            {
+                polled.expect("no source error");
+            }
             held = source.unacknowledged_bytes();
         }
         assert!(
@@ -491,7 +497,7 @@ fn the_streaming_source_reports_what_its_slot_is_holding() {
 
 /// The lag figure moves on WAL the publication never carries.
 ///
-/// The server reports its WAL end on keepalive frames too, so a source whose
+/// A keepalive is what carries the server's own WAL end, so a source whose
 /// publication is idle still learns that it has fallen behind. Without that,
 /// a slot held open beside a busy neighbour reads as caught up right up to
 /// the moment the volume fills, which is the case the figure exists for.
@@ -534,7 +540,8 @@ fn an_idle_publication_still_reports_the_source_falling_behind() {
             // next_event drives the frame loop, and must not produce one.
             match tokio::time::timeout(Duration::from_millis(200), source.next_event()).await {
                 Err(_) => {}
-                Ok(other) => panic!("the publication is idle, got {other:?}"),
+                Ok(Err(e)) => panic!("the source failed while idle: {e}"),
+                Ok(Ok(other)) => panic!("the publication is idle, got {other:?}"),
             }
             grew = source.unacknowledged_bytes();
             if grew > base {
