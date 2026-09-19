@@ -178,6 +178,10 @@ mod placeholder_bytes_bind;
 #[cfg(feature = "pg-streaming")]
 mod polling_smoke;
 
+// The polling source's slot protocol, and where `confirmed_flush_lsn` moves.
+#[cfg(feature = "pg-streaming")]
+mod polling_slot_durability;
+
 // One-shot empirical benchmark comparing the two shipped library
 // transports: the push-based `PgStreamingCdcSource` against the polling
 // `PollingPgCdcSource`. Verifies the architectural claim that push

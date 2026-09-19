@@ -19,17 +19,26 @@
 //! - **Benchmark subject**: the workload-matrix examples measure both
 //!   transports across regimes.
 //!
+//! # Acknowledging is not optional
+//!
+//! The source retains an event until [`crate::CdcSource::ack`] says it is
+//! applied, which is what makes a dropped source cost a re-read rather than
+//! the events. The cost of that guarantee is paid by a consumer that does
+//! not acknowledge. Postgres retains the WAL behind the slot, and every poll
+//! re-reads the whole unacknowledged history, so both grow without bound.
+//! Acknowledge on the same cadence as the work the events drive.
+//!
 //! # Latency characteristics
 //!
 //! Polling adds roughly `poll_interval / 2` average latency on top of
 //! the wire RTT. At 100 ms polling cadence this is ~50 ms per event.
 //!
-//! # Ack semantics differ from push
+//! # Acknowledging releases the slot
 //!
-//! Polling uses `pg_logical_slot_get_binary_changes`, which
-//! auto-advances the slot's `confirmed_flush_lsn` as a side effect of
-//! the drain. Consequently, the `ack` method on the [`CdcSource`] impl
-//! for [`PollingPgCdcSource`] is a **no-op**.
+//! Polling reads through `pg_logical_slot_peek_binary_changes`, which does
+//! not consume, so the slot's `confirmed_flush_lsn` moves only when
+//! [`crate::CdcSource::ack`] says a transaction is applied. That is the same
+//! contract the push source answers.
 //!
 //! [`CdcSource`]: crate::CdcSource
 
@@ -128,11 +137,17 @@ pub enum PollingPgCdcError {
     SourceClosed,
 }
 
-/// Polling-based Postgres CDC source. See the module-level docs for
-/// when to choose polling over the default push source.
+/// Polling-based Postgres CDC source.
+///
+/// See the module-level docs for when to choose polling over the default
+/// push source, and for why a consumer that does not acknowledge grows both
+/// the retained WAL and the cost of a poll.
 pub struct PollingPgCdcSource {
     config: PollingPgCdcConfig,
     event_rx: tokio::sync::mpsc::Receiver<Result<ChangeEvent, PollingPgCdcError>>,
+    /// Positions the consumer acknowledged, carried to the loop, which
+    /// advances the slot on its next iteration.
+    ack_tx: std::sync::mpsc::Sender<u64>,
     polls_issued: Arc<AtomicU64>,
     events_received: Arc<AtomicU64>,
     empty_polls_observed: Arc<AtomicU64>,
@@ -188,6 +203,7 @@ impl PollingPgCdcSource {
         .map_err(|e| PollingPgCdcError::Protocol(format!("connection task panicked: {e}")))??;
 
         let (event_tx, event_rx) = tokio::sync::mpsc::channel(config.buffer_capacity);
+        let (ack_tx, ack_rx) = std::sync::mpsc::channel();
         let shutdown = Arc::new(AtomicBool::new(false));
         let polls_issued = Arc::new(AtomicU64::new(0));
         let events_received = Arc::new(AtomicU64::new(0));
@@ -214,6 +230,7 @@ impl PollingPgCdcSource {
                 task_publication,
                 task_interval,
                 event_tx,
+                ack_rx,
                 task_polls,
                 task_events,
                 task_empty,
@@ -227,6 +244,7 @@ impl PollingPgCdcSource {
         Ok(Self {
             config,
             event_rx,
+            ack_tx,
             polls_issued,
             events_received,
             empty_polls_observed,
@@ -320,13 +338,18 @@ impl crate::CdcSource for PollingPgCdcSource {
         crate::wal::shared_helpers::recv_source_event(&mut self.event_rx)
     }
 
+    // The body is sync, a channel send, but the trait requires
+    // `impl Future + Send`, which both `unused_async` and
+    // `manual_async_fn` would flag.
     #[allow(clippy::manual_async_fn, clippy::unused_async)]
     fn ack(
         &mut self,
-        _upto: PgLsn,
+        upto: PgLsn,
     ) -> impl core::future::Future<Output = Result<(), Self::Error>> + Send {
-        // No-op: `pg_logical_slot_get_binary_changes` auto-advances the
-        // slot's `confirmed_flush_lsn` as a side effect of the drain.
-        async move { Ok(()) }
+        let send_result = self.ack_tx.send(upto.0);
+        async move {
+            send_result.map_err(|_| PollingPgCdcError::SourceClosed)?;
+            Ok(())
+        }
     }
 }

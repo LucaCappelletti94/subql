@@ -183,6 +183,14 @@ where
                 return;
             };
             let observed_at = Instant::now();
+            // A source retains an event until it is acknowledged, so a
+            // consumer that never acknowledged would make every poll re-read
+            // the whole unacknowledged history.
+            if let Some(upto) = ev.checkpoint() {
+                if source.ack(upto).await.is_err() {
+                    return;
+                }
+            }
             if ev.kind() != EventKind::Insert {
                 continue;
             }
@@ -252,10 +260,13 @@ fn polling_vs_push_latency_comparison() {
         .expect("REPLICA IDENTITY FULL");
 
     // One slot per measurement so the runs do not interfere.
-    fn setup_slot(setup: &mut diesel::PgConnection, slot: &str) -> String {
+    // The publication is made up front, the slot at the start of its own
+    // phase. A slot retains every transaction committed after it exists, so
+    // creating all four here would hand each phase the previous phases'
+    // inserts and leave it measuring those.
+    fn setup_publication(setup: &mut diesel::PgConnection, slot: &str) -> String {
         let pub_name = format!("{slot}_pub");
         common::create_publication(setup, &pub_name, "orders");
-        common::create_pgoutput_slot(setup, slot);
         pub_name
     }
 
@@ -264,16 +275,17 @@ fn polling_vs_push_latency_comparison() {
     let bench_poll_100 = db.slot("bench_poll_100");
     let bench_poll_1000 = db.slot("bench_poll_1000");
 
-    let push_pub = setup_slot(&mut setup, &bench_push);
-    let poll10_pub = setup_slot(&mut setup, &bench_poll_10);
-    let poll100_pub = setup_slot(&mut setup, &bench_poll_100);
-    let poll1000_pub = setup_slot(&mut setup, &bench_poll_1000);
+    let push_pub = setup_publication(&mut setup, &bench_push);
+    let poll10_pub = setup_publication(&mut setup, &bench_poll_10);
+    let poll100_pub = setup_publication(&mut setup, &bench_poll_100);
+    let poll1000_pub = setup_publication(&mut setup, &bench_poll_1000);
 
     let pg_url = db.url();
 
     let rt = current_thread_rt();
     let (push_stats, poll_10, poll_100, poll_1000) = rt.block_on(async {
         // --- Push --------------------------------------------------------
+        common::create_pgoutput_slot(&mut setup, &bench_push);
         let gap = insert_gap_for_interval(None);
         let (rx, task) = spawn_push(
             ParserDB::parse::<PostgreSqlDialect>(DDL).expect("parse DDL"),
@@ -294,6 +306,7 @@ fn polling_vs_push_latency_comparison() {
         };
 
         // --- Poll @ 10ms -------------------------------------------------
+        common::create_pgoutput_slot(&mut setup, &bench_poll_10);
         let interval = Duration::from_millis(10);
         let gap = insert_gap_for_interval(Some(interval));
         let (rx, task) = spawn_poll(
@@ -315,6 +328,7 @@ fn polling_vs_push_latency_comparison() {
         };
 
         // --- Poll @ 100ms ------------------------------------------------
+        common::create_pgoutput_slot(&mut setup, &bench_poll_100);
         let interval = Duration::from_millis(100);
         let gap = insert_gap_for_interval(Some(interval));
         let (rx, task) = spawn_poll(
@@ -336,6 +350,7 @@ fn polling_vs_push_latency_comparison() {
         };
 
         // --- Poll @ 1000ms -----------------------------------------------
+        common::create_pgoutput_slot(&mut setup, &bench_poll_1000);
         let interval = Duration::from_millis(1000);
         let gap = insert_gap_for_interval(Some(interval));
         let (rx, task) = spawn_poll(
