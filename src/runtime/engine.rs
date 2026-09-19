@@ -36,8 +36,8 @@ use crate::{
             ShardPayload,
         },
     },
-    DropReason, DroppedRead, DurabilityMode, DurableShardMerge, DurableShardStore, MergeError,
-    MergeJobId, MergeReport, RestoredRead, RestoredReads, StorageError,
+    DropReason, DroppedRead, DurabilityMode, DurableShardMerge, DurableShardStore, MergeDrainError,
+    MergeError, MergeJobId, MergeReport, RestoredRead, RestoredReads, StorageError,
 };
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
@@ -5164,6 +5164,41 @@ where
             .map_err(MergeError::Storage)?;
         self.merge_manager
             .merge_shards_background(table_id, shard_bytes, fingerprint)
+    }
+
+    /// Every merge this engine started and has not swapped in.
+    ///
+    /// A [`MergeJobId`] is the only way to reach a merge, so a caller that
+    /// dropped one recovers it here rather than leaving the work finished,
+    /// held in memory and never applied.
+    #[cfg(feature = "std")]
+    #[must_use]
+    pub fn pending_merges(&self) -> Vec<MergeJobId> {
+        self.merge_manager.pending_merges()
+    }
+
+    /// Swap in every merge that has finished, leaving the rest running.
+    ///
+    /// The reports come back in job order. A merge that failed stops the
+    /// drain, leaving the merges after it outstanding for the next call,
+    /// and the ones already swapped in are carried on the error, since
+    /// swapping cannot be undone and their jobs are gone.
+    ///
+    /// # Errors
+    ///
+    /// [`MergeDrainError`] from the first merge that failed to build or
+    /// swap in, carrying the reports of the merges applied before it.
+    #[cfg(feature = "std")]
+    pub fn complete_ready_merges(&mut self) -> Result<Vec<MergeReport>, MergeDrainError> {
+        let mut applied = Vec::new();
+        for job_id in self.pending_merges() {
+            match self.try_complete_merge(job_id) {
+                Ok(Some(report)) => applied.push(report),
+                Ok(None) => {}
+                Err(source) => return Err(MergeDrainError { applied, source }),
+            }
+        }
+        Ok(applied)
     }
 
     /// Poll for merge completion and swap the result into the live partition

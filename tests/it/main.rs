@@ -222,6 +222,7 @@ mod proptest_row_set_delta;
 mod proptest_throttle;
 
 #[cfg(feature = "std")]
+mod merge_jobs;
 mod reads_persist;
 
 #[cfg(all(feature = "executor-diesel", feature = "diesel-typed-sqlite"))]

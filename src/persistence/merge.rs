@@ -50,7 +50,7 @@ struct MergeTask<I: IdTypes> {
 /// Manager for background merge operations
 pub struct MergeManager<I: IdTypes> {
     jobs: HashMap<MergeJobId, MergeJob<I>>,
-    next_job_id: MergeJobId,
+    next_job_id: u64,
     /// Worker pool sender, spawned lazily on the first merge. `None`
     /// until then, so engines that never merge spawn no threads.
     task_sender: Option<Sender<MergeTask<I>>>,
@@ -124,7 +124,7 @@ impl<I: IdTypes> MergeManager<I> {
         shard_bytes: Vec<Vec<u8>>,
         fingerprint: ShardFingerprintEnvelope,
     ) -> Result<MergeJobId, MergeError> {
-        let job_id = self.next_job_id;
+        let job_id = MergeJobId::new(self.next_job_id);
         self.next_job_id += 1;
 
         let (tx, rx) = mpsc::channel();
@@ -177,6 +177,15 @@ impl<I: IdTypes> MergeManager<I> {
                 Err(MergeError::BuildFailed("Thread panicked".to_string()))
             }
         }
+    }
+
+    /// Every merge still outstanding, so one whose name was lost can be
+    /// reached again.
+    #[must_use]
+    pub fn pending_merges(&self) -> Vec<MergeJobId> {
+        let mut ids: Vec<MergeJobId> = self.jobs.keys().copied().collect();
+        ids.sort_unstable();
+        ids
     }
 
     /// Get number of active jobs
@@ -512,8 +521,8 @@ mod tests {
         let mut manager: MergeManager<DefaultIds> = MergeManager::new();
 
         // Try to get result for non-existent job
-        let result = manager.try_get_result(999);
-        assert!(matches!(result, Err(MergeError::UnknownJob(999))));
+        let result = manager.try_get_result(MergeJobId::new(999));
+        assert!(matches!(result, Err(MergeError::UnknownJob(id)) if id.get() == 999));
     }
 
     #[test]
@@ -831,10 +840,12 @@ mod tests {
 
         let job_id = manager.next_job_id;
         manager.next_job_id += 1;
-        manager.jobs.insert(job_id, MergeJob { receiver: rx });
+        manager
+            .jobs
+            .insert(MergeJobId::new(job_id), MergeJob { receiver: rx });
 
         // Now try_get_result should see Disconnected
-        let result = manager.try_get_result(job_id);
+        let result = manager.try_get_result(MergeJobId::new(job_id));
         assert!(
             matches!(result, Err(MergeError::BuildFailed(ref msg)) if msg == "Thread panicked")
         );
@@ -909,10 +920,12 @@ mod tests {
 
         let job_id = manager.next_job_id;
         manager.next_job_id += 1;
-        manager.jobs.insert(job_id, MergeJob { receiver: rx });
+        manager
+            .jobs
+            .insert(MergeJobId::new(job_id), MergeJob { receiver: rx });
 
         // Before sending anything, check: should be "still running"
-        let result = manager.try_get_result(job_id);
+        let result = manager.try_get_result(MergeJobId::new(job_id));
         assert!(matches!(result, Ok(None)));
 
         // Now send result and check again
@@ -936,7 +949,7 @@ mod tests {
             },
         }));
 
-        let result = manager.try_get_result(job_id);
+        let result = manager.try_get_result(MergeJobId::new(job_id));
         assert!(result.is_ok());
         assert!(result.unwrap().is_some());
     }
