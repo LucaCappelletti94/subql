@@ -299,19 +299,22 @@ impl PgStreamingCdcSource {
             .then(|| PgLsn(self.acked_lsn.load(Ordering::Relaxed)))
     }
 
-    /// Bytes this source has been sent and has not acknowledged.
+    /// Distance between the server's WAL end and this source's flush
+    /// position.
     ///
-    /// The distance between the position the server has sent and the
-    /// position reported back as flushed. A consumer that never
-    /// acknowledges sees this grow without bound, and so does the server's
-    /// WAL volume, until it fills, so a sustained rise is what catches that
-    /// before the disk answers for it.
+    /// Every frame carries the server's WAL end at send time, so this is
+    /// the last end observed minus the position last reported back as
+    /// flushed. A consumer that never acknowledges sees it grow without
+    /// bound, and so does the server's WAL volume, until it fills, so a
+    /// sustained rise is what catches that before the disk answers for it.
     ///
-    /// A lower bound on what the slot retains rather than a measure of it.
-    /// The server also holds WAL it has not streamed yet, and holds back to
+    /// That end is the server's own, not the end of what this source was
+    /// sent, so the figure also counts WAL this publication never carries
+    /// and rises on activity elsewhere in the cluster. It is close to what
+    /// the slot retains without being it, since the server holds back to
     /// the slot's `restart_lsn` rather than to its confirmed flush
-    /// position, neither of which this can see. Alert on this figure
-    /// rising, and read `pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)`
+    /// position, and since the end here is only as fresh as the last frame
+    /// received. Read `pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)`
     /// from `pg_replication_slots` for the size itself.
     #[must_use]
     pub fn unacknowledged_bytes(&self) -> u64 {
