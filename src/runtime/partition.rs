@@ -810,6 +810,25 @@ mod tests {
         );
     }
 
+    /// Whether both maps hold the same entries at the same addresses.
+    ///
+    /// A persistent map shares its nodes, so an untouched index answers with
+    /// the values the published snapshot handed out, and one rebuilt by a
+    /// mutation answers with copies.
+    fn same_entries<K, V>(
+        before: &rpds::HashTrieMapSync<K, V>,
+        now: &rpds::HashTrieMapSync<K, V>,
+    ) -> bool
+    where
+        K: Eq + core::hash::Hash,
+    {
+        before.size() == now.size()
+            && before.iter().all(|(key, value)| {
+                now.get(key)
+                    .is_some_and(|current| core::ptr::eq(value, current))
+            })
+    }
+
     /// What the copy-on-write clone is worth: a mutation deepens the index it
     /// touches and leaves every other one the allocation the published
     /// snapshot holds. An index put back inline, or a `make_mut` turned into
@@ -833,7 +852,7 @@ mod tests {
                         predicate_id: pred_id,
                         consumer_id: u64::from(ordinal.get()),
                         consumer_ordinal: ordinal,
-                        scope: SubscriptionScope::Durable,
+                        scope: SubscriptionScope::Session(7),
                         updated_at_unix_ms: 0,
                     },
                     pred_id,
@@ -867,8 +886,11 @@ mod tests {
 
         let before = &published.predicates;
         let now = &after.predicates;
+        // The four indexes a membership row never reads are persistent maps,
+        // which expose no node identity, so what is asserted is that every
+        // entry they hold is still the same allocation.
         assert!(
-            Arc::ptr_eq(&before.bindings, &now.bindings),
+            same_entries(&before.bindings, &now.bindings),
             "a membership row reads no binding, so it may not copy them"
         );
         assert!(
@@ -876,7 +898,7 @@ mod tests {
             "nor the predicates"
         );
         assert!(
-            Arc::ptr_eq(&before.predicate_consumers, &now.predicate_consumers),
+            same_entries(&before.predicate_consumers, &now.predicate_consumers),
             "nor the consumer bitmaps"
         );
         assert!(
@@ -884,11 +906,11 @@ mod tests {
             "nor the hash index"
         );
         assert!(
-            Arc::ptr_eq(&before.scope_index, &now.scope_index),
+            same_entries(&before.scope_index, &now.scope_index),
             "nor the session index"
         );
         assert!(
-            Arc::ptr_eq(&before.binding_lookup, &now.binding_lookup),
+            same_entries(&before.binding_lookup, &now.binding_lookup),
             "nor the binding lookup"
         );
         assert!(
