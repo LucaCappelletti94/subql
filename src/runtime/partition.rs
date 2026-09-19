@@ -813,6 +813,97 @@ mod tests {
         );
     }
 
+    /// What the copy-on-write clone is worth: a mutation deepens the index it
+    /// touches and leaves every other one the allocation the published
+    /// snapshot holds. An index put back inline, or a `make_mut` turned into
+    /// an owned copy, restores the whole-store copy per event and neither the
+    /// suite nor the publication counter would notice.
+    #[test]
+    fn a_mutation_deepens_only_the_index_it_touches() {
+        let mut partition = TablePartition::<DefaultIds, Postgres>::new(1);
+        let alice = TermKey::String("alice".into());
+        let row = alloc::vec![TermKey::Int(7)];
+        let (moved, untouched) = partition.mutate(|txn| {
+            let moved = txn.add_predicate(make_predicate(0, 0x1111));
+            let untouched = txn.add_predicate(make_predicate(1, 0x2222));
+            for (ordinal, pred_id) in [moved, untouched].into_iter().enumerate() {
+                let ordinal = ConsumerOrdinal::new(
+                    u32::try_from(ordinal).expect("two predicates fit an ordinal"),
+                );
+                txn.add_binding(
+                    SubscriptionBinding {
+                        subscription_id: 100 + u64::from(ordinal.get()),
+                        predicate_id: pred_id,
+                        consumer_id: u64::from(ordinal.get()),
+                        consumer_ordinal: ordinal,
+                        scope: SubscriptionScope::Durable,
+                        updated_at_unix_ms: 0,
+                    },
+                    pred_id,
+                );
+                txn.seed_terms(
+                    pred_id,
+                    ordinal,
+                    core::slice::from_ref(&alice),
+                    &[alloc::vec![(alice.clone(), row.clone())]],
+                );
+            }
+            (moved, untouched)
+        });
+
+        let published = partition.load_snapshot();
+        let mut admitted = RoaringBitmap::new();
+        admitted.insert(0);
+        partition.mutate(|txn| {
+            txn.move_term_members(
+                moved,
+                0,
+                alloc::vec![TermKey::Int(11)],
+                &alice,
+                &admitted,
+                true,
+            );
+        });
+        let after = partition.load_snapshot();
+
+        let before = &published.predicates;
+        let now = &after.predicates;
+        assert!(
+            Arc::ptr_eq(&before.bindings, &now.bindings),
+            "a membership row reads no binding, so it may not copy them"
+        );
+        assert!(
+            Arc::ptr_eq(&before.predicates, &now.predicates),
+            "nor the predicates"
+        );
+        assert!(
+            Arc::ptr_eq(&before.predicate_consumers, &now.predicate_consumers),
+            "nor the consumer bitmaps"
+        );
+        assert!(
+            Arc::ptr_eq(
+                before
+                    .term_members
+                    .get(&(untouched, 0))
+                    .expect("seeded above"),
+                now.term_members.get(&(untouched, 0)).expect("seeded above")
+            ),
+            "nor the term slot it never named"
+        );
+        assert!(
+            !Arc::ptr_eq(
+                before.term_members.get(&(moved, 0)).expect("seeded above"),
+                now.term_members.get(&(moved, 0)).expect("seeded above")
+            ),
+            "the slot the row moved is the one that was rewritten"
+        );
+        assert_eq!(
+            partition.publication_count(),
+            2,
+            "the seeding and the movement publish one snapshot each"
+        );
+    }
+
     #[test]
     fn test_select_candidates_null_cell_matches_is_null_index() {
         use super::super::indexes::{IndexableAtom, NullKind};
