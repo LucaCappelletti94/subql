@@ -786,12 +786,28 @@ where
     }
 
     /// Unregister an in-process subscription by `(consumer_id, sql)`.
+    ///
+    /// One statement can name several subscriptions, so which ids ended is
+    /// not known here. Every context whose subscription neither registry
+    /// holds any more is dropped, which is the same answer without needing
+    /// the list.
+    ///
+    /// # Errors
+    ///
+    /// [`RegisterError`] when the statement does not resolve to a
+    /// predicate this engine holds.
     pub fn unregister_query(
         &mut self,
         consumer_id: I::ConsumerId,
         sql: &str,
     ) -> Result<UnregisterReport, RegisterError> {
-        self.inner.unregister_query(consumer_id, sql)
+        let report = self.inner.unregister_query(consumer_id, sql)?;
+        let Self {
+            inner, contexts, ..
+        } = self;
+        contexts.retain(|subscription_id, _| inner.holds_subscription(*subscription_id));
+        self.purge_unregistered_reads();
+        Ok(report)
     }
 
     /// Advance the resume cursor for `(session_id, sub_id)`. Passthrough to
