@@ -102,3 +102,139 @@ fn a_statement_without_its_predicate_is_not_reported() {
         "only the answer whose predicate came back is reported"
     );
 }
+
+/// An answer the caller ended does not come back.
+///
+/// The reads file was written when an answer was captured and never when
+/// one was dropped, so a restart revived subscriptions the caller had
+/// already been told were gone.
+#[test]
+fn an_ended_read_does_not_come_back() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().to_path_buf();
+
+    let mut engine = Engine::with_storage(catalog(), PostgreSqlDialect {}, path.clone())
+        .expect("open store")
+        .into_parts()
+        .0;
+    let answer = engine
+        .register(SubscriptionRequest::new(
+            1u64,
+            "SELECT MIN(price) FROM orders",
+        ))
+        .expect("the extreme registers")
+        .subscription_id;
+    assert_eq!(engine.reread_count(), 1);
+    assert!(engine.unregister_reread(answer), "the caller ends it");
+    drop(engine);
+
+    let restored = Engine::with_storage(catalog(), PostgreSqlDialect {}, path).expect("reopen");
+    assert!(
+        restored.reads().restored.is_empty(),
+        "an ended answer stays ended, got {:?}",
+        restored.reads().restored
+    );
+}
+
+/// Ending a maintained answer drops its statement too.
+#[test]
+fn an_ended_in_process_answer_leaves_no_statement() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().to_path_buf();
+
+    let mut engine = Engine::with_storage(catalog(), PostgreSqlDialect {}, path.clone())
+        .expect("open store")
+        .into_parts()
+        .0;
+    let answer = engine
+        .register(SubscriptionRequest::new(
+            1u64,
+            "SELECT * FROM orders WHERE status = 'paid'",
+        ))
+        .expect("the filter registers")
+        .subscription_id;
+    engine.snapshot_table(table("orders")).expect("snapshot");
+    assert!(engine.unregister_subscription(answer), "the caller ends it");
+    drop(engine);
+
+    let (mut restored, reads) = Engine::with_storage(catalog(), PostgreSqlDialect {}, path)
+        .expect("reopen")
+        .into_parts();
+    assert!(
+        reads.in_process.is_empty(),
+        "an ended answer keeps no statement"
+    );
+    // What a caller feels, rather than what the report says: the shard
+    // brings maintained answers back, so a removal left out of it revives
+    // one and it notifies a consumer that ended it.
+    assert_eq!(
+        restored.subscription_count(),
+        0,
+        "the shard does not bring the ended answer back"
+    );
+    let notified = restored
+        .consumers(&TestEvent::insert(
+            table("orders"),
+            vec![
+                subql::backend::Value::Int(1),
+                subql::backend::Value::Float(5.0),
+                subql::backend::Value::String("paid".into()),
+            ],
+        ))
+        .expect("the event dispatches");
+    assert!(
+        notified.inserted().is_empty(),
+        "nobody is notified for an answer the caller ended, got {:?}",
+        notified.inserted()
+    );
+}
+
+/// Ending by statement is as final as ending by id.
+///
+/// `unregister_query` ends every maintained answer sharing a predicate,
+/// through the same removal funnel, so it owes the same durability. It is
+/// the fourth door onto the same state, and the one added last.
+#[test]
+fn an_answer_ended_by_statement_does_not_come_back() {
+    const FILTER: &str = "SELECT * FROM orders WHERE status = 'paid'";
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().to_path_buf();
+
+    let mut engine = Engine::with_storage(catalog(), PostgreSqlDialect {}, path.clone())
+        .expect("open store")
+        .into_parts()
+        .0;
+    engine
+        .register(SubscriptionRequest::new(1u64, FILTER))
+        .expect("the filter registers");
+    engine.snapshot_table(table("orders")).expect("snapshot");
+    let report = engine
+        .unregister_query(1u64, FILTER)
+        .expect("the statement names a predicate");
+    assert_eq!(report.removed_bindings, 1, "the answer is ended");
+    drop(engine);
+
+    let (mut restored, _reads) = Engine::with_storage(catalog(), PostgreSqlDialect {}, path)
+        .expect("reopen")
+        .into_parts();
+    assert_eq!(
+        restored.subscription_count(),
+        0,
+        "ending by statement survives the restart"
+    );
+    let notified = restored
+        .consumers(&TestEvent::insert(
+            table("orders"),
+            vec![
+                subql::backend::Value::Int(1),
+                subql::backend::Value::Float(5.0),
+                subql::backend::Value::String("paid".into()),
+            ],
+        ))
+        .expect("the event dispatches");
+    assert!(
+        notified.inserted().is_empty(),
+        "nobody is notified, got {:?}",
+        notified.inserted()
+    );
+}

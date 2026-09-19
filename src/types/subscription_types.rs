@@ -951,8 +951,9 @@ impl<B: Backend> Tier<B> {
 ///
 /// One of three spellings of the same ladder: [`Tier`] is the registration
 /// answer with payloads, [`TierKind`] is the bare name a transition reports,
-/// and this is the persisted subset (in-process answers are never stored as
-/// reads). A new tier must appear in all three, which is what the
+/// and this names the read tiers, which are the ones the file stores as
+/// reads. An in-process answer is stored too, as its statement rather than
+/// as a tier. A new tier must appear in all three, which is what the
 /// [`From<ReadTier>`](TierKind#impl-From<ReadTier>-for-TierKind) conversion
 /// and [`Tier::kind`] exist to keep honest.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -1262,11 +1263,12 @@ pub enum AggregateInstallError {
     DuplicateGroup(SubscriptionId),
 }
 
-/// What reading the re-read answers' file restored, and what it could not.
+/// What reading the saved answers' file restored, and what it could not.
 ///
-/// Every restored answer comes back not knowing its value, so each one needs a
-/// read before it can report anything: this is that list as well as the record
-/// of what was dropped.
+/// Every restored answer comes back not knowing its value, so each one needs
+/// a read before it can report anything. This is that list, the record of
+/// what was dropped, and the answers the engine maintains itself, which read
+/// only when the stream cannot answer them.
 #[derive(Clone, Debug, PartialEq)]
 pub struct RestoredReads<B: Backend = crate::backend::Postgres> {
     /// Answers that came back, each needing a read to fill it in.

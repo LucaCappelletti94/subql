@@ -2616,6 +2616,16 @@ where
 
     /// Drop a re-read answer by id, pruning its routing and session indexes.
     pub fn unregister_reread(&mut self, subscription_id: SubscriptionId) -> bool {
+        let removed = self.unregister_reread_only(subscription_id);
+        if removed {
+            self.persist_reads_after_removal();
+        }
+        removed
+    }
+
+    /// Drop a re-read answer without rewriting the reads file, for a caller
+    /// ending several at once that writes the file itself afterwards.
+    fn unregister_reread_only(&mut self, subscription_id: SubscriptionId) -> bool {
         let Some(entry) = self.reexec.remove(&subscription_id) else {
             return false;
         };
@@ -2659,7 +2669,9 @@ where
             Err(e) => match self.durability_mode {
                 DurabilityMode::BestEffort => Ok(()),
                 DurabilityMode::Required => {
-                    self.unregister_reread(subscription_id);
+                    // The file write is what just failed, so undoing the
+                    // registration does not try it again.
+                    self.unregister_reread_only(subscription_id);
                     Err(RegisterError::Storage(e.to_string()))
                 }
             },
@@ -2675,6 +2687,53 @@ where
     ) -> Result<(), RegisterError> {
         Ok(())
     }
+
+    /// Rewrite a table's shard after an answer on it ends.
+    ///
+    /// The shard is what brings a maintained answer back, so a removal
+    /// left out of it revives the answer and it notifies consumers the
+    /// caller already ended. Logged rather than raised for the same reason
+    /// the reads file is.
+    #[cfg(feature = "std")]
+    fn persist_table_after_removal(&self, table_id: TableId) {
+        if self.storage_path.is_none() {
+            return;
+        }
+        if let Err(e) = self.snapshot_table_only(table_id) {
+            Self::log_best_effort_durability(&format!(
+                "Shard for table {table_id} not rewritten after an answer ended: {e}"
+            ));
+        }
+    }
+
+    /// Without the standard library there is no file to write.
+    #[cfg(not(feature = "std"))]
+    #[allow(clippy::unused_self)]
+    fn persist_table_after_removal(&self, _table_id: TableId) {}
+
+    /// Rewrite the reads file after an answer ends.
+    ///
+    /// The file is what a restart believes, so an answer dropped without
+    /// rewriting it comes back. Ending cannot be undone and the caller has
+    /// already been told it happened, so a failed write is logged rather
+    /// than raised, which leaves the stale file a restart would have had
+    /// anyway.
+    #[cfg(feature = "std")]
+    fn persist_reads_after_removal(&self) {
+        if self.storage_path.is_none() {
+            return;
+        }
+        if let Err(e) = self.snapshot_reads() {
+            Self::log_best_effort_durability(&format!(
+                "Reads file not rewritten after an answer ended: {e}"
+            ));
+        }
+    }
+
+    /// Without the standard library there is no file to write.
+    #[cfg(not(feature = "std"))]
+    #[allow(clippy::unused_self)]
+    fn persist_reads_after_removal(&self) {}
 
     /// Write every re-read answer to its own file.
     ///
@@ -3636,11 +3695,21 @@ where
     /// Also drops every per-session resume cursor associated with this
     /// `subscription_id` so cursors never outlive their owning subscription.
     pub fn unregister_subscription(&mut self, subscription_id: SubscriptionId) -> bool {
+        // Read before the removal takes the index entry with it.
+        #[cfg(feature = "std")]
+        let table = self.subscription_to_table.get(&subscription_id).copied();
         let removed = self
             .unregister_subscription_internal(subscription_id)
             .is_some();
         self.resume_cursors
             .retain(|(_, sub_id), _| *sub_id != subscription_id);
+        if removed {
+            #[cfg(feature = "std")]
+            if let Some(table_id) = table {
+                self.persist_table_after_removal(table_id);
+            }
+            self.persist_reads_after_removal();
+        }
         removed
     }
 
@@ -4483,13 +4552,21 @@ where
             }
         }
 
-        // Remove subscriptions
+        // Remove subscriptions, keeping the tables they were on so their
+        // shards stop naming them.
+        #[cfg(feature = "std")]
+        let mut touched: Vec<TableId> = Vec::new();
         for sub_id in to_remove {
+            #[cfg(feature = "std")]
+            if let Some(table_id) = self.subscription_to_table.get(&sub_id).copied() {
+                if !touched.contains(&table_id) {
+                    touched.push(table_id);
+                }
+            }
             if self.unregister_subscription_internal(sub_id) == Some(true) {
                 removed_predicates += 1;
             }
         }
-
         for (table_id, consumers) in removed_consumer_candidates {
             let Some(consumer_dict) = self.consumer_dictionaries.get_mut(&table_id) else {
                 continue;
@@ -4524,10 +4601,20 @@ where
             .cloned()
             .unwrap_or_default()
         {
-            if self.unregister_reread(subscription_id) {
+            // Not the persisting form: the whole session writes once below.
+            if self.unregister_reread_only(subscription_id) {
                 removed_reads += 1;
             }
         }
+
+        // Once for the session rather than once per answer it held, and
+        // after the consumer dictionaries are trimmed, so a shard never
+        // lands naming consumers the engine has already dropped.
+        #[cfg(feature = "std")]
+        for table_id in touched {
+            self.persist_table_after_removal(table_id);
+        }
+        self.persist_reads_after_removal();
 
         UnregisterReport {
             removed_bindings,
@@ -4602,9 +4689,16 @@ where
             1
         };
 
+        #[cfg(feature = "std")]
+        {
+            self.persist_table_after_removal(table_id);
+            self.persist_reads_after_removal();
+        }
+
         Ok(UnregisterReport {
-            // Unregistering by statement touches predicates only, never the
-            // re-read answers, which are dropped by id.
+            // Unregistering by statement ends the maintained answers that
+            // share the predicate, and never a re-read answer, which is
+            // dropped by id.
             removed_reads: 0,
             removed_bindings,
             removed_predicates,
