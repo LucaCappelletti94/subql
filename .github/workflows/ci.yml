@@ -38,6 +38,14 @@ jobs:
       # Default features too: feature-gated fields and test helpers can be
       # dead here while the all-features run stays clean.
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      # Both again on the toolchain the tests pin. Clippy's lints differ
+      # between releases, so linting only on stable leaves whatever 1.88
+      # alone rejects unrun, which is how a dead import reached main.
+      - uses: dtolnay/rust-toolchain@1.88.0
+        with:
+          components: clippy
+      - run: cargo +1.88.0 clippy --workspace --all-targets --all-features --locked -- -D warnings
+      - run: cargo +1.88.0 clippy --workspace --all-targets --locked -- -D warnings
 
   check-feature-matrix:
     name: check (${{ matrix.profile.name }})
