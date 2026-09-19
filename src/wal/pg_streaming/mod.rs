@@ -124,8 +124,8 @@ pub struct PgStreamingCdcSource {
     ack_tx: tokio::sync::mpsc::UnboundedSender<PgLsn>,
     status_updates_sent: Arc<AtomicU64>,
     events_received: Arc<AtomicU64>,
-    /// The server's WAL end as last observed on a frame, and the position
-    /// last reported back as flushed.
+    /// The furthest position seen on a frame, and the position last
+    /// reported back as flushed.
     received_lsn: Arc<AtomicU64>,
     acked_lsn: Arc<AtomicU64>,
     /// Whether a caller has acknowledged anything, which the position alone
@@ -299,21 +299,21 @@ impl PgStreamingCdcSource {
             .then(|| PgLsn(self.acked_lsn.load(Ordering::Relaxed)))
     }
 
-    /// Distance between the server's WAL end and this source's flush
-    /// position.
+    /// Distance between the furthest position this source has seen and the
+    /// one it last reported as flushed.
     ///
-    /// Every frame carries the server's WAL end at send time, so this is
-    /// the last end observed minus the position last reported back as
-    /// flushed. A consumer that never acknowledges sees it grow without
-    /// bound, and so does the server's WAL volume, until it fills, so a
-    /// sustained rise is what catches that before the disk answers for it.
+    /// A keepalive carries the server's own WAL end, and a data frame
+    /// carries the position of the record it holds, so the figure counts
+    /// WAL this publication never carries and rises on activity elsewhere
+    /// in the cluster. A consumer that never acknowledges sees it grow
+    /// without bound, and so does the server's WAL volume, until it fills,
+    /// so a sustained rise is what catches that before the disk answers
+    /// for it.
     ///
-    /// That end is the server's own, not the end of what this source was
-    /// sent, so the figure also counts WAL this publication never carries
-    /// and rises on activity elsewhere in the cluster. It is close to what
-    /// the slot retains without being it, since the server retains to the
-    /// slot's `restart_lsn`, which lags the confirmed flush position, and
-    /// since the end here is only as fresh as the last frame received. Read `pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)`
+    /// Close to what the slot retains without being it. The server retains
+    /// to the slot's `restart_lsn`, which lags the confirmed flush
+    /// position, and the end here is only as fresh as the last frame
+    /// received. Read `pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)`
     /// from `pg_replication_slots` for the size itself.
     #[must_use]
     pub fn unacknowledged_bytes(&self) -> u64 {
@@ -427,11 +427,13 @@ async fn streaming_task(
                         }
                         // The XLogData header is `'w'` + `start_lsn` (u64
                         // big-endian) + `wal_end` (u64 big-endian) + send time.
-                        // `wal_end` is the server's WAL end position at send
-                        // time, which is what `StandbyStatusUpdate` expects in
-                        // `received_lsn`. The payload byte count is NOT a
-                        // WAL-space distance: pgoutput payloads are
-                        // protocol-encoded, not raw WAL.
+                        // Under logical decoding `wal_end` is the end of the
+                        // record in this message, measured equal to
+                        // `start_lsn` on every frame of the suite, and a
+                        // keepalive is what carries the server's own WAL end.
+                        // The payload byte count is NOT a WAL-space distance,
+                        // since pgoutput payloads are protocol-encoded rather
+                        // than raw WAL.
                         let start_lsn = u64::from_be_bytes(
                             bytes[1..9].try_into().expect("slice is exactly 8 bytes"),
                         );
