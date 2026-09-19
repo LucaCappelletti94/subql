@@ -422,33 +422,37 @@ fn the_streaming_source_reports_what_its_slot_is_holding() {
             .expect("no source error")
             .expect("the source is open");
 
+        let held = source.unacknowledged_bytes();
         assert!(
-            source.unacknowledged_bytes() > 0,
+            held > 0,
             "an unacknowledged event is WAL the slot cannot release"
+        );
+        assert!(
+            held < 1_000_000,
+            "the figure is a distance from the slot's own position, not an \
+             absolute one, got {held}"
         );
         assert!(
             source.acknowledged_position().is_none(),
             "nothing has been acknowledged yet"
         );
 
-        let held = source.unacknowledged_bytes();
         let upto = event.checkpoint().expect("the event carries its position");
         source.ack(upto).await.expect("the ack reaches the source");
+        // The held figure is a distance to the server's WAL end, which every
+        // other database on a shared server also moves, so the acknowledged
+        // position is what this can assert rather than a fall in the figure.
         for _ in 0..40 {
-            if source.unacknowledged_bytes() < held {
+            if source.acknowledged_position().is_some() {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
-        // Not zero, since the server reports a WAL end that runs past the
-        // event's own position, so what is held falls rather than empties.
-        assert!(
-            source.unacknowledged_bytes() < held,
-            "the acknowledgement released part of what the slot was holding, \
-             still {} of {held}",
-            source.unacknowledged_bytes()
+        assert_eq!(
+            source.acknowledged_position(),
+            Some(upto),
+            "the acknowledgement is what releases the slot, and it is reported"
         );
-        assert_eq!(source.acknowledged_position(), Some(upto));
     });
 
     common::drop_slot(&mut setup, &slot);
