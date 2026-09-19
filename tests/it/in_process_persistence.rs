@@ -188,3 +188,53 @@ fn an_ended_in_process_answer_leaves_no_statement() {
         notified.inserted()
     );
 }
+
+/// Ending by statement is as final as ending by id.
+///
+/// `unregister_query` ends every maintained answer sharing a predicate,
+/// through the same removal funnel, so it owes the same durability. It is
+/// the fourth door onto the same state, and the one added last.
+#[test]
+fn an_answer_ended_by_statement_does_not_come_back() {
+    const FILTER: &str = "SELECT * FROM orders WHERE status = 'paid'";
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().to_path_buf();
+
+    let mut engine = Engine::with_storage(catalog(), PostgreSqlDialect {}, path.clone())
+        .expect("open store")
+        .into_parts()
+        .0;
+    engine
+        .register(SubscriptionRequest::new(1u64, FILTER))
+        .expect("the filter registers");
+    engine.snapshot_table(table("orders")).expect("snapshot");
+    let report = engine
+        .unregister_query(1u64, FILTER)
+        .expect("the statement names a predicate");
+    assert_eq!(report.removed_bindings, 1, "the answer is ended");
+    drop(engine);
+
+    let (mut restored, _reads) = Engine::with_storage(catalog(), PostgreSqlDialect {}, path)
+        .expect("reopen")
+        .into_parts();
+    assert_eq!(
+        restored.subscription_count(),
+        0,
+        "ending by statement survives the restart"
+    );
+    let notified = restored
+        .consumers(&TestEvent::insert(
+            table("orders"),
+            vec![
+                subql::backend::Value::Int(1),
+                subql::backend::Value::Float(5.0),
+                subql::backend::Value::String("paid".into()),
+            ],
+        ))
+        .expect("the event dispatches");
+    assert!(
+        notified.inserted().is_empty(),
+        "nobody is notified, got {:?}",
+        notified.inserted()
+    );
+}

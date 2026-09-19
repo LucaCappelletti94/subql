@@ -4567,11 +4567,6 @@ where
                 removed_predicates += 1;
             }
         }
-        #[cfg(feature = "std")]
-        for table_id in touched {
-            self.persist_table_after_removal(table_id);
-        }
-
         for (table_id, consumers) in removed_consumer_candidates {
             let Some(consumer_dict) = self.consumer_dictionaries.get_mut(&table_id) else {
                 continue;
@@ -4612,7 +4607,13 @@ where
             }
         }
 
-        // Once for the session rather than once per answer it held.
+        // Once for the session rather than once per answer it held, and
+        // after the consumer dictionaries are trimmed, so a shard never
+        // lands naming consumers the engine has already dropped.
+        #[cfg(feature = "std")]
+        for table_id in touched {
+            self.persist_table_after_removal(table_id);
+        }
         self.persist_reads_after_removal();
 
         UnregisterReport {
