@@ -364,29 +364,9 @@ where
                     out[jump_idx] = Instruction::JumpIfTrue(rhs_len + 1);
                 }
                 _ => {
-                    // A comparison of a column to a columnless call is the
-                    // caller comparison, recognised here in every build like
-                    // the membership subquery below: dispatch reads the
-                    // compared column off the changed row, and the subscriber
-                    // the request states is the one value the term admits.
-                    // Whether the call names the caller is registration's
-                    // question, since answering it needs `rls2fga`.
-                    if sql_shape::is_caller_comparison(expr) {
-                        let tested =
-                            if resolve_column_ref::<B, DB>(left, table_id, database).is_some() {
-                                left
-                            } else {
-                                right
-                            };
-                        if let Some(column) =
-                            resolve_column_ref::<B, DB>(tested, table_id, database)
-                        {
-                            let slot = out.term_slot(expr, alloc::vec![column])?;
-                            out.push(Instruction::TermTruth(slot));
-                            return Ok(());
-                        }
-                        // A name that resolves to no column falls through to
-                        // the generic arms, whose refusal names it.
+                    // A name resolving to no column falls to the generic arms, whose refusal names it.
+                    if caller_term::<B, DB>(expr, table_id, database, out)? {
+                        return Ok(());
                     }
 
                     // Non-short-circuit operators: compile both sides,
@@ -838,18 +818,57 @@ where
             )?;
         }
 
-        // Unsupported
-        _ => {
-            return Err(RegisterError::UnsupportedSql(format!(
-                "Expression {expr:?} not supported - SubQL supports basic WHERE clause predicates \
-                 (comparisons, AND/OR/NOT, IN lists, BETWEEN, NULL checks, LIKE). For complex \
-                 expressions, aggregates, or functions, run this as a regular SQL query in your \
-                 database."
-            )));
+        // `= ANY(<call>)` is a caller comparison over a set or nothing SubQL runs.
+        Expr::AnyOp { .. } => {
+            if !caller_term::<B, DB>(expr, table_id, database, out)? {
+                return Err(unsupported_expression(expr));
+            }
         }
+
+        _ => return Err(unsupported_expression(expr)),
     }
 
     Ok(())
+}
+
+/// The refusal for a predicate shape SubQL does not serve.
+fn unsupported_expression(expr: &Expr) -> RegisterError {
+    RegisterError::UnsupportedSql(format!(
+        "Expression {expr:?} not supported - SubQL supports basic WHERE clause predicates \
+         (comparisons, AND/OR/NOT, IN lists, BETWEEN, NULL checks, LIKE). For complex \
+         expressions, aggregates, or functions, run this as a regular SQL query in your \
+         database."
+    ))
+}
+
+/// Emit a term slot for `expr` when it compares a column of the subscribed
+/// table to the caller, and report whether it did.
+///
+/// Recognised structurally in every build, `membership-term` or not, so one
+/// build does not accept a filter another refuses. Dispatch reads the compared
+/// column off the changed row, and the caller's values the request states are
+/// what the term admits. Whether the call names the caller, and whether it
+/// names one value or a set, is registration's question, since answering it
+/// needs `rls2fga`.
+fn caller_term<B, DB>(
+    expr: &Expr,
+    table_id: TableId,
+    database: &DB,
+    out: &mut Compiling<B>,
+) -> Result<bool, RegisterError>
+where
+    B: Backend + SqlLiteralParse,
+    DB: DatabaseLike,
+{
+    let Some((column, _)) = sql_shape::caller_comparison_sides(expr) else {
+        return Ok(false);
+    };
+    let Some(column) = resolve_column_ref::<B, DB>(column, table_id, database) else {
+        return Ok(false);
+    };
+    let slot = out.term_slot(expr, alloc::vec![column])?;
+    out.push(Instruction::TermTruth(slot));
+    Ok(true)
 }
 
 /// One `LIKE` or `ILIKE` node, named so the two arms lower through the same

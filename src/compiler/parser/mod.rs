@@ -16,7 +16,7 @@ use super::{
     prefilter::build_prefilter_plan,
     sql_shape, BytecodeProgram, Instruction, PredicateHash, PrefilterPlan,
 };
-use crate::backend::{Backend, ScalarFamily, Value};
+use crate::backend::{Backend, ScalarFamily, ScalarTruth, Value};
 use crate::compiler::bytecode::ComparisonRef;
 use crate::compiler::sql_shape::{AggSpec, QueryProjection};
 use crate::table_resolution::{resolve_table_reference, TableResolutionError};
@@ -27,7 +27,10 @@ use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use compilation_helpers::{compile_expression, wrap_bare_value_as_tri};
 use sql_traits::prelude::DatabaseLike;
-use sqlparser::ast::{Expr, ObjectName, Statement, Value as SqlValue};
+use sqlparser::ast::{
+    Expr, FunctionArg, FunctionArgExpr, FunctionArguments, ObjectName, Query, SetExpr, Statement,
+    Value as SqlValue,
+};
 use sqlparser::dialect::Dialect;
 use sqlparser_canonicalize::Canonicalizer;
 
@@ -574,7 +577,7 @@ fn extract_table_and_where(
 /// had written the literal inline.
 ///
 /// Handles the scalars commonly bound through placeholders (Int, Float,
-/// String, Null) plus Bytes, whose canonical `X'...'` hex spelling round
+/// String, Bool, Null) plus Bytes, whose canonical `X'...'` hex spelling round
 /// trips through [`SqlLiteralParse::parse_literal`]. Every other scalar
 /// returns [`RegisterError::BindResolution`] until a downstream test
 /// exercises it and pins a canonical round-trip format.
@@ -588,6 +591,7 @@ pub(crate) fn value_to_sql_value<B: Backend>(v: &Value<B>) -> Result<SqlValue, R
             "bind value is Missing (not a concrete value)".to_string(),
         )),
         Value::Null => Ok(SqlValue::Null),
+        Value::Bool(b) => Ok(SqlValue::Boolean(b.scalar_truth())),
         Value::Int(i) => Ok(SqlValue::Number(format!("{i:?}"), false)),
         Value::Float(f) => Ok(SqlValue::Number(format!("{f:?}"), false)),
         Value::String(s) => Ok(SqlValue::SingleQuotedString(s.as_ref().to_string())),
@@ -595,8 +599,7 @@ pub(crate) fn value_to_sql_value<B: Backend>(v: &Value<B>) -> Result<SqlValue, R
         // leg (`parse_literal` -> `parse_hex_bytes`) accepts either case,
         // so `parse_literal(value_to_sql_value(Bytes(v))) == Bytes(v)`.
         Value::Bytes(b) => Ok(SqlValue::HexStringLiteral(hex_upper(b.as_ref()))),
-        Value::Bool(_)
-        | Value::Uuid(_)
+        Value::Uuid(_)
         | Value::Timestamp(_)
         | Value::TimestampTz(_)
         | Value::Date(_)
@@ -655,7 +658,7 @@ fn resolve_expr_placeholders<B: Backend>(
                 val.value = value_to_sql_value(&binds[idx])?;
             }
         }
-        Expr::BinaryOp { left, right, .. } => {
+        Expr::BinaryOp { left, right, .. } | Expr::AnyOp { left, right, .. } => {
             resolve_expr_placeholders(left, binds, next_positional)?;
             resolve_expr_placeholders(right, binds, next_positional)?;
         }
@@ -682,7 +685,39 @@ fn resolve_expr_placeholders<B: Backend>(
             resolve_expr_placeholders(expr, binds, next_positional)?;
             resolve_expr_placeholders(pattern, binds, next_positional)?;
         }
+        // A caller accessor's arguments, `current_setting($1, $2)`, are binds under the typed API.
+        Expr::Function(function) => {
+            if let FunctionArguments::List(list) = &mut function.args {
+                for arg in &mut list.args {
+                    if let FunctionArg::Unnamed(FunctionArgExpr::Expr(inner)) = arg {
+                        resolve_expr_placeholders(inner, binds, next_positional)?;
+                    }
+                }
+            }
+        }
+        Expr::InSubquery { expr, subquery, .. } => {
+            resolve_expr_placeholders(expr, binds, next_positional)?;
+            resolve_query_placeholders(subquery, binds, next_positional)?;
+        }
+        Expr::Exists { subquery, .. } => {
+            resolve_query_placeholders(subquery, binds, next_positional)?;
+        }
         _ => {}
+    }
+    Ok(())
+}
+
+/// Resolve the placeholders of a membership subquery's `WHERE`, the only part
+/// of it the compiler reads a value from.
+fn resolve_query_placeholders<B: Backend>(
+    query: &mut Query,
+    binds: &[Value<B>],
+    next_positional: &mut usize,
+) -> Result<(), RegisterError> {
+    if let SetExpr::Select(select) = query.body.as_mut() {
+        if let Some(selection) = select.selection.as_mut() {
+            resolve_expr_placeholders(selection, binds, next_positional)?;
+        }
     }
     Ok(())
 }
@@ -889,17 +924,22 @@ mod tests {
         }
     }
 
-    /// The untouched arms still reject: a `Missing` bind and a `Bool` bind
-    /// both surface `RegisterError::BindResolution`.
+    /// A `Missing` bind surfaces `RegisterError::BindResolution`, and a bool
+    /// bind round-trips as the boolean literal, which is what
+    /// `current_setting($1, $2)` under the typed API needs.
     #[test]
-    fn missing_and_bool_binds_stay_rejected() {
+    fn missing_binds_stay_rejected_and_bools_round_trip() {
         assert!(matches!(
             value_to_sql_value(&Value::<Postgres>::Missing),
             Err(RegisterError::BindResolution(_))
         ));
-        assert!(matches!(
-            value_to_sql_value(&Value::<Postgres>::Bool(true)),
-            Err(RegisterError::BindResolution(_))
-        ));
+        for bool in [true, false] {
+            let sql = value_to_sql_value(&Value::<Postgres>::Bool(bool)).unwrap();
+            assert_eq!(sql, SqlValue::Boolean(bool));
+            assert_eq!(
+                Postgres::parse_literal(&sql, ScalarFamily::Bool.into()).unwrap(),
+                Value::<Postgres>::Bool(bool)
+            );
+        }
     }
 }

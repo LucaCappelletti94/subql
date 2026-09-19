@@ -189,7 +189,7 @@ fn snapshot_seed(conn: &mut PgConnection) -> Vec<(String, i64)> {
 /// inserted under `project` reaches it.
 fn delivers(granted: &[(String, i64)], project: i64) -> bool {
     let (mut engine, docs_id) = engine();
-    let mut request = SubscriptionRequest::new(1u64, TERM).subjects([Value::String(CALLER.into())]);
+    let mut request = SubscriptionRequest::new(1u64, TERM).subscriber(Value::String(CALLER.into()));
     let TermDescription::Membership(description) =
         engine.describe_terms(&request).unwrap().remove(0)
     else {

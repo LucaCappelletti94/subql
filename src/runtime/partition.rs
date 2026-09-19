@@ -343,23 +343,22 @@ impl<I: IdTypes, B: Backend> PartitionTxn<'_, I, B> {
     ///
     /// `seeds` is indexed by term slot: `seeds[i]` is what this subscription
     /// states it matches through slot `i` today, each row paired with the
-    /// subject granting it.
+    /// subject granting it, and the caller's values that slot matches against.
     pub fn seed_terms(
         &mut self,
         pred_id: PredicateId,
         ordinal: ConsumerOrdinal,
-        subjects: &[TermKey<B>],
-        seeds: &[Vec<(TermKey<B>, crate::term::TermRow<B>)>],
+        seeds: &[crate::term::TermSeed<B>],
     ) {
         if seeds.is_empty() {
             return;
         }
         let store = self.store_mut();
-        for (slot, values) in seeds.iter().enumerate() {
+        for (slot, seed) in seeds.iter().enumerate() {
             let Ok(slot) = u16::try_from(slot) else {
                 continue;
             };
-            store.seed_term(pred_id, slot, ordinal, subjects, values.clone());
+            store.seed_term(pred_id, slot, ordinal, &seed.subjects, seed.rows.clone());
         }
         self.dirty = true;
     }
@@ -844,8 +843,10 @@ mod tests {
                 txn.seed_terms(
                     pred_id,
                     ordinal,
-                    core::slice::from_ref(&alice),
-                    &[alloc::vec![(alice.clone(), row.clone())]],
+                    &[crate::term::TermSeed {
+                        subjects: alloc::vec![alice.clone()],
+                        rows: alloc::vec![(alice.clone(), row.clone())],
+                    }],
                 );
             }
             (moved, untouched)

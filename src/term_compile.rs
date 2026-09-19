@@ -20,7 +20,7 @@ use rls2fga::types::{Guard, RecordDerivation, ValueSource};
 use sql_traits::prelude::DatabaseLike;
 use sqlparser::ast::Expr;
 
-use crate::term::{CompiledTerm, TermMovement, TermPlan};
+use crate::term::{CompiledTerm, TermCaller, TermMovement, TermPlan};
 use crate::{catalog_helpers, RegisterError, TableId};
 
 /// Settle whether `term` on `table` can be served, and how its subscriber set
@@ -50,9 +50,13 @@ pub fn plan_term<B: crate::backend::Backend, DB: DatabaseLike>(
         translator.min_confidence(),
     )
     .map_err(|refusal| RegisterError::MembershipTermRefused(refusal.reason))?;
+    let caller = match &shapes.caller {
+        rls2fga::term::TermCaller::Identity => TermCaller::Identity,
+        rls2fga::term::TermCaller::Subjects { .. } => TermCaller::Subjects,
+    };
 
     if term.compares_the_caller() {
-        return caller_plan::<B, DB>(term, table, database, &shapes);
+        return caller_plan::<B, DB>(term, table, database, &shapes, caller);
     }
 
     let movement = member_columns::<B, DB>(term, table, &shapes, database)?;
@@ -82,6 +86,7 @@ pub fn plan_term<B: crate::backend::Backend, DB: DatabaseLike>(
     Ok(TermPlan {
         slot: term.slot,
         columns: term.columns.clone(),
+        caller,
         moved_by: Some(movement),
     })
 }
@@ -97,6 +102,7 @@ fn caller_plan<B: crate::backend::Backend, DB: DatabaseLike>(
     table: TableId,
     database: &DB,
     shapes: &TermShapes,
+    caller: TermCaller,
 ) -> Result<TermPlan, RegisterError> {
     let TermChain::Direct { relation } = &shapes.chain else {
         return Err(RegisterError::MembershipTermRefused(
@@ -167,6 +173,7 @@ fn caller_plan<B: crate::backend::Backend, DB: DatabaseLike>(
     Ok(TermPlan {
         slot: term.slot,
         columns: term.columns.clone(),
+        caller,
         moved_by: None,
     })
 }

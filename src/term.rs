@@ -54,9 +54,9 @@ impl CompiledTerm {
     /// Whether this term compares the caller directly rather than through a
     /// membership subquery.
     ///
-    /// The distinction decides how the term seeds: a caller comparison admits
-    /// exactly the subscriber the request states, so it seeds itself and takes
-    /// no stated values, and nothing ever moves its set.
+    /// The distinction decides how the term seeds. A caller comparison admits
+    /// exactly the caller's values the request states, so it seeds itself and
+    /// takes no stated values, and nothing ever moves its set.
     #[must_use]
     pub fn compares_the_caller(&self) -> bool {
         crate::compiler::sql_shape::is_caller_comparison(&self.expr)
@@ -66,19 +66,42 @@ impl CompiledTerm {
 /// What registration settled about one term, beyond what the compiler saw.
 ///
 /// The compiler knows which columns the filter compares. Whether the
-/// relationship can be served, and which table's rows move it, is what
-/// `rls2fga` answers, and this is that answer resolved to subql's own ids.
+/// relationship can be served, which table's rows move it, and which of the
+/// caller's values it matches, is what `rls2fga` answers, and this is that
+/// answer resolved to subql's own ids.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TermPlan {
     /// The slot this plan belongs to.
     pub slot: u16,
     /// The columns of the subscribed table the term compares, in written order.
     pub columns: Vec<ColumnId>,
+    /// Which of the caller's values a record's subject is matched against.
+    pub caller: TermCaller,
     /// The rows that move which subscribers the term admits.
     ///
-    /// `None` for a caller comparison: its set is the subscriber itself, and an
-    /// identity does not change, so no table's rows are watched for it.
+    /// `None` for a caller comparison: its set is the caller's values
+    /// themselves, and those do not change, so no table's rows are watched
+    /// for it.
     pub moved_by: Option<TermMovement>,
+}
+
+/// Which of the caller's values a term matches a record's subject against.
+///
+/// Both spellings compile to the same subject-keyed records, and the SQL they
+/// run differs. `user_id = current_setting('app.user_id', true)` reads one
+/// session value, `user_id = ANY(string_to_array(current_setting('app.subjects',
+/// true), ','))` reads the set, and a term matching the other one would admit
+/// rows the registered query does not return.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TermCaller {
+    /// The one value [`SubscriptionRequest::subscriber`] states.
+    ///
+    /// [`SubscriptionRequest::subscriber`]: crate::SubscriptionRequest::subscriber
+    Identity,
+    /// Any of the values [`SubscriptionRequest::subjects`] states.
+    ///
+    /// [`SubscriptionRequest::subjects`]: crate::SubscriptionRequest::subjects
+    Subjects,
 }
 
 /// The table and columns whose changed rows move a membership term's set.
@@ -99,6 +122,15 @@ pub struct TermMovement {
     pub member_subject: ColumnId,
 }
 
+/// What one subscription seeds one term with.
+pub struct TermSeed<B: Backend> {
+    /// The caller's values a record's subject is matched against.
+    pub subjects: Vec<TermKey<B>>,
+    /// The value rows the subscription matches today, each under the subject
+    /// granting it. A caller comparison seeds itself, one row per value.
+    pub rows: Vec<(TermKey<B>, TermRow<B>)>,
+}
+
 /// What a caller has to state, and at which kinds, to register one membership
 /// term.
 ///
@@ -116,7 +148,7 @@ pub enum TermDescription {
     /// A membership subquery: run [`seed_sql`](MembershipTermDescription::seed_sql)
     /// as the caller and state what came back.
     Membership(MembershipTermDescription),
-    /// A comparison of a column to the caller: build the subscriber the
+    /// A comparison of a column to the caller: build the caller's values the
     /// request states at the named kind. It seeds itself, so there is no read.
     Caller(CallerTermDescription),
 }
@@ -134,8 +166,16 @@ pub struct MembershipTermDescription {
     pub member_table: String,
     /// The column of `member_table` naming the subscriber a row admits.
     pub member_subject: String,
-    /// The kind every subject in the set has to be built at, and the kind
-    /// [`seed_sql`](Self::seed_sql)'s first column decodes as.
+    /// Which of the caller's values a membership row's subject is matched
+    /// against, and so which of [`SubscriptionRequest::subscriber`] and
+    /// [`SubscriptionRequest::subjects`] the request has to state, and which
+    /// grants every stated row.
+    ///
+    /// [`SubscriptionRequest::subscriber`]: crate::SubscriptionRequest::subscriber
+    /// [`SubscriptionRequest::subjects`]: crate::SubscriptionRequest::subjects
+    pub caller: TermCaller,
+    /// The kind every one of the caller's values has to be built at, and the
+    /// kind [`seed_sql`](Self::seed_sql)'s first column decodes as.
     ///
     /// [`TermKey`] keys a string and a UUID under different variants, so a
     /// subject supplied at another kind could match no membership row, and is
@@ -186,14 +226,21 @@ pub struct TermColumnPair {
     pub custom: Option<String>,
 }
 
-/// The kind the subscriber a caller comparison admits has to be built at.
+/// The kind the caller's values a caller comparison admits have to be built at.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CallerTermDescription {
     /// The compared column of the subscribed table, by catalog name.
     pub column: String,
-    /// The kind to build the subscriber at. One built at another kind is
+    /// Which of the caller's values the comparison admits, and so which of
+    /// [`SubscriptionRequest::subscriber`] and [`SubscriptionRequest::subjects`]
+    /// the request has to state.
+    ///
+    /// [`SubscriptionRequest::subscriber`]: crate::SubscriptionRequest::subscriber
+    /// [`SubscriptionRequest::subjects`]: crate::SubscriptionRequest::subjects
+    pub caller: TermCaller,
+    /// The kind to build the caller's values at. One built at another kind is
     /// refused at registration, since the lookup matches by kind before
-    /// value and a mismatched identity would serve the subscription dead.
+    /// value and a mismatched value would serve the subscription dead.
     pub kind: ScalarFamily,
     /// The custom type [`kind`](Self::kind) carries, when the compared
     /// column is one, as it prints.
@@ -215,12 +262,12 @@ impl TermDescription {
         database: &DB,
         dialect: &dyn sqlparser::dialect::Dialect,
     ) -> Result<Self, RegisterError> {
-        // A caller comparison seeds itself from the one value it admits, so the
-        // kind that value must be built at is all it needs.
+        // A caller comparison seeds itself, so the kind its values are built at is all it needs.
         let Some(movement) = &plan.moved_by else {
             let compared = kind::<B, DB>(database, table, plan.columns[0])?;
             return Ok(Self::Caller(CallerTermDescription {
                 column: name(database, table, plan.columns[0])?,
+                caller: plan.caller,
                 kind: carrier_of::<B>(compared),
                 custom: custom_name::<B>(compared),
             }));
@@ -276,6 +323,7 @@ impl TermDescription {
             pairs,
             member_table: table_name_of(database, movement.member_table)?,
             member_subject,
+            caller: plan.caller,
             subject_kind: carrier_of::<B>(subject),
             subject_custom: custom_name::<B>(subject),
             seed_sql,

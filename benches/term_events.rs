@@ -19,7 +19,8 @@ const DDL: &str = "CREATE TABLE projects(id INTEGER PRIMARY KEY, name TEXT);
      CREATE TABLE docs(id INTEGER PRIMARY KEY, project_id INTEGER, title TEXT, score DOUBLE PRECISION);";
 
 const TERM: &str = "SELECT * FROM docs WHERE project_id IN \
-     (SELECT project_id FROM project_members WHERE user_id = current_setting('app.user_id', true))";
+     (SELECT project_id FROM project_members \
+      WHERE user_id = ANY(string_to_array(current_setting('app.subjects', true), ',')))";
 
 const GRANTS: i64 = 5;
 const SIZES: [u64; 3] = [500, 1_000, 2_000];
@@ -33,6 +34,12 @@ fn engine() -> (Engine, TableId) {
     let engine = SubscriptionEngine::new(database, PostgreSqlDialect {}).with_translator(
         rls2fga::translator::TranslatorBuilder::new()
             .with_min_confidence(rls2fga::types::ConfidenceLevel::B)
+            .with_session_attributes([
+                rls2fga::classifier::function_registry::SessionAttribute::setting(
+                    "app.subjects",
+                    rls2fga::classifier::function_registry::SessionAttributeKind::SetAttribute,
+                ),
+            ])
             .build(),
     );
     (engine, members)

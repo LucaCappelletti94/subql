@@ -4,6 +4,7 @@
 //! membership rows move the pair set.
 #![allow(clippy::unwrap_used)]
 
+use rls2fga::classifier::function_registry::{SessionAttribute, SessionAttributeKind};
 use rls2fga::translator::{Translator, TranslatorBuilder};
 use rls2fga::types::ConfidenceLevel;
 use sql_traits::structs::ParserDB;
@@ -32,6 +33,10 @@ type Engine = SubscriptionEngine<TestEvent<Postgres>, DefaultIds, ParserDB>;
 fn translator() -> Translator {
     TranslatorBuilder::new()
         .with_min_confidence(ConfidenceLevel::B)
+        .with_session_attributes([SessionAttribute::setting(
+            "app.subjects",
+            SessionAttributeKind::SetAttribute,
+        )])
         .build()
 }
 
@@ -53,7 +58,7 @@ fn subscribe(
     pairs: &[(i64, i64)],
 ) -> SubscriptionRequest<DefaultIds, Postgres> {
     SubscriptionRequest::new(consumer, TERM)
-        .subjects([Value::String(user.into())])
+        .subscriber(Value::String(user.into()))
         .term_values(
             vec!["tenant_id", "id"],
             pairs
@@ -131,7 +136,7 @@ fn stated_columns_may_come_in_any_order() {
     engine
         .register(
             SubscriptionRequest::new(1u64, TERM)
-                .subjects([Value::String("alice".into())])
+                .subscriber(Value::String("alice".into()))
                 .term_values(
                     vec!["id", "tenant_id"],
                     vec![(
@@ -296,7 +301,7 @@ fn a_one_pair_exists_is_the_in_spelling_in_other_clothes() {
     engine
         .register(
             SubscriptionRequest::new(1u64, ONE_PAIR)
-                .subjects([Value::String("alice".into())])
+                .subscriber(Value::String("alice".into()))
                 .term_values(
                     vec!["id"],
                     vec![(Value::String("alice".into()), vec![Value::Int(5)])],
@@ -346,13 +351,66 @@ fn describe_terms_names_both_pairs_and_the_seed_read() {
     );
 }
 
+/// The set spelling of the same `EXISTS`, with the caller conjunct kept
+/// verbatim in the seed read, and a share naming any held subject moving the
+/// pair set.
+#[test]
+fn a_set_spelled_exists_names_the_caller_by_its_subjects() {
+    const SET_TERM: &str = "SELECT * FROM docs WHERE EXISTS (SELECT 1 FROM shares s \
+         WHERE s.tenant_id = docs.tenant_id AND s.doc_id = docs.id \
+           AND s.viewer = ANY(string_to_array(current_setting('app.subjects', true), ',')))";
+    let (mut engine, docs, shares) = engine();
+    let described = engine
+        .describe_terms(&SubscriptionRequest::new(1u64, SET_TERM))
+        .expect("the set spelling is describable");
+    let [subql::term::TermDescription::Membership(term)] = described.as_slice() else {
+        panic!("one membership subquery, got {described:?}");
+    };
+    assert_eq!(term.caller, subql::term::TermCaller::Subjects);
+    assert_eq!(
+        term.seed_sql,
+        "SELECT s.viewer, s.tenant_id, s.doc_id FROM shares s \
+         WHERE s.viewer = ANY(string_to_array(current_setting('app.subjects', true), ','))"
+    );
+
+    engine
+        .register(
+            SubscriptionRequest::new(1u64, SET_TERM)
+                .subjects([Value::String("alice".into()), Value::String("key:a".into())])
+                .term_values(
+                    vec!["tenant_id", "id"],
+                    vec![(
+                        Value::String("key:a".into()),
+                        vec![Value::Int(1), Value::Int(5)],
+                    )],
+                ),
+        )
+        .expect("the set spelling registers");
+    let notifs = engine
+        .consumers(&TestEvent::insert(docs, doc(5, 1)))
+        .unwrap();
+    assert_eq!(notifs.inserted(), &[1], "(1, 5) is granted by a held key");
+
+    engine
+        .consumers(&TestEvent::insert(shares, share(2, 6, "alice")))
+        .unwrap();
+    let notifs = engine
+        .consumers(&TestEvent::insert(docs, doc(6, 2)))
+        .unwrap();
+    assert_eq!(
+        notifs.inserted(),
+        &[1],
+        "a share naming the identity moves the set too"
+    );
+}
+
 mod refusals {
     use super::*;
     /// Register a filter the bounded form rejects, expecting the reread tier to
     /// serve it, and return the reason the in-process path gave up.
     fn reread_reason(engine: &mut Engine, sql: &str) -> String {
         let registered = engine
-            .register(SubscriptionRequest::new(1u64, sql).subjects([Value::String("alice".into())]))
+            .register(SubscriptionRequest::new(1u64, sql).subscriber(Value::String("alice".into())))
             .expect("the reread tier serves what the bounded form refuses");
         assert!(
             matches!(registered.tier, subql::Tier::WholeRows { .. }),
@@ -386,7 +444,7 @@ mod refusals {
              (SELECT tenant_id, doc_id FROM shares WHERE viewer = current_setting('app.user_id', true))";
         let reason = refusal(
             &mut engine,
-            SubscriptionRequest::new(1u64, tuple_in).subjects([Value::String("alice".into())]),
+            SubscriptionRequest::new(1u64, tuple_in).subscriber(Value::String("alice".into())),
         );
         assert!(
             reason.contains("EXISTS"),
@@ -404,7 +462,7 @@ mod refusals {
                AND s.viewer = current_setting('app.user_id', true))";
         let registered = engine
             .register(
-                SubscriptionRequest::new(1u64, negated).subjects([Value::String("alice".into())]),
+                SubscriptionRequest::new(1u64, negated).subscriber(Value::String("alice".into())),
             )
             .expect("the reread tier serves subtraction");
         assert!(
@@ -462,7 +520,7 @@ mod refusals {
         let reason = refusal(
             &mut engine,
             SubscriptionRequest::new(1u64, TERM)
-                .subjects([Value::String("alice".into())])
+                .subscriber(Value::String("alice".into()))
                 .term_values(
                     vec!["tenant_id", "id"],
                     vec![(Value::String("alice".into()), vec![Value::Int(1)])],
@@ -481,7 +539,7 @@ mod refusals {
         let reason = refusal(
             &mut engine,
             SubscriptionRequest::new(1u64, TERM)
-                .subjects([Value::String("alice".into())])
+                .subscriber(Value::String("alice".into()))
                 .term_values(
                     vec!["tenant_id"],
                     vec![(Value::String("alice".into()), vec![Value::Int(1)])],
@@ -505,7 +563,7 @@ mod refusals {
         engine
             .register(
                 SubscriptionRequest::new(1u64, REVERSED)
-                    .subjects([Value::String("alice".into())])
+                    .subscriber(Value::String("alice".into()))
                     .term_values(
                         vec!["id", "tenant_id"],
                         vec![(

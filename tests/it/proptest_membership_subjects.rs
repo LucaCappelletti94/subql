@@ -15,6 +15,7 @@
 //! covers, and that one fails where this property still passes.
 
 use proptest::prelude::*;
+use rls2fga::classifier::function_registry::{SessionAttribute, SessionAttributeKind};
 use rls2fga::translator::{Translator, TranslatorBuilder};
 use rls2fga::types::ConfidenceLevel;
 use sql_traits::structs::ParserDB;
@@ -29,7 +30,8 @@ const DDL: &str = "CREATE TABLE projects(id INTEGER PRIMARY KEY, name TEXT);
      CREATE TABLE docs(id INTEGER PRIMARY KEY, project_id INTEGER, title TEXT, score DOUBLE PRECISION);";
 
 const TERM: &str = "SELECT * FROM docs WHERE project_id IN \
-     (SELECT project_id FROM project_members WHERE user_id = current_setting('app.user_id', true))";
+     (SELECT project_id FROM project_members \
+      WHERE user_id = ANY(string_to_array(current_setting('app.subjects', true), ',')))";
 
 const SUBJECTS: usize = 3;
 const PROJECTS: i64 = 3;
@@ -55,6 +57,10 @@ enum Op {
 fn translator() -> Translator {
     TranslatorBuilder::new()
         .with_min_confidence(ConfidenceLevel::B)
+        .with_session_attributes([SessionAttribute::setting(
+            "app.subjects",
+            SessionAttributeKind::SetAttribute,
+        )])
         .build()
 }
 
