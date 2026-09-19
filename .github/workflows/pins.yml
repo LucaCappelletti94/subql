@@ -15,7 +15,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 90
     steps:
+      # A manual dispatch may select another ref, and only main's tree belongs here.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
       - run: sudo apt-get update && sudo apt-get install -y libpq-dev default-libmysqlclient-dev
       # The lockfile has to stay resolvable by the oldest toolchain the project
       # supports, which a newer cargo would not guarantee.
@@ -41,13 +44,18 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          branch="chore/refresh-pins-$(date -u +%Y%m%d)"
+          branch="chore/refresh-pins"
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git checkout -b "$branch"
           git add Cargo.lock fuzz/Cargo.lock
           git commit -m "Advance the resolved pins to their branch tips"
-          git push --force-with-lease origin "$branch"
+          if git ls-remote --exit-code --heads origin "$branch" >/dev/null; then
+            git fetch origin "$branch":refs/remotes/origin/"$branch"
+            git push --force-with-lease origin HEAD:refs/heads/"$branch"
+          else
+            git push origin HEAD:refs/heads/"$branch"
+          fi
           gh pr view "$branch" --json number >/dev/null 2>&1 || gh pr create \
             --base main --head "$branch" \
             --title "Advance the resolved pins to their branch tips" \
