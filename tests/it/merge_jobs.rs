@@ -86,3 +86,50 @@ fn draining_without_a_merge_reports_nothing() {
         .expect("the drain runs")
         .is_empty());
 }
+
+/// A merge that fails does not take the applied ones with it.
+///
+/// Swapping a merged shard into the live partition cannot be undone, and
+/// the job is gone from the manager once it is, so a report lost to a later
+/// failure is lost for good.
+#[test]
+fn a_failed_merge_keeps_the_reports_of_the_merges_already_applied() {
+    let (dir, mut engine, shard) = engine_with_a_shard();
+    let orders = catalog_helpers::table_id::<Postgres, _>(&catalog(), "orders").expect("orders");
+
+    let corrupt = dir.path().join("corrupt.shard");
+    std::fs::write(&corrupt, b"not a shard at all").expect("write the corrupt shard");
+
+    let good = engine
+        .merge_shards_background(orders, &[shard])
+        .expect("the first merge starts");
+    let bad = engine
+        .merge_shards_background(orders, &[corrupt])
+        .expect("the second merge starts");
+    assert!(good < bad, "the drain runs in job order");
+
+    // Both workers are given time to finish, so one drain sees a ready
+    // merge followed by a failing one.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let mut error = None;
+    while std::time::Instant::now() < deadline {
+        match engine.complete_ready_merges() {
+            Ok(_) => std::thread::sleep(std::time::Duration::from_millis(20)),
+            Err(e) => {
+                error = Some(e);
+                break;
+            }
+        }
+    }
+
+    let error = error.expect("the corrupt shard fails the drain");
+    assert_eq!(
+        error.applied.len(),
+        1,
+        "the merge applied before the failure is still reported"
+    );
+    assert!(
+        engine.pending_merges().is_empty(),
+        "both jobs are done with, one applied and one failed"
+    );
+}

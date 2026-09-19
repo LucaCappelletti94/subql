@@ -433,6 +433,21 @@ pub enum StorageError {
     },
 }
 
+/// A drain that stopped, and the merges it had already swapped in.
+///
+/// Swapping a merged shard into the live partition cannot be undone, and
+/// the job is gone from the manager once it is, so a later failure must
+/// not take the earlier reports with it.
+#[cfg(feature = "std")]
+#[derive(Clone, Debug, Error)]
+#[error("{source} after swapping in {} merges", .applied.len())]
+pub struct MergeDrainError {
+    /// Merges swapped in before the failure, in job order.
+    pub applied: alloc::vec::Vec<crate::MergeReport>,
+    /// What stopped the drain.
+    pub source: MergeError,
+}
+
 /// Errors during merge operations
 #[cfg(feature = "std")]
 #[derive(Error, Clone, Debug)]
