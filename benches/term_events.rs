@@ -117,5 +117,46 @@ fn membership_event_benchmark(criterion: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, membership_event_benchmark);
+/// One row of the subscribed table, timed against the same partitions.
+///
+/// Dispatch reads the term index for every candidate row, so whatever the
+/// index costs to look up is paid here rather than on the membership path.
+fn row_event_benchmark(criterion: &mut Criterion) {
+    let mut group = criterion.benchmark_group("row_event");
+    for size in SIZES {
+        for (shape, subjects_each) in [("one_subject", 1), ("three_subjects", 3)] {
+            let (mut engine, _) = engine();
+            let docs = catalog_helpers::table_id::<Postgres, _>(engine.database(), "docs")
+                .expect("docs is in the catalog");
+            for consumer in 0..size {
+                register_term(&mut engine, consumer, subjects_each);
+            }
+            group.bench_with_input(BenchmarkId::new(shape, size), &size, |bencher, _| {
+                bencher.iter(|| {
+                    black_box(
+                        engine
+                            .consumers(&TestEvent::insert(
+                                docs,
+                                alloc_row(i64::try_from(size).expect("the size fits") / 2),
+                            ))
+                            .expect("the bench event dispatches"),
+                    );
+                });
+            });
+        }
+    }
+    group.finish();
+}
+
+/// A `docs` row in the project `grant` names.
+fn alloc_row(grant: i64) -> Vec<Value<Postgres>> {
+    vec![
+        Value::Int(1),
+        Value::Int(grant * GRANTS),
+        Value::String("spec".into()),
+        Value::Float(1.0),
+    ]
+}
+
+criterion_group!(benches, membership_event_benchmark, row_event_benchmark);
 criterion_main!(benches);

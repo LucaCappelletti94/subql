@@ -12,6 +12,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use hashbrown::{HashMap, HashSet};
 use roaring::RoaringBitmap;
+use rpds::HashTrieMapSync;
 use slab::Slab;
 
 /// Compiled predicate with metadata.
@@ -130,9 +131,9 @@ pub struct TermMembers<B: Backend> {
     /// Which consumer ordinals a compared value row admits, keyed by the
     /// values in the filter's column order (one-wide for a single-column
     /// term).
-    by_value: HashMap<TermRow<B>, RoaringBitmap>,
+    by_value: TermAdmissions<B>,
     /// Which consumer ordinals claim each subscriber identity.
-    by_subscriber: HashMap<TermKey<B>, RoaringBitmap>,
+    by_subscriber: HashTrieMapSync<TermKey<B>, RoaringBitmap>,
     /// Ordinals holding at least one claim, so seeding one a second time is
     /// recognised without reading the claim index backwards.
     claimed: RoaringBitmap,
@@ -141,12 +142,18 @@ pub struct TermMembers<B: Backend> {
     several: RoaringBitmap,
     /// Which subjects of a several-subject ordinal grant a value row, keyed by
     /// ordinal first so a withdrawal reaches them through the row it holds.
-    granted_by: HashMap<ConsumerOrdinal, HashMap<TermRow<B>, Vec<TermKey<B>>>>,
+    granted_by: HashTrieMapSync<ConsumerOrdinal, TermGrants<B>>,
 }
+
+/// Which ordinals each compared value row admits.
+pub type TermAdmissions<B> = HashTrieMapSync<TermRow<B>, RoaringBitmap>;
+
+/// Which subjects of one ordinal grant each value row it holds.
+pub type TermGrants<B> = HashTrieMapSync<TermRow<B>, Vec<TermKey<B>>>;
 
 // `Clone` and `Debug` are hand-implemented so their bounds fall on the scalar
 // types `TermKey<B>` names rather than on the backend marker `B`, for the same
-// reason `Value<B>`'s are.
+// reason `Value<B>`'s are. The maps are tries, so this shares their nodes.
 impl<B: Backend> Clone for TermMembers<B> {
     fn clone(&self) -> Self {
         Self {
@@ -174,11 +181,11 @@ impl<B: Backend> core::fmt::Debug for TermMembers<B> {
 impl<B: Backend> Default for TermMembers<B> {
     fn default() -> Self {
         Self {
-            by_value: HashMap::new(),
-            by_subscriber: HashMap::new(),
+            by_value: TermAdmissions::new_sync(),
+            by_subscriber: HashTrieMapSync::new_sync(),
             claimed: RoaringBitmap::new(),
             several: RoaringBitmap::new(),
-            granted_by: HashMap::new(),
+            granted_by: HashTrieMapSync::new_sync(),
         }
     }
 }
@@ -190,24 +197,35 @@ impl<B: Backend> TermMembers<B> {
         self.by_value.get(values)
     }
 
+    /// The ordinals `values` admit today, ready to be changed and put back.
+    fn admitted(&self, values: &[TermKey<B>]) -> RoaringBitmap {
+        self.by_value.get(values).cloned().unwrap_or_default()
+    }
+
     /// Record that `ordinal` matches `values` through this term, granted by
     /// `subject`.
     fn admit(&mut self, subject: &TermKey<B>, values: TermRow<B>, ordinal: ConsumerOrdinal) {
         if self.several.contains(ordinal.get()) {
-            let granting = self
-                .granted_by
-                .entry(ordinal)
-                .or_default()
-                .entry(values.clone())
-                .or_default();
-            if !granting.contains(subject) {
-                granting.push(subject.clone());
-            }
+            self.grant(ordinal, &values, subject);
         }
-        self.by_value
-            .entry(values)
-            .or_default()
-            .insert(ordinal.get());
+        let mut admitted = self.admitted(&values);
+        admitted.insert(ordinal.get());
+        self.by_value.insert_mut(values, admitted);
+    }
+
+    /// Record that `subject` grants `values` to `ordinal`.
+    fn grant(&mut self, ordinal: ConsumerOrdinal, values: &TermRow<B>, subject: &TermKey<B>) {
+        let mut rows = self
+            .granted_by
+            .get(&ordinal)
+            .cloned()
+            .unwrap_or_else(TermGrants::new_sync);
+        let mut granting = rows.get(values).cloned().unwrap_or_default();
+        if !granting.contains(subject) {
+            granting.push(subject.clone());
+        }
+        rows.insert_mut(values.clone(), granting);
+        self.granted_by.insert_mut(ordinal, rows);
     }
 
     /// Record that `ordinal` filters for every subject in `subjects`.
@@ -224,10 +242,9 @@ impl<B: Backend> TermMembers<B> {
             Vec::new()
         };
         for subject in subjects {
-            self.by_subscriber
-                .entry(subject.clone())
-                .or_default()
-                .insert(ordinal.get());
+            let mut claiming = self.by_subscriber.get(subject).cloned().unwrap_or_default();
+            claiming.insert(ordinal.get());
+            self.by_subscriber.insert_mut(subject.clone(), claiming);
         }
         self.claimed.insert(ordinal.get());
 
@@ -242,13 +259,13 @@ impl<B: Backend> TermMembers<B> {
         let [granted] = held.as_slice() else {
             return;
         };
-        let backfilled = self
-            .by_value
-            .iter()
-            .filter(|(_, admitted)| admitted.contains(ordinal.get()))
-            .map(|(values, _)| (values.clone(), alloc::vec![granted.clone()]))
-            .collect();
-        self.granted_by.insert(ordinal, backfilled);
+        let mut backfilled = TermGrants::new_sync();
+        for (values, admitted) in &self.by_value {
+            if admitted.contains(ordinal.get()) {
+                backfilled.insert_mut(values.clone(), alloc::vec![granted.clone()]);
+            }
+        }
+        self.granted_by.insert_mut(ordinal, backfilled);
     }
 
     /// The subjects `ordinal` claims today.
@@ -279,19 +296,12 @@ impl<B: Backend> TermMembers<B> {
         ordinals: &RoaringBitmap,
     ) -> RoaringBitmap {
         for ordinal in &(ordinals & &self.several) {
-            let granting = self
-                .granted_by
-                .entry(ConsumerOrdinal::new(ordinal))
-                .or_default()
-                .entry(values.clone())
-                .or_default();
-            if !granting.contains(subject) {
-                granting.push(subject.clone());
-            }
+            self.grant(ConsumerOrdinal::new(ordinal), &values, subject);
         }
-        let admitted = self.by_value.entry(values).or_default();
-        let entered = ordinals - &*admitted;
-        *admitted |= ordinals;
+        let mut admitted = self.admitted(&values);
+        let entered = ordinals - &admitted;
+        admitted |= ordinals;
+        self.by_value.insert_mut(values, admitted);
         entered
     }
 
@@ -311,24 +321,30 @@ impl<B: Backend> TermMembers<B> {
         };
         let mut left = ordinals & admitted;
         for ordinal in &(&left & &self.several) {
-            let Some(rows) = self.granted_by.get_mut(&ConsumerOrdinal::new(ordinal)) else {
+            let ordinal = ConsumerOrdinal::new(ordinal);
+            let Some(rows) = self.granted_by.get(&ordinal) else {
                 continue;
             };
-            let Some(granting) = rows.get_mut(values) else {
+            let Some(granting) = rows.get(values) else {
                 continue;
             };
+            let mut granting = granting.clone();
             granting.retain(|held| held != subject);
+            let mut rows = rows.clone();
             if granting.is_empty() {
-                rows.remove(values);
+                rows.remove_mut(values);
             } else {
-                left.remove(ordinal);
+                left.remove(ordinal.get());
+                rows.insert_mut(values.to_vec(), granting);
             }
+            self.granted_by.insert_mut(ordinal, rows);
         }
-        if let Some(admitted) = self.by_value.get_mut(values) {
-            *admitted -= &left;
-            if admitted.is_empty() {
-                self.by_value.remove(values);
-            }
+        let mut admitted = self.admitted(values);
+        admitted -= &left;
+        if admitted.is_empty() {
+            self.by_value.remove_mut(values);
+        } else {
+            self.by_value.insert_mut(values.to_vec(), admitted);
         }
         left
     }
@@ -339,32 +355,53 @@ impl<B: Backend> TermMembers<B> {
     /// still filter for the same identities, so a membership row appearing again
     /// moves them back.
     pub fn clear_admissions(&mut self) -> Vec<(TermRow<B>, RoaringBitmap)> {
-        self.granted_by.clear();
-        self.by_value.drain().collect()
+        let withdrawn = self
+            .by_value
+            .iter()
+            .map(|(values, admitted)| (values.clone(), admitted.clone()))
+            .collect();
+        self.by_value = TermAdmissions::new_sync();
+        self.granted_by = HashTrieMapSync::new_sync();
+        withdrawn
     }
 
     /// Drop `ordinal` from every set, as unbinding its subscription does.
     fn forget(&mut self, ordinal: ConsumerOrdinal) {
-        for set in self
-            .by_value
-            .values_mut()
-            .chain(self.by_subscriber.values_mut())
-        {
-            set.remove(ordinal.get());
-        }
-        self.by_value.retain(|_, set| !set.is_empty());
-        self.by_subscriber.retain(|_, set| !set.is_empty());
-        self.granted_by.remove(&ordinal);
+        self.by_value = forgotten(&self.by_value, ordinal);
+        self.by_subscriber = forgotten(&self.by_subscriber, ordinal);
+        self.granted_by.remove_mut(&ordinal);
         self.claimed.remove(ordinal.get());
         self.several.remove(ordinal.get());
     }
 }
 
-/// Predicate storage with deduplication.
+/// `index` without `ordinal`, dropping every key it leaves admitting nobody.
 ///
-/// Manages predicates with slab allocation and hash-based deduplication.
-/// Tracks refcounts and automatically removes predicates when refcount
-/// reaches 0.
+/// Only the keys that held the ordinal are rewritten, so unbinding one
+/// subscription reads the index but copies the paths it actually changes.
+fn forgotten<K>(
+    index: &HashTrieMapSync<K, RoaringBitmap>,
+    ordinal: ConsumerOrdinal,
+) -> HashTrieMapSync<K, RoaringBitmap>
+where
+    K: Eq + core::hash::Hash + Clone,
+{
+    let mut kept = index.clone();
+    for (key, set) in index {
+        if !set.contains(ordinal.get()) {
+            continue;
+        }
+        let mut set = set.clone();
+        set.remove(ordinal.get());
+        if set.is_empty() {
+            kept.remove_mut(key);
+        } else {
+            kept.insert_mut(key.clone(), set);
+        }
+    }
+    kept
+}
+
 /// Which subscribers each of a predicate's term slots admits, one shared entry
 /// per slot.
 pub type TermSlots<B> = HashMap<(PredicateId, u16), Arc<TermMembers<B>>>;
@@ -770,6 +807,41 @@ mod tests {
         let removed = store.decrement_refcount(id);
         assert!(removed);
         assert!(store.get_predicate(id).is_none());
+    }
+
+    /// What the trie is for: cloning a term's members and then admitting one
+    /// more row leaves all but a handful of the other rows' sets where they
+    /// were, so the clone each membership event takes copies a pointer rather
+    /// than the table. The handful is the leaf the insertion rewrites, which
+    /// carries a few entries inline. A plain map put back here moves every
+    /// set and fails this.
+    #[test]
+    fn admitting_one_row_leaves_the_other_sets_where_they_were() {
+        let subject = TermKey::<Postgres>::String("alice".into());
+        let mut members = TermMembers::<Postgres>::default();
+        let ordinal = ConsumerOrdinal::new(0);
+        members.claim(core::slice::from_ref(&subject), ordinal);
+        for value in 0..256i64 {
+            members.admit(&subject, alloc::vec![TermKey::Int(value)], ordinal);
+        }
+
+        let before = members.clone();
+        members.admit(&subject, alloc::vec![TermKey::Int(1_000)], ordinal);
+
+        let moved = (0..256i64)
+            .filter(|value| {
+                let row = [TermKey::Int(*value)];
+                let (Some(then), Some(now)) = (before.admits(&row), members.admits(&row)) else {
+                    return true;
+                };
+                !core::ptr::eq(then, now)
+            })
+            .count();
+        assert!(
+            moved <= 8,
+            "admitting one row rewrote the set of {moved} rows it never named, and only the \
+             entries sharing the rewritten leaf may move"
+        );
     }
 
     #[test]
