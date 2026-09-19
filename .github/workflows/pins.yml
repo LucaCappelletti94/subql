@@ -13,7 +13,8 @@ jobs:
   refresh:
     name: refresh the resolved pins
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    # Monday's cache is cold, because the pins the cache keys on just moved.
+    timeout-minutes: 240
     steps:
       # A manual dispatch may select another ref, and only main's tree belongs here.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -59,7 +60,7 @@ jobs:
       - if: steps.moved.outputs.moved == 'yes'
         env:
           RUSTDOCFLAGS: -D warnings
-        run: cargo doc --workspace --no-deps --all-features --locked
+        run: cargo doc --workspace --no-deps --all-features --locked --release
       - if: steps.moved.outputs.moved == 'yes'
         run: cargo test --workspace --lib --tests --release --locked
       - if: steps.moved.outputs.moved == 'yes'
