@@ -381,13 +381,13 @@ fn every_change_of_one_transaction_is_delivered() {
     common::drop_slot(&mut setup, &slot);
 }
 
-/// The streaming source says how much WAL its slot is holding.
+/// The streaming source reports its distance behind the server's WAL end.
 ///
 /// Acknowledging is what releases a slot, so a consumer that never
 /// acknowledges retains WAL until the server's volume fills, and the only
 /// symptom is a transport error at a layer with no visible connection to the
-/// cause. The distance between what has arrived and what has been
-/// acknowledged is what makes that alertable before the disk answers for it.
+/// cause. The distance between the WAL end the server reports and the
+/// position acknowledged is what makes that alertable beforehand.
 #[test]
 #[ignore = "requires Docker; run with --ignored"]
 fn the_streaming_source_reports_what_its_slot_is_holding() {
@@ -406,11 +406,10 @@ fn the_streaming_source_reports_what_its_slot_is_holding() {
         )
         .await
         .expect("connect streaming source");
-        assert_eq!(
-            source.unacknowledged_bytes(),
-            0,
-            "nothing has arrived yet, so nothing is held"
-        );
+        // Relational throughout. The figure is a distance to the server's
+        // own WAL end, which every other database on a shared server moves,
+        // so an absolute reading races the whole cluster.
+        let base = source.unacknowledged_bytes();
         assert!(source.acknowledged_position().is_none());
 
         sql_query("INSERT INTO orders VALUES (1, 5.0)")
@@ -422,15 +421,19 @@ fn the_streaming_source_reports_what_its_slot_is_holding() {
             .expect("no source error")
             .expect("the source is open");
 
-        let held = source.unacknowledged_bytes();
+        // The server's first frames can report a WAL end no further on than
+        // the position this slot started at, so growth is a bounded wait
+        // rather than a reading taken the instant an event lands.
+        let mut held = base;
+        let started = std::time::Instant::now();
+        while held <= base && started.elapsed() < Duration::from_secs(10) {
+            let _ = tokio::time::timeout(Duration::from_millis(100), source.next_event()).await;
+            held = source.unacknowledged_bytes();
+        }
         assert!(
-            held > 0,
-            "an unacknowledged event is WAL the slot cannot release"
-        );
-        assert!(
-            held < 1_000_000,
-            "the figure is a distance from the slot's own position, not an \
-             absolute one, got {held}"
+            held > base,
+            "an unacknowledged event leaves the source behind the server's \
+             WAL end, {held} against {base}"
         );
         assert!(
             source.acknowledged_position().is_none(),
@@ -452,6 +455,72 @@ fn the_streaming_source_reports_what_its_slot_is_holding() {
             source.acknowledged_position(),
             Some(upto),
             "the acknowledgement is what releases the slot, and it is reported"
+        );
+    });
+
+    common::drop_slot(&mut setup, &slot);
+}
+
+/// The lag figure moves on WAL the publication never carries.
+///
+/// The server reports its WAL end on keepalive frames too, so a source whose
+/// publication is idle still learns that it has fallen behind. Without that,
+/// a slot held open beside a busy neighbour reads as caught up right up to
+/// the moment the volume fills, which is the case the figure exists for.
+#[test]
+#[ignore = "requires Docker; run with --ignored"]
+fn an_idle_publication_still_reports_the_source_falling_behind() {
+    common::assert_docker_available();
+    let db = common::pg_database();
+    let mut setup = db.connect();
+    let mut dml = db.connect();
+    let slot = db.slot("subql_streaming_idle_lag");
+    let publication = "subql_streaming_idle_lag_pub";
+    fixture(&mut setup, "streaming idle lag", publication, &slot);
+    // Outside the publication, so writing to it produces WAL the source is
+    // never sent. Only a keepalive can disclose it.
+    sql_query("CREATE TABLE unpublished (id INT PRIMARY KEY, bulk TEXT)")
+        .execute(&mut setup)
+        .expect("create the unpublished table");
+
+    common::multi_thread_rt().block_on(async {
+        let mut source = subql::PgStreamingCdcSource::connect(
+            subql::PgStreamingConfig::new(db.url(), &slot, publication)
+                .status_interval(Duration::from_millis(100)),
+            catalog(),
+        )
+        .await
+        .expect("connect streaming source");
+        let base = source.unacknowledged_bytes();
+
+        sql_query(
+            "INSERT INTO unpublished SELECT g, repeat('x', 4000) \
+             FROM generate_series(1, 200) AS g",
+        )
+        .execute(&mut dml)
+        .expect("write outside the publication");
+
+        let started = std::time::Instant::now();
+        let mut grew = base;
+        while started.elapsed() < Duration::from_secs(30) {
+            // next_event drives the frame loop, and must not produce one.
+            match tokio::time::timeout(Duration::from_millis(200), source.next_event()).await {
+                Err(_) => {}
+                Ok(other) => panic!("the publication is idle, got {other:?}"),
+            }
+            grew = source.unacknowledged_bytes();
+            if grew > base {
+                break;
+            }
+        }
+        println!(
+            "idle lag moved {base} -> {grew} after {:?}",
+            started.elapsed()
+        );
+        assert!(
+            grew > base,
+            "a keepalive carries the server's WAL end, so an idle source \
+             still learns it is behind, stayed at {grew}"
         );
     });
 
