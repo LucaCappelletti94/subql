@@ -760,20 +760,10 @@ where
         engine
     }
 
-    /// Unregister a subscription by id, resolving whichever registry holds
-    /// it. Returns false if no such subscription existed.
-    ///
-    /// One id counter serves both registries (`next_subscription_id` lives
-    /// only on the inner engine), so an id cannot be claimed by both and the
-    /// order below is a resolution, not a precedence. The read registry is
-    /// tried first, and when it claims the id the stored resolve context and
-    /// any queued read are dropped with it.
+    /// Unregister a subscription by id. Returns false if no such
+    /// subscription existed, in either registry, which the inner engine
+    /// resolves.
     pub fn unregister_subscription(&mut self, subscription_id: SubscriptionId) -> bool {
-        if self.inner.unregister_reread(subscription_id) {
-            self.contexts.remove(&subscription_id);
-            self.purge_unregistered_reads();
-            return true;
-        }
         let removed = self.inner.unregister_subscription(subscription_id);
         if removed {
             // Drop the stored context and any queued read: an in-process

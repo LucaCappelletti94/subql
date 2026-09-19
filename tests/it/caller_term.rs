@@ -349,7 +349,7 @@ fn a_set_spelled_caller_comparison_admits_any_held_subject() {
 mod typed {
     use super::{engine, note};
     use diesel::prelude::*;
-    use diesel::sql_types::{Array, Bool, Text};
+    use diesel::sql_types::{Bool, Text};
     use subql::backend::{Postgres, Value};
     use subql::diesel_api::render_typed;
     use subql::term::{TermCaller, TermDescription};

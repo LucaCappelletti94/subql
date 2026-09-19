@@ -636,3 +636,35 @@ fn a_having_extreme_restores_with_its_condition() {
         opening.updates
     );
 }
+
+/// Ending an answer by id ends it, whichever registry holds it.
+///
+/// One counter hands out ids for the answers the engine maintains and the
+/// answers a read serves alike, so an id names one answer and a caller
+/// holding it has no way to know which registry took it. A removal that
+/// reports `false` is saying no such answer exists, which for a live one
+/// is the opposite of the truth.
+#[test]
+fn ending_a_read_answer_by_id_reports_the_truth() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let mut engine =
+        Engine::with_storage(catalog(DDL), PostgreSqlDialect {}, dir.path().to_path_buf())
+            .expect("open store")
+            .into_parts()
+            .0;
+    let answer = engine
+        .register(SubscriptionRequest::new(1u64, EXTREME))
+        .expect("the extreme registers")
+        .subscription_id;
+    assert_eq!(engine.reread_count(), 1);
+
+    assert!(
+        engine.unregister_subscription(answer),
+        "the answer existed, so ending it succeeded"
+    );
+    assert_eq!(engine.reread_count(), 0, "and it is gone");
+    assert!(
+        !engine.unregister_subscription(answer),
+        "the second ending finds nothing, which is what false means"
+    );
+}

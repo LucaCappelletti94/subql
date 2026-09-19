@@ -3695,12 +3695,23 @@ where
         results
     }
 
-    /// Unregister a subscription
+    /// Unregister a subscription, from whichever registry holds it.
+    ///
+    /// One counter hands out ids for the answers this engine maintains and
+    /// the answers a read serves alike, so an id cannot be claimed by both
+    /// and the order below resolves rather than prefers. `false` therefore
+    /// means no answer had that id, rather than the answer being of the
+    /// other kind.
     ///
     /// Decrements predicate refcount. If refcount reaches 0, predicate is removed.
     /// Also drops every per-session resume cursor associated with this
     /// `subscription_id` so cursors never outlive their owning subscription.
     pub fn unregister_subscription(&mut self, subscription_id: SubscriptionId) -> bool {
+        // Both, rather than the first that answers. An id belongs to one
+        // registry as they are written, but a store whose two files were
+        // written either side of a tier change restores it into both, and
+        // ending it has to mean ended.
+        let read_ended = self.unregister_reread(subscription_id);
         // Read before the removal takes the index entry with it.
         #[cfg(feature = "std")]
         let table = self.subscription_to_table.get(&subscription_id).copied();
@@ -3716,7 +3727,7 @@ where
             }
             self.persist_reads_after_removal();
         }
-        removed
+        read_ended || removed
     }
 
     // Per-`(session, subscription)` resume cursor API. The cursor is the

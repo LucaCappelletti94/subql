@@ -231,3 +231,30 @@ fn unregistering_by_statement_drops_the_queued_read() {
         "no read runs for a subscription the caller ended"
     );
 }
+
+/// Every kind of answer is visible to the predicate removal leans on.
+///
+/// Dropping the contexts of subscriptions neither registry holds is only
+/// safe while every live answer is in one of them. An answer kept
+/// somewhere else would be judged gone, lose its context, and have its
+/// next read refused instead of run.
+#[test]
+fn every_registered_kind_is_held_by_one_registry() {
+    let (mut e, _tid) = engine_with_values(alloc::vec![]);
+    for (consumer, sql) in [
+        (1u64, "SELECT * FROM orders WHERE status = 'paid'"),
+        (2u64, "SELECT COUNT(*) FROM orders WHERE status = 'paid'"),
+        (3u64, "SELECT MIN(price) FROM orders"),
+        (4u64, "SELECT * FROM orders WHERE lower(status) = 'paid'"),
+        (5u64, "SELECT * FROM orders"),
+    ] {
+        let registered = e
+            .register(SubscriptionRequest::new(consumer, sql), ())
+            .expect("the fixture catalog serves every statement here");
+        assert!(
+            e.inner.holds_subscription(registered.subscription_id),
+            "a live answer for {sql} is in neither registry, so removal \
+             would drop its context while it is still registered"
+        );
+    }
+}
