@@ -88,8 +88,9 @@ impl Connector for RecordingConnector {
 fn restore_bound_reads() -> (subql::RestoredReads, [u64; 4]) {
     let directory = tempfile::tempdir().expect("temp dir");
     let path = directory.path().to_path_buf();
-    let (mut engine, _) =
-        Engine::with_storage(catalog(DDL), PostgreSqlDialect {}, path.clone()).expect("open store");
+    let (mut engine, _) = Engine::with_storage(catalog(DDL), PostgreSqlDialect {}, path.clone())
+        .expect("open store")
+        .into_parts();
     let scalar = engine
         .register(
             SubscriptionRequest::new(1u64, "SELECT MIN(price) FROM orders WHERE status = $1")
@@ -128,8 +129,9 @@ fn restore_bound_reads() -> (subql::RestoredReads, [u64; 4]) {
     ];
     drop(engine);
 
-    let (_engine, report) =
-        Engine::with_storage(catalog(DDL), PostgreSqlDialect {}, path).expect("reopen store");
+    let (_engine, report) = Engine::with_storage(catalog(DDL), PostgreSqlDialect {}, path)
+        .expect("reopen store")
+        .into_parts();
     (report, ids)
 }
 
@@ -146,7 +148,9 @@ fn save_then_restore(restore_ddl: &str) -> (subql::RestoredReads, Engine) {
     let path = dir.path().to_path_buf();
 
     let (mut engine, first) =
-        Engine::with_storage(catalog(DDL), PostgreSqlDialect {}, path.clone()).expect("open store");
+        Engine::with_storage(catalog(DDL), PostgreSqlDialect {}, path.clone())
+            .expect("open store")
+            .into_parts();
     assert!(
         first.restored.is_empty() && first.dropped.is_empty(),
         "an empty store restores nothing"
@@ -162,7 +166,8 @@ fn save_then_restore(restore_ddl: &str) -> (subql::RestoredReads, Engine) {
 
     let (restored_engine, report) =
         Engine::with_storage(catalog(restore_ddl), PostgreSqlDialect {}, path)
-            .expect("reopen store");
+            .expect("reopen store")
+            .into_parts();
     // The directory has to outlive the reopen, so it is dropped here.
     drop(dir);
     (report, restored_engine)
@@ -215,7 +220,8 @@ fn per_consumer_reads_on_a_row_secured_table_survive_a_restart() {
 
     let (mut engine, _) =
         Engine::with_storage(catalog(rls_ddl), PostgreSqlDialect {}, path.clone())
-            .expect("open store");
+            .expect("open store")
+            .into_parts();
     let scalar = engine
         .register(SubscriptionRequest::new(1u64, EXTREME).database_reads_per_consumer())
         .expect("a per-consumer scalar registers on the row-secured table");
@@ -231,7 +237,9 @@ fn per_consumer_reads_on_a_row_secured_table_survive_a_restart() {
     drop(engine);
 
     let (restored_engine, report) =
-        Engine::with_storage(catalog(rls_ddl), PostgreSqlDialect {}, path).expect("reopen store");
+        Engine::with_storage(catalog(rls_ddl), PostgreSqlDialect {}, path)
+            .expect("reopen store")
+            .into_parts();
     drop(dir);
     assert!(
         report.dropped.is_empty(),
@@ -252,8 +260,9 @@ fn per_consumer_reads_on_a_row_secured_table_survive_a_restart() {
 fn restored_fixed_tiers_report_exact_executable_queries() {
     let directory = tempfile::tempdir().expect("temp dir");
     let path = directory.path().to_path_buf();
-    let (mut engine, _) =
-        Engine::with_storage(catalog(DDL), PostgreSqlDialect {}, path.clone()).expect("open store");
+    let (mut engine, _) = Engine::with_storage(catalog(DDL), PostgreSqlDialect {}, path.clone())
+        .expect("open store")
+        .into_parts();
     let bind = Value::String("paid".into());
     let scalar = engine
         .register(
@@ -274,8 +283,9 @@ fn restored_fixed_tiers_report_exact_executable_queries() {
         .expect("whole read registers");
     drop(engine);
 
-    let (_engine, report) =
-        Engine::with_storage(catalog(DDL), PostgreSqlDialect {}, path).expect("reopen store");
+    let (_engine, report) = Engine::with_storage(catalog(DDL), PostgreSqlDialect {}, path)
+        .expect("reopen store")
+        .into_parts();
     let expected = [
         (
             scalar.subscription_id,
@@ -490,8 +500,9 @@ fn an_answer_whose_table_moved_is_dropped_and_named() {
 fn a_grouped_scalar_read_restores_under_the_same_identity() {
     let directory = tempfile::tempdir().expect("temp dir");
     let path = directory.path().to_path_buf();
-    let (mut engine, _) =
-        Engine::with_storage(catalog(DDL), PostgreSqlDialect {}, path.clone()).expect("open store");
+    let (mut engine, _) = Engine::with_storage(catalog(DDL), PostgreSqlDialect {}, path.clone())
+        .expect("open store")
+        .into_parts();
     let registered = engine
         .register(SubscriptionRequest::new(
             4u64,
@@ -501,8 +512,9 @@ fn a_grouped_scalar_read_restores_under_the_same_identity() {
     assert!(matches!(registered.tier, Tier::GroupedScalar { .. }));
     drop(engine);
 
-    let (_engine, report) =
-        Engine::with_storage(catalog(DDL), PostgreSqlDialect {}, path).expect("reopen store");
+    let (_engine, report) = Engine::with_storage(catalog(DDL), PostgreSqlDialect {}, path)
+        .expect("reopen store")
+        .into_parts();
     assert_eq!(report.dropped, [] as [subql::DroppedRead; 0]);
     assert_eq!(report.restored.len(), 1);
     assert_eq!(
@@ -520,8 +532,9 @@ fn a_grouped_scalar_read_restores_under_the_same_identity() {
 fn grouped_read_restores_registration_binds() {
     let directory = tempfile::tempdir().expect("temp dir");
     let path = directory.path().to_path_buf();
-    let (mut engine, _) =
-        Engine::with_storage(catalog(DDL), PostgreSqlDialect {}, path.clone()).expect("open store");
+    let (mut engine, _) = Engine::with_storage(catalog(DDL), PostgreSqlDialect {}, path.clone())
+        .expect("open store")
+        .into_parts();
     let registered = engine
         .register(
             SubscriptionRequest::new(
@@ -533,8 +546,9 @@ fn grouped_read_restores_registration_binds() {
         .expect("grouped minimum registers");
     drop(engine);
 
-    let (mut engine, report) =
-        Engine::with_storage(catalog(DDL), PostgreSqlDialect {}, path).expect("reopen store");
+    let (mut engine, report) = Engine::with_storage(catalog(DDL), PostgreSqlDialect {}, path)
+        .expect("reopen store")
+        .into_parts();
     assert_eq!(report.restored.len(), 1);
     Install::install(
         &mut engine,
@@ -579,8 +593,9 @@ fn grouped_read_restores_registration_binds() {
 fn a_having_extreme_restores_with_its_condition() {
     let directory = tempfile::tempdir().expect("temp dir");
     let path = directory.path().to_path_buf();
-    let (mut engine, _) =
-        Engine::with_storage(catalog(DDL), PostgreSqlDialect {}, path.clone()).expect("open store");
+    let (mut engine, _) = Engine::with_storage(catalog(DDL), PostgreSqlDialect {}, path.clone())
+        .expect("open store")
+        .into_parts();
     let registered = engine
         .register(SubscriptionRequest::new(
             5u64,
@@ -589,8 +604,9 @@ fn a_having_extreme_restores_with_its_condition() {
         .expect("filtered grouped minimum registers");
     drop(engine);
 
-    let (mut engine, report) =
-        Engine::with_storage(catalog(DDL), PostgreSqlDialect {}, path).expect("reopen store");
+    let (mut engine, report) = Engine::with_storage(catalog(DDL), PostgreSqlDialect {}, path)
+        .expect("reopen store")
+        .into_parts();
     assert_eq!(report.restored.len(), 1);
     assert!(!report.restored[0].tier_changed);
     let Tier::GroupedScalar { ref bootstrap } = report.restored[0].tier else {

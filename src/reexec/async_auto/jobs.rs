@@ -19,6 +19,10 @@ pub type KeyedRows<B> = Vec<(Vec<Value<B>>, Vec<Value<B>>)>;
 /// One queued read paired with the job phase one planned for it.
 pub type PlannedJob<I, C, B> = (crate::reexec::ReExecutionTrigger<I, C, B>, ResolveJob<B>);
 
+/// Every read planned in one pass, or the first refusal that stopped it.
+pub type PlannedJobs<I, C, B, E> =
+    Result<alloc::vec::Vec<PlannedJob<I, C, B>>, crate::reexec::ReExecError<E>>;
+
 /// One concurrent read's outcome, entering phase three. The trigger travels
 /// with the failure too, so phase three can drop a read whose failure is
 /// not retryable.

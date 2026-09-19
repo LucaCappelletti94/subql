@@ -234,6 +234,45 @@ impl core::fmt::Display for RebuildPayloadError {
     }
 }
 
+/// An engine reopened from storage, holding the answers that came back.
+///
+/// A restored answer comes back knowing neither its value nor the context
+/// its reads run under, because registration is what supplies both and a
+/// restored answer never passes through it. The engine is therefore handed
+/// over only by adopting the answers, through
+/// [`AutoResolvingEngine::adopt`](crate::reexec::AutoResolvingEngine::adopt), or by
+/// taking both halves apart with [`into_parts`](Self::into_parts) and
+/// answering for them.
+#[cfg(feature = "std")]
+#[must_use = "the restored answers still need adopting before any of them can read"]
+pub struct Restored<E: CdcEvent, I: IdTypes, DB: DatabaseLike>
+where
+    E::Backend: SqlLiteralParse,
+{
+    pub(crate) engine: SubscriptionEngine<E, I, DB>,
+    pub(crate) reads: RestoredReads<E::Backend>,
+}
+
+#[cfg(feature = "std")]
+impl<E: CdcEvent, I: IdTypes, DB: DatabaseLike> Restored<E, I, DB>
+where
+    E::Backend: SqlLiteralParse,
+{
+    /// What came back, and what could not.
+    pub const fn reads(&self) -> &RestoredReads<E::Backend> {
+        &self.reads
+    }
+
+    /// Take the engine and the report apart.
+    ///
+    /// The named way past adoption, for a caller that maintains its answers
+    /// itself rather than through an [`AutoResolvingEngine`](crate::reexec::AutoResolvingEngine).
+    /// A restored answer left unadopted refuses its reads.
+    pub fn into_parts(self) -> (SubscriptionEngine<E, I, DB>, RestoredReads<E::Backend>) {
+        (self.engine, self.reads)
+    }
+}
+
 /// Main subscription engine
 ///
 /// Manages subscriptions across all tables with hybrid indexing and
@@ -1468,13 +1507,18 @@ where
     /// Create engine with durable storage
     ///
     /// Loads existing shards from storage directory on startup.
+    ///
+    /// # Errors
+    ///
+    /// [`StorageError`] when the directory cannot be created or the saved
+    /// answers cannot be read.
     #[cfg(feature = "std")]
     #[allow(clippy::needless_pass_by_value)]
     pub fn with_storage(
         database: DB,
         dialect: <E::Backend as Backend>::Dialect,
         storage_path: PathBuf,
-    ) -> Result<(Self, RestoredReads<E::Backend>), StorageError> {
+    ) -> Result<Restored<E, I, DB>, StorageError> {
         let mut engine = Self::new(database, dialect);
         engine.storage_path = Some(storage_path.clone());
 
@@ -1485,12 +1529,12 @@ where
         // Load existing shards
         engine.load_all_shards()?;
         // Then the answers that need a read, which are judged one at a time
-        // against the tables they name. The report is returned rather than
+        // against the tables they name. The report is handed over rather than
         // stored because an answer that could not come back is a subscription
         // the caller still holds an id for.
         let reads = engine.load_reads()?;
 
-        Ok((engine, reads))
+        Ok(Restored { engine, reads })
     }
 
     /// Register a new subscription.
@@ -2440,6 +2484,12 @@ where
     /// Whether a change to `table_id` moves any re-read answer.
     pub(crate) fn routes_reread(&self, table_id: TableId) -> bool {
         self.table_deps.contains_key(&table_id)
+    }
+
+    /// The session a restored re-read belongs to, for rebuilding its
+    /// resolve context on adoption.
+    pub(crate) fn reexec_session(&self, subscription_id: SubscriptionId) -> Option<I::SessionId> {
+        self.reexec.get(&subscription_id).and_then(|e| e.session)
     }
 
     /// How many re-read answers this engine holds.

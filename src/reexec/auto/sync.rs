@@ -341,10 +341,11 @@ where
             }
             return Ok(());
         }
-        let ctx = self
-            .contexts
-            .get(&trigger.subscription_id)
-            .expect("every read tier stores its connector context at registration");
+        let Some(ctx) = self.contexts.get(&trigger.subscription_id) else {
+            return Err(ReExecError::Unadopted {
+                subscription: trigger.subscription_id,
+            });
+        };
         if ctx.keyed {
             let deltas = self.resolve_keyed(
                 trigger.subscription_id,
@@ -396,10 +397,11 @@ where
         crate::AggregateMaintenanceOutput<I, E::Backend, E::Checkpoint>,
         ReExecError<X::Error>,
     > {
-        let context = self
-            .contexts
-            .get(&subscription_id)
-            .expect("a grouped scalar read stores its connector context");
+        let Some(context) = self.contexts.get(&subscription_id) else {
+            return Err(ReExecError::Unadopted {
+                subscription: subscription_id,
+            });
+        };
         let snapshot = self
             .mode
             .0
@@ -568,10 +570,11 @@ where
     where
         S: FnMut(crate::reexec::ReadDelivery<I, E::Backend, E::Checkpoint>),
     {
-        let ctx = self
-            .contexts
-            .get_mut(&subscription_id)
-            .expect("every read tier stores its connector context at registration");
+        let Some(ctx) = self.contexts.get_mut(&subscription_id) else {
+            return Err(ReExecError::Unadopted {
+                subscription: subscription_id,
+            });
+        };
         let query = ctx.query.clone();
         ctx.generation = ctx.generation.saturating_add(1);
         let generation = ctx.generation;

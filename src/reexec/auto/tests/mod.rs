@@ -17,5 +17,6 @@ mod debounce;
 mod fixtures;
 mod queue;
 mod resolve;
+mod restore;
 mod rows;
 mod unregister;

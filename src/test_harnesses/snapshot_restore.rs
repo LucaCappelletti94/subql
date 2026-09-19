@@ -196,7 +196,9 @@ pub fn harness_snapshot_restore_roundtrip(data: &[u8]) {
     let mut engine_a: SubscriptionEngine<TestEvent<Postgres>, DefaultIds, ParserDB> =
         match SubscriptionEngine::with_storage(agg_catalog(), PostgreSqlDialect {}, workdir.clone())
         {
-            Ok((e, _reads)) => e,
+            // The oracle compares the in-process half, which needs no read,
+            // so the answers are taken apart rather than adopted.
+            Ok(restored) => restored.into_parts().0,
             Err(_) => return,
         };
 
@@ -220,7 +222,7 @@ pub fn harness_snapshot_restore_roundtrip(data: &[u8]) {
 
     let mut engine_b: SubscriptionEngine<TestEvent<Postgres>, DefaultIds, ParserDB> =
         match SubscriptionEngine::with_storage(database, PostgreSqlDialect {}, workdir) {
-            Ok((e, _reads)) => e,
+            Ok(restored) => restored.into_parts().0,
             Err(_) => return,
         };
 

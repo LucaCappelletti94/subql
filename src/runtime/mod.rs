@@ -10,6 +10,8 @@ pub mod partition;
 pub mod predicate;
 
 pub use dispatch::MatchedConsumers;
+#[cfg(feature = "std")]
+pub use engine::Restored;
 pub use engine::SubscriptionEngine;
 
 // ConsumerNotifications is re-exported from types.rs via `pub use types::*` in lib.rs.
