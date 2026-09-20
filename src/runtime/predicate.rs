@@ -12,7 +12,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use hashbrown::{HashMap, HashSet};
 use roaring::RoaringBitmap;
-use rpds::HashTrieMapSync;
+use rpds::{HashTrieMapSync, RedBlackTreeSetSync};
 
 /// Compiled predicate with metadata.
 ///
@@ -412,6 +412,33 @@ pub type TermSlots<B> = HashMap<(PredicateId, u16), Arc<TermMembers<B>>>;
 /// membership event, including the bindings and predicates the event never
 /// reads. Shared, the clone copies seven pointers and deepens only into the
 /// index the mutation reaches.
+/// What a removed binding took with it.
+#[derive(Clone, Copy, Debug)]
+pub struct BindingRemoved<I: IdTypes> {
+    /// The binding that was removed.
+    pub binding: SubscriptionBinding<I>,
+    /// Whether it was the last reference, so the predicate went too.
+    pub predicate_removed: bool,
+}
+
+/// Subscriptions, ordered so a walk over them is deterministic and an insert
+/// copies a path instead of the whole set.
+pub type SubscriptionSet = RedBlackTreeSetSync<SubscriptionId>;
+
+/// Everything a predicate's bindings answer.
+///
+/// One record rather than three maps keyed alike, because a binding used to
+/// write all three and they could only agree by hand.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct PredicateBindings {
+    /// How many bindings hold the predicate.
+    pub refcount: u32,
+    /// The consumer ordinals holding it.
+    pub consumers: RoaringBitmap,
+    /// The subscriptions each ordinal holds it through.
+    pub by_ordinal: HashTrieMapSync<ConsumerOrdinal, SubscriptionSet>,
+}
+
 pub struct PredicateStore<I: IdTypes, B: Backend> {
     /// Every predicate on this table, by id.
     pub predicates: PredicateMap<B>,
@@ -429,28 +456,14 @@ pub struct PredicateStore<I: IdTypes, B: Backend> {
     /// SubscriptionId -> SubscriptionBinding.
     pub bindings: HashTrieMapSync<SubscriptionId, SubscriptionBinding<I>>,
     /// SessionId -> `Vec<SubscriptionId>` (for session cleanup).
-    pub scope_index: HashTrieMapSync<I::SessionId, Vec<SubscriptionId>>,
-    /// PredicateId -> `RoaringBitmap<ConsumerOrdinal>` (consumers interested in this predicate).
-    pub predicate_consumers: HashTrieMapSync<PredicateId, RoaringBitmap>,
-    /// (PredicateId, ConsumerOrdinal) -> SubscriptionIds bound to that pair.
-    ///
-    /// A single (predicate, consumer) pair may carry multiple subscription
-    /// ids when the same consumer subscribes under different scopes (e.g.
-    /// one durable and one session-scoped). Used by activity-aware
-    /// eviction policies to stamp the matched subscriptions after
-    /// dispatch in O(1) per matched pair instead of an O(B) scan over
-    /// `bindings`.
-    pub binding_lookup: HashTrieMapSync<(PredicateId, ConsumerOrdinal), Vec<SubscriptionId>>,
+    pub scope_index: HashTrieMapSync<I::SessionId, SubscriptionSet>,
+    /// PredicateId -> who holds it, and through which subscriptions.
+    pub bound: HashTrieMapSync<PredicateId, PredicateBindings>,
     /// How many bindings each consumer holds on this table.
     ///
     /// Answers whether a consumer is still referenced without walking every
     /// binding, which unbinding asked once per subscription.
     pub consumer_bindings: HashTrieMapSync<I::ConsumerId, u32>,
-    /// How many bindings hold each predicate.
-    ///
-    /// Outside the slab because a binding taking or dropping a reference is
-    /// otherwise a copy of every predicate on the table to change one integer.
-    pub refcounts: HashTrieMapSync<PredicateId, u32>,
     /// (PredicateId, term slot) -> which subscribers that term admits.
     ///
     /// Empty for every predicate carrying no membership term, which is every
@@ -475,9 +488,7 @@ impl<I: IdTypes, B: Backend> Clone for PredicateStore<I, B> {
             hash_index: self.hash_index.clone(),
             bindings: self.bindings.clone(),
             scope_index: self.scope_index.clone(),
-            predicate_consumers: self.predicate_consumers.clone(),
-            binding_lookup: self.binding_lookup.clone(),
-            refcounts: self.refcounts.clone(),
+            bound: self.bound.clone(),
             consumer_bindings: self.consumer_bindings.clone(),
             term_members: Arc::clone(&self.term_members),
         }
@@ -495,9 +506,7 @@ impl<I: IdTypes, B: Backend> PredicateStore<I, B> {
             hash_index: HashTrieMapSync::new_sync(),
             bindings: HashTrieMapSync::new_sync(),
             scope_index: HashTrieMapSync::new_sync(),
-            predicate_consumers: HashTrieMapSync::new_sync(),
-            binding_lookup: HashTrieMapSync::new_sync(),
-            refcounts: HashTrieMapSync::new_sync(),
+            bound: HashTrieMapSync::new_sync(),
             consumer_bindings: HashTrieMapSync::new_sync(),
             term_members: Arc::new(HashMap::new()),
         }
@@ -568,37 +577,42 @@ impl<I: IdTypes, B: Backend> PredicateStore<I, B> {
     /// How many bindings hold `id`.
     #[must_use]
     pub fn refcount(&self, id: PredicateId) -> u32 {
-        self.refcounts.get(&id).copied().unwrap_or_default()
+        self.bound.get(&id).map_or(0, |held| held.refcount)
     }
 
-    /// Increment predicate refcount
-    ///
-    /// Returns true if predicate exists.
-    pub fn increment_refcount(&mut self, id: PredicateId) -> bool {
-        if self.get_predicate(id).is_none() {
-            return false;
-        }
-        self.refcounts.insert_mut(id, self.refcount(id) + 1);
-        true
+    /// The consumer ordinals holding `id`.
+    #[must_use]
+    pub fn consumers_of(&self, id: PredicateId) -> Option<&RoaringBitmap> {
+        self.bound.get(&id).map(|held| &held.consumers)
     }
 
-    /// Decrement predicate refcount, remove if reaches 0
-    ///
-    /// Returns true if predicate was removed.
-    pub fn decrement_refcount(&mut self, id: PredicateId) -> bool {
-        let should_remove = if self.get_predicate(id).is_some() {
-            let left = self.refcount(id).saturating_sub(1);
-            self.refcounts.insert_mut(id, left);
-            left == 0
-        } else {
-            false
-        };
+    /// The subscriptions through which `ordinal` holds `id`.
+    #[must_use]
+    pub fn subscriptions_of(
+        &self,
+        id: PredicateId,
+        ordinal: ConsumerOrdinal,
+    ) -> Option<&SubscriptionSet> {
+        self.bound
+            .get(&id)
+            .and_then(|held| held.by_ordinal.get(&ordinal))
+    }
 
-        if should_remove {
-            self.remove_predicate(id);
-            true
+    /// Every predicate that has a holder, with the ordinals holding it.
+    pub fn held_predicates(&self) -> impl Iterator<Item = (PredicateId, &RoaringBitmap)> {
+        self.bound
+            .iter()
+            .map(|(pred_id, held)| (*pred_id, &held.consumers))
+    }
+
+    /// Read, change and write one predicate's record in a single path copy.
+    fn with_bindings(&mut self, id: PredicateId, change: impl FnOnce(&mut PredicateBindings)) {
+        let mut held = self.bound.get(&id).cloned().unwrap_or_default();
+        change(&mut held);
+        if held.refcount == 0 && held.by_ordinal.is_empty() {
+            self.bound.remove_mut(&id);
         } else {
-            false
+            self.bound.insert_mut(id, held);
         }
     }
 
@@ -619,8 +633,7 @@ impl<I: IdTypes, B: Backend> PredicateStore<I, B> {
                     self.hash_index.insert_mut(hash, ids);
                 }
             }
-            self.predicate_consumers.remove_mut(&id);
-            self.refcounts.remove_mut(&id);
+            self.bound.remove_mut(&id);
             Arc::make_mut(&mut self.term_members).retain(|(pred, _), _| *pred != id);
         }
     }
@@ -643,21 +656,31 @@ impl<I: IdTypes, B: Backend> PredicateStore<I, B> {
     /// Remove subscription binding
     ///
     /// Returns the removed binding if it existed.
-    pub fn remove_binding(&mut self, sub_id: SubscriptionId) -> Option<SubscriptionBinding<I>> {
+    pub fn remove_binding(&mut self, sub_id: SubscriptionId) -> Option<BindingRemoved<I>> {
         let binding = self.bindings.get(&sub_id).copied()?;
         self.bindings.remove_mut(&sub_id);
 
         self.remove_binding_indexes(binding);
 
-        Some(binding)
+        // The binding was the reference, so the predicate goes with the last
+        // one. Nothing else takes or drops a reference, which is why the
+        // count cannot disagree with the bindings that produced it.
+        let predicate_removed = self.refcount(binding.predicate_id) == 0
+            && self.get_predicate(binding.predicate_id).is_some();
+        if predicate_removed {
+            self.remove_predicate(binding.predicate_id);
+        }
+
+        Some(BindingRemoved {
+            binding,
+            predicate_removed,
+        })
     }
 
     /// Get all subscription IDs for a session
     #[must_use]
-    pub fn get_session_subscriptions(&self, session_id: I::SessionId) -> Option<&[SubscriptionId]> {
-        self.scope_index
-            .get(&session_id)
-            .map(alloc::vec::Vec::as_slice)
+    pub fn get_session_subscriptions(&self, session_id: I::SessionId) -> Option<&SubscriptionSet> {
+        self.scope_index.get(&session_id)
     }
 
     /// Returns `true` if any active binding references the given consumer.
@@ -679,17 +702,9 @@ impl<I: IdTypes, B: Backend> PredicateStore<I, B> {
 
         if let SubscriptionScope::Session(sid) = binding.scope {
             let mut session = self.scope_index.get(&sid).cloned().unwrap_or_default();
-            session.push(sub_id);
+            session.insert_mut(sub_id);
             self.scope_index.insert_mut(sid, session);
         }
-
-        let mut consumers = self
-            .predicate_consumers
-            .get(&pred_id)
-            .cloned()
-            .unwrap_or_default();
-        consumers.insert(consumer_ord.get());
-        self.predicate_consumers.insert_mut(pred_id, consumers);
 
         let held = self
             .consumer_bindings
@@ -699,16 +714,23 @@ impl<I: IdTypes, B: Backend> PredicateStore<I, B> {
         self.consumer_bindings
             .insert_mut(binding.consumer_id, held + 1);
 
-        let pair = (pred_id, consumer_ord);
-        let mut bound = self.binding_lookup.get(&pair).cloned().unwrap_or_default();
-        if !bound.contains(&sub_id) {
-            bound.push(sub_id);
-        }
-        self.binding_lookup.insert_mut(pair, bound);
+        self.with_bindings(pred_id, |held| {
+            held.refcount += 1;
+            held.consumers.insert(consumer_ord.get());
+            let mut bound = held
+                .by_ordinal
+                .get(&consumer_ord)
+                .cloned()
+                .unwrap_or_default();
+            bound.insert_mut(sub_id);
+            held.by_ordinal.insert_mut(consumer_ord, bound);
+        });
     }
 
     fn remove_binding_indexes(&mut self, binding: SubscriptionBinding<I>) {
         let sub_id = binding.subscription_id;
+        let pred_id = binding.predicate_id;
+        let consumer_ord = binding.consumer_ordinal;
 
         let held = self
             .consumer_bindings
@@ -722,53 +744,49 @@ impl<I: IdTypes, B: Backend> PredicateStore<I, B> {
             self.consumer_bindings.insert_mut(binding.consumer_id, held);
         }
 
-        // `binding_lookup` is keyed by exactly this question, and the upsert
-        // path asks it while the replacement already sits under the same id.
-        let pair = (binding.predicate_id, binding.consumer_ordinal);
-        let has_other_same_consumer_binding = self
-            .binding_lookup
-            .get(&pair)
-            .is_some_and(|bound| bound.iter().any(|&id| id != sub_id))
-            || self.bindings.get(&sub_id).is_some_and(|replacement| {
-                replacement.predicate_id == binding.predicate_id
-                    && replacement.consumer_ordinal == binding.consumer_ordinal
+        // The record is keyed by exactly this question, and the upsert path
+        // asks it while the replacement already sits under the same id.
+        let replaced_in_place = self.bindings.get(&sub_id).is_some_and(|replacement| {
+            replacement.predicate_id == pred_id && replacement.consumer_ordinal == consumer_ord
+        });
+        let mut ordinal_left = false;
+        self.with_bindings(pred_id, |held| {
+            held.refcount = held.refcount.saturating_sub(1);
+            let remaining = held.by_ordinal.get(&consumer_ord).map(|bound| {
+                let mut bound = bound.clone();
+                bound.remove_mut(&sub_id);
+                bound
             });
-
-        if !has_other_same_consumer_binding {
-            if let Some(bitmap) = self.predicate_consumers.get(&binding.predicate_id) {
-                let mut bitmap = bitmap.clone();
-                bitmap.remove(binding.consumer_ordinal.get());
-                if bitmap.is_empty() {
-                    self.predicate_consumers.remove_mut(&binding.predicate_id);
-                } else {
-                    self.predicate_consumers
-                        .insert_mut(binding.predicate_id, bitmap);
+            match remaining {
+                Some(bound) if bound.is_empty() => {
+                    held.by_ordinal.remove_mut(&consumer_ord);
                 }
+                Some(bound) => {
+                    held.by_ordinal.insert_mut(consumer_ord, bound);
+                    ordinal_left = true;
+                }
+                None => {}
             }
-            // Under the same guard as the bitmap: the ordinal is what a term
+            if !ordinal_left && !replaced_in_place {
+                held.consumers.remove(consumer_ord.get());
+            }
+        });
+
+        if !ordinal_left && !replaced_in_place {
+            // Under the same guard as the ordinal: the ordinal is what a term
             // admits, so it stays while any binding still holds it, and a
             // stale ordinal would admit rows to a subscription that is gone.
             for ((pred, _), members) in Arc::make_mut(&mut self.term_members) {
-                if *pred == binding.predicate_id {
-                    Arc::make_mut(members).forget(binding.consumer_ordinal);
+                if *pred == pred_id {
+                    Arc::make_mut(members).forget(consumer_ord);
                 }
-            }
-        }
-
-        if let Some(bound) = self.binding_lookup.get(&pair) {
-            let mut bound = bound.clone();
-            bound.retain(|&id| id != sub_id);
-            if bound.is_empty() {
-                self.binding_lookup.remove_mut(&pair);
-            } else {
-                self.binding_lookup.insert_mut(pair, bound);
             }
         }
 
         if let SubscriptionScope::Session(session_id) = binding.scope {
             if let Some(session) = self.scope_index.get(&session_id) {
                 let mut session = session.clone();
-                session.retain(|&id| id != sub_id);
+                session.remove_mut(&sub_id);
                 if session.is_empty() {
                     self.scope_index.remove_mut(&session_id);
                 } else {
@@ -853,44 +871,36 @@ mod tests {
         assert!(store.get_predicate(id).is_some());
     }
 
+    /// A binding is the reference, so two of them hold the predicate and the
+    /// second removal is what takes it away.
     #[test]
-    fn test_refcount_increment() {
+    fn the_last_binding_takes_the_predicate_with_it() {
         let mut store = PredicateStore::<DefaultIds, Postgres>::new();
+        let id = store.add_predicate(make_predicate(0, 0x1234));
 
-        let pred = make_predicate(0, 0x1234);
-        let id = store.add_predicate(pred);
-        store.increment_refcount(id);
-
-        assert_eq!(store.refcount(id), 1);
-
-        store.increment_refcount(id);
+        for sub_id in [1u64, 2] {
+            store.add_binding(SubscriptionBinding {
+                subscription_id: sub_id,
+                predicate_id: id,
+                consumer_id: sub_id,
+                consumer_ordinal: ConsumerOrdinal::new(u32::try_from(sub_id).unwrap()),
+                scope: SubscriptionScope::Durable,
+                updated_at_unix_ms: 0,
+            });
+        }
         assert_eq!(store.refcount(id), 2);
-    }
 
-    #[test]
-    fn test_refcount_decrement() {
-        let mut store = PredicateStore::<DefaultIds, Postgres>::new();
-
-        let pred = make_predicate(0, 0x1234);
-        let id = store.add_predicate(pred);
-        store.increment_refcount(id);
-        store.increment_refcount(id);
-
-        let removed = store.decrement_refcount(id);
-        assert!(!removed);
+        let first = store.remove_binding(1).expect("bound above");
+        assert!(!first.predicate_removed, "one holder is left");
         assert_eq!(store.refcount(id), 1);
+        assert!(store.get_predicate(id).is_some());
 
-        let removed = store.decrement_refcount(id);
-        assert!(removed);
+        let second = store.remove_binding(2).expect("bound above");
+        assert!(second.predicate_removed, "and none after this one");
         assert!(store.get_predicate(id).is_none());
+        assert_eq!(store.refcount(id), 0);
     }
 
-    /// What the trie is for: cloning a term's members and then admitting one
-    /// more row leaves all but a handful of the other rows' sets where they
-    /// were, so the clone each membership event takes copies a pointer rather
-    /// than the table. The handful is the leaf the insertion rewrites, which
-    /// carries a few entries inline. A plain map put back here moves every
-    /// set and fails this.
     #[test]
     fn admitting_one_row_leaves_the_other_sets_where_they_were() {
         let subject = TermKey::<Postgres>::String("alice".into());
@@ -970,7 +980,7 @@ mod tests {
         store.add_binding(binding1);
         store.add_binding(binding2);
 
-        let bitmap = store.predicate_consumers.get(&pred_id).unwrap();
+        let bitmap = store.consumers_of(pred_id).unwrap();
         assert!(bitmap.contains(0));
         assert!(bitmap.contains(1));
         assert_eq!(bitmap.len(), 2);
@@ -1003,15 +1013,18 @@ mod tests {
         });
 
         assert!(!store
-            .predicate_consumers
-            .get(&pred1_id)
+            .consumers_of(pred1_id)
             .is_some_and(|bitmap| bitmap.contains(0)));
         assert!(store
-            .predicate_consumers
-            .get(&pred2_id)
+            .consumers_of(pred2_id)
             .is_some_and(|bitmap| bitmap.contains(1)));
         assert!(store.get_session_subscriptions(500).is_none());
-        assert_eq!(store.get_session_subscriptions(600), Some(&[100][..]));
+        assert_eq!(
+            store
+                .get_session_subscriptions(600)
+                .map(|held| held.iter().copied().collect::<Vec<_>>()),
+            Some(vec![100])
+        );
     }
 
     #[test]
@@ -1040,36 +1053,15 @@ mod tests {
 
         let _ = store.remove_binding(201);
         let bitmap = store
-            .predicate_consumers
-            .get(&pred_id)
+            .consumers_of(pred_id)
             .expect("bitmap should remain while one binding still exists");
         assert!(bitmap.contains(0));
 
         let _ = store.remove_binding(202);
         assert!(
-            !store.predicate_consumers.contains_key(&pred_id),
+            store.consumers_of(pred_id).is_none(),
             "bitmap should be removed after last binding is removed"
         );
-    }
-
-    #[test]
-    fn test_increment_refcount_nonexistent() {
-        let mut store = PredicateStore::<DefaultIds, Postgres>::new();
-
-        // Try to increment refcount of non-existent predicate
-        let fake_id = PredicateId::from_slab_index(999);
-        let result = store.increment_refcount(fake_id);
-        assert!(!result);
-    }
-
-    #[test]
-    fn test_decrement_refcount_nonexistent() {
-        let mut store = PredicateStore::<DefaultIds, Postgres>::new();
-
-        // Try to decrement refcount of non-existent predicate
-        let fake_id = PredicateId::from_slab_index(999);
-        let result = store.decrement_refcount(fake_id);
-        assert!(!result);
     }
 
     #[test]
@@ -1170,15 +1162,17 @@ mod tests {
         });
 
         assert_eq!(
-            store.binding_lookup.get(&(pred_id, ord)),
-            Some(&vec![555]),
-            "binding_lookup must surface the subscription id for the matched pair"
+            store
+                .subscriptions_of(pred_id, ord)
+                .map(|bound| bound.iter().copied().collect::<Vec<_>>()),
+            Some(vec![555]),
+            "the record must surface the subscription id for the matched pair"
         );
 
         let _ = store.remove_binding(555);
         assert!(
-            !store.binding_lookup.contains_key(&(pred_id, ord)),
-            "binding_lookup must be pruned when no bindings remain"
+            store.subscriptions_of(pred_id, ord).is_none(),
+            "the ordinal must be pruned when no bindings remain"
         );
     }
 
@@ -1208,19 +1202,19 @@ mod tests {
             updated_at_unix_ms: 0,
         });
 
-        let mut subs = store
-            .binding_lookup
-            .get(&(pred_id, ord))
-            .cloned()
+        let subs: Vec<_> = store
+            .subscriptions_of(pred_id, ord)
+            .map(|bound| bound.iter().copied().collect())
             .unwrap_or_default();
-        subs.sort_unstable();
         assert_eq!(subs, vec![1, 2]);
 
         let _ = store.remove_binding(1);
         assert_eq!(
-            store.binding_lookup.get(&(pred_id, ord)),
-            Some(&vec![2]),
-            "removing one of two bindings leaves the other in the lookup"
+            store
+                .subscriptions_of(pred_id, ord)
+                .map(|bound| bound.iter().copied().collect::<Vec<_>>()),
+            Some(vec![2]),
+            "removing one of two bindings leaves the other on the record"
         );
     }
 

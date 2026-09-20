@@ -532,13 +532,13 @@ where
 {
     let snapshot = partition.load_snapshot();
     let mut ordinals = RoaringBitmap::new();
-    for (pred_id, consumers) in snapshot.predicates.predicate_consumers.iter() {
-        let Some(pred) = snapshot.predicates.get_predicate(*pred_id) else {
+    for (pred_id, consumers) in snapshot.predicates.held_predicates() {
+        let Some(pred) = snapshot.predicates.get_predicate(pred_id) else {
             continue;
         };
         if matches!(pred.projection, QueryProjection::Rows) {
             ordinals |= consumers;
-            collect_stamps_for_predicate(&snapshot.predicates, *pred_id, consumers, stamps);
+            collect_stamps_for_predicate(&snapshot.predicates, pred_id, consumers, stamps);
         }
     }
     let deleted = resolve_ordinals(ordinals, consumer_dict);
@@ -717,7 +717,7 @@ fn collect_bound_subscriptions<I: IdTypes, B: Backend, T: Copy>(
 ) {
     for ord_u32 in consumers {
         let ord = ConsumerOrdinal::new(ord_u32);
-        if let Some(sub_ids) = predicates.binding_lookup.get(&(pred_id, ord)) {
+        if let Some(sub_ids) = predicates.subscriptions_of(pred_id, ord) {
             out.extend(sub_ids.iter().map(|sub_id| (ord, *sub_id, payload)));
         }
     }
@@ -731,8 +731,8 @@ fn collect_stamps_for_predicate<I: IdTypes, B: Backend>(
 ) {
     for ord_u32 in consumers {
         let ord = ConsumerOrdinal::new(ord_u32);
-        if let Some(sub_ids) = predicates.binding_lookup.get(&(pred_id, ord)) {
-            out.extend_from_slice(sub_ids);
+        if let Some(sub_ids) = predicates.subscriptions_of(pred_id, ord) {
+            out.extend(sub_ids.iter().copied());
         }
     }
 }
@@ -782,7 +782,7 @@ where
             continue;
         }
 
-        let Some(bitmap) = snapshot.predicates.predicate_consumers.get(&pred_id) else {
+        let Some(bitmap) = snapshot.predicates.consumers_of(pred_id) else {
             continue;
         };
 
@@ -928,7 +928,7 @@ where
             continue;
         };
 
-        let Some(bitmap) = store.predicate_consumers.get(&pred_id) else {
+        let Some(bitmap) = store.consumers_of(pred_id) else {
             continue;
         };
 
@@ -1115,7 +1115,7 @@ fn accumulate_aggregate_deltas<I, B>(
 {
     for ordinal in consumers {
         let ordinal = ConsumerOrdinal::new(ordinal);
-        let Some(subscriptions) = state.store.binding_lookup.get(&(predicate, ordinal)) else {
+        let Some(subscriptions) = state.store.subscriptions_of(predicate, ordinal) else {
             continue;
         };
         for &subscription in subscriptions {
@@ -1172,12 +1172,12 @@ where
         {
             continue;
         }
-        let Some(consumers) = store.predicate_consumers.get(&pred_id) else {
+        let Some(consumers) = store.consumers_of(pred_id) else {
             continue;
         };
         for ord_u32 in consumers {
             let ord = ConsumerOrdinal::new(ord_u32);
-            if let Some(subscriptions) = store.binding_lookup.get(&(pred_id, ord)) {
+            if let Some(subscriptions) = store.subscriptions_of(pred_id, ord) {
                 missing.extend(subscriptions.iter().copied());
             }
         }
@@ -1196,7 +1196,7 @@ fn extend_bound_subscriptions<I, B>(
 {
     for ordinal in consumers {
         let ordinal = ConsumerOrdinal::new(ordinal);
-        if let Some(bound) = store.binding_lookup.get(&(predicate, ordinal)) {
+        if let Some(bound) = store.subscriptions_of(predicate, ordinal) {
             subscriptions.extend(bound.iter().copied());
         }
     }
