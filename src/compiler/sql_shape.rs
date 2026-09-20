@@ -1,13 +1,14 @@
 use crate::{catalog_helpers, RegisterError};
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
+use core::ops::ControlFlow;
 use sql_traits::{
     prelude::DatabaseLike, structs::TargetName, utils::identifier_resolution::identifiers_match,
 };
 use sqlparser::ast::{
     BinaryOperator, Distinct, DuplicateTreatment, Expr, Function, FunctionArg, FunctionArgExpr,
     FunctionArgumentList, FunctionArguments, GroupByExpr, Ident, LimitClause, ObjectName, Query,
-    Select, SelectItem, SelectModifiers, SetExpr, Statement, TableFactor,
+    Select, SelectItem, SelectModifiers, SetExpr, Statement, TableFactor, Visit, Visitor,
 };
 
 const WINDOW_FUNCTIONS_NOT_SUPPORTED: &str = "Window functions not supported";
@@ -1232,10 +1233,12 @@ pub(crate) fn parse_single_statement(
     }
 
     // SAFETY: we just checked len == 1
-    Ok(statements
+    let statement = statements
         .into_iter()
         .next()
-        .expect("len == 1 checked above"))
+        .expect("len == 1 checked above");
+    refuse_deep_nesting(&statement)?;
+    Ok(statement)
 }
 
 /// Render the runnable component-seed bundle for an in-process aggregate.
@@ -1537,6 +1540,53 @@ fn select_projection_mut(stmt: &mut Statement) -> Option<&mut Vec<SelectItem>> {
     select_mut(stmt).map(|select| &mut select.projection)
 }
 
+/// Refuse a statement whose expressions nest deeper than
+/// [`MAX_EXPR_DEPTH`], before anything else touches the tree.
+///
+/// Every walk the compiler runs carries a depth ceiling, but the tree is
+/// cloned and dropped before those walks reach it, and a clone recurses once
+/// per level over every variant. A chain of four hundred additions is flat
+/// text that the tokenizer and the precedence loop both handle iteratively,
+/// so nothing before this refused it, and the clone took the stack down with
+/// it in an unoptimised build. The walk here is the derived visitor, so it
+/// sees every variant rather than the ones the predicate compiler knows, and
+/// it stops at the ceiling, which is what keeps the check itself off the same
+/// cliff.
+///
+/// Nesting a visitor cannot see is bounded before the parse instead:
+/// [`check_sql_sanity`] counts parentheses, brackets and array suffixes,
+/// the last because a type nests once per suffix and the visitor has no
+/// hook to count that.
+fn refuse_deep_nesting(stmt: &Statement) -> Result<(), crate::RegisterError> {
+    struct Depth {
+        current: usize,
+    }
+
+    impl Visitor for Depth {
+        type Break = ();
+
+        fn pre_visit_expr(&mut self, _expr: &Expr) -> ControlFlow<()> {
+            self.current += 1;
+            if self.current > MAX_EXPR_DEPTH {
+                return ControlFlow::Break(());
+            }
+            ControlFlow::Continue(())
+        }
+
+        fn post_visit_expr(&mut self, _expr: &Expr) -> ControlFlow<()> {
+            self.current -= 1;
+            ControlFlow::Continue(())
+        }
+    }
+
+    match stmt.visit(&mut Depth { current: 0 }) {
+        ControlFlow::Break(()) => Err(crate::RegisterError::UnsupportedSql(
+            "Expression nesting too deep".to_string(),
+        )),
+        ControlFlow::Continue(()) => Ok(()),
+    }
+}
+
 /// Maximum expression nesting depth to prevent stack overflow from fuzzer-crafted SQL.
 pub(super) const MAX_EXPR_DEPTH: usize = 128;
 
@@ -1553,6 +1603,7 @@ pub(super) const MAX_SQL_LEN: usize = 8192;
 fn check_sql_sanity(sql: &str) -> Result<(), crate::RegisterError> {
     let mut paren_depth: usize = 0;
     let mut bracket_depth: usize = 0;
+    let mut bracket_pairs: usize = 0;
     let mut consecutive_ops: usize = 0;
 
     for c in sql.bytes() {
@@ -1571,6 +1622,10 @@ fn check_sql_sanity(sql: &str) -> Result<(), crate::RegisterError> {
             // into hundreds of ms of array-subscript backtracking.
             b'[' => {
                 bracket_depth += 1;
+                // A type nests once per array suffix, and `INT[][][]` keeps
+                // the depth counted above at one while doing it, so the
+                // count of suffixes is what bounds how deep a type goes.
+                bracket_pairs += 1;
                 consecutive_ops = 0;
             }
             b']' => {
@@ -1595,6 +1650,7 @@ fn check_sql_sanity(sql: &str) -> Result<(), crate::RegisterError> {
 
         if paren_depth > MAX_EXPR_DEPTH
             || bracket_depth > MAX_EXPR_DEPTH
+            || bracket_pairs > MAX_EXPR_DEPTH
             || consecutive_ops > MAX_EXPR_DEPTH
         {
             return Err(crate::RegisterError::UnsupportedSql(
@@ -2840,6 +2896,61 @@ mod written_column_tests {
             );
         }
     }
+    /// A chain of additions is flat text, so nothing before the new gate
+    /// refused it, and the tree it parses to is as deep as the chain is long.
+    #[test]
+    fn a_chain_past_the_ceiling_is_refused_at_the_gate() {
+        let chain = alloc::vec!["amount"; super::MAX_EXPR_DEPTH + 8].join(" + ");
+        let refusal = super::parse_single_statement(
+            &alloc::format!("SELECT * FROM t WHERE {chain} > 1"),
+            &PostgreSqlDialect {},
+        )
+        .expect_err("past the ceiling");
+        assert!(
+            alloc::string::ToString::to_string(&refusal).contains("deep"),
+            "the refusal names the nesting, got {refusal:?}"
+        );
+    }
+
+    /// And a statement under the ceiling still parses, so the gate refuses
+    /// depth rather than length.
+    #[test]
+    fn a_chain_under_the_ceiling_still_parses() {
+        let chain = alloc::vec!["amount"; super::MAX_EXPR_DEPTH - 8].join(" + ");
+        assert!(super::parse_single_statement(
+            &alloc::format!("SELECT * FROM t WHERE {chain} > 1"),
+            &PostgreSqlDialect {},
+        )
+        .is_ok());
+    }
+
+    /// A type nests once per array suffix and no expression nests with it,
+    /// so the expression gate never sees this one and the clause is cloned
+    /// as deep as the suffixes are many.
+    #[test]
+    fn a_tower_of_array_suffixes_is_refused() {
+        let suffix = "[]".repeat(super::MAX_EXPR_DEPTH + 8);
+        let refusal = super::parse_single_statement(
+            &alloc::format!("SELECT * FROM t WHERE CAST(x AS INT{suffix}) = 1"),
+            &PostgreSqlDialect {},
+        )
+        .expect_err("past the ceiling");
+        assert!(
+            alloc::string::ToString::to_string(&refusal).contains("deep"),
+            "the refusal names the nesting, got {refusal:?}"
+        );
+    }
+
+    /// And an ordinary subscript still parses.
+    #[test]
+    fn an_array_subscript_still_parses() {
+        assert!(super::parse_single_statement(
+            "SELECT * FROM t WHERE tags[1] = 'x'",
+            &PostgreSqlDialect {},
+        )
+        .is_ok());
+    }
+
     /// A statement of `sql`, for the shape readers that take one.
     fn statement_of(sql: &str) -> sqlparser::ast::Statement {
         let statements = sqlparser::parser::Parser::parse_sql(&PostgreSqlDialect {}, sql).unwrap();
