@@ -2465,12 +2465,7 @@ where
         let event = crate::backend::ResolvedEvent::new(event, &self.database);
         let engine = match self.consumers_resolved(&event) {
             Ok(notifications) => notifications,
-            // Unreachable as the engine stands, and kept because it is
-            // the answer if it ever is reached. A table any answer reads
-            // is in the catalog, and a catalogued table answers empty
-            // before this arm, so the refusal that lands here means a
-            // partition without its consumer dictionary, which nothing
-            // constructs.
+            // Unreachable as the engine stands, per `routes_reread`.
             Err(DispatchError::UnknownTableId(_)) if self.routes_reread(event.table_id()) => {
                 crate::ConsumerNotifications::empty().with_checkpoint(event.checkpoint())
             }
@@ -2508,6 +2503,14 @@ where
     }
 
     /// Whether a change to `table_id` moves any re-read answer.
+    ///
+    /// The two dispatch paths ask this to let an unknown table through
+    /// rather than refuse it, and that arm is unreachable as the engine
+    /// stands: a table any answer reads is in the catalog, and a
+    /// catalogued table answers empty before the refusal is built. A
+    /// refusal reaching those arms means a partition without its
+    /// consumer dictionary, which nothing constructs. They stay because
+    /// they are the right answer if that ever changes.
     pub(crate) fn routes_reread(&self, table_id: TableId) -> bool {
         self.table_deps.contains_key(&table_id)
     }
@@ -4469,12 +4472,7 @@ where
         let event = crate::backend::ResolvedEvent::new(event, &self.database);
         let notifications = match self.consumers_resolved(&event) {
             Ok(notifications) => notifications,
-            // Unreachable as the engine stands, and kept because it is
-            // the answer if it ever is reached. A table any answer reads
-            // is in the catalog, and a catalogued table answers empty
-            // before this arm, so the refusal that lands here means a
-            // partition without its consumer dictionary, which nothing
-            // constructs.
+            // Unreachable as the engine stands, per `routes_reread`.
             Err(DispatchError::UnknownTableId(_)) if self.routes_reread(event.table_id()) => {
                 crate::ConsumerNotifications::empty().with_checkpoint(event.checkpoint())
             }
