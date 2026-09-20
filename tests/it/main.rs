@@ -225,6 +225,7 @@ mod proptest_throttle;
 mod dispatch_contract;
 mod engine_removal_bookkeeping;
 mod engine_trait_surface;
+mod engine_unknown_tables;
 mod in_process_persistence;
 mod merge_jobs;
 mod reads_persist;

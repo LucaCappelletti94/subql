@@ -447,3 +447,91 @@ fn burst_of_displacements_costs_one_read() {
     assert_eq!(resolved.scalar_updates.len(), 1);
     assert_eq!(resolved.scalar_updates[0].value, Value::Float(9.0));
 }
+
+/// A row moving between groups reads for the one it left, only.
+///
+/// The group it left lost its minimum and cannot know the next one
+/// without asking. The group it joined gained a value below its own
+/// minimum, which is the answer already, so asking would cost a read to
+/// learn what the fold just computed.
+#[test]
+fn a_row_moving_groups_reads_for_the_group_it_left() {
+    let (mut engine, table) = engine_with_values(Vec::new());
+    let subscription = engine
+        .register(
+            SubscriptionRequest::new(
+                1u64,
+                "SELECT status, MIN(price) FROM orders GROUP BY status",
+            ),
+            (),
+        )
+        .expect("grouped minimum registers")
+        .subscription_id;
+    crate::Install::install(
+        &mut engine.inner,
+        subscription,
+        crate::GroupedScalarSeedInstall {
+            rows: vec![
+                vec![
+                    Value::String("paid".into()),
+                    Value::Float(5.0),
+                    Value::Int(2),
+                ],
+                vec![
+                    Value::String("void".into()),
+                    Value::Float(7.0),
+                    Value::Int(2),
+                ],
+            ],
+            read_at: None::<crate::NoCheckpoint>,
+        },
+    )
+    .expect("group map installs");
+
+    // The row holding the minimum of `paid` becomes a `void` row, so the
+    // group it left and the group it joined are both displaced.
+    let moved = TestEvent::<Postgres>::update(
+        table,
+        vec![
+            Value::Int(1),
+            Value::Float(5.0),
+            Value::Int(1),
+            Value::String("paid".into()),
+        ],
+        vec![
+            Value::Int(1),
+            Value::Float(5.0),
+            Value::Int(1),
+            Value::String("void".into()),
+        ],
+    )
+    .with_pk_columns([0u16])
+    .with_changed_columns([3u16]);
+
+    engine
+        .apply_leaving_reads_queued(&moved)
+        .expect("the move dispatches");
+
+    assert_eq!(
+        engine.pending_read_count(),
+        1,
+        "one read, and it has to be for the right group"
+    );
+
+    // Which group, not merely how many: resolving asks the connector,
+    // and the mock records the query before refusing to answer it.
+    let _ = engine.resolve_collect();
+    let asked = engine.connector().page_queries.borrow();
+    let binds: Vec<_> = asked
+        .iter()
+        .flat_map(|query| query.binds().iter().cloned())
+        .collect();
+    assert!(
+        binds.contains(&Value::String("paid".into())),
+        "the read names the group the row left, got {binds:?}"
+    );
+    assert!(
+        !binds.contains(&Value::String("void".into())),
+        "and not the group it joined, whose minimum the fold already knows"
+    );
+}
