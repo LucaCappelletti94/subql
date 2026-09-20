@@ -83,15 +83,6 @@ enum EvictionStrategy<I: IdTypes> {
     Custom(CustomEvictor<I>),
 }
 
-impl<I: IdTypes> Clone for EvictionStrategy<I> {
-    fn clone(&self) -> Self {
-        match self {
-            Self::BuiltIn(p) => Self::BuiltIn(*p),
-            Self::Custom(f) => Self::Custom(Arc::clone(f)),
-        }
-    }
-}
-
 impl<I: IdTypes> Default for EvictionStrategy<I> {
     fn default() -> Self {
         Self::BuiltIn(crate::EvictionPolicy::Reject)
@@ -2474,6 +2465,12 @@ where
         let event = crate::backend::ResolvedEvent::new(event, &self.database);
         let engine = match self.consumers_resolved(&event) {
             Ok(notifications) => notifications,
+            // Unreachable as the engine stands, and kept because it is
+            // the answer if it ever is reached. A table any answer reads
+            // is in the catalog, and a catalogued table answers empty
+            // before this arm, so the refusal that lands here means a
+            // partition without its consumer dictionary, which nothing
+            // constructs.
             Err(DispatchError::UnknownTableId(_)) if self.routes_reread(event.table_id()) => {
                 crate::ConsumerNotifications::empty().with_checkpoint(event.checkpoint())
             }
@@ -4472,6 +4469,12 @@ where
         let event = crate::backend::ResolvedEvent::new(event, &self.database);
         let notifications = match self.consumers_resolved(&event) {
             Ok(notifications) => notifications,
+            // Unreachable as the engine stands, and kept because it is
+            // the answer if it ever is reached. A table any answer reads
+            // is in the catalog, and a catalogued table answers empty
+            // before this arm, so the refusal that lands here means a
+            // partition without its consumer dictionary, which nothing
+            // constructs.
             Err(DispatchError::UnknownTableId(_)) if self.routes_reread(event.table_id()) => {
                 crate::ConsumerNotifications::empty().with_checkpoint(event.checkpoint())
             }
