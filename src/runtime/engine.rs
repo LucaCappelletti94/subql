@@ -5580,6 +5580,40 @@ mod tests {
 
     type Engine = SubscriptionEngine<TestEvent<Postgres>, DefaultIds, ParserDB>;
 
+    /// A consumer that holds nothing on a table loses its name there.
+    ///
+    /// The dictionary hands out a dense ordinal per consumer per table,
+    /// so a name kept after its last answer ended is a slot that never
+    /// comes back, and a workload that churns consumers grows it without
+    /// bound. Nothing outside the engine can see the entry, which is why
+    /// this reads it directly rather than through a dispatch.
+    #[test]
+    fn a_consumer_that_holds_nothing_loses_its_name() {
+        let database = ParserDB::parse::<PostgreSqlDialect>(DDL).expect("the DDL parses");
+        let table =
+            crate::catalog_helpers::table_id::<crate::backend::Postgres, _>(&database, "orders")
+                .expect("orders resolves");
+        let mut engine: Engine = SubscriptionEngine::new(database, PostgreSqlDialect {});
+        let only = engine
+            .register(SubscriptionRequest::new(
+                1u64,
+                "SELECT * FROM orders WHERE status = 'paid'",
+            ))
+            .expect("the filter registers")
+            .subscription_id;
+        assert!(
+            engine.consumer_dictionaries[&table].get(1u64).is_some(),
+            "the consumer is named while it holds an answer"
+        );
+
+        assert!(engine.unregister_subscription(only), "its only answer ends");
+
+        assert!(
+            engine.consumer_dictionaries[&table].get(1u64).is_none(),
+            "and the name goes with it"
+        );
+    }
+
     /// The core delivers no read answers, holding no connector, which the
     /// auto-resolving wrapper relies on by omitting both channels.
     #[test]

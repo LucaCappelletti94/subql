@@ -223,6 +223,7 @@ mod proptest_throttle;
 
 #[cfg(feature = "std")]
 mod dispatch_contract;
+mod engine_removal_bookkeeping;
 mod engine_trait_surface;
 mod in_process_persistence;
 mod merge_jobs;
