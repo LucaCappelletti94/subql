@@ -64,7 +64,7 @@ fn the_registration_trait_ends_a_subscription() {
 /// Snapshotting through the trait writes the files.
 #[test]
 fn the_store_trait_writes_a_shard() {
-    let (_dir, path, mut engine) = stored_engine_with_one_answer();
+    let (_dir, path, engine) = stored_engine_with_one_answer();
 
     DurableShardStore::snapshot_table(&engine, orders()).expect("the trait writes");
 
