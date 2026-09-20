@@ -515,6 +515,23 @@ fn a_row_moving_groups_reads_for_the_group_it_left() {
     assert_eq!(
         engine.pending_read_count(),
         1,
-        "one read, for the group whose minimum walked out of it"
+        "one read, and it has to be for the right group"
+    );
+
+    // Which group, not merely how many: resolving asks the connector,
+    // and the mock records the query before refusing to answer it.
+    let _ = engine.resolve_collect();
+    let asked = engine.connector().page_queries.borrow();
+    let binds: Vec<_> = asked
+        .iter()
+        .flat_map(|query| query.binds().iter().cloned())
+        .collect();
+    assert!(
+        binds.contains(&Value::String("paid".into())),
+        "the read names the group the row left, got {binds:?}"
+    );
+    assert!(
+        !binds.contains(&Value::String("void".into())),
+        "and not the group it joined, whose minimum the fold already knows"
     );
 }
