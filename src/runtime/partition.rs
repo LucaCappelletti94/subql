@@ -979,7 +979,7 @@ mod tests {
                 .flat_map(|(column, entries)| {
                     entries
                         .iter()
-                        .map(|(key, upper)| (*column, key.predicate_id.as_u32(), key.lower, *upper))
+                        .map(|(key, upper)| (*column, key.predicate_id.as_u32(), key.lower, upper))
                 })
                 .collect();
             flattened.sort_unstable();
