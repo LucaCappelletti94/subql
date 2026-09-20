@@ -94,14 +94,10 @@ fn the_merge_trait_runs_a_merge() {
     engine.snapshot_table(orders()).expect("write the shard");
     let shard = path.join(format!("table_{}.shard", orders()));
 
-    assert_eq!(engine.active_merge_jobs(), 0, "nothing is merging yet");
+    let before = engine.active_merge_jobs();
     let job = DurableShardMerge::merge_shards_background(&mut engine, orders(), &[shard])
         .expect("the trait starts a merge");
-    assert_eq!(
-        engine.active_merge_jobs(),
-        1,
-        "the merge is outstanding until it is swapped in"
-    );
+    let outstanding = engine.active_merge_jobs();
 
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     let mut report = None;
@@ -114,9 +110,9 @@ fn the_merge_trait_runs_a_merge() {
     }
     let report = report.expect("the trait completes the merge rather than polling forever");
     assert_eq!(
-        engine.active_merge_jobs(),
-        0,
-        "and nothing is outstanding once it is"
+        (before, outstanding, engine.active_merge_jobs()),
+        (0, 1, 0),
+        "none before, one while it runs, none once it is swapped in"
     );
     assert_eq!(report.input_shards, 1, "the shard it was given");
     assert_eq!(report.output_predicates, 1, "carrying the one predicate");
