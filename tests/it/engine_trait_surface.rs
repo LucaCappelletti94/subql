@@ -81,9 +81,10 @@ fn the_merge_trait_runs_a_merge() {
         .expect("open store")
         .into_parts()
         .0;
-    engine
+    let answer = engine
         .register(SubscriptionRequest::new(1u64, FILTER))
-        .expect("registers");
+        .expect("registers")
+        .subscription_id;
     engine.snapshot_table(orders()).expect("write the shard");
     let shard = path.join(format!("table_{}.shard", orders()));
 
@@ -99,9 +100,41 @@ fn the_merge_trait_runs_a_merge() {
         }
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
+    let report = report.expect("the trait completes the merge rather than polling forever");
+    assert_eq!(report.input_shards, 1, "the shard it was given");
+    assert_eq!(report.output_predicates, 1, "carrying the one predicate");
+    assert_eq!(report.output_bindings, 1, "and the one binding");
+
+    // The swap put a rebuilt partition in place of the live one, so the
+    // answer still has to be there and still has to match. A completion
+    // that reported success without rebuilding leaves this passing only
+    // by accident, which is why the report above is checked as well.
+    assert_eq!(
+        engine.subscription_count(),
+        1,
+        "the answer survived the swap"
+    );
+    let notified = engine
+        .consumers(
+            &TestEvent::insert(
+                orders(),
+                vec![
+                    subql::backend::Value::Int(1),
+                    subql::backend::Value::Float(5.0),
+                    subql::backend::Value::String("paid".into()),
+                ],
+            )
+            .with_pk_columns([0u16]),
+        )
+        .expect("the event dispatches");
+    assert_eq!(
+        notified.inserted(),
+        &[1],
+        "and the rebuilt partition still routes to it"
+    );
     assert!(
-        report.is_some(),
-        "the trait swaps the merge in rather than reporting nothing forever"
+        engine.unregister_subscription(answer),
+        "the rebuilt state knows the answer by its own id"
     );
 }
 
