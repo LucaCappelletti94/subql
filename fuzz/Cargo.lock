@@ -1284,7 +1284,7 @@ dependencies = [
 [[package]]
 name = "sqlparser-canonicalize"
 version = "0.1.0"
-source = "git+https://github.com/LucaCappelletti94/sqlparser-canonicalize?branch=main#50cc6a4a7223b2cb86096529466bdcce779f75b4"
+source = "git+https://github.com/LucaCappelletti94/sqlparser-canonicalize?branch=main#bec4fd1fc464c5ada922c341cd63754420b9f2b0"
 dependencies = [
  "seahash",
  "sqlparser",
