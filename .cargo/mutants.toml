@@ -1,2 +1,10 @@
 profile = "mutants"
 gitignore = true
+
+# Unreachable without an internal invariant violation: a refusal reaches
+# these arms only when a partition has no consumer dictionary, which no
+# path constructs. The arms stay as the answer if that ever changes.
+exclude_re = [
+    "replace match guard self.routes_reread",
+    "routes_reread -> bool",
+]

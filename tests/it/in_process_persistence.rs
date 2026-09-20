@@ -10,6 +10,8 @@ use subql::{catalog_helpers, DefaultIds, SubscriptionEngine, SubscriptionRequest
 const DDL: &str = "CREATE TABLE orders (id INT PRIMARY KEY, price FLOAT, status TEXT);\
                    CREATE TABLE invoices (id INT PRIMARY KEY, state TEXT);";
 
+use crate::common::store::{StoredEngine, TempStore};
+
 type Engine = SubscriptionEngine<TestEvent<Postgres>, DefaultIds, ParserDB>;
 
 fn catalog() -> ParserDB {
@@ -28,13 +30,8 @@ fn table(name: &str) -> subql::TableId {
 /// statement except the one that caused it.
 #[test]
 fn a_registration_that_forces_a_snapshot_saves_its_own_statement() {
-    let dir = tempfile::tempdir().expect("temp dir");
-    let path = dir.path().to_path_buf();
-
-    let mut engine = Engine::with_storage(catalog(), PostgreSqlDialect {}, path.clone())
-        .expect("open store")
-        .into_parts()
-        .0;
+    let store = TempStore::new();
+    let mut engine = store.open(catalog());
     engine.set_durability_mode(subql::DurabilityMode::Required);
     // Rotation is what makes a registration snapshot, and this makes the
     // first one rotate.
@@ -48,7 +45,8 @@ fn a_registration_that_forces_a_snapshot_saves_its_own_statement() {
     // No snapshot by hand: the durability mode is what writes.
     drop(engine);
 
-    let restored = Engine::with_storage(catalog(), PostgreSqlDialect {}, path).expect("reopen");
+    let restored =
+        StoredEngine::with_storage(catalog(), PostgreSqlDialect {}, store.path()).expect("reopen");
     assert_eq!(
         restored.reads().in_process.len(),
         1,
@@ -64,13 +62,8 @@ fn a_registration_that_forces_a_snapshot_saves_its_own_statement() {
 /// answer came back when nothing answers.
 #[test]
 fn a_statement_without_its_predicate_is_not_reported() {
-    let dir = tempfile::tempdir().expect("temp dir");
-    let path = dir.path().to_path_buf();
-
-    let mut engine = Engine::with_storage(catalog(), PostgreSqlDialect {}, path.clone())
-        .expect("open store")
-        .into_parts()
-        .0;
+    let store = TempStore::new();
+    let mut engine = store.open(catalog());
     let on_orders = engine
         .register(SubscriptionRequest::new(
             1u64,
@@ -89,7 +82,8 @@ fn a_statement_without_its_predicate_is_not_reported() {
     engine.snapshot_table(table("orders")).expect("snapshot");
     drop(engine);
 
-    let restored = Engine::with_storage(catalog(), PostgreSqlDialect {}, path).expect("reopen");
+    let restored =
+        StoredEngine::with_storage(catalog(), PostgreSqlDialect {}, store.path()).expect("reopen");
     let reported: Vec<u64> = restored
         .reads()
         .in_process
@@ -110,13 +104,8 @@ fn a_statement_without_its_predicate_is_not_reported() {
 /// already been told were gone.
 #[test]
 fn an_ended_read_does_not_come_back() {
-    let dir = tempfile::tempdir().expect("temp dir");
-    let path = dir.path().to_path_buf();
-
-    let mut engine = Engine::with_storage(catalog(), PostgreSqlDialect {}, path.clone())
-        .expect("open store")
-        .into_parts()
-        .0;
+    let store = TempStore::new();
+    let mut engine = store.open(catalog());
     let answer = engine
         .register(SubscriptionRequest::new(
             1u64,
@@ -128,7 +117,8 @@ fn an_ended_read_does_not_come_back() {
     assert!(engine.unregister_reread(answer), "the caller ends it");
     drop(engine);
 
-    let restored = Engine::with_storage(catalog(), PostgreSqlDialect {}, path).expect("reopen");
+    let restored =
+        StoredEngine::with_storage(catalog(), PostgreSqlDialect {}, store.path()).expect("reopen");
     assert!(
         restored.reads().restored.is_empty(),
         "an ended answer stays ended, got {:?}",
@@ -139,13 +129,8 @@ fn an_ended_read_does_not_come_back() {
 /// Ending a maintained answer drops its statement too.
 #[test]
 fn an_ended_in_process_answer_leaves_no_statement() {
-    let dir = tempfile::tempdir().expect("temp dir");
-    let path = dir.path().to_path_buf();
-
-    let mut engine = Engine::with_storage(catalog(), PostgreSqlDialect {}, path.clone())
-        .expect("open store")
-        .into_parts()
-        .0;
+    let store = TempStore::new();
+    let mut engine = store.open(catalog());
     let answer = engine
         .register(SubscriptionRequest::new(
             1u64,
@@ -157,9 +142,7 @@ fn an_ended_in_process_answer_leaves_no_statement() {
     assert!(engine.unregister_subscription(answer), "the caller ends it");
     drop(engine);
 
-    let (mut restored, reads) = Engine::with_storage(catalog(), PostgreSqlDialect {}, path)
-        .expect("reopen")
-        .into_parts();
+    let (mut restored, reads) = store.open_reporting(catalog());
     assert!(
         reads.in_process.is_empty(),
         "an ended answer keeps no statement"
@@ -197,13 +180,8 @@ fn an_ended_in_process_answer_leaves_no_statement() {
 #[test]
 fn an_answer_ended_by_statement_does_not_come_back() {
     const FILTER: &str = "SELECT * FROM orders WHERE status = 'paid'";
-    let dir = tempfile::tempdir().expect("temp dir");
-    let path = dir.path().to_path_buf();
-
-    let mut engine = Engine::with_storage(catalog(), PostgreSqlDialect {}, path.clone())
-        .expect("open store")
-        .into_parts()
-        .0;
+    let store = TempStore::new();
+    let mut engine = store.open(catalog());
     engine
         .register(SubscriptionRequest::new(1u64, FILTER))
         .expect("the filter registers");
@@ -214,9 +192,7 @@ fn an_answer_ended_by_statement_does_not_come_back() {
     assert_eq!(report.removed_bindings, 1, "the answer is ended");
     drop(engine);
 
-    let (mut restored, _reads) = Engine::with_storage(catalog(), PostgreSqlDialect {}, path)
-        .expect("reopen")
-        .into_parts();
+    let (mut restored, _reads) = store.open_reporting(catalog());
     assert_eq!(
         restored.subscription_count(),
         0,
@@ -247,13 +223,8 @@ fn an_answer_ended_by_statement_does_not_come_back() {
 /// with it.
 #[test]
 fn ending_a_session_stops_its_answers_coming_back() {
-    let dir = tempfile::tempdir().expect("temp dir");
-    let path = dir.path().to_path_buf();
-
-    let mut engine = Engine::with_storage(catalog(), PostgreSqlDialect {}, path.clone())
-        .expect("open store")
-        .into_parts()
-        .0;
+    let store = TempStore::new();
+    let mut engine = store.open(catalog());
     engine
         .register(
             SubscriptionRequest::new(1u64, "SELECT * FROM orders WHERE status = 'paid'")
@@ -275,9 +246,7 @@ fn ending_a_session_stops_its_answers_coming_back() {
     assert_eq!(report.removed_reads, 1, "and one answer a read served");
     drop(engine);
 
-    let (mut restored, reads) = Engine::with_storage(catalog(), PostgreSqlDialect {}, path)
-        .expect("reopen")
-        .into_parts();
+    let (mut restored, reads) = store.open_reporting(catalog());
     assert_eq!(
         restored.subscription_count(),
         0,
