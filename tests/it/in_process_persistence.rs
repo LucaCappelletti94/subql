@@ -324,3 +324,74 @@ fn ending_a_session_keeps_the_consumers_that_remain() {
         "the consumer that stayed is still named and still told"
     );
 }
+
+/// Under `Required`, a batch that cannot be written is not registered.
+///
+/// The mode is a promise that a registration the caller is told
+/// succeeded is on disk. When the write fails before anything is
+/// committed, keeping the answers in memory breaks that promise in the
+/// direction that matters, since the caller holds ids for answers a
+/// restart will not bring back.
+#[test]
+fn a_batch_that_cannot_be_written_is_rolled_back() {
+    let store = TempStore::new();
+    let path = store.path();
+    let mut engine = store.open(catalog());
+    engine.set_durability_mode(subql::DurabilityMode::Required);
+    engine.set_rotation_threshold(0);
+
+    // The store's directory is gone, so every write into it fails. The
+    // premise is asserted rather than assumed, because a fault that
+    // silently does not happen leaves a test that proves nothing.
+    std::fs::remove_dir_all(&path).expect("remove the store directory");
+    assert!(
+        engine.snapshot_table(table("orders")).is_err(),
+        "the fixture has to make writing fail to test what happens when it does"
+    );
+
+    let results = engine.register_batch(vec![
+        SubscriptionRequest::new(1u64, "SELECT * FROM orders WHERE status = 'paid'"),
+        SubscriptionRequest::new(2u64, "SELECT * FROM orders WHERE status = 'shipped'"),
+    ]);
+
+    assert!(
+        results.iter().all(std::result::Result::is_err),
+        "every answer in the batch is refused, got {results:?}"
+    );
+    assert_eq!(
+        engine.subscription_count(),
+        0,
+        "and none of them is left registered behind the refusal"
+    );
+}
+
+/// Under `BestEffort`, the same failure keeps the registrations.
+///
+/// The mode is the other promise: answers are served from memory and
+/// the store is a convenience, so a write that fails costs durability
+/// rather than the registration.
+#[test]
+fn a_batch_that_cannot_be_written_survives_best_effort() {
+    let store = TempStore::new();
+    let path = store.path();
+    let mut engine = store.open(catalog());
+    engine.set_durability_mode(subql::DurabilityMode::BestEffort);
+    engine.set_rotation_threshold(0);
+
+    std::fs::remove_dir_all(&path).expect("remove the store directory");
+    assert!(
+        engine.snapshot_table(table("orders")).is_err(),
+        "the same fault as the test above"
+    );
+
+    let results = engine.register_batch(vec![
+        SubscriptionRequest::new(1u64, "SELECT * FROM orders WHERE status = 'paid'"),
+        SubscriptionRequest::new(2u64, "SELECT * FROM orders WHERE status = 'shipped'"),
+    ]);
+
+    assert!(
+        results.iter().all(std::result::Result::is_ok),
+        "the answers register despite the store, got {results:?}"
+    );
+    assert_eq!(engine.subscription_count(), 2, "and both stay registered");
+}

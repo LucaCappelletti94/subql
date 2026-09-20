@@ -7,4 +7,7 @@ gitignore = true
 exclude_re = [
     "replace match guard self.routes_reread",
     "routes_reread -> bool",
+    # Same invariant seen from the merge side: a table holds both maps or
+    # neither, so `||` and `&&` answer alike outside a test injector.
+    "replace \\|\\| with && in SubscriptionEngine<E, I, DB>::try_complete_merge",
 ]

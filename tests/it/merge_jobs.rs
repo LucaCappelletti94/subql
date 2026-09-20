@@ -7,7 +7,8 @@ use subql::backend::Postgres;
 use subql::testing::TestEvent;
 use subql::{catalog_helpers, DefaultIds, SubscriptionEngine, SubscriptionRequest};
 
-const DDL: &str = "CREATE TABLE orders (id INT PRIMARY KEY, price FLOAT, status TEXT);";
+const DDL: &str = "CREATE TABLE orders (id INT PRIMARY KEY, price FLOAT, status TEXT);\
+     CREATE TABLE customers (id INT PRIMARY KEY, name TEXT);";
 
 use crate::common::store::TempStore;
 
@@ -124,5 +125,115 @@ fn a_failed_merge_keeps_the_reports_of_the_merges_already_applied() {
     assert!(
         engine.pending_merges().is_empty(),
         "both jobs are done with, one applied and one failed"
+    );
+}
+
+/// A merge that would drop a live answer is refused, not applied.
+///
+/// A merge reads a shard from disk in the background while the engine
+/// keeps registering. Swapping its payload into the live partition
+/// cannot be undone, so a payload that does not carry every answer the
+/// partition currently holds would silently unsubscribe whoever
+/// registered while the merge was running.
+#[test]
+fn a_merge_missing_a_live_answer_is_refused() {
+    let (_store, mut engine, shard) = engine_with_a_shard();
+    let orders = catalog_helpers::table_id::<Postgres, _>(&catalog(), "orders").expect("orders");
+
+    let _ = engine
+        .merge_shards_background(orders, &[shard])
+        .expect("the merge starts");
+
+    // Registered after the merge read its input, so the payload coming
+    // back cannot know about it.
+    engine
+        .register(SubscriptionRequest::new(
+            2u64,
+            "SELECT * FROM orders WHERE status = 'shipped'",
+        ))
+        .expect("the late answer registers");
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let outcome = loop {
+        let outcome = engine.complete_ready_merges();
+        match outcome {
+            Ok(ref reports) if reports.is_empty() => {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the merge never finished"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            other => break other,
+        }
+    };
+
+    let Err(error) = outcome else {
+        panic!("the merge was applied, dropping a live answer: {outcome:?}");
+    };
+    assert!(
+        format!("{error}").contains("missing live subscriptions"),
+        "refused for the right reason, got {error}"
+    );
+    assert_eq!(
+        engine.subscription_count(),
+        2,
+        "and both answers are still registered"
+    );
+}
+
+/// Applying a merge keeps the other tables' answers on their shards.
+///
+/// Completing a merge rebuilds the engine's map from answer to table,
+/// which every table shares. The map is what tells a later removal which
+/// table to write back, so rebuilding it for the merged table has to
+/// spare the rows belonging to the others. Losing them costs no answer
+/// immediately, and surfaces on the next restart as an answer that was
+/// ended coming back.
+#[test]
+fn a_merge_on_one_table_keeps_the_answers_on_another() {
+    let (store, mut engine, shard) = engine_with_a_shard();
+    let orders = catalog_helpers::table_id::<Postgres, _>(&catalog(), "orders").expect("orders");
+    let customers =
+        catalog_helpers::table_id::<Postgres, _>(&catalog(), "customers").expect("customers");
+
+    let elsewhere = engine
+        .register(SubscriptionRequest::new(
+            7u64,
+            "SELECT * FROM customers WHERE id = 1",
+        ))
+        .expect("the answer on the other table registers")
+        .subscription_id;
+    engine
+        .snapshot_table(customers)
+        .expect("the other table reaches disk");
+
+    let _ = engine
+        .merge_shards_background(orders, &[shard])
+        .expect("the merge starts");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let reports = engine.complete_ready_merges().expect("the drain runs");
+        if !reports.is_empty() {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the merge never finished"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+
+    assert!(
+        engine.unregister_subscription(elsewhere),
+        "the answer on the untouched table ends"
+    );
+    drop(engine);
+
+    let reopened = store.open(catalog());
+    assert_eq!(
+        reopened.subscription_count(),
+        1,
+        "only the merged table's answer comes back, not the ended one"
     );
 }

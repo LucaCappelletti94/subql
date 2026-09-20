@@ -3633,7 +3633,9 @@ where
                 }
             }
 
-            if !failures.is_empty() && self.durability_mode == DurabilityMode::Required {
+            // `enforce_table_durability` reports a failure only under
+            // `Required`, so a failure here already carries the mode.
+            if !failures.is_empty() {
                 for (table_id, message, post_commit) in failures {
                     if !post_commit {
                         if let Some(sub_ids) = table_inserted_sub_ids.get(&table_id) {
@@ -5381,6 +5383,10 @@ where
             return Ok(None);
         };
 
+        // The two maps are written together in `replace_table_state` and
+        // nothing outside a test injector takes one without the other, so
+        // in practice these two answer alike. See `routes_reread` for the
+        // same invariant and why the halves are still checked separately.
         let had_live_table_state = self.partitions.contains_key(&merged.table_id)
             || self.consumer_dictionaries.contains_key(&merged.table_id);
         if had_live_table_state {
