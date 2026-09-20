@@ -5383,6 +5383,10 @@ where
             return Ok(None);
         };
 
+        // The two maps are written together in `replace_table_state` and
+        // nothing outside a test injector takes one without the other, so
+        // in practice these two answer alike. See `routes_reread` for the
+        // same invariant and why the halves are still checked separately.
         let had_live_table_state = self.partitions.contains_key(&merged.table_id)
             || self.consumer_dictionaries.contains_key(&merged.table_id);
         if had_live_table_state {
