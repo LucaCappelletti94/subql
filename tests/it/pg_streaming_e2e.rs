@@ -477,6 +477,10 @@ fn drop_source_shuts_down_inner_task() {
             !task_exited.load(std::sync::atomic::Ordering::Relaxed),
             "inner task must still be running before drop"
         );
+        assert!(
+            !source.task_exited(),
+            "and the source says so itself, which is what an operator asks"
+        );
 
         // Shutdown is cooperative; the biased select! polls the cancel arm before the WAL read.
         drop(source);
@@ -559,5 +563,63 @@ fn events_received_counter_tracks_pushed_events() {
         println!("events_received after {N} inserts: {observed}");
     });
 
+    common::drop_slot(&mut setup, &slot);
+}
+
+/// The source says its task died, without being dropped to find out.
+///
+/// An operator asks a live source whether its inner task is still there,
+/// and the answer matters most when the server ended the connection
+/// rather than the caller ending the source. Terminating the slot's
+/// backend is that case.
+#[test]
+#[ignore = "requires Docker; run with --ignored"]
+fn a_source_reports_a_task_the_server_killed() {
+    common::assert_docker_available();
+    let db = common::pg_database();
+    let mut setup = db.connect();
+    sql_query(PG_DDL).execute(&mut setup).expect("create table");
+    sql_query("ALTER TABLE orders REPLICA IDENTITY FULL")
+        .execute(&mut setup)
+        .expect("REPLICA IDENTITY FULL");
+    let slot = db.slot("subql_pg_streaming_killed");
+    let publication = "subql_pg_streaming_killed_pub";
+    common::create_publication(&mut setup, publication, "orders");
+    common::create_pgoutput_slot(&mut setup, &slot);
+
+    let catalog = ParserDB::parse::<PostgreSqlDialect>(DDL).expect("parse DDL");
+    let config = PgStreamingConfig::new(db.url(), &slot, publication)
+        .status_interval(Duration::from_millis(100));
+
+    let (mut setup, slot) = current_thread_rt().block_on(async move {
+        let mut source = PgStreamingCdcSource::connect(config, catalog)
+            .await
+            .expect("connect");
+        assert!(!source.task_exited(), "the task is there to begin with");
+
+        // Only this slot's backend, named by the slot rather than by a
+        // sweep, so no other test's connection is touched.
+        sql_query(format!(
+            "SELECT pg_terminate_backend(active_pid) FROM pg_replication_slots \
+             WHERE slot_name = '{slot}' AND active_pid IS NOT NULL"
+        ))
+        .execute(&mut setup)
+        .expect("terminate the slot's backend");
+
+        // Drive the source so the loop notices the connection is gone.
+        let deadline = Instant::now() + ARRIVAL;
+        while Instant::now() < deadline {
+            if source.task_exited() {
+                break;
+            }
+            let _ = tokio::time::timeout(Duration::from_millis(100), source.next_event()).await;
+        }
+
+        assert!(
+            source.task_exited(),
+            "a live source reports the task the server took from it"
+        );
+        (setup, slot)
+    });
     common::drop_slot(&mut setup, &slot);
 }
