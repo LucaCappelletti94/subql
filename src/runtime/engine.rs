@@ -533,11 +533,7 @@ fn subscriptions_for<I: IdTypes, B: Backend>(
 ) -> Vec<SubscriptionId> {
     let mut ids: Vec<SubscriptionId> = ordinals
         .iter()
-        .filter_map(|ordinal| {
-            store
-                .binding_lookup
-                .get(&(predicate, ConsumerOrdinal::new(ordinal)))
-        })
+        .filter_map(|ordinal| store.subscriptions_of(predicate, ConsumerOrdinal::new(ordinal)))
         .flatten()
         .copied()
         .collect();
@@ -4331,7 +4327,7 @@ where
         };
         // Only this predicate's own subscribers: an ordinal is dense per table
         // and several predicates share the numbering.
-        let moved = match store.predicate_consumers.get(&watch.predicate) {
+        let moved = match store.consumers_of(watch.predicate) {
             Some(bitmap) => claiming & bitmap,
             None => return,
         };
@@ -4570,8 +4566,8 @@ where
             let snapshot = partition.load_snapshot();
 
             if let Some(sub_ids) = snapshot.predicates.get_session_subscriptions(session_id) {
-                removed_bindings += sub_ids.len();
-                to_remove.extend_from_slice(sub_ids);
+                removed_bindings += sub_ids.size();
+                to_remove.extend(sub_ids.iter().copied());
                 let consumers = removed_consumer_candidates.entry(table_id).or_default();
                 for sub_id in sub_ids {
                     if let Some(binding) = snapshot.predicates.bindings.get(sub_id) {

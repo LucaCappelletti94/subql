@@ -332,9 +332,11 @@ impl<I: IdTypes, B: Backend> PartitionTxn<'_, I, B> {
 
     /// Bind a subscription to an existing predicate, taking a refcount.
     pub fn add_binding(&mut self, binding: SubscriptionBinding<I>, pred_id: PredicateId) {
-        let store = self.store_mut();
-        store.add_binding(binding);
-        store.increment_refcount(pred_id);
+        debug_assert!(
+            self.store().get_predicate(pred_id).is_some(),
+            "a binding names a predicate the store holds"
+        );
+        self.store_mut().add_binding(binding);
         self.dirty = true;
     }
 
@@ -426,17 +428,19 @@ impl<I: IdTypes, B: Backend> PartitionTxn<'_, I, B> {
             return None;
         }
         let store = self.store_mut();
-        let binding = store.remove_binding(sub_id)?;
-        // Read before the count drops, since what decided where the
+        // Read before the binding goes, since what decided where the
         // predicate's bits went is gone with the predicate.
-        let bits = store.get_predicate(binding.predicate_id).map(|pred| {
+        let predicate_id = store.bindings.get(&sub_id)?.predicate_id;
+        let bits = store.get_predicate(predicate_id).map(|pred| {
             (
                 Arc::clone(&pred.index_atoms),
                 Arc::clone(&pred.dependency_columns),
                 pred.projection.clone(),
             )
         });
-        let removed = store.decrement_refcount(binding.predicate_id);
+        let removal = store.remove_binding(sub_id)?;
+        let binding = removal.binding;
+        let removed = removal.predicate_removed;
         self.dirty = true;
         if removed && !self.rebuild_all {
             if let Some((atoms, deps, projection)) = bits {
@@ -914,8 +918,8 @@ mod tests {
             "nor the predicates"
         );
         assert!(
-            same_entries(&before.predicate_consumers, &now.predicate_consumers),
-            "nor the consumer bitmaps"
+            same_entries(&before.bound, &now.bound),
+            "nor what holds each predicate"
         );
         assert!(
             same_entries(&before.hash_index, &now.hash_index),
@@ -925,10 +929,7 @@ mod tests {
             same_entries(&before.scope_index, &now.scope_index),
             "nor the session index"
         );
-        assert!(
-            same_entries(&before.binding_lookup, &now.binding_lookup),
-            "nor the binding lookup"
-        );
+
         assert!(
             Arc::ptr_eq(
                 before
@@ -1152,21 +1153,19 @@ mod tests {
         );
         assert!(
             store
-                .binding_lookup
-                .get(&(live, ConsumerOrdinal::new(0)))
+                .subscriptions_of(live, ConsumerOrdinal::new(0))
                 .is_none(),
             "the recycled id answers for no ordinal the dead one held"
         );
         assert_eq!(
             store
-                .binding_lookup
-                .get(&(live, ConsumerOrdinal::new(1)))
-                .map(Vec::as_slice),
-            Some([200].as_slice()),
+                .subscriptions_of(live, ConsumerOrdinal::new(1))
+                .map(|bound| bound.iter().copied().collect::<Vec<_>>()),
+            Some(vec![200]),
             "only the live binding"
         );
         assert_eq!(
-            store.predicate_consumers.get(&live).map(RoaringBitmap::len),
+            store.consumers_of(live).map(RoaringBitmap::len),
             Some(1),
             "and only its consumer"
         );
