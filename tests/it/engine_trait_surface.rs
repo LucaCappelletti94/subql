@@ -23,6 +23,20 @@ fn orders() -> subql::TableId {
     catalog_helpers::table_id::<Postgres, _>(&catalog(), "orders").expect("orders")
 }
 
+/// An engine on a fresh store, with the answer that carries `FILTER`.
+fn stored_engine_with_one_answer() -> (tempfile::TempDir, std::path::PathBuf, Engine) {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().to_path_buf();
+    let mut engine = Engine::with_storage(catalog(), PostgreSqlDialect {}, path.clone())
+        .expect("open store")
+        .into_parts()
+        .0;
+    engine
+        .register(SubscriptionRequest::new(1u64, FILTER))
+        .expect("registers");
+    (dir, path, engine)
+}
+
 /// Ending a subscription through the trait ends it.
 ///
 /// The trait is what a caller holds when the engine behind it is not
@@ -50,15 +64,7 @@ fn the_registration_trait_ends_a_subscription() {
 /// Snapshotting through the trait writes the files.
 #[test]
 fn the_store_trait_writes_a_shard() {
-    let dir = tempfile::tempdir().expect("temp dir");
-    let path = dir.path().to_path_buf();
-    let mut engine = Engine::with_storage(catalog(), PostgreSqlDialect {}, path.clone())
-        .expect("open store")
-        .into_parts()
-        .0;
-    engine
-        .register(SubscriptionRequest::new(1u64, FILTER))
-        .expect("registers");
+    let (_dir, path, mut engine) = stored_engine_with_one_answer();
 
     DurableShardStore::snapshot_table(&engine, orders()).expect("the trait writes");
 
