@@ -212,3 +212,72 @@ fn grouped_debounce_is_scoped_by_group_key() {
     assert!(engine.debounce_skip(7, &first));
     assert!(!engine.debounce_skip(7, &second));
 }
+
+/// The window ends where it says it ends.
+///
+/// A read one whole window after the last one is not inside it. Treating
+/// the boundary as inside holds a read back for another full window, and
+/// a caller that spaces its work exactly by the window it configured
+/// never gets a read at all.
+#[test]
+fn a_read_exactly_one_window_later_is_not_skipped() {
+    let clock = alloc::sync::Arc::new(crate::ManualClock::new(0));
+    let engine_clock: crate::ClockHandle = alloc::sync::Arc::<crate::ManualClock>::clone(&clock);
+    let (engine, _tid) = engine_with_values(alloc::vec![]);
+    let mut engine = engine
+        .with_clock(engine_clock)
+        .with_debounce_per_query(core::time::Duration::from_secs(1));
+    let read = crate::reexec::ReExecutionRead::Subscription;
+
+    engine.stamp_reexec(7, &read);
+    clock.advance(core::time::Duration::from_micros(999_999));
+    assert!(
+        engine.debounce_skip(7, &read),
+        "a microsecond short of the window is inside it"
+    );
+    clock.advance(core::time::Duration::from_micros(1));
+    assert!(
+        !engine.debounce_skip(7, &read),
+        "one whole window later is not"
+    );
+}
+
+/// A clamped budget is one, never zero.
+///
+/// Zero keys or zero bytes would let a read make no progress and come
+/// back asking for the same page forever, so both settings take one as
+/// their floor rather than the caller's zero.
+#[test]
+fn a_zero_budget_clamps_to_one() {
+    let (engine, _tid) = engine_with_values(alloc::vec![]);
+    let engine = engine.with_max_keys_per_read(0).with_max_page_bytes(0);
+    assert_eq!(engine.max_keys_per_read, 1, "zero keys means one at a time");
+    assert_eq!(engine.max_page_bytes, 1, "and zero bytes means one row");
+
+    let (other, _tid) = engine_with_values(alloc::vec![]);
+    let other = other.with_max_keys_per_read(9).with_max_page_bytes(4096);
+    assert_eq!(
+        other.max_keys_per_read, 9,
+        "a budget given is a budget kept"
+    );
+    assert_eq!(other.max_page_bytes, 4096);
+}
+
+/// The count of captured queries follows the registry.
+#[test]
+fn the_reexec_query_count_follows_the_registry() {
+    let (mut engine, _tid) = engine_with_values(alloc::vec![]);
+    assert_eq!(engine.reexec_query_count(), 0, "nothing is captured yet");
+    crate::reexec::test_fixtures::register_scalar_query(
+        &mut engine,
+        1u64,
+        "SELECT MIN(price) FROM orders",
+    );
+    assert_eq!(engine.reexec_query_count(), 1);
+    crate::reexec::test_fixtures::register_scalar_query(
+        &mut engine,
+        2u64,
+        "SELECT MAX(price) FROM orders",
+    );
+    assert_eq!(engine.reexec_query_count(), 2, "and it counts each one");
+}
