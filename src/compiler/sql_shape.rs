@@ -1552,6 +1552,11 @@ fn select_projection_mut(stmt: &mut Statement) -> Option<&mut Vec<SelectItem>> {
 /// sees every variant rather than the ones the predicate compiler knows, and
 /// it stops at the ceiling, which is what keeps the check itself off the same
 /// cliff.
+///
+/// Nesting a visitor cannot see is bounded before the parse instead:
+/// [`check_sql_sanity`] counts parentheses, brackets and array suffixes,
+/// the last because a type nests once per suffix and the visitor has no
+/// hook to count that.
 fn refuse_deep_nesting(stmt: &Statement) -> Result<(), crate::RegisterError> {
     struct Depth {
         current: usize,
@@ -1598,6 +1603,7 @@ pub(super) const MAX_SQL_LEN: usize = 8192;
 fn check_sql_sanity(sql: &str) -> Result<(), crate::RegisterError> {
     let mut paren_depth: usize = 0;
     let mut bracket_depth: usize = 0;
+    let mut bracket_pairs: usize = 0;
     let mut consecutive_ops: usize = 0;
 
     for c in sql.bytes() {
@@ -1616,6 +1622,10 @@ fn check_sql_sanity(sql: &str) -> Result<(), crate::RegisterError> {
             // into hundreds of ms of array-subscript backtracking.
             b'[' => {
                 bracket_depth += 1;
+                // A type nests once per array suffix, and `INT[][][]` keeps
+                // the depth counted above at one while doing it, so the
+                // count of suffixes is what bounds how deep a type goes.
+                bracket_pairs += 1;
                 consecutive_ops = 0;
             }
             b']' => {
@@ -1640,6 +1650,7 @@ fn check_sql_sanity(sql: &str) -> Result<(), crate::RegisterError> {
 
         if paren_depth > MAX_EXPR_DEPTH
             || bracket_depth > MAX_EXPR_DEPTH
+            || bracket_pairs > MAX_EXPR_DEPTH
             || consecutive_ops > MAX_EXPR_DEPTH
         {
             return Err(crate::RegisterError::UnsupportedSql(
@@ -2908,6 +2919,33 @@ mod written_column_tests {
         let chain = alloc::vec!["amount"; super::MAX_EXPR_DEPTH - 8].join(" + ");
         assert!(super::parse_single_statement(
             &alloc::format!("SELECT * FROM t WHERE {chain} > 1"),
+            &PostgreSqlDialect {},
+        )
+        .is_ok());
+    }
+
+    /// A type nests once per array suffix and no expression nests with it,
+    /// so the expression gate never sees this one and the clause is cloned
+    /// as deep as the suffixes are many.
+    #[test]
+    fn a_tower_of_array_suffixes_is_refused() {
+        let suffix = "[]".repeat(super::MAX_EXPR_DEPTH + 8);
+        let refusal = super::parse_single_statement(
+            &alloc::format!("SELECT * FROM t WHERE CAST(x AS INT{suffix}) = 1"),
+            &PostgreSqlDialect {},
+        )
+        .expect_err("past the ceiling");
+        assert!(
+            alloc::string::ToString::to_string(&refusal).contains("deep"),
+            "the refusal names the nesting, got {refusal:?}"
+        );
+    }
+
+    /// And an ordinary subscript still parses.
+    #[test]
+    fn an_array_subscript_still_parses() {
+        assert!(super::parse_single_statement(
+            "SELECT * FROM t WHERE tags[1] = 'x'",
             &PostgreSqlDialect {},
         )
         .is_ok());
