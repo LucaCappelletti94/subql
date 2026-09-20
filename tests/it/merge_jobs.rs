@@ -9,6 +9,8 @@ use subql::{catalog_helpers, DefaultIds, SubscriptionEngine, SubscriptionRequest
 
 const DDL: &str = "CREATE TABLE orders (id INT PRIMARY KEY, price FLOAT, status TEXT);";
 
+use crate::common::store::TempStore;
+
 type Engine = SubscriptionEngine<TestEvent<Postgres>, DefaultIds, ParserDB>;
 
 fn catalog() -> ParserDB {
@@ -16,13 +18,10 @@ fn catalog() -> ParserDB {
 }
 
 /// An engine with one shard file on disk, and the path to it.
-fn engine_with_a_shard() -> (tempfile::TempDir, Engine, std::path::PathBuf) {
-    let dir = tempfile::tempdir().expect("temp dir");
-    let path = dir.path().to_path_buf();
-    let mut engine = Engine::with_storage(catalog(), PostgreSqlDialect {}, path.clone())
-        .expect("open store")
-        .into_parts()
-        .0;
+fn engine_with_a_shard() -> (TempStore, Engine, std::path::PathBuf) {
+    let store = TempStore::new();
+    let path = store.path();
+    let mut engine = store.open(catalog());
     let orders = catalog_helpers::table_id::<Postgres, _>(&catalog(), "orders").expect("orders");
     engine
         .register(SubscriptionRequest::new(
@@ -33,7 +32,7 @@ fn engine_with_a_shard() -> (tempfile::TempDir, Engine, std::path::PathBuf) {
     engine.snapshot_table(orders).expect("write the shard");
     let shard = path.join(format!("table_{orders}.shard"));
     assert!(shard.exists(), "the snapshot wrote {}", shard.display());
-    (dir, engine, shard)
+    (store, engine, shard)
 }
 
 /// Every merge is drained by name, without the caller holding on to one.

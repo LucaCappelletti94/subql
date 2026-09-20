@@ -13,6 +13,8 @@ use subql::{
 const DDL: &str = "CREATE TABLE orders (id INT PRIMARY KEY, price FLOAT, status TEXT);\
                    CREATE TABLE invoices (id INT PRIMARY KEY, state TEXT);";
 
+use crate::common::store::TempStore;
+
 type Engine = SubscriptionEngine<TestEvent<Postgres>, DefaultIds, ParserDB>;
 
 fn catalog() -> ParserDB {
@@ -143,13 +145,8 @@ fn a_table_only_a_read_answer_depends_on_is_not_unknown() {
 /// and then ending one of them ends the other.
 #[test]
 fn a_reopened_store_hands_out_a_fresh_identity() {
-    let dir = tempfile::tempdir().expect("temp dir");
-    let path = dir.path().to_path_buf();
-
-    let mut engine = Engine::with_storage(catalog(), PostgreSqlDialect {}, path.clone())
-        .expect("open store")
-        .into_parts()
-        .0;
+    let store = TempStore::new();
+    let mut engine = store.open(catalog());
     let mut restored_ids = Vec::new();
     for consumer in 1u64..=3 {
         restored_ids.push(
@@ -165,10 +162,7 @@ fn a_reopened_store_hands_out_a_fresh_identity() {
     engine.snapshot_table(table("orders")).expect("snapshot");
     drop(engine);
 
-    let mut reopened = Engine::with_storage(catalog(), PostgreSqlDialect {}, path)
-        .expect("reopen")
-        .into_parts()
-        .0;
+    let mut reopened = store.open(catalog());
     assert_eq!(reopened.subscription_count(), 3, "all three came back");
 
     let fresh = reopened

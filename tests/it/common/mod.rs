@@ -41,6 +41,7 @@ pub mod patchset;
 ))]
 pub mod reexec;
 pub mod semantics;
+pub mod store;
 pub mod throttle;
 
 const PG_IMAGE: &str = "subql-test/postgres-wal2json";

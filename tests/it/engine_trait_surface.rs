@@ -13,6 +13,8 @@ use subql::{
 const DDL: &str = "CREATE TABLE orders (id INT PRIMARY KEY, price FLOAT, status TEXT);";
 const FILTER: &str = "SELECT * FROM orders WHERE status = 'paid'";
 
+use crate::common::store::TempStore;
+
 type Engine = SubscriptionEngine<TestEvent<Postgres>, DefaultIds, ParserDB>;
 
 fn catalog() -> ParserDB {
@@ -23,18 +25,14 @@ fn orders() -> subql::TableId {
     catalog_helpers::table_id::<Postgres, _>(&catalog(), "orders").expect("orders")
 }
 
-/// An engine on a fresh store, with the answer that carries `FILTER`.
-fn stored_engine_with_one_answer() -> (tempfile::TempDir, std::path::PathBuf, Engine) {
-    let dir = tempfile::tempdir().expect("temp dir");
-    let path = dir.path().to_path_buf();
-    let mut engine = Engine::with_storage(catalog(), PostgreSqlDialect {}, path.clone())
-        .expect("open store")
-        .into_parts()
-        .0;
+/// A store holding one answer that carries `FILTER`.
+fn stored_engine_with_one_answer() -> (TempStore, Engine) {
+    let store = TempStore::new();
+    let mut engine = store.open(catalog());
     engine
         .register(SubscriptionRequest::new(1u64, FILTER))
         .expect("registers");
-    (dir, path, engine)
+    (store, engine)
 }
 
 /// Ending a subscription through the trait ends it.
@@ -64,7 +62,8 @@ fn the_registration_trait_ends_a_subscription() {
 /// Snapshotting through the trait writes the files.
 #[test]
 fn the_store_trait_writes_a_shard() {
-    let (_dir, path, engine) = stored_engine_with_one_answer();
+    let (store, engine) = stored_engine_with_one_answer();
+    let path = store.path();
 
     DurableShardStore::snapshot_table(&engine, orders()).expect("the trait writes");
 
@@ -81,12 +80,9 @@ fn the_store_trait_writes_a_shard() {
 /// Merging through the trait starts and completes a job.
 #[test]
 fn the_merge_trait_runs_a_merge() {
-    let dir = tempfile::tempdir().expect("temp dir");
-    let path = dir.path().to_path_buf();
-    let mut engine = Engine::with_storage(catalog(), PostgreSqlDialect {}, path.clone())
-        .expect("open store")
-        .into_parts()
-        .0;
+    let store = TempStore::new();
+    let path = store.path();
+    let mut engine = store.open(catalog());
     let answer = engine
         .register(SubscriptionRequest::new(1u64, FILTER))
         .expect("registers")
@@ -175,12 +171,9 @@ fn the_durability_settings_are_read_back() {
 /// for a store the caller asked to leave alone until it grew.
 #[test]
 fn a_partition_exactly_on_the_threshold_does_not_rotate() {
-    let dir = tempfile::tempdir().expect("temp dir");
-    let path = dir.path().to_path_buf();
-    let mut engine = Engine::with_storage(catalog(), PostgreSqlDialect {}, path.clone())
-        .expect("open store")
-        .into_parts()
-        .0;
+    let store = TempStore::new();
+    let path = store.path();
+    let mut engine = store.open(catalog());
     engine.set_durability_mode(DurabilityMode::Required);
     // One predicate and one binding weigh this much by the engine's own
     // estimate, so the first registration lands exactly on the line.
@@ -216,12 +209,9 @@ fn a_partition_exactly_on_the_threshold_does_not_rotate() {
 /// one that dropped the bindings or subtracted them.
 #[test]
 fn one_answer_outweighs_a_threshold_between_its_parts() {
-    let dir = tempfile::tempdir().expect("temp dir");
-    let path = dir.path().to_path_buf();
-    let mut engine = Engine::with_storage(catalog(), PostgreSqlDialect {}, path.clone())
-        .expect("open store")
-        .into_parts()
-        .0;
+    let store = TempStore::new();
+    let path = store.path();
+    let mut engine = store.open(catalog());
     engine.set_durability_mode(DurabilityMode::Required);
     // Above a lone predicate, below a predicate plus its binding.
     engine.set_rotation_threshold(1100);
