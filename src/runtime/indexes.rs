@@ -14,6 +14,7 @@
 //! UPDATE candidates come from [`HybridIndexes::full_row`] instead.
 
 use super::ids::PredicateId;
+use super::range_index::{RangeIndex, RangeKey, RangeProbe};
 use crate::backend::{Backend, Value};
 use crate::compiler::sql_shape::QueryProjection;
 use crate::compiler::{PlannerAtom, PlannerValue};
@@ -21,7 +22,6 @@ use crate::ColumnId;
 use alloc::sync::Arc;
 use hashbrown::HashMap;
 use roaring::RoaringBitmap;
-use rpds::RedBlackTreeMapSync;
 
 /// Indexable cell value (excludes NULL/Missing)
 ///
@@ -58,24 +58,6 @@ impl IndexableCell {
         }
     }
 }
-
-/// Range index key, ordered by lower bound.
-///
-/// `Ord` puts an unbounded lower bound first and orders the rest along the
-/// numeric line, so a probe walks the column in bound order and stops at the
-/// first key it cannot reach. The predicate id only breaks ties between equal
-/// bounds.
-#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub struct RangeKey {
-    pub lower: Option<i64>,
-    pub predicate_id: PredicateId,
-}
-
-/// One column's range entries, keyed by lower bound, valued by upper bound.
-///
-/// Persistent because registration clones the whole index to patch it, and a
-/// `Vec` made that clone cost the length of the column.
-pub type RangeColumn = RedBlackTreeMapSync<RangeKey, Option<i64>>;
 
 /// NULL check kind
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
@@ -142,8 +124,8 @@ pub struct HybridIndexes {
     /// Equality: col -> (val -> `RoaringBitmap<PredicateId>`)
     pub equality: HashMap<ColumnId, HashMap<IndexableCell, RoaringBitmap>>,
 
-    /// Range: col -> entries ordered by lower bound
-    pub range: HashMap<ColumnId, RangeColumn>,
+    /// Range: col -> the intervals on that column
+    pub range: HashMap<ColumnId, RangeIndex>,
 
     /// NULL: (col, kind) -> `RoaringBitmap<PredicateId>`
     pub null_checks: HashMap<(ColumnId, NullKind), RoaringBitmap>,
@@ -299,20 +281,13 @@ impl HybridIndexes {
                     lower,
                     upper,
                 } => {
-                    let key = RangeKey {
-                        lower: *lower,
-                        predicate_id: pred_id,
-                    };
-                    let column = self.range.entry(*column_id).or_default();
-                    // One predicate can file two ranges on a column sharing a
-                    // lower bound, as `a BETWEEN 5 AND 10 OR a BETWEEN 5 AND
-                    // 20` does. The key holds one of them, so it holds the
-                    // wider upper bound, which keeps the index a superset and
-                    // leaves the verdict to the comparator.
-                    let upper = column
-                        .get(&key)
-                        .map_or(*upper, |held| widest_upper(*held, *upper));
-                    column.insert_mut(key, upper);
+                    self.range.entry(*column_id).or_default().insert(
+                        RangeKey {
+                            lower: *lower,
+                            predicate_id: pred_id,
+                        },
+                        *upper,
+                    );
                 }
 
                 IndexableAtom::Null { column_id, kind } => {
@@ -394,7 +369,7 @@ impl HybridIndexes {
                     column_id, lower, ..
                 } => {
                     if let Some(entries) = self.range.get_mut(column_id) {
-                        entries.remove_mut(&RangeKey {
+                        entries.remove(&RangeKey {
                             lower: *lower,
                             predicate_id: pred_id,
                         });
@@ -479,23 +454,11 @@ impl HybridIndexes {
         // every entry on the column stays a candidate and the comparator
         // alone decides.
         if numeric.is_unordered() {
-            out.extend(entries.keys().map(|key| key.predicate_id.as_u32()));
+            entries.insert_all_into(out);
             return;
         }
 
-        for (key, upper) in entries {
-            // Entries walk in lower-bound order, so once a lower bound
-            // exceeds the searched value no later entry can match.
-            if let Some(lower) = key.lower {
-                if !numeric.gte_lower(lower) {
-                    break;
-                }
-            }
-
-            if upper.is_none_or(|u| numeric.lte_upper(u)) {
-                out.insert(key.predicate_id.as_u32());
-            }
-        }
+        entries.stab_into(&numeric, out);
     }
 
     /// Query range index (return predicates whose ranges contain value)
@@ -511,6 +474,16 @@ impl HybridIndexes {
 enum NumericValue {
     Int(i64),
     Float(f64),
+}
+
+impl RangeProbe for NumericValue {
+    fn reaches(&self, lower: i64) -> bool {
+        self.gte_lower(lower)
+    }
+
+    fn within(&self, upper: i64) -> bool {
+        self.lte_upper(upper)
+    }
 }
 
 impl NumericValue {
@@ -547,15 +520,6 @@ impl NumericValue {
             #[allow(clippy::cast_precision_loss)]
             Self::Float(v) => v <= upper as f64,
         }
-    }
-}
-
-/// The upper bound that admits every row either bound admits. Unbounded wins,
-/// otherwise the larger one does.
-const fn widest_upper(lhs: Option<i64>, rhs: Option<i64>) -> Option<i64> {
-    match (lhs, rhs) {
-        (Some(left), Some(right)) => Some(if left >= right { left } else { right }),
-        _ => None,
     }
 }
 

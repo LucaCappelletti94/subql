@@ -8,6 +8,7 @@ pub mod ids;
 pub mod indexes;
 pub mod partition;
 pub mod predicate;
+pub mod range_index;
 
 pub use dispatch::MatchedConsumers;
 #[cfg(feature = "std")]
