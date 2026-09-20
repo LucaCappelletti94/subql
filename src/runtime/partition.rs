@@ -1073,6 +1073,130 @@ mod tests {
         }
     }
 
+    /// A partition whose live predicate holds the id a removed one freed.
+    ///
+    /// The dead predicate filtered column 0 for a consumer on a session, the
+    /// live one filters column 1 for another consumer, so every index keyed by
+    /// id would answer differently if anything survived the removal.
+    fn partition_with_a_recycled_id() -> (TablePartition<DefaultIds, Postgres>, PredicateId) {
+        let mut partition = TablePartition::<DefaultIds, Postgres>::new(1);
+        let dead = add_predicate(
+            &mut partition,
+            make_predicate_on_col(0, 0xDEAD, 0),
+            &[IndexableAtom::Equality {
+                column_id: 0,
+                value: IndexableCell::Int(42),
+            }],
+        );
+        add_binding(
+            &mut partition,
+            SubscriptionBinding {
+                subscription_id: 100,
+                predicate_id: dead,
+                consumer_id: 7,
+                consumer_ordinal: ConsumerOrdinal::new(0),
+                scope: SubscriptionScope::Session(9),
+                updated_at_unix_ms: 0,
+            },
+            dead,
+        );
+        assert!(
+            remove_binding(&mut partition, 100),
+            "the only binding takes its predicate with it"
+        );
+
+        let live = add_predicate(
+            &mut partition,
+            make_predicate_on_col(1, 0xBEEF, 1),
+            &[IndexableAtom::Equality {
+                column_id: 1,
+                value: IndexableCell::Int(7),
+            }],
+        );
+        assert_eq!(live, dead, "the freed id is the one handed out next");
+        add_binding(
+            &mut partition,
+            SubscriptionBinding {
+                subscription_id: 200,
+                predicate_id: live,
+                consumer_id: 8,
+                consumer_ordinal: ConsumerOrdinal::new(1),
+                scope: SubscriptionScope::Durable,
+                updated_at_unix_ms: 0,
+            },
+            live,
+        );
+        (partition, live)
+    }
+
+    /// Nothing the dead predicate left behind answers for the id it freed.
+    #[test]
+    fn a_recycled_id_holds_no_index_of_the_predicate_that_freed_it() {
+        let (partition, live) = partition_with_a_recycled_id();
+        let snapshot = partition.load_snapshot();
+        let store = &snapshot.predicates;
+        assert_eq!(
+            store.get_predicate(live).map(|pred| pred.hash),
+            Some(0xBEEF),
+            "the id names the predicate that took it"
+        );
+        assert_eq!(
+            store.find_by_hash(0xDEAD),
+            None,
+            "and the dead predicate's hash names nothing"
+        );
+        assert_eq!(store.refcount(live), 1, "one binding, one reference");
+        assert_eq!(
+            store.bindings.size(),
+            1,
+            "the dead predicate's binding is gone"
+        );
+        assert!(
+            store.scope_index.get(&9).is_none(),
+            "so is its session entry"
+        );
+        assert!(
+            store
+                .binding_lookup
+                .get(&(live, ConsumerOrdinal::new(0)))
+                .is_none(),
+            "the recycled id answers for no ordinal the dead one held"
+        );
+        assert_eq!(
+            store
+                .binding_lookup
+                .get(&(live, ConsumerOrdinal::new(1)))
+                .map(Vec::as_slice),
+            Some([200].as_slice()),
+            "only the live binding"
+        );
+        assert_eq!(
+            store.predicate_consumers.get(&live).map(RoaringBitmap::len),
+            Some(1),
+            "and only its consumer"
+        );
+    }
+
+    /// And no row the dead predicate matched reaches the id it freed.
+    #[test]
+    fn a_recycled_id_is_not_a_candidate_for_the_dead_predicate_s_rows() {
+        let (partition, live) = partition_with_a_recycled_id();
+        let stale = make_row(vec![Value::<Postgres>::Int(42), Value::<Postgres>::Int(0)]);
+        assert!(
+            !partition
+                .select_candidates(stale.len(), probe_from_row(&stale))
+                .contains(live.as_u32()),
+            "a row the dead predicate matched must not reach the id it left"
+        );
+        let matching = make_row(vec![Value::<Postgres>::Int(0), Value::<Postgres>::Int(7)]);
+        assert!(
+            partition
+                .select_candidates(matching.len(), probe_from_row(&matching))
+                .contains(live.as_u32()),
+            "and a row the live predicate matches still does"
+        );
+    }
+
     /// A binding takes a reference on its predicate, and the count for that
     /// lives in the store rather than in the predicate, so binding one leaves
     /// the predicates exactly where the published snapshot has them. Put the
