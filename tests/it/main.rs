@@ -221,6 +221,8 @@ mod proptest_row_set_delta;
 
 mod proptest_throttle;
 
+mod register_batch_cap;
+
 #[cfg(feature = "std")]
 mod dispatch_contract;
 mod engine_removal_bookkeeping;

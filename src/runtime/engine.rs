@@ -3633,7 +3633,9 @@ where
                 }
             }
 
-            if !failures.is_empty() && self.durability_mode == DurabilityMode::Required {
+            // `enforce_table_durability` reports a failure only under
+            // `Required`, so a failure here already carries the mode.
+            if !failures.is_empty() {
                 for (table_id, message, post_commit) in failures {
                     if !post_commit {
                         if let Some(sub_ids) = table_inserted_sub_ids.get(&table_id) {
