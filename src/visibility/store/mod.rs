@@ -43,10 +43,13 @@
 //! # The load runs the same operation
 //!
 //! [`Shapes::materialisations`](crate::visibility::shapes::Shapes::materialisations)
-//! is every group. The load runs all of them and an event runs the ones it
-//! obliged, which is the same call, so the load heals whatever drifted and the
-//! replay path is exercised at startup rather than only by a change that
-//! happens to arrive.
+//! is every group, and
+//! [`Shapes::load_regions`](crate::visibility::shapes::Shapes::load_regions)
+//! is every region a shape maintains alone. A terminal policy's
+//! `reconcile_store` reconciles both at once against the whole load, and an
+//! event runs the groups it obliged, which is the same call, so the load
+//! heals whatever drifted and the replay path is exercised at startup rather
+//! than only by a change that happens to arrive.
 //!
 //! # When a replayed query has to have finished
 //!

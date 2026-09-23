@@ -36,10 +36,10 @@ use rls2fga::types::{Record, RecordContextValue};
 use sqlparser::dialect::PostgreSqlDialect;
 use subql::backend::{Postgres, Value};
 use subql::testing::TestEvent;
-use subql::visibility::openfga::{MaterialiseError, OpenFgaPolicy};
+use subql::visibility::openfga::{OpenFgaPolicy, ReconcileError, Reconciled};
 use subql::visibility::policy::{RequestValues, RowPolicy, Subject};
 use subql::visibility::shapes::Shapes;
-use subql::visibility::store::{Enumeration, Replay, Replayer, Requery, StoreDiff};
+use subql::visibility::store::{Enumeration, Region, Replay, Replayer, Requery, StoreDiff};
 use subql::visibility::{EventRow, RowWrite, Verdict, VisibilityPolicy};
 use subql::{catalog_helpers, ParserDB, TableId};
 
@@ -1162,7 +1162,7 @@ async fn two_members_contradicting_one_fact_are_refused_before_any_write() {
         .await
         .expect_err("a contradiction is refused");
     assert!(
-        matches!(&refused, MaterialiseError::Contradiction(fact) if fact.contains("user:carol")),
+        matches!(&refused, ReconcileError::Contradiction(fact) if fact.contains("user:carol")),
         "named as a contradiction rather than as a store failure, which a \
          caller would retry for ever: {refused:?}"
     );
@@ -1261,6 +1261,307 @@ async fn a_reconcile_removes_a_fact_for_an_object_the_event_never_named() {
         report.added.is_empty(),
         "alice was already stored: {report:?}"
     );
+}
+
+/// A row-settled link from a doc to its team and a membership only a replay
+/// reaches, each alone in its region, so the load is the whole truth for both.
+const TWO_ALONE: &str = "
+CREATE TABLE public.teams(id INTEGER PRIMARY KEY);
+CREATE TABLE public.team_members(team_id INTEGER REFERENCES teams(id), user_id TEXT,
+                          expires_at TIMESTAMPTZ);
+CREATE TABLE public.docs(id INTEGER PRIMARY KEY, team_id INTEGER REFERENCES teams(id));
+ALTER TABLE docs ENABLE ROW LEVEL SECURITY;
+CREATE POLICY p ON docs FOR SELECT USING (
+  EXISTS (SELECT 1 FROM team_members
+          WHERE team_members.team_id = docs.team_id AND team_members.user_id = current_user
+            AND team_members.expires_at > now()));
+";
+
+/// A store loaded before a backup the database was then restored from.
+struct Restored {
+    client: OpenFgaServiceClient<Channel>,
+    store: String,
+    backend: OpenFgaPolicy<ParserDB, Channel, String, Postgres>,
+    /// Facts the restored database still states.
+    kept: Vec<Record>,
+    /// Facts only the store still holds: mallory's membership and doc 2's link.
+    stale: Vec<Record>,
+}
+
+/// [`TWO_ALONE`]'s facts over a store whose model is written from `model_sql`.
+async fn restored(name: &str, model_sql: &str) -> Restored {
+    let mut client = openfga().await;
+    let (store, model_id) =
+        create_store_with_model(&mut client, name, &wiring(model_sql).model).await;
+
+    let wired = wiring(TWO_ALONE);
+    let members = catalog_helpers::table_id::<Postgres, _>(&wired.db, "team_members")
+        .expect("members is in the catalog");
+    let shapes = wired.shapes();
+    let backend = OpenFgaPolicy::<_, _, String, Postgres>::new(
+        Arc::clone(&shapes),
+        client.clone(),
+        store.clone(),
+    )
+    .expect("the index carries what the questions need")
+    .authorization_model_id(model_id);
+
+    let left = TestEvent::<Postgres>::delete(
+        members,
+        vec![
+            Value::Int(3),
+            Value::String("alice".into()),
+            Value::String("2027-01-01T00:00:00Z".into()),
+        ],
+    );
+    let (_, requeries) = shapes.diff(&left).expect("the previous image is whole");
+    let [Requery::Keyed(requery)] = requeries.as_slice() else {
+        panic!("the membership is keyed: {requeries:?}");
+    };
+    let condition = requery
+        .query
+        .condition()
+        .expect("the membership is conditional");
+    let link = shapes
+        .load_regions()
+        .iter()
+        .flat_map(Region::parts)
+        .find(|part| part.object_type() == "docs")
+        .expect("the load owns the doc's link to its team")
+        .relation()
+        .clone();
+    let doc_on_team_3 = |doc: &str| Record {
+        object: doc.to_owned(),
+        relation: link.clone(),
+        subject: "teams:3".to_owned(),
+        context: None,
+    };
+    let expiry = "2027-01-01T00:00:00+00:00";
+    let kept = vec![
+        membership("user:alice", condition, expiry),
+        doc_on_team_3("docs:1"),
+    ];
+    let stale = vec![
+        membership("user:mallory", condition, expiry),
+        doc_on_team_3("docs:2"),
+    ];
+    backend
+        .write_records(&[kept.as_slice(), stale.as_slice()].concat())
+        .await
+        .expect("load the store before the backup");
+
+    Restored {
+        client,
+        store,
+        backend,
+        kept,
+        stale,
+    }
+}
+
+/// Facts the restored database no longer states leave the store, keyed and
+/// row-settled alike, and nothing else moves.
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "requires docker"]
+async fn a_restore_sweeps_keyed_and_row_settled_facts_alike() {
+    let mut restored = restored("subql-sweep-restore", TWO_ALONE).await;
+    let nothing = CannedReplay { rows: Vec::new() };
+
+    let reports = restored
+        .backend
+        .reconcile_store(&restored.kept, &nothing)
+        .await
+        .expect("sweep the store");
+
+    assert_eq!(
+        reports.len(),
+        2,
+        "one report per region that moved: {reports:?}"
+    );
+    assert!(
+        reports.iter().all(|report| report.added.is_empty()),
+        "the load states nothing the store lacked: {reports:?}"
+    );
+    let mut withdrawn: Vec<(String, String)> = reports
+        .iter()
+        .flat_map(|report| &report.removed)
+        .map(|fact| (fact.object.clone(), fact.subject.clone()))
+        .collect();
+    withdrawn.sort();
+    let mut expected: Vec<(String, String)> = restored
+        .stale
+        .iter()
+        .map(|fact| (fact.object.clone(), fact.subject.clone()))
+        .collect();
+    expected.sort();
+    assert_eq!(withdrawn, expected);
+
+    let link = restored.kept[1].relation.to_string();
+    assert_eq!(
+        stored_members(&mut restored.client, &restored.store).await,
+        ["user:alice".to_owned()]
+    );
+    assert_eq!(
+        stored_relation(&mut restored.client, &restored.store, &link, "docs:1").await,
+        ["teams:3".to_owned()]
+    );
+    assert_eq!(
+        stored_relation(&mut restored.client, &restored.store, &link, "docs:2").await,
+        Vec::<String>::new()
+    );
+
+    let again = restored
+        .backend
+        .reconcile_store(&restored.kept, &nothing)
+        .await
+        .expect("sweep the healed store");
+    assert_eq!(
+        again,
+        Vec::<Reconciled>::new(),
+        "a healed store moves nothing"
+    );
+}
+
+/// A fact in a relation no shape declares survives the sweep, so a store shared
+/// with another writer keeps that writer's facts.
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "requires docker"]
+async fn a_fact_no_shape_declares_survives_the_sweep() {
+    // The other writer's model adds folders, which this translation never sees.
+    const SHARED: &str = "
+CREATE TABLE public.teams(id INTEGER PRIMARY KEY);
+CREATE TABLE public.team_members(team_id INTEGER REFERENCES teams(id), user_id TEXT,
+                          expires_at TIMESTAMPTZ);
+CREATE TABLE public.docs(id INTEGER PRIMARY KEY, team_id INTEGER REFERENCES teams(id));
+CREATE TABLE public.folders(id INTEGER PRIMARY KEY, owner_id TEXT);
+ALTER TABLE docs ENABLE ROW LEVEL SECURITY;
+ALTER TABLE folders ENABLE ROW LEVEL SECURITY;
+CREATE POLICY p ON docs FOR SELECT USING (
+  EXISTS (SELECT 1 FROM team_members
+          WHERE team_members.team_id = docs.team_id AND team_members.user_id = current_user
+            AND team_members.expires_at > now()));
+CREATE POLICY f ON folders FOR SELECT USING (owner_id = current_user);
+";
+    let mut restored = restored("subql-sweep-shared", SHARED).await;
+    restored
+        .client
+        .write(WriteRequest {
+            store_id: restored.store.clone(),
+            writes: Some(WriteRequestWrites {
+                tuple_keys: vec![TupleKey {
+                    user: "user:bob".to_owned(),
+                    relation: "owner".to_owned(),
+                    object: "folders:1".to_owned(),
+                    condition: None,
+                }],
+                on_duplicate: String::new(),
+            }),
+            deletes: None,
+            authorization_model_id: String::new(),
+        })
+        .await
+        .expect("the other writer's fact");
+
+    restored
+        .backend
+        .reconcile_store(&restored.kept, &CannedReplay { rows: Vec::new() })
+        .await
+        .expect("sweep the store");
+
+    assert_eq!(
+        stored_members(&mut restored.client, &restored.store).await,
+        ["user:alice".to_owned()],
+        "the sweep ran"
+    );
+    assert_eq!(
+        stored_relation(&mut restored.client, &restored.store, "owner", "folders:1").await,
+        ["user:bob".to_owned()],
+        "and left the other writer's fact alone"
+    );
+}
+
+/// One sweep heals a group's region from its replays and the load's regions
+/// from the records, reporting the load's regions first.
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "requires docker"]
+async fn one_sweep_heals_a_group_region_and_the_loads_regions() {
+    let mut client = openfga().await;
+    let wired = wiring(SHARED_REGION);
+    let (store, model_id) =
+        create_store_with_model(&mut client, "subql-sweep-group", &wired.model).await;
+    let shapes = wired.shapes();
+    let backend = OpenFgaPolicy::<_, _, String, Postgres>::new(
+        Arc::clone(&shapes),
+        client.clone(),
+        store.clone(),
+    )
+    .expect("the index carries what the questions need")
+    .authorization_model_id(model_id);
+    let link = shapes
+        .load_regions()
+        .iter()
+        .flat_map(Region::parts)
+        .find(|part| part.object_type() == "docs")
+        .expect("the load owns the doc's link to its team")
+        .relation()
+        .clone();
+    let doc_on_team = |doc: &str, team: &str| Record {
+        object: doc.to_owned(),
+        relation: link.clone(),
+        subject: team.to_owned(),
+        context: None,
+    };
+
+    backend
+        .write_records(&[
+            plain_membership("teams:3", "user:carol"),
+            plain_membership("teams:3", "user:dave"),
+            doc_on_team("docs:4", "teams:1"),
+        ])
+        .await
+        .expect("seed the store");
+    let replay = CannedReplay {
+        rows: vec![
+            (
+                "team_members",
+                vec![plain_membership("teams:3", "user:alice")],
+            ),
+            (
+                "team_guests",
+                vec![plain_membership("teams:3", "user:carol")],
+            ),
+        ],
+    };
+
+    let reports = backend
+        .reconcile_store(&[doc_on_team("docs:5", "teams:3")], &replay)
+        .await
+        .expect("sweep the store");
+
+    let [load, group] = reports.as_slice() else {
+        panic!("the load's region and the group's: {reports:?}");
+    };
+    assert_eq!(load.added, [doc_on_team("docs:5", "teams:3")]);
+    assert_eq!(
+        load.removed
+            .iter()
+            .map(|fact| fact.object.as_str())
+            .collect::<Vec<_>>(),
+        ["docs:4"]
+    );
+    assert_eq!(group.added, [plain_membership("teams:3", "user:alice")]);
+    assert_eq!(
+        group
+            .removed
+            .iter()
+            .map(|fact| fact.subject.as_str())
+            .collect::<Vec<_>>(),
+        ["user:dave"]
+    );
+
+    let mut members = stored_members(&mut client, &store).await;
+    members.sort();
+    assert_eq!(members, ["user:alice".to_owned(), "user:carol".to_owned()]);
 }
 
 fn membership(subject: &str, condition: &str, expires_at: &str) -> Record {
