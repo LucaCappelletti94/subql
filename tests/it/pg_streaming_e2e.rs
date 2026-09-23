@@ -18,11 +18,11 @@ use crate::common;
 
 use std::time::{Duration, Instant};
 
-use diesel::{sql_query, RunQueryDsl};
+use diesel::{sql_query, Connection, RunQueryDsl};
 use sql_traits::structs::ParserDB;
 use sqlparser::dialect::PostgreSqlDialect;
 use subql::backend::CdcEvent;
-use subql::{CdcSource, EventKind, PgLsn, PgStreamingCdcSource, PgStreamingConfig};
+use subql::{CdcSource, EventKind, PgLsn, PgStreamingCdcSource, PgStreamingConfig, TimelineSwitch};
 
 const DDL: &str = "CREATE TABLE orders (id INT PRIMARY KEY, price FLOAT);";
 const PG_DDL: &str = "CREATE TABLE orders (id INT PRIMARY KEY, price DOUBLE PRECISION)";
@@ -622,4 +622,248 @@ fn a_source_reports_a_task_the_server_killed() {
         (setup, slot)
     });
     common::drop_slot(&mut setup, &slot);
+}
+
+#[derive(diesel::QueryableByName)]
+struct ControlSystem {
+    #[diesel(sql_type = diesel::sql_types::BigInt)]
+    system_identifier: i64,
+    #[diesel(sql_type = diesel::sql_types::Integer)]
+    timeline: i32,
+}
+
+/// The cluster's identity as plain SQL reports it, outside the replication protocol.
+fn control_system(conn: &mut diesel::PgConnection) -> (u64, u32) {
+    // The DSL cannot put a set-returning function in FROM.
+    let row = sql_query(
+        "SELECT s.system_identifier, c.timeline_id AS timeline \
+         FROM pg_control_system() s, pg_control_checkpoint() c",
+    )
+    .get_result::<ControlSystem>(conn)
+    .expect("pg_control_system");
+    (
+        u64::try_from(row.system_identifier).expect("system id positive"),
+        u32::try_from(row.timeline).expect("timeline positive"),
+    )
+}
+
+/// Parse a raw history file without the code under test.
+fn raw_history_switches(content: &str) -> Vec<TimelineSwitch> {
+    content
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| {
+            let mut fields = line.split('\t');
+            TimelineSwitch {
+                timeline: fields.next().unwrap().trim().parse().unwrap(),
+                switch_lsn: PgLsn::parse(fields.next().unwrap().trim()).unwrap(),
+            }
+        })
+        .collect()
+}
+
+fn docker_ok(args: &[&str]) -> String {
+    let out = std::process::Command::new("docker")
+        .args(args)
+        .output()
+        .unwrap_or_else(|e| panic!("docker {}: {e}", args.join(" ")));
+    assert!(
+        out.status.success(),
+        "docker {}: {}",
+        args.join(" "),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+fn wait_until(what: &str, mut probe: impl FnMut() -> bool) {
+    let deadline = Instant::now() + ARRIVAL;
+    while !probe() {
+        assert!(
+            Instant::now() < deadline,
+            "{what} did not happen within {ARRIVAL:?}"
+        );
+        std::thread::sleep(Duration::from_millis(250));
+    }
+}
+
+/// A promoted point-in-time clone of the shared server.
+struct PitrCluster {
+    container: String,
+    volume: String,
+    port: u16,
+}
+
+impl PitrCluster {
+    /// Clone the shared server with `pg_basebackup`, recover to the backup's consistency point and promote to timeline 2.
+    fn promoted(name: &str) -> Self {
+        let mut clone = Self {
+            container: format!("subql-pitr-{name}"),
+            volume: format!("subql-pitr-{name}-vol"),
+            port: 0,
+        };
+        let image = common::pg_image_ref();
+        docker_ok(&["volume", "create", &clone.volume]);
+        // Postgres refuses an immediate target without a restore_command, and consistency never consults it.
+        docker_ok(&[
+            "run",
+            "--rm",
+            "--network",
+            &format!("container:{}", common::container_name("pg")),
+            "-v",
+            &format!("{}:/dst", clone.volume),
+            "-e",
+            "PGPASSWORD=subql_test",
+            &image,
+            "sh",
+            "-c",
+            r#"pg_basebackup -h 127.0.0.1 -U subql_test -D /dst -X stream \
+               && printf "recovery_target = 'immediate'\nrestore_command = 'false'\n" >> /dst/postgresql.auto.conf \
+               && touch /dst/recovery.signal"#,
+        ]);
+        let data = format!("{}:/var/lib/postgresql/data", clone.volume);
+        let mut run = vec![
+            "run",
+            "-d",
+            "--name",
+            &clone.container,
+            "-v",
+            &data,
+            "-p",
+            "127.0.0.1:0:5432",
+            "-e",
+            "POSTGRES_USER=subql_test",
+            "-e",
+            "POSTGRES_PASSWORD=subql_test",
+            &image,
+        ];
+        run.extend(common::pg::PG_COMMAND);
+        docker_ok(&run);
+        // PG16 pauses at the recovery target, and resuming promotes.
+        let in_recovery = |want: &str| {
+            let out = std::process::Command::new("docker")
+                .args([
+                    "exec",
+                    &clone.container,
+                    "psql",
+                    "user=subql_test dbname=postgres",
+                    "-tAc",
+                    "SELECT pg_is_in_recovery()",
+                ])
+                .output()
+                .expect("docker runs");
+            out.status.success() && String::from_utf8_lossy(&out.stdout).trim() == want
+        };
+        wait_until("clone reached the paused recovery point", || {
+            in_recovery("t")
+        });
+        docker_ok(&[
+            "exec",
+            &clone.container,
+            "psql",
+            "user=subql_test dbname=postgres",
+            "-c",
+            "SELECT pg_wal_replay_resume()",
+        ]);
+        wait_until("clone promoted", || in_recovery("f"));
+        let mapped = docker_ok(&["port", &clone.container, "5432/tcp"]);
+        clone.port = mapped
+            .lines()
+            .next()
+            .and_then(|line| line.rsplit(':').next())
+            .and_then(|p| p.parse().ok())
+            .expect("mapped port");
+        clone
+    }
+
+    /// libpq URL of the test database on the clone.
+    fn url(&self, database: &str) -> String {
+        common::pg::PgDatabase::url_at(self.port, database)
+    }
+
+    /// The clone's raw `00000002.history`, read off its disk.
+    fn raw_history(&self) -> String {
+        docker_ok(&[
+            "exec",
+            &self.container,
+            "sh",
+            "-c",
+            "find /var/lib/postgresql/data/pg_wal -name 00000002.history -exec cat {} +",
+        ])
+    }
+}
+
+impl Drop for PitrCluster {
+    fn drop(&mut self) {
+        let _ = std::process::Command::new("docker")
+            .args(["rm", "-f", &self.container])
+            .output();
+        let _ = std::process::Command::new("docker")
+            .args(["volume", "rm", &self.volume])
+            .output();
+    }
+}
+
+/// `cluster_identity` matches `pg_control_system` on timeline 1, with no history.
+#[test]
+#[ignore = "requires Docker; run with --ignored"]
+fn cluster_identity_of_the_running_cluster() {
+    common::assert_docker_available();
+    let db = common::pg_database();
+    let mut setup = db.connect();
+    sql_query(PG_DDL).execute(&mut setup).expect("create table");
+    let slot = db.slot("subql_pg_streaming_identity");
+    let publication = "subql_pg_streaming_identity_pub";
+    common::create_publication(&mut setup, publication, "orders");
+    common::create_pgoutput_slot(&mut setup, &slot);
+    let (system_id, timeline) = control_system(&mut setup);
+
+    let catalog = ParserDB::parse::<PostgreSqlDialect>(DDL).expect("parse DDL");
+    let config = PgStreamingConfig::new(db.url(), &slot, publication);
+    current_thread_rt().block_on(async move {
+        let source = PgStreamingCdcSource::connect(config, catalog)
+            .await
+            .expect("connect");
+        let identity = source.cluster_identity();
+        assert_eq!(identity.system_id, system_id);
+        assert_eq!(identity.timeline, timeline);
+        assert_eq!(identity.history, Vec::<TimelineSwitch>::new());
+    });
+
+    common::drop_slot(&mut setup, &slot);
+}
+
+/// A promoted point-in-time clone reports timeline 2 and its own history file's switch point.
+#[test]
+#[ignore = "requires Docker; run with --ignored"]
+fn cluster_identity_of_a_promoted_point_in_time_clone() {
+    common::assert_docker_available();
+    let db = common::pg_database();
+    let mut setup = db.connect();
+    sql_query(PG_DDL).execute(&mut setup).expect("create table");
+    // Recovery discards restored logical slots, so only the publication is created before the clone.
+    let publication = "subql_pg_streaming_pitr_pub";
+    common::create_publication(&mut setup, publication, "orders");
+
+    let clone = PitrCluster::promoted(db.name());
+    let mut on_clone =
+        diesel::PgConnection::establish(&clone.url(db.name())).expect("connect to clone");
+    let slot = db.slot("subql_pg_streaming_pitr");
+    common::create_pgoutput_slot(&mut on_clone, &slot);
+    let (system_id, _) = control_system(&mut on_clone);
+    let expected = raw_history_switches(&clone.raw_history());
+    assert!(!expected.is_empty(), "history file names the branch");
+
+    let catalog = ParserDB::parse::<PostgreSqlDialect>(DDL).expect("parse DDL");
+    let config = PgStreamingConfig::new(clone.url(db.name()), &slot, publication);
+    current_thread_rt().block_on(async move {
+        let source = PgStreamingCdcSource::connect(config, catalog)
+            .await
+            .expect("connect to promoted clone");
+        let identity = source.cluster_identity();
+        assert_eq!(identity.timeline, 2);
+        assert_eq!(identity.history, expected);
+        // Promotion keeps the system id, which is why the timeline is needed.
+        assert_eq!(identity.system_id, system_id);
+    });
 }

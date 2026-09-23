@@ -107,6 +107,19 @@ pub fn assert_docker_available() {
     );
 }
 
+/// Name the `docker` CLI uses for this run's shared `engine` server, as
+/// [`shared_server`] names it.
+#[cfg(feature = "pg-streaming")]
+pub fn container_name(engine: &str) -> String {
+    format!("subql-{engine}-{}", run_id())
+}
+
+/// `image:tag` of the fixture Postgres image, after [`ensure_image`].
+#[cfg(feature = "pg-streaming")]
+pub fn pg_image_ref() -> String {
+    format!("{PG_IMAGE}:{PG_TAG}")
+}
+
 /// Multi-thread tokio runtime for the async e2e tests. Built at the sync
 /// test boundary so blocking testcontainers setup runs before `block_on`,
 /// then used to drive the async apply and re-exec paths. Multi-thread so
