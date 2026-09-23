@@ -108,6 +108,13 @@ pub struct Shapes<DB> {
     uncovered: Vec<Uncovered>,
     /// Every region reconciled as one unit, which a table's entry indexes into.
     groups: Vec<Materialisation>,
+    /// Regions a full load is the whole truth for, one per shape that
+    /// maintains itself.
+    ///
+    /// Only the placement above knows that a region holds exactly one
+    /// producer's facts, which is what makes that producer's rows the whole
+    /// truth for it and nothing else's.
+    load: Vec<Region>,
     /// How the model names a row of each table it names rows of.
     naming: HashMap<TableId, RowNaming>,
     /// Tables the database filters nothing on, which the action report cannot
@@ -146,6 +153,7 @@ impl<DB: DatabaseLike> Shapes<DB> {
         let mut recipes = HashMap::new();
         let mut by_table: HashMap<TableId, TableShapes> = HashMap::new();
         let mut uncovered = Vec::new();
+        let mut load: Vec<Region> = Vec::new();
 
         let producers = producers(relations);
         let plan = plan_groups(&producers, enumerations);
@@ -154,13 +162,15 @@ impl<DB: DatabaseLike> Shapes<DB> {
             index_recipe::<B, DB>(&db, entry, &mut recipes);
         }
         for (position, producer) in producers.iter().enumerate() {
-            index_shape::<B, DB>(
-                &db,
-                producer,
-                plan.of(position),
-                &mut by_table,
-                &mut uncovered,
-            );
+            let placement = plan.of(position);
+            if let Some(region) = producer
+                .region
+                .as_ref()
+                .filter(|_| placement == Placement::Alone)
+            {
+                load.push(region.clone());
+            }
+            index_shape::<B, DB>(&db, producer, placement, &mut by_table, &mut uncovered);
         }
 
         Self {
@@ -169,6 +179,7 @@ impl<DB: DatabaseLike> Shapes<DB> {
             by_table,
             uncovered,
             groups: plan.groups,
+            load,
             answers: HashMap::new(),
             naming: HashMap::new(),
             unrestricted: HashSet::new(),
@@ -417,6 +428,26 @@ impl<DB: DatabaseLike> Shapes<DB> {
     #[must_use]
     pub fn materialisations(&self) -> &[Materialisation] {
         &self.groups
+    }
+
+    /// Every region a full load is the whole truth for, one per shape that
+    /// maintains itself.
+    ///
+    /// A shape maintains itself when it is the only producer stating facts in
+    /// its region, so the region is that shape's whole family and the rows a
+    /// load returns for it are neither more nor less than the facts it holds.
+    /// That pair is what earns a delete, and it is why a region under a
+    /// [`Materialisation`]'s authority is absent here, since the union of that
+    /// group's replays is its whole truth rather than the caller's rows.
+    ///
+    /// Regions here overlap neither one another nor any
+    /// [`materialisations`](Self::materialisations) region, because overlap is
+    /// what gathers producers into a group and what is left alone overlaps
+    /// nothing. A region nothing can place is absent from both lists and
+    /// nothing may delete over it, which [`uncovered`](Self::uncovered) names.
+    #[must_use]
+    pub fn load_regions(&self) -> &[Region] {
+        &self.load
     }
 
     /// Shapes whose records a row of `table` settles on its own.
@@ -1045,12 +1076,14 @@ mod tests {
 
     use core::ops::Not;
 
-    use rls2fga::translator::TranslatorBuilder;
+    use rls2fga::translator::{Outputs, TranslatorBuilder};
     use rls2fga_types::ConfidenceLevel;
+    use rls2fga_types::TypeName;
     use rls2fga_types::{ActionAnswer, ActionStatement};
+    use rls2fga_types::{RecordDerivation, RecordDescription, RelationName, RelationShapes};
     use sqlparser::dialect::PostgreSqlDialect;
 
-    use super::{Enumeration, Shapes};
+    use super::{Enumeration, Materialisation, Region, Shapes};
     use crate::{catalog_helpers, ParserDB, TableId};
 
     /// Every statement a table can be asked about, so a test says "every" rather
@@ -1066,8 +1099,7 @@ mod tests {
         ActionStatement::UpdateWithoutWhere,
     ];
 
-    /// Build the index the way a real caller does, from all three reports.
-    fn shapes(sql: &str) -> Shapes<ParserDB> {
+    fn translated(sql: &str) -> (ParserDB, Outputs) {
         let db = ParserDB::parse::<PostgreSqlDialect>(sql).unwrap();
         let outputs = TranslatorBuilder::new()
             .with_min_confidence(ConfidenceLevel::B)
@@ -1075,10 +1107,13 @@ mod tests {
             .translate(&db)
             .unwrap()
             .outputs_accepting_gaps();
-        let translation = outputs.translation();
-        // A skipped query carries no description, so `filter_map` drops exactly
-        // the entries that enumerate nothing.
-        let enumerations: Vec<Enumeration<'_>> = outputs
+        (db, outputs)
+    }
+
+    /// A skipped query carries no description, so `filter_map` drops exactly
+    /// the entries that enumerate nothing.
+    fn enumerations(outputs: &Outputs) -> Vec<Enumeration<'_>> {
+        outputs
             .tuple_queries()
             .iter()
             .filter_map(|query| {
@@ -1088,7 +1123,14 @@ mod tests {
                     condition: query.condition.as_deref(),
                 })
             })
-            .collect();
+            .collect()
+    }
+
+    /// Build the index the way a real caller does, from all three reports.
+    fn shapes(sql: &str) -> Shapes<ParserDB> {
+        let (db, outputs) = translated(sql);
+        let translation = outputs.translation();
+        let enumerations = enumerations(&outputs);
         let naming = alloc::borrow::Cow::from(translation.row_naming()).into_owned();
         let answers = translation.action_relations().to_vec();
         let unrestricted = translation.unrestricted_tables().to_vec();
@@ -1286,5 +1328,119 @@ mod tests {
             "a time part now has an identity spelling: {:?}",
             shapes.uncovered()
         );
+    }
+
+    /// A row-settled owner and a membership only a replay reaches, each alone in
+    /// its region.
+    const TWO_ALONE: &str = "
+        CREATE TABLE teams(id INTEGER PRIMARY KEY);
+        CREATE TABLE team_members(team_id INTEGER REFERENCES teams(id), user_id TEXT,
+                                  expires_at TIMESTAMPTZ);
+        CREATE TABLE docs(id INTEGER PRIMARY KEY, team_id INTEGER REFERENCES teams(id));
+        ALTER TABLE docs ENABLE ROW LEVEL SECURITY;
+        CREATE POLICY p ON docs FOR SELECT USING (
+          EXISTS (SELECT 1 FROM team_members
+                  WHERE team_members.team_id = docs.team_id
+                    AND team_members.user_id = current_user
+                    AND team_members.expires_at > now()));";
+
+    /// The load owns the regions of row-settled and keyed shapes alike, and no
+    /// two of them share a fact.
+    #[test]
+    fn the_load_owns_row_settled_and_keyed_regions_alike() {
+        let shapes = shapes(TWO_ALONE);
+        assert_eq!(shapes.materialisations(), Vec::<Materialisation>::new());
+
+        let owns = |object: &str, relation: &str, subject: &str| {
+            shapes
+                .load_regions()
+                .iter()
+                .filter(|region| region.holds(object, relation, subject))
+                .count()
+        };
+        assert_eq!(
+            owns("docs:1", "teams", "teams:3"),
+            1,
+            "the row-settled link"
+        );
+        assert_eq!(
+            owns("teams:3", "member", "user:alice"),
+            1,
+            "the keyed membership"
+        );
+        assert_eq!(
+            owns("teams:3", "owner", "user:alice"),
+            0,
+            "a relation nothing states"
+        );
+    }
+
+    /// A region several producers share is its group's, so the load owns none
+    /// of it and owns everything alone beside it.
+    #[test]
+    fn a_group_region_is_left_to_its_members() {
+        let shapes = shapes(
+            "CREATE TABLE teams(id INTEGER PRIMARY KEY);
+             CREATE TABLE team_members(team_id INTEGER REFERENCES teams(id), user_id TEXT);
+             CREATE TABLE team_guests(team_id INTEGER REFERENCES teams(id), user_id TEXT,
+                                      expires_at TIMESTAMPTZ);
+             CREATE TABLE docs(id INTEGER PRIMARY KEY, owner_id TEXT);
+             ALTER TABLE teams ENABLE ROW LEVEL SECURITY;
+             ALTER TABLE docs ENABLE ROW LEVEL SECURITY;
+             CREATE POLICY t ON teams FOR SELECT USING (
+               EXISTS (SELECT 1 FROM team_members
+                       WHERE team_members.team_id = teams.id
+                         AND team_members.user_id = current_user)
+               OR EXISTS (SELECT 1 FROM team_guests
+                       WHERE team_guests.team_id = teams.id
+                         AND team_guests.user_id = current_user
+                         AND team_guests.expires_at > now()));
+             CREATE POLICY d ON docs FOR SELECT USING (owner_id = current_user);",
+        );
+        let [group] = shapes.materialisations() else {
+            panic!("one shared region: {:?}", shapes.materialisations());
+        };
+        assert!(group.region().holds("teams:3", "member", "user:alice"));
+        assert!(
+            shapes
+                .load_regions()
+                .iter()
+                .all(|region| region.overlaps(group.region()).not()),
+            "{:?}",
+            shapes.load_regions()
+        );
+        assert!(shapes.load_regions().iter().any(|region| region.holds(
+            "docs:1",
+            "owner",
+            "user:alice"
+        )));
+    }
+
+    /// One shape nothing can place leaves the load owning nothing, since its
+    /// facts could lie in any region.
+    #[test]
+    fn an_unplaceable_shape_leaves_the_load_owning_nothing() {
+        let (db, outputs) = translated(TWO_ALONE);
+        let enumerations = enumerations(&outputs);
+        let mut relations = outputs.translation().relations().to_vec();
+        relations.push(RelationShapes {
+            type_name: TypeName::canonicalized("probe"),
+            relation: RelationName::canonicalized("probe"),
+            from_one_row: false,
+            decision: None,
+            grants_nobody: false,
+            shapes: alloc::vec![RecordDescription {
+                tables: Vec::new(),
+                derivation: RecordDerivation::Joined {
+                    queries: Vec::new(),
+                    reason: "a joining shape carrying no query".into(),
+                },
+            }],
+        });
+
+        let shapes = Shapes::new::<Postgres>(db, &relations, &enumerations);
+
+        assert_eq!(shapes.load_regions(), Vec::<Region>::new());
+        assert_eq!(shapes.materialisations(), Vec::<Materialisation>::new());
     }
 }

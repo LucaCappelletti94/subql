@@ -28,7 +28,7 @@ use rls2fga_types::{ActionAnswer, ActionStatement, RowVersion};
 
 use crate::visibility::records::render_text;
 use crate::visibility::shapes::{RequiredParameter, Shapes, SharedShapes};
-use crate::visibility::store::{KeyedRequery, Materialisation, Replayer, StoreDiff};
+use crate::visibility::store::{KeyedRequery, Materialisation, Region, Replayer, StoreDiff};
 use crate::visibility::{RowView, RowWrite, Verdict, VisibilityPolicy};
 
 use super::errors::OpenFgaError;
@@ -639,6 +639,10 @@ where
     /// [`KeyedRequery`] returned, due before the
     /// event is delivered, exactly as the store module's contract says.
     ///
+    /// The whole-store counterpart is
+    /// [`reconcile_store`](Self::reconcile_store), authoritative over every
+    /// region the translation owns at once.
+    ///
     /// The read asks authoritatively whatever the configured read preference
     /// says, because it reads this policy's own writes: a replica missing the
     /// newest one would resurrect what was just deleted.
@@ -700,7 +704,7 @@ where
                 tuple.condition,
             );
         }
-        let moved = difference(&stored, records);
+        let moved = difference(&stored, records.iter());
         self.send(&moved).await?;
         Ok(moved)
     }
@@ -720,10 +724,10 @@ where
     /// closed over region overlap, so no group's writes fall in another's
     /// region.
     ///
-    /// The load runs every group of
-    /// [`Shapes::materialisations`](crate::visibility::shapes::Shapes::materialisations)
-    /// and an event runs the ones it obliged, which is the same call, so the
-    /// load heals whatever drifted.
+    /// A load runs every group through
+    /// [`reconcile_store`](Self::reconcile_store) and an event runs the ones it
+    /// obliged through this, which is the same reconcile, so the load heals
+    /// whatever drifted.
     ///
     /// # A failure part way through a pass keeps what it already wrote
     ///
@@ -736,11 +740,11 @@ where
     ///
     /// # Errors
     ///
-    /// [`MaterialiseError::Replay`] carrying the caller's own error when a
-    /// member's query could not be run, [`MaterialiseError::OutOfRegion`] when
+    /// [`ReconcileError::Replay`] carrying the caller's own error when a
+    /// member's query could not be run, [`ReconcileError::OutOfRegion`] when
     /// a replay returned a fact outside the region its group declared,
-    /// [`MaterialiseError::Contradiction`] when two members state one fact
-    /// under different conditions, and [`MaterialiseError::Store`] as
+    /// [`ReconcileError::Contradiction`] when two members state one fact
+    /// under different conditions, and [`ReconcileError::Store`] as
     /// [`apply`](Self::apply). Only the last of the four is worth retrying
     /// unchanged, and the first three are raised before anything is written
     /// for the group that caused them.
@@ -748,7 +752,7 @@ where
         &self,
         groups: impl IntoIterator<Item = &'a Materialisation> + Send,
         replayer: &R,
-    ) -> Result<Vec<Reconciled>, MaterialiseError<R::Error>>
+    ) -> Result<Vec<Reconciled>, ReconcileError<R::Error>>
     where
         R: Replayer + Sync,
     {
@@ -766,52 +770,96 @@ where
         let held = self.read_every_tuple().await?;
         let mut reports = Vec::with_capacity(pass.len());
         for group in pass {
-            let mut records = Vec::new();
-            for member in group.members() {
-                records.extend(
-                    replayer
-                        .replay(member)
-                        .await
-                        .map_err(MaterialiseError::Replay)?,
-                );
-            }
-            records.extend_from_slice(group.constants());
-            for record in &records {
-                if !group.region().holds_record(record) {
-                    return Err(MaterialiseError::OutOfRegion(alloc::format!(
-                        "({}, {}, {})",
-                        record.subject,
-                        record.relation,
-                        record.object
-                    )));
-                }
-            }
-            if let Some(fact) = contradiction(&records) {
-                return Err(MaterialiseError::Contradiction(fact));
-            }
-
-            let mut stored: BTreeMap<Triple, Option<RelationshipCondition>> = BTreeMap::new();
-            for tuple in &held {
-                if !group
-                    .region()
-                    .holds(&tuple.object, &tuple.relation, &tuple.user)
-                {
-                    continue;
-                }
-                stored.insert(
-                    (
-                        tuple.user.clone(),
-                        tuple.relation.clone(),
-                        tuple.object.clone(),
-                    ),
-                    tuple.condition.clone(),
-                );
-            }
-            let moved = difference(&stored, &records);
+            let moved = group_difference(group, replayer, &held).await?;
             self.send(&moved).await?;
             reports.push(moved);
         }
         Ok(reports)
+    }
+
+    /// Make the store state exactly what `records` and `replayer` state, over
+    /// every region the translation owns, and report what moved.
+    ///
+    /// `records` is the whole load, every row every tuple query returned, not
+    /// the keyed ones alone. A region is authoritative over every fact it
+    /// states, so a row the load stopped returning withdraws a fact, and a
+    /// caller handing over a subset withdraws the facts of the shapes it left
+    /// out.
+    ///
+    /// Both authorities are reconciled. Every region of
+    /// [`Shapes::load_regions`](Shapes::load_regions) becomes what the records
+    /// lying in it state, which is the row-settled and keyed shapes, and every
+    /// [`Shapes::materialisations`](Shapes::materialisations) region becomes
+    /// the union of its members' replays. These are the operations the change
+    /// path runs per event, which is what makes a boot heal whatever drifted
+    /// while it was down.
+    ///
+    /// Facts outside every region the translation declares are left alone, so
+    /// a store shared with another writer keeps its own facts, and so does a
+    /// constant or a shape named by
+    /// [`Shapes::uncovered`](Shapes::uncovered), neither of which this call
+    /// may place.
+    ///
+    /// # One read is enough because the regions are disjoint
+    ///
+    /// `Read` filters by a user or an object id and nothing narrower, so the
+    /// whole store is read once and every region is filtered out of that in
+    /// memory. Every difference comes from that one read, and it stays right
+    /// while the earlier regions' writes go out, because no region of
+    /// [`Shapes::load_regions`](Shapes::load_regions) overlaps another or any
+    /// group's. Overlap is what gathers producers into a group, so no write
+    /// lands where another region's difference reads.
+    ///
+    /// # Nothing is written until every truth is known
+    ///
+    /// Every replay runs and every difference is computed before the first
+    /// write, so a query that fails or one fact stated under two conditions
+    /// stops the pass with the store untouched. The sends then go region by
+    /// region, and a transport failure leaves the regions before it applied.
+    /// Retrying the whole call is safe, since each region's reconcile is
+    /// authoritative over its own region and re-running one that succeeded
+    /// sends nothing.
+    ///
+    /// A store already equal to the load costs the read and sends no writes.
+    ///
+    /// # Errors
+    ///
+    /// [`ReconcileError::Replay`] carrying the caller's own error when a
+    /// member's query could not be run, [`ReconcileError::OutOfRegion`] when a
+    /// replay returned a fact outside the region its group declared,
+    /// [`ReconcileError::Contradiction`] when one fact is stated under two
+    /// conditions, and [`ReconcileError::Store`] as [`apply`](Self::apply).
+    /// The first three are raised before the first write.
+    pub async fn reconcile_store<R>(
+        &self,
+        records: &[Record],
+        replayer: &R,
+    ) -> Result<Vec<Reconciled>, ReconcileError<R::Error>>
+    where
+        R: Replayer + Sync,
+    {
+        let held = self.read_every_tuple().await?;
+        let mut pass: Vec<Reconciled> = Vec::new();
+        for region in self.shapes.load_regions() {
+            let truth = records.iter().filter(|record| region.holds_record(record));
+            if let Some(fact) = contradiction(truth.clone()) {
+                return Err(ReconcileError::Contradiction(fact));
+            }
+            let moved = difference(&stored_in(region, &held), truth);
+            if moved.is_empty().not() {
+                pass.push(moved);
+            }
+        }
+        for group in self.shapes.materialisations() {
+            let moved = group_difference(group, replayer, &held).await?;
+            if moved.is_empty().not() {
+                pass.push(moved);
+            }
+        }
+        for moved in &pass {
+            self.send(moved).await?;
+        }
+        Ok(pass)
     }
 
     /// Send one reconciliation's difference.
@@ -991,10 +1039,10 @@ where
 
     /// Write `records` as tuples, splitting them across calls the server accepts.
     ///
-    /// This is where the initial load's rows go: it only ever writes, so what a
-    /// replayed [`KeyedRequery`] returned goes
-    /// through [`reconcile_records`](Self::reconcile_records) instead, which
-    /// also takes out what the replay stopped returning.
+    /// It only ever writes, so a load that has to take out what the database
+    /// stopped stating goes through [`reconcile_store`](Self::reconcile_store),
+    /// and what a replayed [`KeyedRequery`] returned goes through
+    /// [`reconcile_records`](Self::reconcile_records).
     ///
     /// # Errors
     ///
@@ -1057,13 +1105,13 @@ where
     }
 }
 
-/// Why a group could not be reconciled.
+/// Why an authoritative reconcile could not be carried out.
 ///
-/// Three causes, kept apart because only one of them is worth retrying: a
-/// store that could not be reached may work on the next attempt, while a
-/// replay that returned the wrong facts returns them again for ever.
+/// Four causes, kept apart because only one of them is worth retrying, since a
+/// store that could not be reached may work on the next attempt while a replay
+/// that returned the wrong facts returns them again for ever.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
-pub enum MaterialiseError<E> {
+pub enum ReconcileError<E> {
     /// A member's query could not be run.
     #[error("replaying a group member failed: {0}")]
     Replay(E),
@@ -1072,11 +1120,11 @@ pub enum MaterialiseError<E> {
     /// right.
     #[error("a replayed fact lies outside its group's region: {0}")]
     OutOfRegion(String),
-    /// Two members state the same fact under different conditions, so nothing
-    /// here can say which of them is the grant. A tuple carries one condition,
-    /// and collapsing to either would hand somebody access on terms a producer
-    /// did not state.
-    #[error("two members state {0} under different conditions")]
+    /// One fact stated under two conditions, by two group members or by two
+    /// rows of one load, so nothing here can say which of them is the grant.
+    /// A tuple carries one condition, and collapsing to either would hand
+    /// somebody access on terms a producer did not state.
+    #[error("{0} is stated under two different conditions")]
     Contradiction(String),
     /// The store could not be read or written, which is the retryable one.
     #[error(transparent)]
@@ -1091,12 +1139,12 @@ pub enum MaterialiseError<E> {
 /// triple: one fact stated by two members collapses, and the two filters agree
 /// about which of them they collapsed to. Reading the last here and the first
 /// below would delete a tuple and write nothing in its place.
-fn difference(
+fn difference<'r>(
     stored: &BTreeMap<Triple, Option<RelationshipCondition>>,
-    records: &[Record],
+    records: impl Iterator<Item = &'r Record> + Clone,
 ) -> Reconciled {
     let mut desired: BTreeMap<Triple, Option<RelationshipCondition>> = BTreeMap::new();
-    for record in records {
+    for record in records.clone() {
         desired
             .entry(triple_of(record))
             .or_insert_with(|| record.context.as_ref().map(condition_of));
@@ -1129,11 +1177,11 @@ fn difference(
 /// report.
 ///
 /// One fact stated twice identically is a duplicate and collapses. One stated
-/// twice with different conditions is a contradiction between its producers:
-/// the tuple can carry one condition, and nothing here can say which of them
-/// is the grant. Collapsing to either would hand somebody access on terms a
-/// producer did not state.
-fn contradiction(records: &[Record]) -> Option<String> {
+/// twice with different conditions is a contradiction between its producers,
+/// because the tuple can carry one condition and nothing here can say which of
+/// them is the grant. Collapsing to either would hand somebody access on terms
+/// a producer did not state.
+fn contradiction<'r>(records: impl IntoIterator<Item = &'r Record>) -> Option<String> {
     let mut seen: BTreeMap<Triple, Option<RelationshipCondition>> = BTreeMap::new();
     for record in records {
         let condition = record.context.as_ref().map(condition_of);
@@ -1156,7 +1204,73 @@ fn contradiction(records: &[Record]) -> Option<String> {
     None
 }
 
-/// What [`OpenFgaPolicy::reconcile_records`] moved.
+/// The stored facts lying in `region`, keyed as the server keys them.
+///
+/// The one store read holds every region's facts, so a reconcile filters what
+/// it owns out of it here rather than asking the server for a filter it cannot
+/// express.
+fn stored_in(
+    region: &Region,
+    held: &[TupleKey],
+) -> BTreeMap<Triple, Option<RelationshipCondition>> {
+    let mut stored = BTreeMap::new();
+    for tuple in held {
+        if !region.holds(&tuple.object, &tuple.relation, &tuple.user) {
+            continue;
+        }
+        stored.insert(
+            (
+                tuple.user.clone(),
+                tuple.relation.clone(),
+                tuple.object.clone(),
+            ),
+            tuple.condition.clone(),
+        );
+    }
+    stored
+}
+
+/// What one group's replay states over `held`, decided before anything is
+/// sent.
+///
+/// Every member runs first, because a fact one member stopped returning may be
+/// a fact another still states, and only the union is the whole truth for the
+/// region.
+async fn group_difference<R>(
+    group: &Materialisation,
+    replayer: &R,
+    held: &[TupleKey],
+) -> Result<Reconciled, ReconcileError<R::Error>>
+where
+    R: Replayer + Sync + ?Sized,
+{
+    let mut records = Vec::new();
+    for member in group.members() {
+        records.extend(
+            replayer
+                .replay(member)
+                .await
+                .map_err(ReconcileError::Replay)?,
+        );
+    }
+    records.extend_from_slice(group.constants());
+    for record in &records {
+        if !group.region().holds_record(record) {
+            return Err(ReconcileError::OutOfRegion(alloc::format!(
+                "({}, {}, {})",
+                record.subject,
+                record.relation,
+                record.object
+            )));
+        }
+    }
+    if let Some(fact) = contradiction(records.iter()) {
+        return Err(ReconcileError::Contradiction(fact));
+    }
+    Ok(difference(&stored_in(group.region(), held), records.iter()))
+}
+
+/// What one authoritative reconcile moved.
 ///
 /// `added` is in the differenced path's own currency, since those facts are
 /// the caller's records. `removed` came back from the server, and a
@@ -1170,6 +1284,14 @@ pub struct Reconciled {
     /// Facts the store held and the slice no longer states, deleted by this
     /// call.
     pub removed: Vec<WithdrawnFact>,
+}
+
+impl Reconciled {
+    /// Whether the reconcile moved nothing.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.added.is_empty() && self.removed.is_empty()
+    }
 }
 
 /// One fact the store held and the reconciled slice no longer states.
@@ -1370,14 +1492,14 @@ mod tests {
         batch_request, condition_of, consistency_for, context_for, difference, fits_one_call,
         triple_of, tuple_of, usable_index, ActionStatement, Asked, BatchCheckItem,
         BatchCheckRequest, CheckRequestTupleKey, ConsistencyPreference, Kind, OpenFgaError,
-        OpenFgaPolicy, OpenFgaServiceClient, ProstValue, Question, Record, RecordContextValue,
-        RelationshipCondition, RequestValues, RequiredParameter, RowWrite, Struct, Subject,
-        TupleKeyWithoutCondition, WriteRequest, MAX_TUPLES_PER_WRITE,
+        OpenFgaPolicy, OpenFgaServiceClient, ProstValue, Question, ReconcileError, Record,
+        RecordContextValue, RelationName, RelationshipCondition, RequestValues, RequiredParameter,
+        RowWrite, Struct, Subject, TupleKeyWithoutCondition, WriteRequest, MAX_TUPLES_PER_WRITE,
     };
     use crate::backend::{Postgres, Value};
     use crate::testing::{block_on, TestEvent};
     use crate::visibility::shapes::Shapes;
-    use crate::visibility::store::{Enumeration, Requeries, Requery, StoreDiff};
+    use crate::visibility::store::{Enumeration, Replay, Replayer, Requeries, Requery, StoreDiff};
     use crate::visibility::{test_names, EventRow, Verdict, VisibilityPolicy};
     use crate::{catalog_helpers, ParserDB};
     use alloc::string::String;
@@ -1387,7 +1509,7 @@ mod tests {
     use core::task::{Context as CoreContext, Poll};
     use openfga_client::client::{
         batch_check_single_result::CheckResult, BatchCheckResponse, BatchCheckSingleResult,
-        WriteResponse,
+        ReadResponse, Tuple, WriteResponse,
     };
     use openfga_client::tonic::client::GrpcService;
     use openfga_client::tonic::codec::{Codec, EncodeBody, SingleMessageCompressionOverride};
@@ -2551,7 +2673,7 @@ CREATE POLICY p ON docs FOR SELECT USING (
         let held = membership_record(Some("when_one"));
         let stored = BTreeMap::from([(triple_of(&held), held.context.as_ref().map(condition_of))]);
 
-        let moved = difference(&stored, &[held, membership_record(Some("when_two"))]);
+        let moved = difference(&stored, [held, membership_record(Some("when_two"))].iter());
 
         assert!(
             moved.removed.is_empty(),
@@ -2586,7 +2708,7 @@ CREATE POLICY p ON docs FOR SELECT USING (
         let stated = granted("shares:1|~6b65793a62", "key:r86k-b");
         let stored = BTreeMap::from([(triple_of(&held), held.context.as_ref().map(condition_of))]);
 
-        let moved = difference(&stored, core::slice::from_ref(&stated));
+        let moved = difference(&stored, core::slice::from_ref(&stated).iter());
 
         let [withdrawn] = moved.removed.as_slice() else {
             panic!("the fact the store held alone is withdrawn: {moved:?}");
@@ -2622,7 +2744,7 @@ CREATE POLICY p ON docs FOR SELECT USING (
         let stated = granted("key:r86k-b");
         let stored = BTreeMap::from([(triple_of(&held), held.context.as_ref().map(condition_of))]);
 
-        let moved = difference(&stored, core::slice::from_ref(&stated));
+        let moved = difference(&stored, core::slice::from_ref(&stated).iter());
 
         let [withdrawn] = moved.removed.as_slice() else {
             panic!("the key is withdrawn and written again: {moved:?}");
@@ -2664,7 +2786,7 @@ CREATE POLICY p ON docs FOR SELECT USING (
             }),
         )]);
 
-        let moved = difference(&stored, &[]);
+        let moved = difference(&stored, core::iter::empty::<&Record>());
 
         let [withdrawn] = moved.removed.as_slice() else {
             panic!("an empty replay withdraws what the store held: {moved:?}");
@@ -2685,5 +2807,138 @@ CREATE POLICY p ON docs FOR SELECT USING (
                 values: BTreeMap::new(),
             }),
         }
+    }
+
+    /// A shared membership region beside a row-settled owner, so a sweep has a
+    /// group and a region the load owns.
+    const SWEEP: &str = "
+CREATE TABLE teams(id INTEGER PRIMARY KEY);
+CREATE TABLE team_members(team_id INTEGER REFERENCES teams(id), user_id TEXT);
+CREATE TABLE team_guests(team_id INTEGER REFERENCES teams(id), user_id TEXT,
+                         expires_at TIMESTAMPTZ);
+CREATE TABLE docs(id INTEGER PRIMARY KEY, owner_id TEXT);
+ALTER TABLE teams ENABLE ROW LEVEL SECURITY;
+ALTER TABLE docs ENABLE ROW LEVEL SECURITY;
+CREATE POLICY t ON teams FOR SELECT USING (
+  EXISTS (SELECT 1 FROM team_members
+          WHERE team_members.team_id = teams.id AND team_members.user_id = current_user)
+  OR EXISTS (SELECT 1 FROM team_guests
+          WHERE team_guests.team_id = teams.id AND team_guests.user_id = current_user
+            AND team_guests.expires_at > now()));
+CREATE POLICY d ON docs FOR SELECT USING (owner_id = current_user);
+";
+
+    /// Canned replays, each recognised by the table its SQL reads.
+    struct Canned(Vec<(&'static str, Vec<Record>)>);
+
+    impl Replayer for Canned {
+        type Error = core::convert::Infallible;
+
+        fn replay(
+            &self,
+            member: &Replay,
+        ) -> impl Future<Output = Result<Vec<Record>, Self::Error>> + Send {
+            let (_, rows) = self
+                .0
+                .iter()
+                .find(|(table, _)| member.sql().contains(table))
+                .unwrap_or_else(|| panic!("no canned rows for {}", member.sql()));
+            core::future::ready(Ok(rows.clone()))
+        }
+    }
+
+    fn fact(object: &str, relation: &RelationName, subject: &str) -> Record {
+        Record {
+            object: object.to_string(),
+            relation: relation.clone(),
+            subject: subject.to_string(),
+            context: None,
+        }
+    }
+
+    fn stored(records: &[&Record]) -> ReadResponse {
+        ReadResponse {
+            tuples: records
+                .iter()
+                .map(|record| Tuple {
+                    key: Some(tuple_of(record)),
+                    timestamp: None,
+                })
+                .collect(),
+            continuation_token: String::new(),
+        }
+    }
+
+    /// The owner the load states, the member the group replays, and a fact in a
+    /// relation nothing declares.
+    fn sweep_facts(shapes: &Shapes<ParserDB>) -> (Record, Record, Record) {
+        let [group] = shapes.materialisations() else {
+            panic!("one shared region: {:?}", shapes.materialisations());
+        };
+        let member = group.region().parts()[0].relation();
+        (
+            fact("docs:1", &test_names::relation("owner"), "user:alice"),
+            fact("teams:3", member, "user:alice"),
+            fact("docs:4", &RelationName::canonicalized("viewer"), "user:bob"),
+        )
+    }
+
+    /// A store already equal to the load costs the one read and sends nothing.
+    #[test]
+    fn an_equal_store_costs_the_read_and_no_write() {
+        let shapes = shapes_over(SWEEP);
+        let (owner, member, stray) = sweep_facts(&shapes);
+        let transport = Scripted::new([ScriptedReply::message(stored(&[&owner, &member, &stray]))]);
+        let policy = OpenFgaPolicy::<_, _, String, Postgres>::new(
+            Arc::clone(&shapes),
+            OpenFgaServiceClient::new(transport.clone()),
+            "store",
+        )
+        .unwrap();
+        let replay = Canned(vec![
+            ("team_members", vec![member]),
+            ("team_guests", Vec::new()),
+        ]);
+
+        let reports = block_on(policy.reconcile_store(core::slice::from_ref(&owner), &replay));
+
+        assert_eq!(reports, Ok(Vec::new()));
+        let calls = transport.calls();
+        assert_eq!(calls.len(), 1, "the read and nothing else");
+        assert_eq!(calls[0].path, "/openfga.v1.OpenFGAService/Read");
+    }
+
+    /// One fact the load states under two conditions stops the pass after the
+    /// read and before any write.
+    #[test]
+    fn an_ambiguous_load_is_refused_before_any_write() {
+        let shapes = shapes_over(SWEEP);
+        let (owner, member, _) = sweep_facts(&shapes);
+        let transport = Scripted::new([ScriptedReply::message(stored(&[]))]);
+        let policy = OpenFgaPolicy::<_, _, String, Postgres>::new(
+            Arc::clone(&shapes),
+            OpenFgaServiceClient::new(transport.clone()),
+            "store",
+        )
+        .unwrap();
+        let gated = Record {
+            context: Some(RecordContextValue {
+                condition: "when_owner".to_string(),
+                values: BTreeMap::new(),
+            }),
+            ..owner.clone()
+        };
+        let replay = Canned(vec![
+            ("team_members", vec![member]),
+            ("team_guests", Vec::new()),
+        ]);
+
+        let refused = block_on(policy.reconcile_store(&[owner, gated], &replay));
+
+        assert!(
+            matches!(&refused, Err(ReconcileError::Contradiction(fact)) if fact.contains("docs:1")),
+            "{refused:?}"
+        );
+        assert_eq!(transport.calls().len(), 1, "the read and no write");
     }
 }
