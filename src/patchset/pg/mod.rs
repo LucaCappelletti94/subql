@@ -23,8 +23,10 @@
 //!   assignment cast from text to `numeric`. Any other wire shape on a
 //!   decimal column is rejected.
 //! * `TIMESTAMP`, `TIMESTAMPTZ`, `DATE`, and `TIME` get native temporal
-//!   binds when the wire carries a `Value::Text` holding the verbatim
-//!   Postgres text form, parsed through `sql_scalar_text`. `TIMESTAMPTZ` normalizes to a UTC instant.
+//!   binds when the wire carries a `Value::Text` holding the replica's
+//!   temporal text (`YYYY-MM-DD HH:MM:SS.ffffff+00:00` for a
+//!   `TIMESTAMPTZ`) or Postgres's own text output, parsed through
+//!   `sql_scalar_text`. `TIMESTAMPTZ` normalizes to a UTC instant.
 //!   Each column is classified through the catalog's [`crate::backend::ScalarKind`],
 //!   since Postgres has no implicit assignment cast from text to these
 //!   types. Any other wire shape on such a column is rejected.
