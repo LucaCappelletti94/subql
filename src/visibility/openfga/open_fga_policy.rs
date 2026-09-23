@@ -768,9 +768,11 @@ where
         }
 
         let held = self.read_every_tuple().await?;
+        let stored =
+            RegionIndex::new(pass.iter().map(|group| group.region()).collect()).stored(&held);
         let mut reports = Vec::with_capacity(pass.len());
-        for group in pass {
-            let moved = group_difference(group, replayer, &held).await?;
+        for (group, stored) in pass.into_iter().zip(&stored) {
+            let moved = group_difference(group, replayer, stored).await?;
             self.send(&moved).await?;
             reports.push(moved);
         }
@@ -821,8 +823,9 @@ where
     /// sends nothing.
     ///
     /// A store already equal to the load costs the read and sends no writes.
-    /// Each region filters the whole read, so the pass costs the regions times
-    /// the store, which a boot over a very large store pays once.
+    /// The read and the load are each bucketed by region in one pass, so the
+    /// sweep grows with the store and the load rather than with their product
+    /// over the regions.
     ///
     /// # This is not the loader
     ///
@@ -849,19 +852,37 @@ where
         R: Replayer + Sync,
     {
         let held = self.read_every_tuple().await?;
+        let load = self.shapes.load_regions();
+        let groups = self.shapes.materialisations();
+        let index = RegionIndex::new(
+            load.iter()
+                .chain(groups.iter().map(Materialisation::region))
+                .collect(),
+        );
+        let stored = index.stored(&held);
+        let mut truths: Vec<Vec<&Record>> = alloc::vec![Vec::new(); load.len()];
+        for record in records {
+            // A record in a group's region is the group's replay's to state.
+            if let Some(truth) = index
+                .holding(&record.object, record.relation.as_str(), &record.subject)
+                .and_then(|position| truths.get_mut(position))
+            {
+                truth.push(record);
+            }
+        }
+
         let mut pass: Vec<Reconciled> = Vec::new();
-        for region in self.shapes.load_regions() {
-            let truth = records.iter().filter(|record| region.holds_record(record));
-            if let Some(fact) = contradiction(truth.clone()) {
+        for (truth, stored) in truths.iter().zip(&stored) {
+            if let Some(fact) = contradiction(truth.iter().copied()) {
                 return Err(ReconcileError::Contradiction(fact));
             }
-            let moved = difference(&stored_in(region, &held), truth);
+            let moved = difference(stored, truth.iter().copied());
             if moved.is_empty().not() {
                 pass.push(moved);
             }
         }
-        for group in self.shapes.materialisations() {
-            let moved = group_difference(group, replayer, &held).await?;
+        for (group, stored) in groups.iter().zip(&stored[load.len()..]) {
+            let moved = group_difference(group, replayer, stored).await?;
             if moved.is_empty().not() {
                 pass.push(moved);
             }
@@ -1214,34 +1235,78 @@ fn contradiction<'r>(records: impl IntoIterator<Item = &'r Record>) -> Option<St
     None
 }
 
-/// The stored facts lying in `region`, keyed as the server keys them.
+/// The stored facts of each region, keyed as the server keys them.
+type Stored = BTreeMap<Triple, Option<RelationshipCondition>>;
+
+/// Regions indexed by the object type and relation of their parts, so the
+/// region a fact lies in is one lookup rather than a scan of every region.
 ///
-/// The one store read holds every region's facts, so a reconcile filters what
-/// it owns out of it here rather than asking the server for a filter it cannot
-/// express.
-fn stored_in(
-    region: &Region,
-    held: &[TupleKey],
-) -> BTreeMap<Triple, Option<RelationshipCondition>> {
-    let mut stored = BTreeMap::new();
-    for tuple in held {
-        if !region.holds(&tuple.object, &tuple.relation, &tuple.user) {
-            continue;
-        }
-        stored.insert(
-            (
-                tuple.user.clone(),
-                tuple.relation.clone(),
-                tuple.object.clone(),
-            ),
-            tuple.condition.clone(),
-        );
-    }
-    stored
+/// `Read` cannot filter by region, so the one store read holds every region's
+/// facts, and each reconcile takes its own out of it here.
+struct RegionIndex<'r> {
+    regions: Vec<&'r Region>,
+    by_part: BTreeMap<(&'r str, &'r str), Vec<usize>>,
 }
 
-/// What one group's replay states over `held`, decided before anything is
-/// sent.
+impl<'r> RegionIndex<'r> {
+    fn new(regions: Vec<&'r Region>) -> Self {
+        let mut by_part: BTreeMap<(&str, &str), Vec<usize>> = BTreeMap::new();
+        for (position, region) in regions.iter().enumerate() {
+            for part in region.parts() {
+                let slot = by_part
+                    .entry((part.object_type(), part.relation().as_str()))
+                    .or_default();
+                if !slot.contains(&position) {
+                    slot.push(position);
+                }
+            }
+        }
+        Self { regions, by_part }
+    }
+
+    /// Every region holding the fact, in index order.
+    fn every_holding<'q>(
+        &'q self,
+        object: &'q str,
+        relation: &'q str,
+        subject: &'q str,
+    ) -> impl Iterator<Item = usize> + 'q {
+        object
+            .split_once(':')
+            .and_then(|(kind, _)| self.by_part.get(&(kind, relation)))
+            .into_iter()
+            .flatten()
+            .copied()
+            .filter(move |position| self.regions[*position].holds(object, relation, subject))
+    }
+
+    /// The first region holding the fact, which is the only one where the
+    /// regions come from one index and so never overlap.
+    fn holding(&self, object: &str, relation: &str, subject: &str) -> Option<usize> {
+        self.every_holding(object, relation, subject).next()
+    }
+
+    /// What the store holds in each region, in index order.
+    fn stored(&self, held: &[TupleKey]) -> Vec<Stored> {
+        let mut out: Vec<Stored> = (0..self.regions.len()).map(|_| BTreeMap::new()).collect();
+        for tuple in held {
+            for position in self.every_holding(&tuple.object, &tuple.relation, &tuple.user) {
+                out[position].insert(
+                    (
+                        tuple.user.clone(),
+                        tuple.relation.clone(),
+                        tuple.object.clone(),
+                    ),
+                    tuple.condition.clone(),
+                );
+            }
+        }
+        out
+    }
+}
+
+/// What one group's replay states over what the store holds in its region,
+/// decided before anything is sent.
 ///
 /// Every member runs first, because a fact one member stopped returning may be
 /// a fact another still states, and only the union is the whole truth for the
@@ -1249,7 +1314,7 @@ fn stored_in(
 async fn group_difference<R>(
     group: &Materialisation,
     replayer: &R,
-    held: &[TupleKey],
+    stored: &Stored,
 ) -> Result<Reconciled, ReconcileError<R::Error>>
 where
     R: Replayer + Sync + ?Sized,
@@ -1277,7 +1342,7 @@ where
     if let Some(fact) = contradiction(records.iter()) {
         return Err(ReconcileError::Contradiction(fact));
     }
-    Ok(difference(&stored_in(group.region(), held), records.iter()))
+    Ok(difference(stored, records.iter()))
 }
 
 /// What one authoritative reconcile moved.
