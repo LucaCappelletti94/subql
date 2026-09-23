@@ -432,7 +432,7 @@ mod schema_dml_fixtures {
             note: row.note,
             price: row.price.as_ref().map(ToString::to_string),
             ts: row.ts.format("%Y-%m-%d %H:%M:%S%.6f").to_string(),
-            tstz: row.tstz.format("%Y-%m-%d %H:%M:%S%.6f+00").to_string(),
+            tstz: row.tstz.format("%Y-%m-%d %H:%M:%S%.6f+00:00").to_string(),
             d: row.d.format("%Y-%m-%d").to_string(),
             t: row.t.format("%H:%M:%S%.6f").to_string(),
             dp: row.dp,

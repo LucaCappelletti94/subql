@@ -1082,6 +1082,69 @@ mod tests {
         );
     }
 
+    /// A `timestamptz` lands as the same canonical UTC text whether it
+    /// arrives as binary microseconds (snapshot) or as pgoutput text in the
+    /// server's session time zone (CDC).
+    #[cfg(feature = "pgoutput-emit")]
+    #[test]
+    fn pgbinary_and_pgoutput_agree_on_timestamptz_text() {
+        use sqlite_diff_rs::pg_walstream::{ColumnValue, EventType, Lsn, RowData};
+
+        let db = ParserDB::parse::<PostgreSqlDialect>(
+            "CREATE TABLE orders (id UUID PRIMARY KEY, created_at TIMESTAMPTZ NOT NULL);",
+        )
+        .unwrap();
+        let uuid_bytes: [u8; 16] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
+        let uuid_str = "00010203-0405-0607-0809-0a0b0c0d0e0f";
+
+        let pg_epoch = chrono::NaiveDate::from_ymd_opt(2000, 1, 1)
+            .unwrap()
+            .and_hms_opt(0, 0, 0)
+            .unwrap()
+            .and_utc();
+        let instant = chrono::NaiveDate::from_ymd_opt(2026, 9, 23)
+            .unwrap()
+            .and_hms_micro_opt(13, 42, 7, 957_522)
+            .unwrap()
+            .and_utc();
+        let micros = (instant - pg_epoch)
+            .num_microseconds()
+            .unwrap()
+            .to_be_bytes();
+        let rows = vec![vec![Some(uuid_bytes.as_slice()), Some(micros.as_slice())]];
+        let binary_bytes = pgbinary_patchset::<crate::backend::Postgres, _>(
+            &db,
+            "orders",
+            &["id", "created_at"],
+            &rows,
+        )
+        .unwrap();
+
+        let ev = PgChangeEvent {
+            event_type: EventType::Insert {
+                schema: "public".into(),
+                table: "orders".into(),
+                relation_oid: 1,
+                data: RowData::from_pairs(vec![
+                    ("id", ColumnValue::text(uuid_str)),
+                    (
+                        "created_at",
+                        ColumnValue::text("2026-09-23 15:42:07.957522+02"),
+                    ),
+                ]),
+            },
+            lsn: Lsn::new(1),
+            metadata: None,
+        };
+        let cdc_bytes = pgoutput_patchset(&db, core::slice::from_ref(&ev)).unwrap();
+
+        assert_eq!(binary_bytes, cdc_bytes);
+        assert_eq!(
+            only_insert_values(&binary_bytes)[1],
+            WireValue::Text("2026-09-23 13:42:07.957522+00:00".into())
+        );
+    }
+
     #[test]
     fn pgbinary_null_cell_emits_null() {
         let db = orders_uuid_db();

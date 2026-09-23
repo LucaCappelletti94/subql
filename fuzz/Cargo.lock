@@ -858,7 +858,7 @@ checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
 [[package]]
 name = "pg2sqlite"
 version = "0.1.0"
-source = "git+https://github.com/LucaCappelletti94/pg2sqlite?branch=main#2da44f19f7334201d66b0c91194b08d27f0ee79c"
+source = "git+https://github.com/LucaCappelletti94/pg2sqlite?branch=main#787815b7cb578e1407b524e7f43c73be91bd6b5b"
 dependencies = [
  "sql-traits",
  "sqlparser",
@@ -963,9 +963,9 @@ checksum = "dc33ff2d4973d518d823d61aa239014831e521c75da58e3df4840d3f47749d09"
 
 [[package]]
 name = "rand"
-version = "0.10.2"
+version = "0.10.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c7f5fa3a058cd35567ef9bfa5e75732bee0f9e4c55fa90477bef2dfcdbc4be80"
+checksum = "65c9fb96cbc91e3478eaae79a69fcd3f1ae4ad052e471fe6732fff548984b4af"
 dependencies = [
  "rand_core",
 ]
@@ -1048,7 +1048,7 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 [[package]]
 name = "rls2fga"
 version = "0.1.0"
-source = "git+https://github.com/LucaCappelletti94/rls2fga?branch=main#0d08df0dbb28c5eaf8af24ce05df6e78ce026a92"
+source = "git+https://github.com/LucaCappelletti94/rls2fga?branch=main#af9d8706aefc1bf96b843d3599f1184ac5e70f01"
 dependencies = [
  "rls2fga-types",
  "serde",
@@ -1061,7 +1061,7 @@ dependencies = [
 [[package]]
 name = "rls2fga-types"
 version = "0.1.0"
-source = "git+https://github.com/LucaCappelletti94/rls2fga?branch=main#0d08df0dbb28c5eaf8af24ce05df6e78ce026a92"
+source = "git+https://github.com/LucaCappelletti94/rls2fga?branch=main#af9d8706aefc1bf96b843d3599f1184ac5e70f01"
 dependencies = [
  "serde",
  "thiserror",
@@ -1224,7 +1224,7 @@ dependencies = [
 [[package]]
 name = "sql-traits"
 version = "0.1.0"
-source = "git+https://github.com/earth-metabolome-initiative/sql-traits?branch=main#50f3b0ce22a8a4ff22095d2baf943b2c9ae7e08a"
+source = "git+https://github.com/earth-metabolome-initiative/sql-traits?branch=main#7e068a8c14ed9ec7eed0112427121d4e89799be8"
 dependencies = [
  "geometric-traits",
  "serde",
@@ -1245,9 +1245,9 @@ dependencies = [
 
 [[package]]
 name = "sqlite-diff-rs"
-version = "0.13.0"
+version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9492ba2237745ec8d2c2475b23097ceb916d1175d264d7aeb1e44399face303f"
+checksum = "26dd4527d7fe7a00a76907a4512c2fdefaa3b5dc20a5c7801d8ff614eae9dc4a"
 dependencies = [
  "hashbrown 0.17.1",
  "indexmap",
@@ -1273,7 +1273,7 @@ dependencies = [
 [[package]]
 name = "sqlparser"
 version = "0.63.0"
-source = "git+https://github.com/apache/datafusion-sqlparser-rs?branch=main#1195239663b48a51bf6b153f5d5150ec71042335"
+source = "git+https://github.com/apache/datafusion-sqlparser-rs?branch=main#3255202ab074697bdd84b141f43301bbe814711e"
 dependencies = [
  "log",
  "recursive",
@@ -1303,7 +1303,7 @@ dependencies = [
 [[package]]
 name = "sqlparser_derive"
 version = "0.6.0"
-source = "git+https://github.com/apache/datafusion-sqlparser-rs?branch=main#1195239663b48a51bf6b153f5d5150ec71042335"
+source = "git+https://github.com/apache/datafusion-sqlparser-rs?branch=main#3255202ab074697bdd84b141f43301bbe814711e"
 dependencies = [
  "proc-macro2",
  "quote",
