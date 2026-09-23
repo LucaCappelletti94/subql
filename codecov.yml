@@ -1,0 +1,6 @@
+coverage:
+  status:
+    project:
+      default:
+        # Docker-backed tests reach some timing-dependent paths on one run and not the next.
+        threshold: 0.1%
