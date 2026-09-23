@@ -302,9 +302,12 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: sudo apt-get update && sudo apt-get install -y libpq-dev default-libmysqlclient-dev
       - uses: dtolnay/rust-toolchain@stable
-      - uses: taiki-e/install-action@cargo-llvm-cov
+      - uses: taiki-e/install-action@7623a79cdfecb99d681017af368ca353d9f49bb5 # v2.87.19
+        with:
+          tool: cargo-llvm-cov,nextest
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
-      - run: cargo llvm-cov --workspace --all-features --profile coverage --locked --codecov --output-path codecov.json
+      # Ignored tests are the Docker-backed ones, and code only they reach would otherwise read as uncovered.
+      - run: cargo llvm-cov nextest --workspace --all-features --cargo-profile coverage --locked --run-ignored all --no-fail-fast --test-threads 8 --codecov --output-path codecov.json
       - uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
         with:
           files: codecov.json
