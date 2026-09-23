@@ -9,6 +9,7 @@
 use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use core::time::Duration;
 
@@ -21,7 +22,9 @@ use super::into_engine_events;
 use crate::PgLsn;
 
 mod wire_format_helpers;
-use wire_format_helpers::{ensure_replication_param, PRIMARY_KEEPALIVE_LEN, XLOG_DATA_HEADER_LEN};
+use wire_format_helpers::{
+    ensure_replication_param, parse_timeline_history, PRIMARY_KEEPALIVE_LEN, XLOG_DATA_HEADER_LEN,
+};
 
 /// Configuration for a [`PgStreamingCdcSource`].
 ///
@@ -116,6 +119,31 @@ pub enum PgStreamingError {
     SourceClosed,
 }
 
+/// One point where a later timeline branched from `timeline`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TimelineSwitch {
+    /// The ancestor timeline, the history line's first field.
+    pub timeline: u32,
+    /// Position where the branch left the ancestor.
+    pub switch_lsn: PgLsn,
+}
+
+/// The history a [`PgStreamingCdcSource`] streams from, which a WAL
+/// position is only meaningful within.
+///
+/// A promoted point-in-time restore keeps `system_id` and moves to a new
+/// `timeline` branching below earlier positions, while a dump restored
+/// into a fresh cluster changes `system_id`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ClusterIdentity {
+    /// `IDENTIFY_SYSTEM`'s `systemid`.
+    pub system_id: u64,
+    /// `IDENTIFY_SYSTEM`'s `timeline`, the one the server is writing.
+    pub timeline: u32,
+    /// One entry per ancestor timeline in ascending order, empty on timeline 1.
+    pub history: Vec<TimelineSwitch>,
+}
+
 /// Push-based Postgres CDC source. See the [`crate::CdcSource`] trait for
 /// the lifecycle contract.
 pub struct PgStreamingCdcSource {
@@ -140,6 +168,9 @@ pub struct PgStreamingCdcSource {
     /// backstop in case the cooperative signal does not propagate in
     /// time.
     task: tokio::task::JoinHandle<()>,
+    /// The cluster identity read on the replication connection during
+    /// `connect`.
+    cluster_identity: ClusterIdentity,
 }
 
 impl PgStreamingCdcSource {
@@ -171,17 +202,10 @@ impl PgStreamingCdcSource {
         // libpq connect + IDENTIFY_SYSTEM + START_REPLICATION are all
         // synchronous calls that block on socket I/O. Bounce through the
         // blocking pool so we do not stall the runtime worker thread.
-        let (conn, base_lsn) =
+        let (conn, base_lsn, cluster_identity) =
             tokio::task::spawn_blocking(move || -> Result<_, PgStreamingError> {
                 let mut conn = PgReplicationConnection::connect(&conninfo)?;
-                let ident = conn.identify_system()?;
-                if ident.ntuples() == 0 {
-                    return Err(PgStreamingError::Protocol(
-                        "IDENTIFY_SYSTEM returned no row; is the connection in \
-                     replication=database mode?"
-                            .to_string(),
-                    ));
-                }
+                let cluster_identity = read_cluster_identity(&mut conn)?;
                 let options = [
                     ("proto_version", "1"),
                     ("publication_names", publication_names.as_str()),
@@ -199,7 +223,7 @@ impl PgStreamingCdcSource {
                     .and_then(|text| pg_walstream::parse_lsn(&text).ok())
                     .unwrap_or(0);
                 conn.start_replication(&slot_name, start_lsn, &options)?;
-                Ok((conn, base))
+                Ok((conn, base, cluster_identity))
             })
             .await
             .map_err(|e| PgStreamingError::Protocol(format!("connection task panicked: {e}")))??;
@@ -250,6 +274,7 @@ impl PgStreamingCdcSource {
             shutdown_token,
             task_exited,
             task,
+            cluster_identity,
         })
     }
 
@@ -327,6 +352,12 @@ impl PgStreamingCdcSource {
     #[must_use]
     pub const fn config(&self) -> &PgStreamingConfig {
         &self.config
+    }
+
+    /// The cluster identity read at `connect`, which a fresh `connect` re-reads.
+    #[must_use]
+    pub const fn cluster_identity(&self) -> &ClusterIdentity {
+        &self.cluster_identity
     }
 }
 
@@ -550,4 +581,57 @@ async fn send_status_update(
         .map_err(|_| ())?;
     status_counter.fetch_add(1, Ordering::Relaxed);
     Ok(())
+}
+
+/// Read `IDENTIFY_SYSTEM` and, above timeline 1, the current timeline's history.
+fn read_cluster_identity(
+    conn: &mut PgReplicationConnection,
+) -> Result<ClusterIdentity, PgStreamingError> {
+    let ident = conn.identify_system()?;
+    if ident.ntuples() == 0 {
+        return Err(PgStreamingError::Protocol(
+            "IDENTIFY_SYSTEM returned no row; is the connection in \
+             replication=database mode?"
+                .to_string(),
+        ));
+    }
+    let system_id = ident
+        .get_value(0, 0)
+        .and_then(|text| text.trim().parse::<u64>().ok())
+        .ok_or_else(|| {
+            PgStreamingError::Protocol(format!(
+                "IDENTIFY_SYSTEM returned an unreadable systemid: {:?}",
+                ident.get_value(0, 0)
+            ))
+        })?;
+    let timeline = ident
+        .get_value(0, 1)
+        .and_then(|text| text.trim().parse::<u32>().ok())
+        .ok_or_else(|| {
+            PgStreamingError::Protocol(format!(
+                "IDENTIFY_SYSTEM returned an unreadable timeline: {:?}",
+                ident.get_value(0, 1)
+            ))
+        })?;
+    // The server has no history file for timeline 1 and rejects the command there.
+    let history = if timeline > 1 {
+        let reply = conn.exec(&format!("TIMELINE_HISTORY {timeline}"))?;
+        let content = (reply.ntuples() == 1)
+            .then(|| reply.get_value(0, 1))
+            .flatten()
+            .ok_or_else(|| {
+                PgStreamingError::Protocol(format!(
+                    "TIMELINE_HISTORY {timeline} returned {} rows, expected one file",
+                    reply.ntuples()
+                ))
+            })?;
+        parse_timeline_history(&content)?
+    } else {
+        Vec::new()
+    };
+    Ok(ClusterIdentity {
+        system_id,
+        timeline,
+        history,
+    })
 }

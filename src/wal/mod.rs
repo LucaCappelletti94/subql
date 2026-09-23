@@ -23,7 +23,9 @@ pub use maxwell::parse_messages as parse_maxwell;
 pub use maxwell::MaxwellEvent;
 pub use maxwell_cdc::Message as MaxwellMessage;
 #[cfg(feature = "pg-streaming")]
-pub use pg_streaming::{PgStreamingCdcSource, PgStreamingConfig, PgStreamingError};
+pub use pg_streaming::{
+    ClusterIdentity, PgStreamingCdcSource, PgStreamingConfig, PgStreamingError, TimelineSwitch,
+};
 pub use pg_walstream::ChangeEvent;
 pub(crate) use shared_helpers::{changed_columns_by_name, resolve_table};
 #[cfg(feature = "std")]

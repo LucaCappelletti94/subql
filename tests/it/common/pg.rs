@@ -8,6 +8,24 @@ use testcontainers::{ContainerRequest, GenericImage, ImageExt};
 
 use super::{ensure_image, fresh_db_name, shared_server, PASSWORD, PG_IMAGE, PG_TAG};
 
+/// The shared server's command, which a recovering clone must repeat because
+/// recovery refuses settings lower than the primary's.
+pub const PG_COMMAND: [&str; 11] = [
+    "postgres",
+    "-c",
+    "wal_level=logical",
+    "-c",
+    "max_wal_senders=128",
+    "-c",
+    "max_replication_slots=128",
+    "-c",
+    "max_connections=400",
+    "-c",
+    // PostgreSQL 16.15 made this an allow-list that replaces rather
+    // than extends, so the two shipped plugins are repeated.
+    "output_plugin_libraries=pgoutput,test_decoding,wal2json",
+];
+
 fn pg_request() -> ContainerRequest<GenericImage> {
     ensure_image();
     GenericImage::new(PG_IMAGE, PG_TAG)
@@ -19,21 +37,7 @@ fn pg_request() -> ContainerRequest<GenericImage> {
         .with_env_var("POSTGRES_USER", "subql_test")
         .with_env_var("POSTGRES_PASSWORD", PASSWORD)
         .with_env_var("POSTGRES_DB", "postgres")
-        .with_cmd([
-            "postgres",
-            "-c",
-            "wal_level=logical",
-            "-c",
-            "max_wal_senders=128",
-            "-c",
-            "max_replication_slots=128",
-            "-c",
-            "max_connections=400",
-            "-c",
-            // PostgreSQL 16.15 made this an allow-list that replaces rather
-            // than extends, so the two shipped plugins are repeated.
-            "output_plugin_libraries=pgoutput,test_decoding,wal2json",
-        ])
+        .with_cmd(PG_COMMAND)
 }
 
 fn pg_url_for(port: u16, database: &str) -> String {
@@ -49,11 +53,19 @@ fn pg_admin(port: u16) -> ConnectionResult<PgConnection> {
 pub struct PgDatabase {
     port: u16,
     pub(super) name: String,
+    #[cfg_attr(
+        not(feature = "pg-streaming"),
+        expect(
+            dead_code,
+            reason = "only the point-in-time restore test clones the server"
+        )
+    )]
+    container: String,
 }
 
 /// Acquire the shared Postgres and create a fresh database on it.
 pub fn pg_database() -> PgDatabase {
-    let port = shared_server(
+    let (port, container) = shared_server(
         "pg",
         pg_request,
         5432,
@@ -66,7 +78,11 @@ pub fn pg_database() -> PgDatabase {
     diesel::sql_query(format!("CREATE DATABASE {name}"))
         .execute(&mut admin)
         .expect("create test database");
-    PgDatabase { port, name }
+    PgDatabase {
+        port,
+        name,
+        container,
+    }
 }
 
 impl PgDatabase {
@@ -78,6 +94,24 @@ impl PgDatabase {
     /// Establish a diesel [`PgConnection`] to this database.
     pub fn connect(&self) -> PgConnection {
         PgConnection::establish(&self.url()).expect("PG connection")
+    }
+
+    /// Name of this database inside the shared cluster.
+    #[cfg(feature = "pg-streaming")]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Docker id of the shared server holding this database.
+    #[cfg(feature = "pg-streaming")]
+    pub fn container(&self) -> &str {
+        &self.container
+    }
+
+    /// libpq URL at an arbitrary port of the fixture server.
+    #[cfg(feature = "pg-streaming")]
+    pub fn url_at(port: u16, database: &str) -> String {
+        pg_url_for(port, database)
     }
 
     /// A replication slot name for this database. Slot names are cluster

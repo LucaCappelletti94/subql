@@ -31,7 +31,9 @@ pub use wal::{
     MaxwellMessage, MessageV2, WalParseError, WalParser,
 };
 #[cfg(feature = "pg-streaming")]
-pub use wal::{PgStreamingCdcSource, PgStreamingConfig, PgStreamingError};
+pub use wal::{
+    ClusterIdentity, PgStreamingCdcSource, PgStreamingConfig, PgStreamingError, TimelineSwitch,
+};
 
 // Re-export the sql-traits types subql consumers most often need to spell out
 // at call sites: trait bounds for generic code, the canonical schema
