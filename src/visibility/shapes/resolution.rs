@@ -153,7 +153,6 @@ impl<DB: DatabaseLike> Shapes<DB> {
         let mut recipes = HashMap::new();
         let mut by_table: HashMap<TableId, TableShapes> = HashMap::new();
         let mut uncovered = Vec::new();
-        let mut load: Vec<Region> = Vec::new();
 
         let producers = producers(relations);
         let plan = plan_groups(&producers, enumerations);
@@ -162,16 +161,25 @@ impl<DB: DatabaseLike> Shapes<DB> {
             index_recipe::<B, DB>(&db, entry, &mut recipes);
         }
         for (position, producer) in producers.iter().enumerate() {
-            let placement = plan.of(position);
-            if let Some(region) = producer
-                .region
-                .as_ref()
-                .filter(|_| placement == Placement::Alone)
-            {
-                load.push(region.clone());
-            }
-            index_shape::<B, DB>(&db, producer, placement, &mut by_table, &mut uncovered);
+            index_shape::<B, DB>(
+                &db,
+                producer,
+                plan.of(position),
+                &mut by_table,
+                &mut uncovered,
+            );
         }
+        // A region is the load's only when one tuple query enumerates it, since
+        // a load holding none of its rows would read as the region being empty.
+        let load: Vec<Region> = producers
+            .into_iter()
+            .enumerate()
+            .filter(|(position, producer)| {
+                plan.of(*position) == Placement::Alone
+                    && enumeration_of(producer.shape, enumerations).is_some()
+            })
+            .filter_map(|(_, producer)| producer.region)
+            .collect();
 
         Self {
             db,
@@ -445,6 +453,9 @@ impl<DB: DatabaseLike> Shapes<DB> {
     /// what gathers producers into a group and what is left alone overlaps
     /// nothing. A region nothing can place is absent from both lists and
     /// nothing may delete over it, which [`uncovered`](Self::uncovered) names.
+    /// A shape no tuple query enumerates, or two enumerate differently, is
+    /// absent too, since the load would hold none of its rows or two
+    /// disagreeing sets of them.
     #[must_use]
     pub fn load_regions(&self) -> &[Region] {
         &self.load
@@ -770,16 +781,31 @@ fn replay_of(
             region.clone(),
         ));
     }
+    let enumeration = enumeration_of(producer.shape, enumerations)?;
+    Some(Replay::new(
+        enumeration.sql.to_string(),
+        enumeration.condition.map(ToString::to_string),
+        region.clone(),
+    ))
+}
+
+/// The one enumeration stating `shape`'s facts, or [`None`] where nothing
+/// enumerates them or two enumerations disagree.
+///
+/// One description reported twice is an ambiguity nothing here can settle, so
+/// it is refused rather than reconciled from a guess. The condition counts as
+/// much as the text, because it decides whether the rows carry a condition and
+/// which one, so taking either of two would grant on terms the other did not
+/// state.
+fn enumeration_of<'e, 'a>(
+    shape: &RecordDescription,
+    enumerations: &'e [Enumeration<'a>],
+) -> Option<&'e Enumeration<'a>> {
     let mut found: Option<&Enumeration<'_>> = None;
     for candidate in enumerations {
-        if candidate.description != producer.shape {
+        if candidate.description != shape {
             continue;
         }
-        // One description reported twice is an ambiguity nothing here can
-        // settle, so the region is refused rather than reconciled from a
-        // guess. The condition counts as much as the text: it decides whether
-        // the rows carry a condition and which one, so taking either of two
-        // would grant on terms the other did not state.
         if found
             .is_some_and(|held| held.sql != candidate.sql || held.condition != candidate.condition)
         {
@@ -787,12 +813,7 @@ fn replay_of(
         }
         found = Some(candidate);
     }
-    let enumeration = found?;
-    Some(Replay::new(
-        enumeration.sql.to_string(),
-        enumeration.condition.map(ToString::to_string),
-        region.clone(),
-    ))
+    found
 }
 
 /// Whether the region these producers share has to be reconciled as one unit.
@@ -1442,5 +1463,35 @@ mod tests {
 
         assert_eq!(shapes.load_regions(), Vec::<Region>::new());
         assert_eq!(shapes.materialisations(), Vec::<Materialisation>::new());
+    }
+
+    /// A shape no tuple query enumerates is not the load's, since the load holds
+    /// none of its rows and would read as the region being empty.
+    #[test]
+    fn a_shape_the_load_does_not_enumerate_is_not_the_loads() {
+        let (db, outputs) = translated(TWO_ALONE);
+        let translation = outputs.translation();
+
+        let shapes = Shapes::new::<Postgres>(db, translation.relations(), &[]);
+
+        assert_eq!(shapes.load_regions(), Vec::<Region>::new());
+    }
+
+    /// A shape two tuple queries enumerate differently is not the load's, since
+    /// nothing here can say which of the two is its truth.
+    #[test]
+    fn a_shape_enumerated_two_ways_is_not_the_loads() {
+        let (db, outputs) = translated(TWO_ALONE);
+        let translation = outputs.translation();
+        let once = enumerations(&outputs);
+        let mut twice = once.clone();
+        twice.extend(once.iter().map(|enumeration| Enumeration {
+            sql: "SELECT 'another enumeration'",
+            ..*enumeration
+        }));
+
+        let shapes = Shapes::new::<Postgres>(db, translation.relations(), &twice);
+
+        assert_eq!(shapes.load_regions(), Vec::<Region>::new());
     }
 }

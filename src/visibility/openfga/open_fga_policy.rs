@@ -821,6 +821,16 @@ where
     /// sends nothing.
     ///
     /// A store already equal to the load costs the read and sends no writes.
+    /// Each region filters the whole read, so the pass costs the regions times
+    /// the store, which a boot over a very large store pays once.
+    ///
+    /// # This is not the loader
+    ///
+    /// Nothing outside the named regions is written, so a translation whose
+    /// every producer is refused makes this a read that changes nothing, and a
+    /// constant outside every region is never written here. A boot writes the
+    /// load through [`write_records`](Self::write_records) and then reconciles
+    /// it here.
     ///
     /// # Errors
     ///
