@@ -53,11 +53,19 @@ fn pg_admin(port: u16) -> ConnectionResult<PgConnection> {
 pub struct PgDatabase {
     port: u16,
     pub(super) name: String,
+    #[cfg_attr(
+        not(feature = "pg-streaming"),
+        expect(
+            dead_code,
+            reason = "only the point-in-time restore test clones the server"
+        )
+    )]
+    container: String,
 }
 
 /// Acquire the shared Postgres and create a fresh database on it.
 pub fn pg_database() -> PgDatabase {
-    let port = shared_server(
+    let (port, container) = shared_server(
         "pg",
         pg_request,
         5432,
@@ -70,7 +78,11 @@ pub fn pg_database() -> PgDatabase {
     diesel::sql_query(format!("CREATE DATABASE {name}"))
         .execute(&mut admin)
         .expect("create test database");
-    PgDatabase { port, name }
+    PgDatabase {
+        port,
+        name,
+        container,
+    }
 }
 
 impl PgDatabase {
@@ -88,6 +100,12 @@ impl PgDatabase {
     #[cfg(feature = "pg-streaming")]
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    /// Docker id of the shared server holding this database.
+    #[cfg(feature = "pg-streaming")]
+    pub fn container(&self) -> &str {
+        &self.container
     }
 
     /// libpq URL at an arbitrary port of the fixture server.

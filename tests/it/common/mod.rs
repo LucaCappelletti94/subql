@@ -107,13 +107,6 @@ pub fn assert_docker_available() {
     );
 }
 
-/// Name the `docker` CLI uses for this run's shared `engine` server, as
-/// [`shared_server`] names it.
-#[cfg(feature = "pg-streaming")]
-pub fn container_name(engine: &str) -> String {
-    format!("subql-{engine}-{}", run_id())
-}
-
 /// `image:tag` of the fixture Postgres image, after [`ensure_image`].
 #[cfg(feature = "pg-streaming")]
 pub fn pg_image_ref() -> String {
@@ -181,8 +174,8 @@ fn reap_stale() {
     }
 }
 
-/// Look up or start this run's shared `engine` server and wait until `ready`
-/// accepts its mapped host port.
+/// Look up or start this run's shared `engine` server, wait until `ready`
+/// accepts its mapped host port, and return that port with the container id.
 ///
 /// Test processes race on the first acquisition: both miss the lookup, one
 /// creation loses on the name and retries into a hit. The reuse path skips the
@@ -193,7 +186,7 @@ fn shared_server(
     container_port: u16,
     ready: impl Fn(u16) -> bool,
     timeout: Duration,
-) -> u16 {
+) -> (u16, String) {
     reap_stale();
     let run = run_id();
     let name = format!("subql-{engine}-{run}");
@@ -227,7 +220,7 @@ fn shared_server(
         );
         std::thread::sleep(Duration::from_millis(250));
     }
-    port
+    (port, container.id().to_string())
 }
 
 static DB_COUNTER: AtomicU32 = AtomicU32::new(0);
@@ -271,7 +264,7 @@ pub use pg::{create_slot, drain_slot, drop_slot, pg_database};
 #[cfg(all(feature = "visibility-openfga", feature = "testing"))]
 pub fn openfga_port() -> u16 {
     use testcontainers::core::WaitFor;
-    shared_server(
+    let (port, _) = shared_server(
         "openfga",
         || {
             // The image does not declare its gRPC port. The log line precedes
@@ -284,5 +277,6 @@ pub fn openfga_port() -> u16 {
         8081,
         |port| std::net::TcpStream::connect(("127.0.0.1", port)).is_ok(),
         Duration::from_secs(60),
-    )
+    );
+    port
 }

@@ -67,7 +67,7 @@ fn ensure_network(run: &str) {
 pub fn mysql_database() -> MysqlDatabase {
     let run = run_id();
     ensure_network(&run);
-    let port = shared_server(
+    let (port, _) = shared_server(
         "mysql",
         || mysql_request(&run),
         3306,

@@ -696,7 +696,7 @@ struct PitrCluster {
 
 impl PitrCluster {
     /// Clone the shared server with `pg_basebackup`, recover to the backup's consistency point and promote to timeline 2.
-    fn promoted(name: &str) -> Self {
+    fn promoted(name: &str, source_container: &str) -> Self {
         let mut clone = Self {
             container: format!("subql-pitr-{name}"),
             volume: format!("subql-pitr-{name}-vol"),
@@ -705,11 +705,14 @@ impl PitrCluster {
         let image = common::pg_image_ref();
         docker_ok(&["volume", "create", &clone.volume]);
         // Postgres refuses an immediate target without a restore_command, and consistency never consults it.
+        let seed = r#"pg_basebackup -h 127.0.0.1 -U subql_test -D /dst -X stream \
+               && printf "recovery_target = 'immediate'\nrestore_command = 'false'\n" >> /dst/postgresql.auto.conf \
+               && touch /dst/recovery.signal"#;
         docker_ok(&[
             "run",
             "--rm",
             "--network",
-            &format!("container:{}", common::container_name("pg")),
+            &format!("container:{source_container}"),
             "-v",
             &format!("{}:/dst", clone.volume),
             "-e",
@@ -717,9 +720,7 @@ impl PitrCluster {
             &image,
             "sh",
             "-c",
-            r#"pg_basebackup -h 127.0.0.1 -U subql_test -D /dst -X stream \
-               && printf "recovery_target = 'immediate'\nrestore_command = 'false'\n" >> /dst/postgresql.auto.conf \
-               && touch /dst/recovery.signal"#,
+            seed,
         ]);
         let data = format!("{}:/var/lib/postgresql/data", clone.volume);
         let mut run = vec![
@@ -845,7 +846,7 @@ fn cluster_identity_of_a_promoted_point_in_time_clone() {
     let publication = "subql_pg_streaming_pitr_pub";
     common::create_publication(&mut setup, publication, "orders");
 
-    let clone = PitrCluster::promoted(db.name());
+    let clone = PitrCluster::promoted(db.name(), db.container());
     let mut on_clone =
         diesel::PgConnection::establish(&clone.url(db.name())).expect("connect to clone");
     let slot = db.slot("subql_pg_streaming_pitr");
