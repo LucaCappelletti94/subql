@@ -3016,4 +3016,68 @@ CREATE POLICY d ON docs FOR SELECT USING (owner_id = current_user);
         );
         assert_eq!(transport.calls().len(), 1, "the read and no write");
     }
+
+    /// A replay the database could not run.
+    struct Unreachable;
+
+    impl Replayer for Unreachable {
+        type Error = &'static str;
+
+        fn replay(
+            &self,
+            _member: &Replay,
+        ) -> impl Future<Output = Result<Vec<Record>, Self::Error>> + Send {
+            core::future::ready(Err("the database is unreachable"))
+        }
+    }
+
+    /// A group replay that fails stops the pass before the load's own region,
+    /// whose difference is already known, is written.
+    #[test]
+    fn a_failing_replay_leaves_the_loads_difference_unsent() {
+        let shapes = shapes_over(SWEEP);
+        let (owner, _, _) = sweep_facts(&shapes);
+        let transport = Scripted::new([ScriptedReply::message(stored(&[&owner]))]);
+        let policy = OpenFgaPolicy::<_, _, String, Postgres>::new(
+            Arc::clone(&shapes),
+            OpenFgaServiceClient::new(transport.clone()),
+            "store",
+        )
+        .unwrap();
+
+        let refused = block_on(policy.reconcile_store(&[], &Unreachable));
+
+        assert_eq!(
+            refused,
+            Err(ReconcileError::Replay("the database is unreachable"))
+        );
+        assert_eq!(transport.calls().len(), 1, "the read and no write");
+    }
+
+    /// A replay returning a fact outside its group's region is refused before
+    /// anything is written, including the load's pending addition.
+    #[test]
+    fn a_replay_outside_its_region_is_refused_before_any_write() {
+        let shapes = shapes_over(SWEEP);
+        let (owner, _, _) = sweep_facts(&shapes);
+        let transport = Scripted::new([ScriptedReply::message(stored(&[]))]);
+        let policy = OpenFgaPolicy::<_, _, String, Postgres>::new(
+            Arc::clone(&shapes),
+            OpenFgaServiceClient::new(transport.clone()),
+            "store",
+        )
+        .unwrap();
+        let replay = Canned(vec![
+            ("team_members", vec![owner.clone()]),
+            ("team_guests", Vec::new()),
+        ]);
+
+        let refused = block_on(policy.reconcile_store(core::slice::from_ref(&owner), &replay));
+
+        assert!(
+            matches!(&refused, Err(ReconcileError::OutOfRegion(fact)) if fact.contains("docs:1")),
+            "{refused:?}"
+        );
+        assert_eq!(transport.calls().len(), 1, "the read and no write");
+    }
 }
