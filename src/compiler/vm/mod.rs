@@ -377,6 +377,8 @@ impl<B: Backend> Vm<B> {
                 self.replace_top(2, result);
             }
 
+            Instruction::Coalesce(count) => self.coalesce(usize::from(*count), src)?,
+
             Instruction::Truth => {
                 let result = value_truth(peek(&self.stack, 0, src)?)?;
                 self.replace_top(1, result);
@@ -644,6 +646,35 @@ impl<B: Backend> Vm<B> {
             Some(referring) => referred(&referring, src).cloned().map_err(Into::into),
             None => Err(VmError::StackUnderflow),
         }
+    }
+
+    /// Replace the top `count` slots with the first whose value is not `Null`,
+    /// a `Missing` one ahead of it standing for the answer.
+    fn coalesce<E: CdcEvent<Backend = B>, DB: DatabaseLike>(
+        &mut self,
+        count: usize,
+        src: &Operands<'_, B, E, DB>,
+    ) -> Result<(), VmError> {
+        let base = self
+            .stack
+            .len()
+            .checked_sub(count)
+            .ok_or(VmError::StackUnderflow)?;
+        let mut answer = None;
+        for depth in (0..count).rev() {
+            if !peek(&self.stack, depth, src)?.is_null() {
+                answer = Some(base + (count - 1 - depth));
+                break;
+            }
+        }
+        if let Some(index) = answer {
+            self.stack.swap(base, index);
+            self.stack.truncate(base + 1);
+        } else {
+            self.stack.truncate(base);
+            self.stack.push(StackValue::Value(Value::Null));
+        }
+        Ok(())
     }
 
     /// Drop the `consumed` operands on top of the stack and push `result`.

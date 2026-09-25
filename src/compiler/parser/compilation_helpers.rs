@@ -3,7 +3,9 @@
 use super::{Compiling, MAX_TERMS_PER_FILTER};
 use crate::backend::{Backend, NullSafeEquality, ScalarFamily, Value, ValueKindOf};
 use crate::compiler::bytecode::{ComparisonRef, FloatResult};
-use crate::compiler::literals::{resolve_column_ref, SqlLiteralParse};
+use crate::compiler::literals::{
+    coalesce_arguments, resolve_column_ref, value_column, SqlLiteralParse,
+};
 use crate::compiler::{canonicalize, sql_shape, BytecodeProgram, Instruction, Tri};
 use crate::term::{term_columns, CompiledTerm};
 use crate::{RegisterError, TableId};
@@ -25,7 +27,7 @@ fn column_scalar_of<B: Backend, DB: DatabaseLike>(
     table_id: TableId,
     database: &DB,
 ) -> Option<ValueKindOf<B>> {
-    let col = resolve_column_ref::<B, DB>(expr, table_id, database)?;
+    let col = resolve_column_ref::<B, DB>(value_column(expr), table_id, database)?;
     crate::catalog_helpers::column_scalar_kind::<B, DB>(database, table_id, col)
         .map(|kind| kind.value_kind())
 }
@@ -153,7 +155,7 @@ fn is_boolean_column<B: Backend, DB: DatabaseLike>(
     table_id: TableId,
     database: &DB,
 ) -> bool {
-    let mut bare = expr;
+    let mut bare = value_column(expr);
     while let Expr::Nested(inner) = bare {
         bare = inner;
     }
@@ -294,7 +296,7 @@ fn float_result_width<B: Backend, DB: DatabaseLike>(
     database: &DB,
     depth: usize,
 ) -> FloatResult {
-    if let Some(column) = resolve_column_ref::<B, DB>(expr, table_id, database) {
+    if let Some(column) = resolve_column_ref::<B, DB>(value_column(expr), table_id, database) {
         return crate::catalog_helpers::column_comparison::<B, DB>(database, table_id, column)
             .and_then(|facts| facts.kind.declared_type())
             .and_then(crate::backend::DeclaredType::float_width);
@@ -428,6 +430,7 @@ where
                     }
                     refuse_condition_operand(left)?;
                     refuse_condition_operand(right)?;
+                    refuse_literal_foreign_to_coalesce::<B, DB>(left, right, table_id, database)?;
 
                     // Non-short-circuit operators: compile both sides,
                     // then emit the op. Target-typed literal inference
@@ -605,6 +608,7 @@ where
 
             let mut literals: Vec<Value<B>> = Vec::with_capacity(list.len());
             for item in list {
+                refuse_literal_foreign_to_coalesce::<B, DB>(expr, item, table_id, database)?;
                 if let Expr::Value(val) = item {
                     literals.push(B::parse_literal(&val.value, list_target)?);
                 } else {
@@ -699,6 +703,9 @@ where
         } => {
             let range_target = column_scalar_of::<B, DB>(expr, table_id, database)
                 .unwrap_or_else(|| ScalarFamily::String.into());
+            for bound in [low, high] {
+                refuse_literal_foreign_to_coalesce::<B, DB>(expr, bound, table_id, database)?;
+            }
 
             // Stack order: value, lower, upper.
             compile_expr_recursive::<B, DB>(
@@ -897,6 +904,11 @@ where
                 depth,
             )?;
         }
+
+        Expr::Function(_) if coalesce_arguments(expr).is_some() => {
+            compile_coalesce::<B, DB>(expr, table_id, database, out, depth)?;
+        }
+
         // Nested Expressions (parentheses)
         Expr::Nested(inner) => {
             compile_expr_recursive::<B, DB>(
@@ -1022,6 +1034,146 @@ where
     out.push(Instruction::Like { comparison, escape });
     if node.negated {
         out.push(Instruction::Not);
+    }
+    Ok(())
+}
+
+/// The families a served `COALESCE` may answer in: the ones whose literal
+/// every engine reads alike.
+const COALESCE_FAMILIES: [ScalarFamily; 5] = [
+    ScalarFamily::Int,
+    ScalarFamily::Float,
+    ScalarFamily::Decimal,
+    ScalarFamily::String,
+    ScalarFamily::Bool,
+];
+
+/// Whether `literal` is written in `family`'s own form, the one every engine
+/// types alike: a number for the numeric families, and an integer one for
+/// `Int`, since a fraction makes the engines pick a decimal type.
+fn native_literal(literal: &SqlValue, family: ScalarFamily) -> bool {
+    match (literal, family) {
+        (SqlValue::Null, _)
+        | (SqlValue::Number(..), ScalarFamily::Float | ScalarFamily::Decimal)
+        | (SqlValue::SingleQuotedString(_), ScalarFamily::String)
+        | (SqlValue::Boolean(_), ScalarFamily::Bool) => true,
+        (SqlValue::Number(digits, _), ScalarFamily::Int) => !digits.contains(['.', 'e', 'E']),
+        _ => false,
+    }
+}
+
+/// The refusal for a `COALESCE` the engines type differently.
+fn coalesce_refusal(reason: &str) -> RegisterError {
+    RegisterError::UnsupportedSql(format!(
+        "COALESCE is served over column arguments of one declared type and collation and \
+         literals written in that type's own form, and {reason}"
+    ))
+}
+
+/// Compile a `COALESCE` whose arguments every engine types alike.
+///
+/// Its column arguments share one declared type and collation in a family
+/// whose literals every engine reads alike, and each literal is written in
+/// that family's form. Measured, the engines disagree past that:
+/// `COALESCE(1, 2.5) / 2` is `0.5` on PostgreSQL and MySQL and `0` on SQLite,
+/// and `COALESCE(1, 'a')` is an error on PostgreSQL only.
+fn compile_coalesce<B, DB>(
+    expr: &Expr,
+    table_id: TableId,
+    database: &DB,
+    out: &mut Compiling<B>,
+    depth: usize,
+) -> Result<(), RegisterError>
+where
+    B: Backend + SqlLiteralParse,
+    DB: DatabaseLike,
+{
+    let arguments = coalesce_arguments(expr).unwrap_or_default();
+    if arguments.len() < 2 {
+        return Err(coalesce_refusal(
+            "a call of one argument is an error on SQLite",
+        ));
+    }
+    let mut facts = None;
+    for argument in &arguments {
+        match argument {
+            Expr::Value(_) => {}
+            Expr::Identifier(_) | Expr::CompoundIdentifier(_) => {
+                let column = resolve_column_ref::<B, DB>(argument, table_id, database)
+                    .ok_or_else(|| coalesce_refusal("an argument names no column of the table"))?;
+                let declared =
+                    crate::catalog_helpers::column_comparison::<B, DB>(database, table_id, column);
+                match (&facts, declared) {
+                    (_, None) => return Err(coalesce_refusal("an argument has no known type")),
+                    (None, Some(declared)) => facts = Some((column, declared)),
+                    (Some((_, first)), Some(declared)) if *first == declared => {}
+                    (Some(_), Some(_)) => {
+                        return Err(coalesce_refusal(
+                            "its columns differ in declared type or collation",
+                        ))
+                    }
+                }
+            }
+            _ => {
+                return Err(coalesce_refusal(
+                    "an argument is neither a column nor a literal",
+                ))
+            }
+        }
+    }
+    let Some((column, _)) = facts else {
+        return Err(coalesce_refusal("no argument is a column"));
+    };
+    let family = crate::catalog_helpers::column_scalar_family(database, table_id, column)
+        .filter(|family| COALESCE_FAMILIES.contains(family))
+        .ok_or_else(|| coalesce_refusal("its type is one whose literals the engines read apart"))?;
+    for argument in &arguments {
+        if let Expr::Value(literal) = argument {
+            if !native_literal(&literal.value, family) {
+                return Err(coalesce_refusal(
+                    "a literal is written in another type's form",
+                ));
+            }
+        }
+    }
+    let target =
+        column_scalar_of::<B, DB>(expr, table_id, database).unwrap_or_else(|| family.into());
+    for argument in &arguments {
+        compile_expr_recursive::<B, DB>(argument, table_id, database, out, depth + 1, target)?;
+    }
+    let count = u16::try_from(arguments.len())
+        .map_err(|_| coalesce_refusal("it has more arguments than a program counts"))?;
+    out.push(Instruction::Coalesce(count));
+    Ok(())
+}
+
+/// Refuse a literal beside a `COALESCE` written in another family's form.
+///
+/// SQLite gives an expression no affinity, so it compares a quoted literal
+/// with a `COALESCE` over integers as text and answers false, where PostgreSQL
+/// and MySQL convert it: measured, `COALESCE(NULL, 1) = '1'`.
+fn refuse_literal_foreign_to_coalesce<B: Backend, DB: DatabaseLike>(
+    left: &Expr,
+    right: &Expr,
+    table_id: TableId,
+    database: &DB,
+) -> Result<(), RegisterError> {
+    for (coalesced, other) in [(left, right), (right, left)] {
+        if coalesce_arguments(coalesced).is_none() {
+            continue;
+        }
+        let Expr::Value(literal) = other else {
+            continue;
+        };
+        let family = resolve_column_ref::<B, DB>(value_column(coalesced), table_id, database)
+            .and_then(|column| {
+                crate::catalog_helpers::column_scalar_family(database, table_id, column)
+            });
+        if !family.is_some_and(|family| native_literal(&literal.value, family)) {
+            return Err(coalesce_refusal(
+                "a literal compared with it is written in another type's form",
+            ));
+        }
     }
     Ok(())
 }
@@ -1179,6 +1331,7 @@ where
     refuse_term_operand(right)?;
     refuse_condition_operand(left)?;
     refuse_condition_operand(right)?;
+    refuse_literal_foreign_to_coalesce::<B, DB>(left, right, table_id, database)?;
     let target = nested_column_scalar_of::<B, DB>(left, table_id, database, depth)
         .or_else(|| nested_column_scalar_of::<B, DB>(right, table_id, database, depth))
         .unwrap_or_else(|| ScalarFamily::String.into());

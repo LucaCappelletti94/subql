@@ -91,6 +91,7 @@ mod tests {
             Instruction::NotDistinct(_) => 25,
             Instruction::IsTruth { .. } => 26,
             Instruction::Truth => 27,
+            Instruction::Coalesce(_) => 28,
         }
     }
 
@@ -153,7 +154,7 @@ mod tests {
 
         assert_eq!(
             seen.len(),
-            27,
+            28,
             "expected all Instruction variants, saw {seen:?}"
         );
     }

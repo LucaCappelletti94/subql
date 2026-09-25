@@ -403,6 +403,14 @@ pub enum Instruction<B: Backend> {
     ///
     /// Stack: `[..., value] -> [..., Tri]`.
     Truth,
+
+    // COALESCE (pop n values, push value)
+    /// `COALESCE(a, b, ...)` over the last `n` values: the first that is not
+    /// `Null`, else `Null`. A `Missing` value ahead of it is the answer, since
+    /// the row may hold anything there.
+    ///
+    /// Stack: `[..., a, b, ...] -> [..., value]`.
+    Coalesce(u16),
 }
 
 /// A compiled bytecode program.
@@ -585,6 +593,7 @@ impl<B: Backend> Clone for Instruction<B> {
                 negated: *negated,
             },
             Self::Truth => Self::Truth,
+            Self::Coalesce(count) => Self::Coalesce(*count),
         }
     }
 }
@@ -643,6 +652,7 @@ impl<B: Backend> core::fmt::Debug for Instruction<B> {
                 .field("negated", negated)
                 .finish(),
             Self::Truth => f.write_str("Truth"),
+            Self::Coalesce(count) => f.debug_tuple("Coalesce").field(count).finish(),
         }
     }
 }
@@ -705,7 +715,9 @@ impl<B: Backend> PartialEq for Instruction<B> {
             ) => a == b && ar == br,
             (Self::JumpIfFalse(a), Self::JumpIfFalse(b))
             | (Self::JumpIfTrue(a), Self::JumpIfTrue(b)) => a == b,
-            (Self::TermTruth(a), Self::TermTruth(b)) => a == b,
+            (Self::TermTruth(a), Self::TermTruth(b)) | (Self::Coalesce(a), Self::Coalesce(b)) => {
+                a == b
+            }
             (
                 Self::IsTruth {
                     value: av,
@@ -761,7 +773,7 @@ mod tests {
     #[test]
     fn every_instruction_keeps_its_persisted_tag() {
         let r = ComparisonRef::NONE;
-        let tagged: [(Instruction<Postgres>, u8); 28] = [
+        let tagged: [(Instruction<Postgres>, u8); 29] = [
             (Instruction::PushLiteral(Value::Null), 0),
             (Instruction::LoadColumn(0), 1),
             (Instruction::Equal(r), 2),
@@ -808,6 +820,7 @@ mod tests {
                 26,
             ),
             (Instruction::Truth, 27),
+            (Instruction::Coalesce(2), 28),
         ];
         for (instruction, tag) in tagged {
             let bytes = postcard::to_allocvec(&instruction).expect("an instruction serializes");

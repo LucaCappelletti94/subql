@@ -21,7 +21,7 @@ use alloc::format;
 use parse_helpers::err_shape;
 use sqlparser::ast::Value as SqlValue;
 
-pub(super) use column_ref::resolve_column_ref;
+pub(super) use column_ref::{coalesce_arguments, resolve_column_ref, value_column};
 pub(super) use parse_helpers::hex_upper;
 
 /// Backend-aware parsing of sqlparser AST literals into typed [`Value`]s.

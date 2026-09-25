@@ -111,7 +111,7 @@ fn arb_quotient(u: &mut Unstructured<'_>) -> arbitrary::Result<Quotient> {
 
 /// Generate an [`Instruction<Postgres>`] from fuzzer-controlled bytes.
 pub fn arb_instruction(u: &mut Unstructured<'_>) -> arbitrary::Result<Instruction<Postgres>> {
-    match u.int_in_range(0u8..=26)? {
+    match u.int_in_range(0u8..=27)? {
         0 => Ok(Instruction::PushLiteral(arb_value(u)?)),
         1 => Ok(Instruction::LoadColumn(u.int_in_range(0u16..=63)?)),
         2 => Ok(Instruction::Equal(arb_comparison_ref(u)?)),
@@ -165,7 +165,8 @@ pub fn arb_instruction(u: &mut Unstructured<'_>) -> arbitrary::Result<Instructio
             },
             negated: u.arbitrary()?,
         }),
-        _ => Ok(Instruction::Truth),
+        26 => Ok(Instruction::Truth),
+        _ => Ok(Instruction::Coalesce(u.int_in_range(0u16..=4)?)),
     }
 }
 

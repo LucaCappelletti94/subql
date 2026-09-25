@@ -616,6 +616,21 @@ mod tests {
         forms
     }
 
+    /// `COALESCE` over one column and literals of its family, compared,
+    /// computed with, and read as a condition.
+    fn coalesce_forms() -> Vec<&'static str> {
+        vec![
+            "COALESCE(narrow, 3) = 3",
+            "COALESCE(narrow, 4) = 3",
+            "COALESCE(narrow, NULL, 3) > 2",
+            "COALESCE(narrow, 0) + 1 > 3",
+            "COALESCE(narrow, 0) = wide",
+            "COALESCE(flag, true)",
+            "NOT COALESCE(flag, false)",
+            "COALESCE(narrow, 3) IS NULL",
+        ]
+    }
+
     /// Every NULL pairing of two integer columns and a boolean one, asked of
     /// the engine and of subql in process, which must both answer and agree
     /// on each.
@@ -734,6 +749,41 @@ mod tests {
             Engine::MySql,
             &bare_boolean_forms(Engine::MySql),
         );
+    }
+
+    #[test]
+    fn coalesce_agrees_with_sqlite_on_every_null_pairing() {
+        assert_null_pairings_agree(&mut SqliteOracle::open(), Engine::Sqlite, &coalesce_forms());
+    }
+
+    #[test]
+    #[ignore = "requires Docker; run with --ignored"]
+    fn coalesce_agrees_with_postgres_on_every_null_pairing() {
+        let db = crate::common::pg_database();
+        let mut oracle = crate::differential::oracle::PgOracle {
+            connection: db.connect(),
+        };
+        assert_null_pairings_agree(&mut oracle, Engine::Postgres, &coalesce_forms());
+    }
+
+    #[cfg(any(
+        feature = "executor-diesel-postgres",
+        feature = "executor-diesel-async-postgres",
+        feature = "executor-diesel-postgres-r2d2",
+        feature = "executor-diesel-mysql",
+        feature = "executor-diesel-async-mysql",
+        feature = "diesel-typed-mysql",
+        feature = "apply-patchset-mysql",
+        feature = "apply-patchset-mysql-async",
+    ))]
+    #[test]
+    #[ignore = "requires Docker; run with --ignored"]
+    fn coalesce_agrees_with_mysql_on_every_null_pairing() {
+        let db = crate::common::mysql_database();
+        let mut oracle = crate::differential::oracle::MySqlOracle {
+            connection: db.connect(),
+        };
+        assert_null_pairings_agree(&mut oracle, Engine::MySql, &coalesce_forms());
     }
 
     #[test]

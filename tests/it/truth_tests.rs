@@ -106,6 +106,7 @@ fn sqlite_reads_a_stored_nonzero_boolean_as_true() {
         ("flag IS TRUE", true),
         ("flag IS NOT FALSE", true),
         ("n = 1 AND flag", true),
+        ("COALESCE(flag, false)", true),
         ("NOT flag", false),
         ("flag = true", false),
     ] {
