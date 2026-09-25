@@ -814,6 +814,9 @@ pub fn predicate_forms(engine: Engine) -> Vec<String> {
     // E6: `COALESCE` over a column and a literal of its family.
     forms.push("COALESCE(narrow, 0) > 3".to_string());
     forms.push("COALESCE(unbounded_bytes, 'ab') = 'ab'".to_string());
+    // An arithmetic side tested by `IN` and `BETWEEN`.
+    forms.push("narrow + 1 IN (2, 4)".to_string());
+    forms.push("narrow * 2 BETWEEN 3 AND 8".to_string());
     if engine != Engine::Sqlite {
         forms.push("(unbounded_nocase = 'AB') IS UNKNOWN".to_string());
     }
@@ -851,6 +854,8 @@ pub fn served_forms(engine: Engine) -> Vec<&'static str> {
         "narrow > 0 AND flag",
         "COALESCE(narrow, 0) > 3",
         "COALESCE(unbounded_bytes, 'ab') = 'ab'",
+        "narrow + 1 IN (2, 4)",
+        "narrow * 2 BETWEEN 3 AND 8",
     ];
     if engine != Engine::MySql {
         forms.extend([

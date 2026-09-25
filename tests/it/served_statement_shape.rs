@@ -344,6 +344,105 @@ fn a_clause_the_subscription_cannot_honour_is_refused() {
     refused_naming("SELECT * INTO other FROM t", "INTO");
 }
 
+/// `IN` and `BETWEEN` type their literals by the column the tested side reads,
+/// through arithmetic as `=` does, so `amount + 1 IN (5, 6)` is served and
+/// answers as the engine does. A tested side reading no column, or a condition
+/// where a value is read, is routed rather than refused as a bad literal.
+#[test]
+fn an_expression_tested_by_in_or_between_is_served_or_routed() {
+    let selects = |predicate: &str, amount: i64| {
+        let mut engine = engine();
+        let table = subql::catalog_helpers::table_id::<Postgres, _>(
+            &ParserDB::parse::<PostgreSqlDialect>(DDL).unwrap(),
+            "t",
+        )
+        .unwrap();
+        let registered = engine
+            .register(SubscriptionRequest::new(
+                1u64,
+                format!("SELECT * FROM t WHERE {predicate}"),
+            ))
+            .unwrap_or_else(|error| panic!("{predicate} registers, got {error:?}"));
+        assert!(
+            matches!(registered.tier, Tier::InProcess(_)),
+            "{predicate}: {:?}",
+            registered.not_served_because
+        );
+        let row = vec![Value::Int(1), Value::String("a".into()), Value::Int(amount)];
+        !engine
+            .consumers(&TestEvent::insert(table, row))
+            .unwrap()
+            .inserted()
+            .is_empty()
+    };
+    assert!(selects("amount + 1 IN (5, 6)", 4));
+    assert!(!selects("amount + 1 IN (5, 6)", 7));
+    assert!(selects("amount * 2 BETWEEN 7 AND 9", 4));
+    assert!(!selects("amount * 2 BETWEEN 7 AND 9", 5));
+    assert!(selects("amount + 1 NOT IN (5, 6)", 7));
+    for predicate in [
+        "1 + 1 IN (2, 3)",
+        "1 + 1 BETWEEN 1 AND 3",
+        "(amount = 1) IN (true)",
+        "(amount = 1) BETWEEN false AND true",
+        "amount BETWEEN (amount = 1) AND 3",
+        "(status = 'a') LIKE 't%'",
+    ] {
+        let _ = refusal(&format!("SELECT * FROM t WHERE {predicate}"));
+    }
+}
+
+/// `IN` asks the question `=` asks of each item, so a column whose collation
+/// `=` leaves to the database leaves `IN` there too, however it is wrapped.
+/// It used to compare bytes: under a case-insensitive collation
+/// `folded IN ('a')` missed a stored `'A'` that the database selects.
+#[test]
+fn in_is_classified_as_equality_is() {
+    const COLLATED: &str = "CREATE COLLATION ci (provider = icu, \
+                            locale = 'und-u-ks-level2', deterministic = false); \
+                            CREATE TABLE t (id INT PRIMARY KEY, label TEXT, \
+                            strict TEXT COLLATE \"C\", folded TEXT COLLATE \"ci\")";
+    let served = |predicate: &str| {
+        let database = ParserDB::parse::<PostgreSqlDialect>(COLLATED).unwrap();
+        let mut engine: Engine = SubscriptionEngine::new(database, PostgreSqlDialect {});
+        engine
+            .register(SubscriptionRequest::new(
+                1u64,
+                format!("SELECT * FROM t WHERE {predicate}"),
+            ))
+            .unwrap_or_else(|error| panic!("{predicate} registers, got {error:?}"))
+            .not_served_because
+            .is_none()
+    };
+    for column in ["label", "strict", "folded"] {
+        let equality = served(&format!("{column} = 'a'"));
+        for membership in [
+            format!("{column} IN ('a', 'b')"),
+            format!("{column} NOT IN ('a', 'b')"),
+            format!("({column}) IN ('a', 'b')"),
+            format!("COALESCE({column}, 'x') IN ('a', 'b')"),
+            // Parentheses hide nothing from `=` either.
+            format!("({column}) = 'a'"),
+            format!("({column}) IS NOT DISTINCT FROM 'a'"),
+        ] {
+            assert_eq!(served(&membership), equality, "{membership}");
+        }
+        let ordering = served(&format!("{column} < 'b'"));
+        for ordered in [
+            format!("({column}) < 'b'"),
+            format!("({column}) BETWEEN 'a' AND 'b'"),
+        ] {
+            assert_eq!(served(&ordered), ordering, "{ordered}");
+        }
+        let pattern = served(&format!("{column} LIKE 'a%'"));
+        assert_eq!(
+            served(&format!("({column}) LIKE 'a%'")),
+            pattern,
+            "({column}) LIKE"
+        );
+    }
+}
+
 /// The served shape itself, so the refusals above are not a blanket one. The
 /// last two spell out a default rather than asking for anything: `ALL` asks for
 /// every row with duplicates kept, and `LIMIT ALL` asks for no bound, which is

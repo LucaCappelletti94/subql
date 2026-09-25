@@ -33,21 +33,27 @@ pub fn resolve_column_ref<B: Backend, DB: DatabaseLike>(
     )
 }
 
-/// The column a `COALESCE` over `expr` reads as, its first column argument,
-/// or `expr` itself when it is not one.
+/// The expression `expr` reads as a value: itself with its parentheses
+/// removed, or a `COALESCE`'s first column argument.
 ///
 /// Registration serves a `COALESCE` only when its column arguments share one
 /// declared type and collation, so the first one's facts are the call's.
-/// Purely syntactic: whether the call is served is the compiler's question.
+/// Parentheses change nothing a comparison reads, so they must not hide a
+/// column's collation from one. Purely syntactic: whether the call is served
+/// is the compiler's question.
 #[must_use]
 pub fn value_column(expr: &Expr) -> &Expr {
-    coalesce_arguments(expr)
+    let mut bare = expr;
+    while let Expr::Nested(inner) = bare {
+        bare = inner;
+    }
+    coalesce_arguments(bare)
         .and_then(|arguments| {
             arguments.into_iter().find(|argument| {
                 matches!(argument, Expr::Identifier(_) | Expr::CompoundIdentifier(_))
             })
         })
-        .unwrap_or(expr)
+        .unwrap_or(bare)
 }
 
 /// The arguments of `expr` when it is a plain `COALESCE(...)` call, parentheses

@@ -67,6 +67,25 @@ fn nested_column_scalar_of<B: Backend, DB: DatabaseLike>(
     }
 }
 
+/// The kind the literals beside `tested` are read at: the kind of the column it
+/// reads, through the arithmetic around it, as `=` reads it.
+///
+/// A side reading no column has no kind every engine agrees on, so it is
+/// routed to the engine rather than read as text and refused as a bad literal.
+fn tested_side_kind<B: Backend, DB: DatabaseLike>(
+    tested: &Expr,
+    table_id: TableId,
+    database: &DB,
+    depth: usize,
+    keyword: &str,
+) -> Result<ValueKindOf<B>, RegisterError> {
+    nested_column_scalar_of::<B, DB>(tested, table_id, database, depth).ok_or_else(|| {
+        RegisterError::UnsupportedSql(format!(
+            "{keyword} is served over a tested side reading a column of the table"
+        ))
+    })
+}
+
 /// The kind a binary operation answers, given the kind its operands carry.
 ///
 /// Only `/` moves it, and only where the engine's `/` answers a decimal:
@@ -599,10 +618,8 @@ where
             list,
             negated,
         } => {
-            // Derive target from the tested expression if it's a column
-            // reference; fall back to String otherwise (best-effort).
-            let list_target = column_scalar_of::<B, DB>(expr, table_id, database)
-                .unwrap_or_else(|| ScalarFamily::String.into());
+            refuse_condition_operand(expr)?;
+            let list_target = tested_side_kind::<B, DB>(expr, table_id, database, depth, "IN")?;
 
             compile_expr_recursive::<B, DB>(expr, table_id, database, out, depth + 1, list_target)?;
 
@@ -621,10 +638,21 @@ where
                 }
             }
 
-            let tested = out.intern_comparison(expr, table_id, database);
+            // Each item asks the question `=` asks, so the collation `=` would
+            // refuse is refused here, and the rule it would resolve is used.
+            let comparison = match list.first() {
+                Some(item) => out.comparison_for(
+                    expr,
+                    item,
+                    table_id,
+                    database,
+                    crate::backend::TextOperation::Equality,
+                )?,
+                None => ComparisonRef::new(out.intern_comparison(expr, table_id, database), None),
+            };
             out.push(Instruction::In {
                 literals,
-                comparison: ComparisonRef::new(tested, None),
+                comparison,
             });
 
             if *negated {
@@ -701,8 +729,11 @@ where
             high,
             negated,
         } => {
-            let range_target = column_scalar_of::<B, DB>(expr, table_id, database)
-                .unwrap_or_else(|| ScalarFamily::String.into());
+            for operand in [expr, low, high] {
+                refuse_condition_operand(operand)?;
+            }
+            let range_target =
+                tested_side_kind::<B, DB>(expr, table_id, database, depth, "BETWEEN")?;
             for bound in [low, high] {
                 refuse_literal_foreign_to_coalesce::<B, DB>(expr, bound, table_id, database)?;
             }
@@ -1019,6 +1050,9 @@ where
             }
         },
     };
+    for operand in [node.expr, node.pattern] {
+        refuse_condition_operand(operand)?;
+    }
     for operand in [node.expr, node.pattern] {
         compile_expr_recursive::<B, DB>(
             operand,
