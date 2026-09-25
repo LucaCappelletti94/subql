@@ -450,6 +450,60 @@ fn an_explicit_projection_still_delivers_the_primary_key() {
     );
 }
 
+/// A key column renamed by its alias is still the key, read where it sits.
+/// The column is what is written before the alias, so swapped names put the
+/// key where `id` is read and not where `id` is spelt. A computed value
+/// carrying the key's name is not the key.
+#[test]
+fn a_key_column_under_an_alias_is_still_the_key() {
+    for (sql, columns) in [
+        (
+            "SELECT status, id AS order_id FROM orders WHERE lower(status) = 'paid'",
+            ["status", "order_id"],
+        ),
+        (
+            "SELECT id AS status, status AS id FROM orders WHERE lower(status) = 'paid'",
+            ["status", "id"],
+        ),
+    ] {
+        let (mut engine, table) = setup(&[(1, "paid")]);
+        match engine
+            .register(
+                SubscriptionRequest::<DefaultIds, SQLite>::new(9u64, sql),
+                (),
+            )
+            .expect("a filter outside the language is captured")
+        {
+            Registered {
+                tier: Tier::KeyedRows { .. },
+                ..
+            } => {}
+            other => panic!("{sql}: expected a keyed capture, got {other:?}"),
+        }
+        let event = TestEvent::<SQLite>::update(table, row(1, "paid"), row(1, "paid"))
+            .with_pk_columns([0u16]);
+        engine.apply_leaving_reads_queued(&event).expect("apply");
+        let notifications = engine.resolve_collect().expect("dispatch");
+        assert_eq!(notifications.row_deltas.len(), 1, "{sql}");
+        let delta = &notifications.row_deltas[0];
+        assert_eq!(delta.key, vec![Value::Int(1)], "{sql}");
+        assert_eq!(delta.columns.as_ref(), columns.map(String::from), "{sql}");
+    }
+
+    let (mut engine, _table) = setup(&[(1, "paid")]);
+    let computed = "SELECT id + 0 AS id, status FROM orders WHERE lower(status) = 'paid'";
+    let registered = engine
+        .register(
+            SubscriptionRequest::<DefaultIds, SQLite>::new(9u64, computed),
+            (),
+        )
+        .expect("a filter outside the language is captured");
+    assert!(
+        !matches!(registered.tier, Tier::KeyedRows { .. }),
+        "{computed} carries no key column, got {registered:?}"
+    );
+}
+
 /// A filter that reads a second table cannot be served by asking about the
 /// changed rows of the first.
 ///

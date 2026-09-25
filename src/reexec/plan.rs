@@ -891,15 +891,18 @@ fn key_projection_positions<B: Backend, DB: DatabaseLike>(
     }
     let mut named: Vec<Option<(&Ident, bool)>> = Vec::with_capacity(select.projection.len());
     for item in &select.projection {
-        named.push(match item {
-            SelectItem::UnnamedExpr(Expr::Identifier(ident)) => {
-                Some((ident, ident.quote_style.is_some()))
-            }
-            SelectItem::UnnamedExpr(Expr::CompoundIdentifier(parts)) => {
+        // An alias renames the column it follows, so the column is read from
+        // the expression and never from the alias.
+        let (SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. }) = item else {
+            named.push(None);
+            continue;
+        };
+        named.push(match expr {
+            Expr::Identifier(ident) => Some((ident, ident.quote_style.is_some())),
+            Expr::CompoundIdentifier(parts) => {
                 parts.last().map(|last| (last, last.quote_style.is_some()))
             }
-            // An expression, an alias, or another table's wildcard delivers a
-            // value, not the key column itself.
+            // A computed value delivers a value, not the key column itself.
             _ => None,
         });
     }
