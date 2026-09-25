@@ -159,6 +159,26 @@ fn read_binlog_pos(conn: &mut diesel::MysqlConnection) -> Option<crate::MysqlBin
     binlog_pos_from(&file, position)
 }
 
+/// Take the binlog position, then run `body` inside one transaction with
+/// `setup` applied.
+///
+/// The position is read first, per `Connector::Checkpoint`: it is the
+/// server's current coordinate, so taken after the read it can sit ahead of
+/// the snapshot and a replay from there loses a commit.
+#[cfg(feature = "executor-diesel-mysql")]
+fn read_at_binlog_pos<T>(
+    conn: &mut diesel::MysqlConnection,
+    setup: &[String],
+    body: impl FnOnce(&mut diesel::MysqlConnection) -> diesel::QueryResult<T>,
+) -> diesel::QueryResult<(T, Option<crate::MysqlBinlogPos>)> {
+    let pos = read_binlog_pos(conn);
+    let value = conn.transaction(|conn| {
+        run_setup_statements(conn, setup)?;
+        body(conn)
+    })?;
+    Ok((value, pos))
+}
+
 #[cfg(feature = "executor-diesel-mysql")]
 impl<S: SessionSetup, C: crate::backend::MySqlTableNameCase> Connector
     for MysqlDieselConnector<S, C>
@@ -175,14 +195,8 @@ impl<S: SessionSetup, C: crate::backend::MySqlTableNameCase> Connector
         auth: &S,
     ) -> Result<(Value<Self::Backend>, Option<Self::Checkpoint>), Self::Error> {
         let mut conn = self.conn.borrow_mut();
-        // Position before snapshot, per `Connector::Checkpoint`: the coordinate
-        // is the server's current one, so taken after the read it can sit ahead
-        // of the snapshot and a replay from there loses a commit.
-        let pos = read_binlog_pos(&mut conn);
-        diesel::connection::Connection::transaction(&mut *conn, |conn| {
-            run_setup_statements(conn, auth.setup_statements())?;
-            let value = load_scalar::<_, Self::Backend>(conn, query, kind)?;
-            Ok((value, pos))
+        read_at_binlog_pos(&mut conn, auth.setup_statements(), |conn| {
+            load_scalar::<_, Self::Backend>(conn, query, kind)
         })
     }
 
@@ -193,16 +207,10 @@ impl<S: SessionSetup, C: crate::backend::MySqlTableNameCase> Connector
         auth: &S,
     ) -> Result<Snapshot<RowPage<Self::Backend>, Self::Checkpoint>, Self::Error> {
         let mut conn = self.conn.borrow_mut();
-        // Position before snapshot, per `Connector::Checkpoint`.
-        let pos = read_binlog_pos(&mut conn);
-        conn.transaction(|conn| {
-            run_setup_statements(conn, auth.setup_statements())?;
-            let value = load_page::<_, Self::Backend>(conn, query, max_bytes)?;
-            Ok(Snapshot {
-                value,
-                checkpoint: pos,
-            })
-        })
+        let (value, checkpoint) = read_at_binlog_pos(&mut conn, auth.setup_statements(), |conn| {
+            load_page::<_, Self::Backend>(conn, query, max_bytes)
+        })?;
+        Ok(Snapshot { value, checkpoint })
     }
 
     fn execute_scalar_row(
@@ -218,11 +226,8 @@ impl<S: SessionSetup, C: crate::backend::MySqlTableNameCase> Connector
         ScalarRowError<Self::Error>,
     > {
         let mut conn = self.conn.borrow_mut();
-        let pos = read_binlog_pos(&mut conn);
-        diesel::connection::Connection::transaction(&mut *conn, |conn| {
-            run_setup_statements(conn, auth.setup_statements())?;
-            let values = load_scalar_row::<_, Self::Backend>(conn, query, kinds)?;
-            Ok((values, pos))
+        read_at_binlog_pos(&mut conn, auth.setup_statements(), |conn| {
+            load_scalar_row::<_, Self::Backend>(conn, query, kinds)
         })
         .map_err(ScalarRowError::Connector)
     }

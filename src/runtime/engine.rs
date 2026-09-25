@@ -1861,49 +1861,52 @@ where
 
     /// The registration-time row-security refusal for one planned tier, or
     /// `Ok(())` when it may register.
-    ///
-    /// A shared answer is unsafe when the read's table filters rows per
-    /// viewer, unless the subscription reads per consumer, which is exactly
-    /// the mode that stays safe under row-level security.
     fn registration_rls_refusal(
         &self,
         planned: &crate::reexec::plan::QueryPlan<E::Backend>,
         database_reads_per_consumer: bool,
     ) -> Result<(), RegisterError> {
-        if database_reads_per_consumer {
+        let Some(table_id) = self.shared_rls_table(planned, database_reads_per_consumer)? else {
             return Ok(());
+        };
+        Err(match planned {
+            crate::reexec::plan::QueryPlan::GroupedPartial(_)
+            | crate::reexec::plan::QueryPlan::Partial(_) => {
+                RegisterError::AggregatorOnRlsTable { table_id }
+            }
+            crate::reexec::plan::QueryPlan::Keyed(_) | crate::reexec::plan::QueryPlan::Total(_) => {
+                RegisterError::RowCaptureOnRlsTable { table_id }
+            }
+        })
+    }
+
+    /// The first row-secured table `planned` reads, which makes it unsafe as
+    /// one shared answer, or `None` when it may be shared.
+    ///
+    /// A per-consumer read stays safe under row-level filtering, on every
+    /// plan shape alike, which is the one mode that returns `None` unread.
+    fn shared_rls_table(
+        &self,
+        planned: &crate::reexec::plan::QueryPlan<E::Backend>,
+        database_reads_per_consumer: bool,
+    ) -> Result<Option<TableId>, crate::CatalogError> {
+        if database_reads_per_consumer {
+            return Ok(None);
         }
-        match planned {
+        let tables = match planned {
             crate::reexec::plan::QueryPlan::GroupedPartial(plan) => {
-                if crate::catalog_helpers::table_has_rls(&self.database, plan.table_id)? {
-                    return Err(RegisterError::AggregatorOnRlsTable {
-                        table_id: plan.table_id,
-                    });
-                }
+                core::slice::from_ref(&plan.table_id)
             }
-            crate::reexec::plan::QueryPlan::Partial(plan) => {
-                if crate::catalog_helpers::table_has_rls(&self.database, plan.table_id)? {
-                    return Err(RegisterError::AggregatorOnRlsTable {
-                        table_id: plan.table_id,
-                    });
-                }
-            }
-            crate::reexec::plan::QueryPlan::Keyed(plan) => {
-                if crate::catalog_helpers::table_has_rls(&self.database, plan.table)? {
-                    return Err(RegisterError::RowCaptureOnRlsTable {
-                        table_id: plan.table,
-                    });
-                }
-            }
-            crate::reexec::plan::QueryPlan::Total(plan) => {
-                for table in plan.tables.iter().copied() {
-                    if crate::catalog_helpers::table_has_rls(&self.database, table)? {
-                        return Err(RegisterError::RowCaptureOnRlsTable { table_id: table });
-                    }
-                }
+            crate::reexec::plan::QueryPlan::Partial(plan) => core::slice::from_ref(&plan.table_id),
+            crate::reexec::plan::QueryPlan::Keyed(plan) => core::slice::from_ref(&plan.table),
+            crate::reexec::plan::QueryPlan::Total(plan) => plan.tables.as_slice(),
+        };
+        for &table in tables {
+            if crate::catalog_helpers::table_has_rls(&self.database, table)? {
+                return Ok(Some(table));
             }
         }
-        Ok(())
+        Ok(None)
     }
     fn plan_whole_reread(
         &mut self,
@@ -2459,7 +2462,36 @@ where
     ) -> Result<crate::reexec::ReExecNotifications<I, E::Backend, E::Checkpoint>, DispatchError>
     {
         let event = crate::backend::ResolvedEvent::new(event, &self.database);
-        let engine = match self.consumers_resolved(&event) {
+        // `unseeded_aggregate_triggers` is deliberately left out: the facade
+        // seeds an aggregate through `Install`, never auto-bootstraps.
+        let crate::DispatchOutput {
+            notifications,
+            aggregate_updates,
+            scalar_updates,
+            triggers,
+            transitions,
+        } = self.dispatch_resolved(&event, false)?;
+        Ok(crate::reexec::ReExecNotifications {
+            engine: notifications,
+            aggregate_updates,
+            scalar_updates,
+            rows_updates: Vec::new(),
+            row_deltas: Vec::new(),
+            triggers,
+            transitions,
+        })
+    }
+
+    /// One resolved event's row notifications, aggregate folds, scalar
+    /// updates, reads and tier changes, as `dispatch` and
+    /// `reread_notifications` both report them. `bootstrap_unseeded` adds a
+    /// read for every aggregate still waiting for its seed.
+    fn dispatch_resolved(
+        &mut self,
+        event: &crate::backend::ResolvedEvent<'_, E>,
+        bootstrap_unseeded: bool,
+    ) -> Result<crate::DispatchOutput<I, E::Checkpoint, E::Backend>, DispatchError> {
+        let mut notifications = match self.consumers_resolved(event) {
             Ok(notifications) => notifications,
             // Unreachable as the engine stands, per `routes_reread`.
             Err(DispatchError::UnknownTableId(_)) if self.routes_reread(event.table_id()) => {
@@ -2467,17 +2499,21 @@ where
             }
             Err(error) => return Err(error),
         };
-        // Fold the ungrouped aggregate channel too, the way `dispatch` does, so
-        // a seeded COUNT/SUM/AVG updates through the wrapper facade rather than
-        // being silently absorbed. `aggregate_updates` runs before `maintain`
-        // so a demotion it triggers is visible to the reexec registry `maintain`
-        // then reads. `unseeded_aggregate_triggers` is deliberately left out:
-        // the facade seeds an aggregate through `Install`, never auto-bootstraps.
-        let mut aggregate = self.aggregate_updates_resolved(&event)?;
+        // `aggregate_updates` runs before `maintain` so a demotion it triggers
+        // is visible to the reexec registry `maintain` then reads.
+        let mut aggregate = self.aggregate_updates_resolved(event)?;
+        self.report_aggregate_refusals(
+            event.table_id(),
+            &aggregate.evaluation_failures,
+            &mut notifications,
+        );
         let (grouped_updates, scalar_updates, mut triggers, mut transitions) =
-            self.maintain_resolved(&event)?;
+            self.maintain_resolved(event)?;
         aggregate.updates.extend(grouped_updates);
         triggers.extend(aggregate.triggers);
+        if bootstrap_unseeded {
+            triggers.extend(self.unseeded_aggregate_triggers(event));
+        }
         triggers.sort_unstable_by(|left, right| {
             (left.subscription_id, left.read.group_key())
                 .cmp(&(right.subscription_id, right.read.group_key()))
@@ -2487,15 +2523,44 @@ where
                 && left.read.group_key() == right.read.group_key()
         });
         transitions.extend(aggregate.transitions);
-        Ok(crate::reexec::ReExecNotifications {
-            engine,
-            aggregate_updates: aggregate.updates,
+        Ok(crate::DispatchOutput::from_parts(
+            notifications,
+            aggregate.updates,
             scalar_updates,
-            rows_updates: Vec::new(),
-            row_deltas: Vec::new(),
             triggers,
             transitions,
-        })
+        ))
+    }
+
+    /// Add one event's refused aggregates to its refused rows, each with the
+    /// consumer its subscription is bound for, so a caller finds every
+    /// refusal the event produced in one list.
+    fn report_aggregate_refusals(
+        &self,
+        table_id: TableId,
+        refused: &[(
+            SubscriptionId,
+            crate::compiler::vm::refusal::EvaluationRefusal,
+        )],
+        notifications: &mut crate::ConsumerNotifications<I, E::Checkpoint, E::Backend>,
+    ) {
+        if refused.is_empty() {
+            return;
+        }
+        let Some(partition) = self.partitions.get(&table_id) else {
+            return;
+        };
+        let snapshot = partition.load_snapshot();
+        notifications
+            .evaluation_failures
+            .extend(refused.iter().filter_map(|&(subscription_id, refusal)| {
+                let binding = snapshot.predicates.bindings.get(&subscription_id)?;
+                Some(crate::types::EvaluationFailure {
+                    subscription_id,
+                    consumer_id: binding.consumer_id,
+                    refusal,
+                })
+            }));
     }
 
     /// Whether a change to `table_id` moves any re-read answer.
@@ -2974,52 +3039,18 @@ where
     }
 
     /// The row-secured table that makes restoring `planned` unsafe as one
-    /// shared answer, or `None` when the restore may proceed.
-    ///
-    /// The same guard registration applies: per-consumer reads stay safe
-    /// under row-level filtering, on every plan shape alike.
+    /// shared answer, or `None` when the restore may proceed, under the
+    /// guard registration applies.
     #[cfg(feature = "std")]
     fn restored_rls_table(
         &self,
         planned: &crate::reexec::plan::QueryPlan<E::Backend>,
         database_reads_per_consumer: bool,
     ) -> Result<Option<TableId>, DropReason> {
-        if database_reads_per_consumer {
-            return Ok(None);
-        }
-        let catalog_failed = |e: crate::CatalogError| DropReason::Unplannable {
-            message: format!("row-security could not be checked: {e}"),
-        };
-        let found = match planned {
-            crate::reexec::plan::QueryPlan::GroupedPartial(plan) => {
-                crate::catalog_helpers::table_has_rls(&self.database, plan.table_id)
-                    .map_err(catalog_failed)?
-                    .then_some(plan.table_id)
-            }
-            crate::reexec::plan::QueryPlan::Partial(plan) => {
-                crate::catalog_helpers::table_has_rls(&self.database, plan.table_id)
-                    .map_err(catalog_failed)?
-                    .then_some(plan.table_id)
-            }
-            crate::reexec::plan::QueryPlan::Keyed(plan) => {
-                crate::catalog_helpers::table_has_rls(&self.database, plan.table)
-                    .map_err(catalog_failed)?
-                    .then_some(plan.table)
-            }
-            crate::reexec::plan::QueryPlan::Total(plan) => {
-                let mut found = None;
-                for table_id in plan.tables.iter().copied() {
-                    if crate::catalog_helpers::table_has_rls(&self.database, table_id)
-                        .map_err(catalog_failed)?
-                    {
-                        found = Some(table_id);
-                        break;
-                    }
-                }
-                found
-            }
-        };
-        Ok(found)
+        self.shared_rls_table(planned, database_reads_per_consumer)
+            .map_err(|e| DropReason::Unplannable {
+                message: format!("row-security could not be checked: {e}"),
+            })
     }
 
     /// Register a `SELECT` for `consumer_id`, building the
@@ -3960,46 +3991,42 @@ where
         // Capture dedup key from binding before removing it.
         let dedup_key = self.dedup_key_for_subscription(subscription_id);
 
-        // Fast path: direct lookup from subscription index.
+        let (table_id, removal) = self.remove_binding_anywhere(subscription_id)?;
+        self.subscription_to_table.remove(&subscription_id);
+        self.subscription_activity.remove(&subscription_id);
+        if let Some(key) = dedup_key {
+            self.binding_dedup.remove(&key);
+        }
+        self.cleanup_consumer_if_unreferenced(table_id, removal.consumer_id);
+        Some(removal.predicate_removed)
+    }
+
+    /// Remove `subscription_id`'s binding from the partition that holds it,
+    /// naming that partition's table.
+    ///
+    /// The subscription index answers directly, and a stale index entry falls
+    /// back to scanning every partition, for pre-index or inconsistent states.
+    fn remove_binding_anywhere(
+        &mut self,
+        subscription_id: SubscriptionId,
+    ) -> Option<(TableId, crate::runtime::partition::BindingRemoval<I>)> {
         if let Some(table_id) = self.subscription_to_table.get(&subscription_id).copied() {
             let removal = self
                 .partitions
                 .get_mut(&table_id)
                 .and_then(|partition| partition.mutate(|txn| txn.remove_binding(subscription_id)));
             if let Some(removal) = removal {
-                self.subscription_to_table.remove(&subscription_id);
-                self.subscription_activity.remove(&subscription_id);
-                if let Some(key) = dedup_key {
-                    self.binding_dedup.remove(&key);
-                }
-                self.cleanup_consumer_if_unreferenced(table_id, removal.consumer_id);
-                return Some(removal.predicate_removed);
+                return Some((table_id, removal));
             }
-
-            // Stale index entry. Clean it up and fall back to scan.
             self.subscription_to_table.remove(&subscription_id);
         }
-
-        // Fallback scan for pre-index or inconsistent states.
-        let mut removed = None;
-        for (&table_id, partition) in &mut self.partitions {
-            if let Some(removal) = partition.mutate(|txn| txn.remove_binding(subscription_id)) {
-                removed = Some((table_id, removal));
-                break;
-            }
-        }
-
-        if let Some((table_id, removal)) = removed {
-            self.subscription_to_table.remove(&subscription_id);
-            self.subscription_activity.remove(&subscription_id);
-            if let Some(key) = dedup_key {
-                self.binding_dedup.remove(&key);
-            }
-            self.cleanup_consumer_if_unreferenced(table_id, removal.consumer_id);
-            return Some(removal.predicate_removed);
-        }
-
-        None
+        self.partitions
+            .iter_mut()
+            .find_map(|(&table_id, partition)| {
+                partition
+                    .mutate(|txn| txn.remove_binding(subscription_id))
+                    .map(|removal| (table_id, removal))
+            })
     }
 
     /// Look up the dedup natural key for a subscription by finding its binding.
@@ -4468,36 +4495,7 @@ where
         event: &E,
     ) -> Result<crate::DispatchOutput<I, E::Checkpoint, E::Backend>, DispatchError> {
         let event = crate::backend::ResolvedEvent::new(event, &self.database);
-        let notifications = match self.consumers_resolved(&event) {
-            Ok(notifications) => notifications,
-            // Unreachable as the engine stands, per `routes_reread`.
-            Err(DispatchError::UnknownTableId(_)) if self.routes_reread(event.table_id()) => {
-                crate::ConsumerNotifications::empty().with_checkpoint(event.checkpoint())
-            }
-            Err(error) => return Err(error),
-        };
-        let mut aggregate = self.aggregate_updates_resolved(&event)?;
-        let (grouped_updates, scalar_updates, mut triggers, mut transitions) =
-            self.maintain_resolved(&event)?;
-        aggregate.updates.extend(grouped_updates);
-        triggers.extend(aggregate.triggers);
-        triggers.extend(self.unseeded_aggregate_triggers(&event));
-        triggers.sort_unstable_by(|left, right| {
-            (left.subscription_id, left.read.group_key())
-                .cmp(&(right.subscription_id, right.read.group_key()))
-        });
-        triggers.dedup_by(|left, right| {
-            left.subscription_id == right.subscription_id
-                && left.read.group_key() == right.read.group_key()
-        });
-        transitions.extend(aggregate.transitions);
-        let output = crate::DispatchOutput::from_parts(
-            notifications,
-            aggregate.updates,
-            scalar_updates,
-            triggers,
-            transitions,
-        );
+        let output = self.dispatch_resolved(&event, true)?;
         if event.kind() == EventKind::Delete && !self.pk_follows.is_empty() {
             self.close_deleted_pk_follows(&event);
         }

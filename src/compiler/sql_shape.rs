@@ -340,19 +340,23 @@ fn extract_column_arg(arg: &FunctionArg) -> Option<&Ident> {
     }
 }
 
-/// Resolve a single bare-column aggregate argument (`SUM(col)`, `MIN(col)`,
-/// etc.) to a `ColumnId`. Rejects `FILTER`, `OVER`, `DISTINCT`, wildcard
-/// arguments, multi-argument calls, and non-column expressions. Does not
-/// constrain the column type. Callers needing a numeric column add that
-/// check on top (see [`resolve_numeric_agg_column`]).
-///
-/// `display` is the upper-cased function name used in error messages.
-pub(crate) fn resolve_single_column_arg<B: crate::backend::Backend, DB: DatabaseLike>(
+/// One aggregate call's lone argument, past the checks every aggregate shares.
+enum LoneArgument<'f> {
+    /// `*`, which only `COUNT` serves.
+    Star,
+    /// A bare or table-qualified column name.
+    Column(&'f Ident),
+}
+
+/// Read `f`'s lone argument, refusing `FILTER`, `OVER`, `DISTINCT`, any other
+/// arity and any expression. `display` is the upper-cased function name the
+/// refusals use, and `admits_star` only changes their wording, since `COUNT`
+/// is the one aggregate whose refusal should say `*` is accepted.
+fn lone_argument<'f>(
     display: &str,
-    f: &sqlparser::ast::Function,
-    table_id: crate::TableId,
-    database: &DB,
-) -> Result<crate::ColumnId, RegisterError> {
+    f: &'f sqlparser::ast::Function,
+    admits_star: bool,
+) -> Result<LoneArgument<'f>, RegisterError> {
     if f.filter.is_some() {
         return Err(RegisterError::UnsupportedSql(format!(
             "{display}(...) FILTER (WHERE ...) not supported"
@@ -363,41 +367,64 @@ pub(crate) fn resolve_single_column_arg<B: crate::backend::Backend, DB: Database
             WINDOW_FUNCTIONS_NOT_SUPPORTED.to_string(),
         ));
     }
-
-    match &f.args {
-        FunctionArguments::List(list) => {
-            if list.duplicate_treatment == Some(DuplicateTreatment::Distinct) {
-                return Err(RegisterError::UnsupportedSql(format!(
-                    "{display}(DISTINCT ...) not supported"
-                )));
-            }
-            if list.args.len() != 1 {
-                return Err(RegisterError::UnsupportedSql(format!(
-                    "{display} requires exactly one argument"
-                )));
-            }
-            if matches!(
-                &list.args[0],
-                FunctionArg::Unnamed(FunctionArgExpr::Wildcard)
-            ) {
-                return Err(RegisterError::UnsupportedSql(format!(
-                    "{display}(*) is not supported, use {display}(column_name)"
-                )));
-            }
-            let col_name = extract_column_arg(&list.args[0]).ok_or_else(|| {
-                RegisterError::UnsupportedSql(format!(
-                    "{display} argument must be a plain column name, not an expression"
-                ))
-            })?;
-            written_column::<B, DB>(database, table_id, col_name).ok_or_else(|| {
-                RegisterError::UnknownColumn {
-                    table_id,
-                    column: col_name.value.clone(),
-                }
-            })
-        }
-        _ => Err(RegisterError::UnsupportedSql(format!(
+    let FunctionArguments::List(list) = &f.args else {
+        return Err(RegisterError::UnsupportedSql(format!(
             "{display} requires a column argument"
+        )));
+    };
+    if list.duplicate_treatment == Some(DuplicateTreatment::Distinct) {
+        return Err(RegisterError::UnsupportedSql(format!(
+            "{display}(DISTINCT ...) not supported"
+        )));
+    }
+    let [argument] = list.args.as_slice() else {
+        return Err(RegisterError::UnsupportedSql(format!(
+            "{display} requires exactly one argument"
+        )));
+    };
+    if matches!(argument, FunctionArg::Unnamed(FunctionArgExpr::Wildcard)) {
+        return Ok(LoneArgument::Star);
+    }
+    let accepted = if admits_star {
+        "* or a plain column name"
+    } else {
+        "a plain column name"
+    };
+    extract_column_arg(argument)
+        .map(LoneArgument::Column)
+        .ok_or_else(|| {
+            RegisterError::UnsupportedSql(format!(
+                "{display} argument must be {accepted}, not an expression"
+            ))
+        })
+}
+
+/// The catalog column `name` writes, or the refusal naming it.
+fn written_or_unknown<B: crate::backend::Backend, DB: DatabaseLike>(
+    name: &Ident,
+    table_id: crate::TableId,
+    database: &DB,
+) -> Result<crate::ColumnId, RegisterError> {
+    written_column::<B, DB>(database, table_id, name).ok_or_else(|| RegisterError::UnknownColumn {
+        table_id,
+        column: name.value.clone(),
+    })
+}
+
+/// Resolve a single bare-column aggregate argument (`SUM(col)`, `MIN(col)`,
+/// etc.) to a `ColumnId`, refusing everything [`lone_argument`] refuses and
+/// `*`. Does not constrain the column type. Callers needing a numeric column
+/// add that check on top (see [`resolve_numeric_agg_column`]).
+pub(crate) fn resolve_single_column_arg<B: crate::backend::Backend, DB: DatabaseLike>(
+    display: &str,
+    f: &sqlparser::ast::Function,
+    table_id: crate::TableId,
+    database: &DB,
+) -> Result<crate::ColumnId, RegisterError> {
+    match lone_argument(display, f, false)? {
+        LoneArgument::Column(name) => written_or_unknown::<B, DB>(name, table_id, database),
+        LoneArgument::Star => Err(RegisterError::UnsupportedSql(format!(
+            "{display}(*) is not supported, use {display}(column_name)"
         ))),
     }
 }
@@ -587,59 +614,12 @@ fn aggregate_from_expr<B: crate::backend::Backend, DB: DatabaseLike>(
         .map(|ident| ident.value.to_lowercase());
 
     match func_name.as_deref() {
-        Some("count") => {
-            // Supports COUNT(*) and COUNT(column): no FILTER, OVER, or DISTINCT.
-            if f.filter.is_some() {
-                return Err(RegisterError::UnsupportedSql(
-                    "COUNT FILTER (WHERE ...) not supported".to_string(),
-                ));
-            }
-            if f.over.is_some() {
-                return Err(RegisterError::UnsupportedSql(
-                    WINDOW_FUNCTIONS_NOT_SUPPORTED.to_string(),
-                ));
-            }
-
-            match &f.args {
-                FunctionArguments::List(list) => {
-                    if list.duplicate_treatment == Some(DuplicateTreatment::Distinct) {
-                        return Err(RegisterError::UnsupportedSql(
-                            "COUNT(DISTINCT ...) not supported".to_string(),
-                        ));
-                    }
-                    if list.args.len() != 1 {
-                        return Err(RegisterError::UnsupportedSql(
-                            "COUNT requires exactly one argument".to_string(),
-                        ));
-                    }
-                    // COUNT(*): wildcard arg
-                    if matches!(
-                        &list.args[0],
-                        FunctionArg::Unnamed(FunctionArgExpr::Wildcard)
-                    ) {
-                        return Ok(AggSpec::CountStar);
-                    }
-                    // COUNT(column): plain column identifier
-                    let col_name = extract_column_arg(&list.args[0]).ok_or_else(|| {
-                        RegisterError::UnsupportedSql(
-                            "COUNT argument must be * or a plain column name, not an expression"
-                                .to_string(),
-                        )
-                    })?;
-                    let column =
-                        written_column::<B, DB>(database, table_id, col_name).ok_or_else(|| {
-                            RegisterError::UnknownColumn {
-                                table_id,
-                                column: col_name.value.clone(),
-                            }
-                        })?;
-                    Ok(AggSpec::CountColumn { column })
-                }
-                _ => Err(RegisterError::UnsupportedSql(
-                    "COUNT requires an argument".to_string(),
-                )),
-            }
-        }
+        Some("count") => Ok(match lone_argument("COUNT", f, true)? {
+            LoneArgument::Star => AggSpec::CountStar,
+            LoneArgument::Column(name) => AggSpec::CountColumn {
+                column: written_or_unknown::<B, DB>(name, table_id, database)?,
+            },
+        }),
         Some(
             func @ ("sum" | "avg" | "var_pop" | "var_samp" | "variance" | "stddev_pop"
             | "stddev_samp" | "stddev"),

@@ -161,6 +161,32 @@ fn distinct_is_refused() {
     refused_naming("SELECT DISTINCT id, status, amount FROM t", "DISTINCT");
 }
 
+/// `COUNT` is refused in the words every aggregate uses, and alone keeps
+/// telling the caller that `*` is accepted.
+#[test]
+fn count_is_refused_in_the_aggregates_shared_words() {
+    for (sql, words) in [
+        (
+            "SELECT COUNT(*) FILTER (WHERE amount > 1) FROM t",
+            "COUNT(...) FILTER (WHERE ...) not supported",
+        ),
+        (
+            "SELECT SUM(amount) FILTER (WHERE amount > 1) FROM t",
+            "SUM(...) FILTER (WHERE ...) not supported",
+        ),
+        (
+            "SELECT COUNT(amount + 1) FROM t",
+            "COUNT argument must be * or a plain column name, not an expression",
+        ),
+        (
+            "SELECT SUM(amount + 1) FROM t",
+            "SUM argument must be a plain column name, not an expression",
+        ),
+    ] {
+        refused_naming(sql, words);
+    }
+}
+
 /// A bound on how many rows come back is a question about the other rows, and
 /// a change event carries one row.
 #[test]

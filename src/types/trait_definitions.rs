@@ -769,11 +769,11 @@ pub struct DispatchOutput<
     C: Checkpoint = NoCheckpoint,
     B: Backend = crate::backend::Postgres,
 > {
-    notifications: ConsumerNotifications<I, C, B>,
-    aggregate_updates: Vec<AggregateValueUpdate<I, B>>,
-    scalar_updates: Vec<crate::reexec::ScalarUpdate<I, B, C>>,
-    triggers: Vec<crate::reexec::ReExecutionTrigger<I, C, B>>,
-    transitions: Vec<MaintenanceTransition<B>>,
+    pub(crate) notifications: ConsumerNotifications<I, C, B>,
+    pub(crate) aggregate_updates: Vec<AggregateValueUpdate<I, B>>,
+    pub(crate) scalar_updates: Vec<crate::reexec::ScalarUpdate<I, B, C>>,
+    pub(crate) triggers: Vec<crate::reexec::ReExecutionTrigger<I, C, B>>,
+    pub(crate) transitions: Vec<MaintenanceTransition<B>>,
 }
 
 impl<I: IdTypes, C: Checkpoint, B: Backend> DispatchOutput<I, C, B> {

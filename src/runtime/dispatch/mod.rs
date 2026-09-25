@@ -1033,56 +1033,33 @@ pub(crate) struct AggregateDelta<B: crate::backend::Backend> {
     pub rows: i64,
 }
 
-/// The refused subscriptions of one event, with their deltas removed.
+/// The subscriptions one event reported, each with its first report in
+/// evaluation order, and with their deltas removed.
 ///
-/// A refused subscription contributes no delta, even when one row version
+/// A reported subscription contributes no delta, even when one row version
 /// was served: an update's fold needs both versions, and folding half of it
 /// would move the total by a row the filter never judged. The caller
 /// applies the stop after folding, so the removal happens here.
-fn refused_subscriptions<B: crate::backend::Backend>(
-    refusals: Vec<(ConsumerOrdinal, SubscriptionId, EvaluationRefusal)>,
+fn reported_subscriptions<B: crate::backend::Backend, T>(
+    reports: Vec<(ConsumerOrdinal, SubscriptionId, T)>,
     deltas: &mut Vec<AggregateDelta<B>>,
-) -> Vec<(SubscriptionId, EvaluationRefusal)> {
-    let mut refused: Vec<(SubscriptionId, EvaluationRefusal)> = refusals
+) -> Vec<(SubscriptionId, T)> {
+    let mut reported: Vec<(SubscriptionId, T)> = reports
         .into_iter()
-        .map(|(_, subscription, failure)| (subscription, failure))
+        .map(|(_, subscription, report)| (subscription, report))
         .collect();
-    refused.sort_unstable_by_key(|(subscription, _)| *subscription);
-    refused.dedup_by_key(|(subscription, _)| *subscription);
-    if !refused.is_empty() {
+    // Stable, so the report met first survives the dedup, as the engine
+    // raises the first error it reaches.
+    reported.sort_by_key(|(subscription, _)| *subscription);
+    reported.dedup_by_key(|(subscription, _)| *subscription);
+    if !reported.is_empty() {
         deltas.retain(|delta| {
-            refused
+            reported
                 .binary_search_by_key(&delta.subscription, |(subscription, _)| *subscription)
                 .is_err()
         });
     }
-    refused
-}
-
-/// Drop every delta belonging to a subscription whose filter could not
-/// read a cell, and report those subscriptions with the column.
-///
-/// Mirrors [`refused_subscriptions`]: an aggregate's delta is only sound
-/// when both sides of the transition were decidable, so a subscription
-/// that could not answer one of them contributes nothing at all.
-fn unanswered_subscriptions<B: crate::backend::Backend>(
-    unanswered: Vec<(ConsumerOrdinal, SubscriptionId, crate::ColumnId)>,
-    deltas: &mut Vec<AggregateDelta<B>>,
-) -> Vec<(SubscriptionId, crate::ColumnId)> {
-    let mut absent: Vec<(SubscriptionId, crate::ColumnId)> = unanswered
-        .into_iter()
-        .map(|(_, subscription, column)| (subscription, column))
-        .collect();
-    absent.sort_unstable();
-    absent.dedup_by_key(|(subscription, _)| *subscription);
-    if !absent.is_empty() {
-        deltas.retain(|delta| {
-            absent
-                .binary_search_by_key(&delta.subscription, |(subscription, _)| *subscription)
-                .is_err()
-        });
-    }
-    absent
+    reported
 }
 
 pub(crate) struct AggregateComputation<B: crate::backend::Backend> {
@@ -1322,11 +1299,11 @@ where
     missing_old.sort_unstable();
     let mut group_key_failed: Vec<_> = group_key_failed.into_iter().collect();
     group_key_failed.sort_unstable();
-    let evaluation_refused = refused_subscriptions(reports.refusals, &mut deltas);
+    let evaluation_refused = reported_subscriptions(reports.refusals, &mut deltas);
     // The same treatment as a refusal, for the same reason: a delta the
     // event could only compute for one side of the transition is worse
     // than no delta, because the error never washes out.
-    let unanswered_filter = unanswered_subscriptions(reports.unanswered, &mut deltas);
+    let unanswered_filter = reported_subscriptions(reports.unanswered, &mut deltas);
 
     Ok(AggregateComputation {
         deltas,
