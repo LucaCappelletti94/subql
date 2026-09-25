@@ -1033,7 +1033,7 @@ impl<B: Backend> Served<B> {
         match &self.projection {
             crate::QueryProjection::Aggregate(spec)
             | crate::QueryProjection::GroupedAggregate { agg: spec, .. } => Some(spec),
-            crate::QueryProjection::Rows => None,
+            crate::QueryProjection::Rows | crate::QueryProjection::Columns { .. } => None,
         }
     }
 }

@@ -982,3 +982,58 @@ fn a_batch_spanning_several_pages_answers_every_key_once() {
         "every key answered exactly once, none twice and none missing"
     );
 }
+
+/// A subset of columns under a filter the engine evaluates is served in
+/// process, where it used to be this tier. So an UPDATE of an unprojected
+/// column neither notifies nor sends the database anything, where this tier
+/// read the row back and delivered it unchanged.
+#[test]
+fn a_column_subset_under_an_evaluable_filter_reads_nothing() {
+    const WIDE: &str = "CREATE TABLE orders (id INTEGER PRIMARY KEY, status TEXT, note TEXT)";
+    let mut conn = SqliteConnection::establish(":memory:").unwrap();
+    diesel::sql_query(WIDE).execute(&mut conn).expect("create");
+    diesel::sql_query("INSERT INTO orders VALUES (1, 'paid', 'b')")
+        .execute(&mut conn)
+        .expect("seed");
+    let catalog = ParserDB::parse::<SQLiteDialect>(WIDE).expect("catalog");
+    let table = subql::catalog_helpers::table_id::<subql::backend::Postgres, _>(&catalog, "orders")
+        .expect("orders");
+    let inner = SubscriptionEngine::<TestEvent<SQLite>, DefaultIds, ParserDB>::new(
+        catalog,
+        SQLiteDialect {},
+    );
+    let mut engine: CountingEngine = AutoResolvingEngine::new(inner, SyncMode(Counting::new(conn)));
+    let registered = engine
+        .register(
+            SubscriptionRequest::<DefaultIds, SQLite>::new(
+                1u64,
+                "SELECT id, status FROM orders WHERE status = 'paid'",
+            ),
+            (),
+        )
+        .expect("registers");
+    assert!(
+        matches!(registered.tier, Tier::InProcess(_)),
+        "{:?}",
+        registered.tier
+    );
+    let cells = |note: &str| {
+        vec![
+            Value::Int(1),
+            Value::String("paid".into()),
+            Value::String(note.into()),
+        ]
+    };
+    let applied = engine
+        .apply_leaving_reads_queued(
+            &TestEvent::<SQLite>::update(table, cells("a"), cells("b")).with_pk_columns([0u16]),
+        )
+        .expect("apply");
+    assert!(applied.engine.updated().is_empty());
+    let resolved = engine.resolve_collect().expect("resolve");
+    assert!(resolved.row_deltas.is_empty() && resolved.rows_updates.is_empty());
+    assert!(
+        engine.connector().take().is_empty(),
+        "the database is not asked"
+    );
+}

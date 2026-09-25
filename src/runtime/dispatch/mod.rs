@@ -553,13 +553,69 @@ where
         let Some(pred) = snapshot.predicates.get_predicate(pred_id) else {
             continue;
         };
-        if matches!(pred.projection, QueryProjection::Rows) {
+        if pred.projection.delivers_rows() {
             ordinals.add(consumers);
             extend_subscriptions(&snapshot.predicates, pred_id, consumers, stamps);
         }
     }
     let deleted = resolve_ordinals(ordinals.finish(), consumer_dict);
     ConsumerNotifications::from_parts(Vec::new(), deleted, Vec::new())
+}
+
+/// What an event did to the columns a subset projects.
+#[derive(Clone, Copy)]
+enum ProjectedChange {
+    /// The old image does not carry this projected column, and the subset
+    /// does not carry the key to apply the change by instead.
+    OldLacks(crate::ColumnId),
+    /// Every projected cell is carried and equal in both images.
+    Unchanged,
+    /// A projected cell differs, or an image does not carry one.
+    Changed,
+}
+
+/// What `event` did to the columns `projection` names, `None` unless it
+/// names a subset. An image without a new row compares nothing, and so
+/// reads only whether the old one lacks a column, which only a subset
+/// without the key cannot answer.
+fn projected_change<E: CdcEvent, DB: DatabaseLike>(
+    projection: &QueryProjection,
+    event: &E,
+    db: &DB,
+) -> Result<Option<ProjectedChange>, DispatchError> {
+    let QueryProjection::Columns {
+        columns,
+        carries_key,
+    } = projection
+    else {
+        return Ok(None);
+    };
+    let cell = |row, column| {
+        event
+            .cell_at(db, row, column)
+            .map_err(|error| dispatch_vm_error(VmError::Value(error)))
+    };
+    let mut change = ProjectedChange::Unchanged;
+    for &column in columns {
+        let old = cell(RowKind::Old, column)?;
+        if old.is_missing() {
+            // A keyed consumer applies the change by key, which every old
+            // image carries, so only a bag needs the old values.
+            return Ok(Some(if *carries_key {
+                ProjectedChange::Changed
+            } else {
+                ProjectedChange::OldLacks(column)
+            }));
+        }
+        if matches!(change, ProjectedChange::Unchanged) && event.kind() == EventKind::Update {
+            let new = cell(RowKind::New, column)?;
+            // `Missing` equals no carried value, so an absent new cell is a change.
+            if *new != *old {
+                change = ProjectedChange::Changed;
+            }
+        }
+    }
+    Ok(Some(change))
 }
 
 /// Resolve a `RoaringBitmap` of consumer ordinals into a `Vec` of consumer IDs.
@@ -796,7 +852,7 @@ where
         };
 
         // Only row subscriptions participate in consumers().
-        if !matches!(pred.projection, QueryProjection::Rows) {
+        if !pred.projection.delivers_rows() {
             continue;
         }
 
@@ -865,7 +921,25 @@ where
 
         let new_served = new_matched.matched.without(&refused_here);
         let old_served = old_matched.matched.without(&refused_here);
+        let subset = projected_change(&pred.projection, event, db)?;
         split_transition(&new_served, &old_served, |slot, set| {
+            // A consumer removes a row of a subset by its old projected
+            // values, and one whose projected values did not move holds
+            // nothing that changed.
+            match (slot, subset) {
+                (Slot::Deleted | Slot::Updated, Some(ProjectedChange::OldLacks(column))) => {
+                    collect_bound_subscriptions(
+                        &snapshot.predicates,
+                        pred_id,
+                        set,
+                        column,
+                        &mut reports.unanswered,
+                    );
+                    return;
+                }
+                (Slot::Updated, Some(ProjectedChange::Unchanged)) => return,
+                _ => {}
+            }
             extend_subscriptions(&snapshot.predicates, pred_id, set, stamps);
             match slot {
                 Slot::Inserted => inserted_ordinals.add(set),
@@ -905,6 +979,7 @@ where
         probe_column_for_index(event, row, col, arity, db)
     });
     let mut matching_ordinals = OrdinalUnion::default();
+    let mut unanswered = Vec::new();
 
     for_each_matching_predicate(
         &candidates,
@@ -912,13 +987,32 @@ where
         &mut EvalContext { event, row, vm, db },
         reports,
         |pred, consumers| {
-            if matches!(pred.projection, QueryProjection::Rows) {
-                matching_ordinals.add(consumers);
-                extend_subscriptions(&snapshot.predicates, pred.id, consumers, stamps);
+            if !pred.projection.delivers_rows() {
+                return Ok(());
             }
+            // A deleted row of a subset is removed by its old projected values.
+            if row == RowKind::Old {
+                if let Some(ProjectedChange::OldLacks(column)) =
+                    projected_change(&pred.projection, event, db)?
+                {
+                    unanswered.push((pred.id, consumers.clone(), column));
+                    return Ok(());
+                }
+            }
+            matching_ordinals.add(consumers);
+            extend_subscriptions(&snapshot.predicates, pred.id, consumers, stamps);
             Ok(())
         },
     )?;
+    for (pred_id, consumers, column) in &unanswered {
+        collect_bound_subscriptions(
+            &snapshot.predicates,
+            *pred_id,
+            consumers,
+            *column,
+            &mut reports.unanswered,
+        );
+    }
 
     Ok(matching_ordinals.finish())
 }
@@ -1006,7 +1100,7 @@ fn delta_spec_and_groups(
             };
             Some((spec, groups))
         }
-        QueryProjection::Rows => None,
+        QueryProjection::Rows | QueryProjection::Columns { .. } => None,
     }
 }
 

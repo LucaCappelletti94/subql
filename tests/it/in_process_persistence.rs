@@ -470,3 +470,37 @@ fn a_written_like_escape_comes_back_answering_as_it_did() {
         .inserted()
         .is_empty());
 }
+
+/// A column subset comes back from its shard still naming its columns, so an
+/// update of an unprojected column is still not reported.
+#[test]
+fn a_column_subset_comes_back_answering_as_it_did() {
+    let store = TempStore::new();
+    let mut engine = store.open(catalog());
+    engine
+        .register(SubscriptionRequest::new(
+            1u64,
+            "SELECT id, status FROM orders WHERE status = 'paid'",
+        ))
+        .expect("the filter registers");
+    engine.snapshot_table(table("orders")).expect("snapshot");
+    drop(engine);
+
+    let mut restored = store.open(catalog());
+    assert_eq!(restored.subscription_count(), 1);
+    let row = |price: f64| {
+        vec![
+            subql::backend::Value::Int(1),
+            subql::backend::Value::Float(price),
+            subql::backend::Value::String("paid".into()),
+        ]
+    };
+    let repriced = restored
+        .consumers(&TestEvent::update(table("orders"), row(1.0), row(2.0)))
+        .expect("dispatch");
+    assert!(repriced.updated().is_empty(), "the price is not projected");
+    let inserted = restored
+        .consumers(&TestEvent::insert(table("orders"), row(1.0)))
+        .expect("dispatch");
+    assert_eq!(inserted.inserted(), [1u64]);
+}

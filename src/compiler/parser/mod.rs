@@ -711,6 +711,16 @@ fn resolve_where_placeholders<B: Backend>(
 pub(crate) fn projection_hash_input(normalized: &str, projection: &QueryProjection) -> String {
     match projection {
         QueryProjection::Rows => normalized.to_owned(),
+        // Two subsets over one filter report different changes, and so do
+        // two orders of one subset, since the consumer trims by position.
+        QueryProjection::Columns { columns, .. } => {
+            let mut out = format!("{normalized}\x00COLUMNS");
+            for column in columns {
+                out.push('\x00');
+                let _ = core::fmt::Write::write_fmt(&mut out, format_args!("{column}"));
+            }
+            out
+        }
         QueryProjection::Aggregate(spec) => {
             format!("{normalized}\x00{}", agg_tag(spec))
         }

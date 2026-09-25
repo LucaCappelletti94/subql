@@ -62,6 +62,34 @@ pub enum QueryProjection {
         /// the statement carries one the fold can evaluate in process.
         having: Option<AggHaving>,
     },
+    /// `SELECT c1, ..., cn` naming a subset of the table's columns, in the
+    /// order written: deliver row events, except an UPDATE that changes none
+    /// of these columns, which changes nothing the result holds.
+    ///
+    /// The consumer trims each event to these columns. A subset carrying the
+    /// primary key is applied by key, so an old image lacking a projected
+    /// cell, as PostgreSQL's default replica identity sends, is reported as
+    /// usual. One without the key may be held as a bag whose rows are removed
+    /// by their projected values, so there such an UPDATE or DELETE is
+    /// unanswered.
+    ///
+    /// The enum-level `non_exhaustive` does NOT cover this variant's fields:
+    /// match it with `..`.
+    Columns {
+        /// The projected columns, in the order written.
+        columns: Vec<crate::ColumnId>,
+        /// Whether the table has a primary key and every key column is
+        /// projected, resolved once at registration.
+        carries_key: bool,
+    },
+}
+
+impl QueryProjection {
+    /// Whether this projection delivers row events rather than a value.
+    #[must_use]
+    pub const fn delivers_rows(&self) -> bool {
+        matches!(self, Self::Rows | Self::Columns { .. })
+    }
 }
 
 /// Aggregate function specification.
@@ -569,6 +597,15 @@ pub(super) fn extract_projection<B: crate::backend::Backend, DB: DatabaseLike>(
         return Ok(QueryProjection::Rows);
     }
 
+    if let Some(columns) = projected_columns::<B, DB>(select, table_id, database) {
+        let key = catalog_helpers::primary_key_columns(database, table_id)?;
+        let carries_key = !key.is_empty() && key.iter().all(|column| columns.contains(column));
+        return Ok(QueryProjection::Columns {
+            columns,
+            carries_key,
+        });
+    }
+
     // Single expression (with or without alias)
     if items.len() == 1 {
         let expr = match &items[0] {
@@ -595,6 +632,40 @@ pub(super) fn extract_projection<B: crate::backend::Backend, DB: DatabaseLike>(
     }
 }
 
+/// The columns of the table read that `select` projects, in the order written,
+/// or `None` unless every item is one: bare, qualified by that table, or
+/// renamed by an alias.
+fn projected_columns<B: crate::backend::Backend, DB: DatabaseLike>(
+    select: &Select,
+    table_id: crate::TableId,
+    database: &DB,
+) -> Option<Vec<crate::ColumnId>> {
+    select
+        .projection
+        .iter()
+        .map(|item| {
+            let (SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. }) = item
+            else {
+                return None;
+            };
+            let column = match expr {
+                Expr::Identifier(column) => column,
+                Expr::CompoundIdentifier(parts) => {
+                    let (column, qualifier) = parts.split_last()?;
+                    let qualifier = ObjectName::from(qualifier.to_vec());
+                    if !qualifier_names_read_table::<B, DB>(&qualifier, select, table_id, database)
+                    {
+                        return None;
+                    }
+                    column
+                }
+                _ => return None,
+            };
+            written_column::<B, DB>(database, table_id, column)
+        })
+        .collect()
+}
+
 /// Whether `item` is `q.*` with `q` naming the one table `select` reads,
 /// resolved to `table_id`.
 ///
@@ -612,6 +683,18 @@ pub(crate) fn wildcard_of_read_table<B: crate::backend::Backend, DB: DatabaseLik
     else {
         return false;
     };
+    qualifier_names_read_table::<B, DB>(qualifier, select, table_id, database)
+}
+
+/// Whether `qualifier` names the one table `select` reads, resolved to
+/// `table_id`: its alias when one is written, else its written name or any
+/// name resolving to it.
+fn qualifier_names_read_table<B: crate::backend::Backend, DB: DatabaseLike>(
+    qualifier: &ObjectName,
+    select: &Select,
+    table_id: crate::TableId,
+    database: &DB,
+) -> bool {
     let Some(TableFactor::Table { name, alias, .. }) =
         select.from.first().map(|from| &from.relation)
     else {
@@ -1290,7 +1373,7 @@ pub(crate) fn render_aggregate_bootstrap<B: crate::backend::Backend, DB: Databas
     database: &DB,
 ) -> Option<crate::AggregateBootstrap<B>> {
     let (spec, groups, having) = match projection {
-        QueryProjection::Rows => return None,
+        QueryProjection::Rows | QueryProjection::Columns { .. } => return None,
         QueryProjection::Aggregate(spec) => (spec, &[][..], None),
         QueryProjection::GroupedAggregate {
             groups,

@@ -568,7 +568,7 @@ fn projection_computes_a_mean(projection: &crate::compiler::sql_shape::QueryProj
     let mean_spec =
         |spec: &crate::compiler::AggSpec| matches!(spec, crate::compiler::AggSpec::Avg { .. });
     match projection {
-        QueryProjection::Rows => false,
+        QueryProjection::Rows | QueryProjection::Columns { .. } => false,
         QueryProjection::Aggregate(spec) => mean_spec(spec),
         QueryProjection::GroupedAggregate { agg, having, .. } => {
             mean_spec(agg)
@@ -1128,7 +1128,7 @@ where
             {
                 QueryProjection::Aggregate(spec) => (spec.column(), &[]),
                 QueryProjection::GroupedAggregate { groups, agg, .. } => (agg.column(), groups),
-                QueryProjection::Rows => (None, &[]),
+                QueryProjection::Rows | QueryProjection::Columns { .. } => (None, &[]),
             };
             for &column in group_cols {
                 if !dep_cols.contains(&column) {
@@ -1155,7 +1155,9 @@ where
                 })
                 .collect::<Option<Vec<_>>>()
                 .and_then(E::Backend::group_key_encoder),
-            QueryProjection::Rows | QueryProjection::Aggregate(_) => None,
+            QueryProjection::Rows
+            | QueryProjection::Columns { .. }
+            | QueryProjection::Aggregate(_) => None,
         };
 
         Predicate {
@@ -5067,7 +5069,9 @@ where
                     })
                     .collect::<Option<Vec<_>>>()
                     .and_then(E::Backend::group_key_encoder),
-                QueryProjection::Rows | QueryProjection::Aggregate(_) => None,
+                QueryProjection::Rows
+                | QueryProjection::Columns { .. }
+                | QueryProjection::Aggregate(_) => None,
             };
 
             let bytecode: BytecodeProgram<E::Backend> =
