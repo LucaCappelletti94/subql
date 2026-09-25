@@ -127,8 +127,6 @@ mod tests {
             "SELECT * FROM t WHERE x IN (SELECT id FROM m WHERE owner = 'b')",
             // A different tested column.
             "SELECT * FROM t WHERE y IN (SELECT id FROM m WHERE owner = 'a')",
-            // A clause that changes which rows are members.
-            "SELECT * FROM t WHERE x IN (SELECT id FROM m WHERE owner = 'a' LIMIT 1)",
             // The negation, which is refused later but must not share either.
             "SELECT * FROM t WHERE x NOT IN (SELECT id FROM m WHERE owner = 'a')",
         ] {
@@ -138,6 +136,14 @@ mod tests {
                 "{other} names a different relationship and must not share the predicate"
             );
         }
+
+        // A limit changes which rows are members, so it has no canonical
+        // spelling at all, and a refused filter shares no predicate.
+        assert!(normalize_sql(
+            "SELECT * FROM t WHERE x IN (SELECT id FROM m WHERE owner = 'a' LIMIT 1)",
+            &dialect,
+        )
+        .is_err());
     }
 
     /// The clause entry point answers the same as the whole-statement one, since slot
