@@ -195,6 +195,20 @@ impl<B: Backend, C: Checkpoint> CdcEvent for TestEvent<B, C> {
     ) -> Result<Value<Self::Backend>, crate::ValueError> {
         Ok(self.cell(row, col).cloned().unwrap_or(Value::Missing))
     }
+
+    const LENDS_CELLS: bool = true;
+
+    fn cell_at<DB: DatabaseLike>(
+        &self,
+        _db: &DB,
+        row: RowKind,
+        col: ColumnId,
+    ) -> Result<alloc::borrow::Cow<'_, Value<Self::Backend>>, crate::ValueError> {
+        Ok(self.cell(row, col).map_or(
+            alloc::borrow::Cow::Owned(Value::Missing),
+            alloc::borrow::Cow::Borrowed,
+        ))
+    }
 }
 
 /// Drive a future that never parks to completion on a synchronous boundary.

@@ -290,6 +290,42 @@ fn only_the_subscription_that_reads_the_absent_cell_is_reported() {
     );
 }
 
+/// Every subscription one consumer holds on the same filter is reported, not
+/// only the first. Two sessions give one consumer two subscriptions sharing
+/// one compiled predicate.
+#[test]
+fn every_subscription_a_consumer_holds_on_the_filter_is_reported() {
+    let (mut engine, table) = engine();
+    let mut expected: Vec<_> = [7u64, 8]
+        .into_iter()
+        .map(|session| {
+            engine
+                .register(
+                    SubscriptionRequest::new(1u64, "SELECT * FROM docs WHERE body = 'keep'")
+                        .scope(subql::SubscriptionScope::Session(session)),
+                )
+                .expect("registers")
+                .subscription_id
+        })
+        .collect();
+    expected.sort_unstable();
+
+    let notifications = engine
+        .consumers(&TestEvent::insert(
+            table,
+            vec![Value::Int(1), Value::Missing, Value::String("t".into())],
+        ))
+        .expect("dispatch succeeds");
+
+    let mut reported: Vec<_> = notifications
+        .unanswered()
+        .iter()
+        .map(|entry| entry.subscription_id)
+        .collect();
+    reported.sort_unstable();
+    assert_eq!(reported, expected);
+}
+
 /// A short-circuit decides it, as it does for the arithmetic failures: if
 /// the predicate answers before reaching the absent cell, there is nothing
 /// to report.

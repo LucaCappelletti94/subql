@@ -19,8 +19,8 @@
 //! * Same-scalar arithmetic only. Cross-scalar operands, or `Missing` /
 //!   `Null` operands, collapse to `Value::Null`.
 //! * A `LoadColumn` instruction reads its cell through
-//!   [`CdcEvent::value_at`], which decodes it against the catalog and
-//!   returns an owned [`Value`]. Boolean predicates on a bare column
+//!   [`CdcEvent::cell_at`], which lends the decoded [`Value`] when the event
+//!   caches it and hands an owned one over otherwise. Boolean predicates on a bare column
 //!   MUST be lowered by the compiler as an explicit comparison
 //!   (`LoadColumn(col)` + `PushLiteral(Bool(true))` + `Equal`)
 //!   because the VM does not lift a bare `Value::Bool` on the stack to
@@ -36,7 +36,7 @@ use super::{
     BytecodeProgram, Instruction, Tri,
 };
 use crate::backend::{Backend, CdcEvent, ComparisonContext, RowKind, Value};
-use alloc::vec::Vec;
+use alloc::{borrow::Cow, vec::Vec};
 use arithmetic::{
     arithmetic_add, arithmetic_divide, arithmetic_modulo, arithmetic_multiply, arithmetic_negate,
     arithmetic_subtract,
@@ -94,12 +94,17 @@ pub enum VmError {
 
 /// Slot on the VM's evaluation stack.
 ///
-/// `Value(_)` variants come from `PushLiteral`, `LoadColumn`, and the
-/// arithmetic instructions. `Tri(_)` variants come from comparison,
+/// `Value(_)` holds arithmetic results and absent operands. A present
+/// literal or column cell is referred to rather than copied, by
+/// `Literal(_)` and `Cell(_)`. `Tri(_)` variants come from comparison,
 /// null-check, and logical instructions.
 enum StackValue<B: Backend> {
-    /// Scalar value (from literals, column loads, or arithmetic results).
+    /// Scalar value (from arithmetic, or an absent literal or cell).
     Value(Value<B>),
+    /// The present literal of the `PushLiteral` at this instruction index.
+    Literal(usize),
+    /// A present cell of this column, lent by the event for the evaluated row.
+    Cell(crate::ColumnId),
     /// Tri-state boolean (from comparisons, null checks, or logical ops).
     Tri(Tri),
 }
@@ -112,6 +117,8 @@ impl<B: Backend> Clone for StackValue<B> {
     fn clone(&self) -> Self {
         match self {
             Self::Value(v) => Self::Value(v.clone()),
+            Self::Literal(ip) => Self::Literal(*ip),
+            Self::Cell(col) => Self::Cell(*col),
             Self::Tri(t) => Self::Tri(*t),
         }
     }
@@ -121,6 +128,8 @@ impl<B: Backend> core::fmt::Debug for StackValue<B> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::Value(v) => f.debug_tuple("Value").field(v).finish(),
+            Self::Literal(ip) => f.debug_tuple("Literal").field(ip).finish(),
+            Self::Cell(col) => f.debug_tuple("Cell").field(col).finish(),
             Self::Tri(t) => f.debug_tuple("Tri").field(t).finish(),
         }
     }
@@ -130,6 +139,8 @@ impl<B: Backend> PartialEq for StackValue<B> {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
             (Self::Value(a), Self::Value(b)) => a == b,
+            (Self::Literal(a), Self::Literal(b)) => a == b,
+            (Self::Cell(a), Self::Cell(b)) => a == b,
             (Self::Tri(a), Self::Tri(b)) => a == b,
             _ => false,
         }
@@ -152,6 +163,8 @@ pub struct Vm<B: Backend> {
     /// absent cell records nothing, and so a `Null` cell, which is a value
     /// the database holds, is never mistaken for an absent one.
     absent_column: Option<crate::ColumnId>,
+    /// Buffers every `LIKE` walk reuses, so matching allocates nothing once warm.
+    like: LikeScratch,
 }
 
 impl<B: Backend> Vm<B> {
@@ -164,6 +177,7 @@ impl<B: Backend> Vm<B> {
         Self {
             stack: Vec::with_capacity(16),
             absent_column: None,
+            like: LikeScratch::default(),
         }
     }
 
@@ -234,6 +248,12 @@ impl<B: Backend> Vm<B> {
         let instructions = &program.instructions;
         let len = instructions.len();
         let mut ip = 0;
+        let src = Operands {
+            program,
+            event,
+            row,
+            db,
+        };
 
         // Execute instructions with explicit instruction pointer (supports jumps).
         while ip < len {
@@ -267,7 +287,7 @@ impl<B: Backend> Vm<B> {
                     }
                 }
                 other => {
-                    self.execute(other, program, event, row, db, truths)?;
+                    self.execute(ip, other, &src, truths)?;
                 }
             }
             ip += 1;
@@ -293,6 +313,8 @@ impl<B: Backend> Vm<B> {
                     Err(VmError::MalformedProgram)
                 }
             }
+            // Only a present value is ever referred to rather than held.
+            Some(StackValue::Literal(_) | StackValue::Cell(_)) => Err(VmError::MalformedProgram),
             None => Err(VmError::StackUnderflow),
         }
     }
@@ -300,66 +322,75 @@ impl<B: Backend> Vm<B> {
     #[allow(clippy::too_many_lines)]
     fn execute<E, DB>(
         &mut self,
+        ip: usize,
         instruction: &Instruction<B>,
-        program: &BytecodeProgram<B>,
-        event: &E,
-        row: RowKind,
-        db: &DB,
+        src: &Operands<'_, B, E, DB>,
         truths: &[Tri],
     ) -> Result<(), VmError>
     where
         E: CdcEvent<Backend = B>,
         DB: DatabaseLike,
     {
+        let program = src.program;
         match instruction {
             Instruction::PushLiteral(value) => {
-                self.stack.push(StackValue::Value(value.clone()));
+                self.stack.push(if worth_referring(value) {
+                    StackValue::Literal(ip)
+                } else {
+                    StackValue::Value(value.clone())
+                });
             }
 
             Instruction::LoadColumn(col_id) => {
-                let value = event.value_at(db, row, *col_id).map_err(VmError::Value)?;
-                if value.is_missing() && self.absent_column.is_none() {
+                let cell = src
+                    .event
+                    .cell_at(src.db, src.row, *col_id)
+                    .map_err(VmError::Value)?;
+                if cell.is_missing() && self.absent_column.is_none() {
                     self.absent_column = Some(*col_id);
                 }
-                self.stack.push(StackValue::Value(value));
+                self.stack.push(match cell {
+                    Cow::Borrowed(value) if worth_referring(value) => StackValue::Cell(*col_id),
+                    cell => StackValue::Value(cell.into_owned()),
+                });
             }
 
             Instruction::Equal(comparison) => {
                 let result =
-                    self.compare_values(program, *comparison, |ctx, a, b| values_equal(ctx, a, b))?;
+                    self.compare_values(src, *comparison, |ctx, a, b| values_equal(ctx, a, b))?;
                 self.stack.push(StackValue::Tri(result));
             }
 
             Instruction::NotEqual(comparison) => {
-                let result = self.compare_values(program, *comparison, |ctx, a, b| {
+                let result = self.compare_values(src, *comparison, |ctx, a, b| {
                     values_equal(ctx, a, b).map(|equal| !equal)
                 })?;
                 self.stack.push(StackValue::Tri(result));
             }
 
             Instruction::LessThan(comparison) => {
-                let result = self.compare_ordered(program, *comparison, |ord| {
+                let result = self.compare_ordered(src, *comparison, |ord| {
                     matches!(ord, core::cmp::Ordering::Less)
                 })?;
                 self.stack.push(StackValue::Tri(result));
             }
 
             Instruction::LessThanOrEqual(comparison) => {
-                let result = self.compare_ordered(program, *comparison, |ord| {
+                let result = self.compare_ordered(src, *comparison, |ord| {
                     !matches!(ord, core::cmp::Ordering::Greater)
                 })?;
                 self.stack.push(StackValue::Tri(result));
             }
 
             Instruction::GreaterThan(comparison) => {
-                let result = self.compare_ordered(program, *comparison, |ord| {
+                let result = self.compare_ordered(src, *comparison, |ord| {
                     matches!(ord, core::cmp::Ordering::Greater)
                 })?;
                 self.stack.push(StackValue::Tri(result));
             }
 
             Instruction::GreaterThanOrEqual(comparison) => {
-                let result = self.compare_ordered(program, *comparison, |ord| {
+                let result = self.compare_ordered(src, *comparison, |ord| {
                     !matches!(ord, core::cmp::Ordering::Less)
                 })?;
                 self.stack.push(StackValue::Tri(result));
@@ -375,7 +406,7 @@ impl<B: Backend> Vm<B> {
             // selected, and answering `FALSE` for `IS NOT NULL` would
             // lose one it would.
             Instruction::IsNull => {
-                let value = self.pop_value()?;
+                let value = peek(&self.stack, 0, src)?;
                 let result = if value.is_missing() {
                     Tri::Unknown
                 } else if value.is_null() {
@@ -383,11 +414,11 @@ impl<B: Backend> Vm<B> {
                 } else {
                     Tri::False
                 };
-                self.stack.push(StackValue::Tri(result));
+                self.replace_top(1, result);
             }
 
             Instruction::IsNotNull => {
-                let value = self.pop_value()?;
+                let value = peek(&self.stack, 0, src)?;
                 let result = if value.is_missing() {
                     Tri::Unknown
                 } else if value.is_null() {
@@ -395,7 +426,7 @@ impl<B: Backend> Vm<B> {
                 } else {
                     Tri::True
                 };
-                self.stack.push(StackValue::Tri(result));
+                self.replace_top(1, result);
             }
 
             Instruction::And => {
@@ -419,66 +450,57 @@ impl<B: Backend> Vm<B> {
                 literals,
                 comparison,
             } => {
-                let value = self.pop_value()?;
+                let value = peek(&self.stack, 0, src)?;
                 let ctx = comparison_context(program, *comparison)?;
-
-                if value.is_absent() {
-                    self.stack.push(StackValue::Tri(Tri::Unknown));
-                    return Ok(());
-                }
-
-                let mut has_null_rhs = false;
-                let mut found = false;
-                for lit in literals {
-                    if lit.is_absent() {
-                        has_null_rhs = true;
-                    } else if values_equal(ctx, &value, lit).map_err(VmError::Refused)? {
-                        found = true;
-                        break;
+                let result = 'result: {
+                    if value.is_absent() {
+                        break 'result Tri::Unknown;
                     }
-                }
-
-                let result = if found {
-                    Tri::True
-                } else if has_null_rhs {
+                    let mut has_null_rhs = false;
+                    for lit in literals {
+                        if lit.is_absent() {
+                            has_null_rhs = true;
+                        } else if values_equal(ctx, value, lit).map_err(VmError::Refused)? {
+                            break 'result Tri::True;
+                        }
+                    }
                     // x IN (1, NULL) -> Unknown when x doesn't match 1 (SQL standard).
-                    Tri::Unknown
-                } else {
-                    Tri::False
+                    if has_null_rhs {
+                        Tri::Unknown
+                    } else {
+                        Tri::False
+                    }
                 };
-                self.stack.push(StackValue::Tri(result));
+                self.replace_top(1, result);
             }
 
             Instruction::Between {
                 lower: lower_facts,
                 upper: upper_facts,
             } => {
-                let upper = self.pop_value()?;
-                let lower = self.pop_value()?;
-                let value = self.pop_value()?;
-
-                if value.is_absent() || lower.is_absent() || upper.is_absent() {
-                    self.stack.push(StackValue::Tri(Tri::Unknown));
-                    return Ok(());
-                }
-
-                let ge_lower = compare_ordered_values(
-                    comparison_context(program, *lower_facts)?,
-                    &value,
-                    &lower,
-                    |ord| !matches!(ord, core::cmp::Ordering::Less),
-                )
-                .map_err(VmError::Refused)?;
-                let le_upper = compare_ordered_values(
-                    comparison_context(program, *upper_facts)?,
-                    &value,
-                    &upper,
-                    |ord| !matches!(ord, core::cmp::Ordering::Greater),
-                )
-                .map_err(VmError::Refused)?;
-
-                let result = ge_lower.and(le_upper);
-                self.stack.push(StackValue::Tri(result));
+                let value = peek(&self.stack, 2, src)?;
+                let lower = peek(&self.stack, 1, src)?;
+                let upper = peek(&self.stack, 0, src)?;
+                let result = if value.is_absent() || lower.is_absent() || upper.is_absent() {
+                    Tri::Unknown
+                } else {
+                    let ge_lower = compare_ordered_values(
+                        comparison_context(program, *lower_facts)?,
+                        value,
+                        lower,
+                        |ord| !matches!(ord, core::cmp::Ordering::Less),
+                    )
+                    .map_err(VmError::Refused)?;
+                    let le_upper = compare_ordered_values(
+                        comparison_context(program, *upper_facts)?,
+                        value,
+                        upper,
+                        |ord| !matches!(ord, core::cmp::Ordering::Greater),
+                    )
+                    .map_err(VmError::Refused)?;
+                    ge_lower.and(le_upper)
+                };
+                self.replace_top(3, result);
             }
 
             Instruction::Like { comparison } => {
@@ -488,76 +510,69 @@ impl<B: Backend> Vm<B> {
                 let case = comparison
                     .text
                     .map_or(crate::backend::TextCase::Exact, |rule| rule.case);
-                let pattern = self.pop_value()?;
-                let string = self.pop_value()?;
-
-                if string.is_absent() || pattern.is_absent() {
-                    self.stack.push(StackValue::Tri(Tri::Unknown));
-                    return Ok(());
-                }
-
-                // Only String-scalar operands support LIKE. Anything else
-                // is a compiler bug in a well-formed program; degrade to
-                // `Unknown` rather than erroring so a malformed schema
-                // hint does not take down the whole dispatch loop.
-                let (str_val, pat_val) =
-                    if let (Value::String(s), Value::String(p)) = (&string, &pattern) {
-                        (s.as_ref(), p.as_ref())
-                    } else {
-                        self.stack.push(StackValue::Tri(Tri::Unknown));
-                        return Ok(());
-                    };
-
-                let escape = B::LIKE_ESCAPE.map(|escape| escape.character);
-                let walk = simple_like(str_val, pat_val, escape, case);
-                // The walk reports a dangling escape only where the engine
-                // refuses it, which is where the matcher reached it with
-                // input left. What that means is the engine's: PostgreSQL
-                // raises, MySQL answers no-match.
-                let matched = match walk {
-                    Ok(matched) => matched,
-                    Err(PatternError::TrailingEscape) => match B::LIKE_ESCAPE {
-                        Some(LikeEscape {
-                            dangling: DanglingEscape::Fails,
-                            ..
-                        }) => {
-                            return Err(VmError::Refused(
-                                EvaluationRefusal::LikePatternEndsWithEscape,
-                            ))
+                let Self { stack, like, .. } = &mut *self;
+                let string = peek(stack, 1, src)?;
+                let pattern = peek(stack, 0, src)?;
+                let result = match (string, pattern) {
+                    (string, pattern) if string.is_absent() || pattern.is_absent() => Tri::Unknown,
+                    (Value::String(s), Value::String(p)) => {
+                        let escape = B::LIKE_ESCAPE.map(|escape| escape.character);
+                        // The walk reports a dangling escape only where the engine
+                        // refuses it, which is where the matcher reached it with
+                        // input left. What that means is the engine's: PostgreSQL
+                        // raises, MySQL answers no-match.
+                        let matched = match like.matches(s.as_ref(), p.as_ref(), escape, case) {
+                            Ok(matched) => matched,
+                            Err(PatternError::TrailingEscape) => match B::LIKE_ESCAPE {
+                                Some(LikeEscape {
+                                    dangling: DanglingEscape::Fails,
+                                    ..
+                                }) => {
+                                    return Err(VmError::Refused(
+                                        EvaluationRefusal::LikePatternEndsWithEscape,
+                                    ))
+                                }
+                                _ => false,
+                            },
+                        };
+                        if matched {
+                            Tri::True
+                        } else {
+                            Tri::False
                         }
-                        _ => false,
-                    },
+                    }
+                    // Only String-scalar operands support LIKE. Anything else
+                    // is a compiler bug in a well-formed program; degrade to
+                    // `Unknown` rather than erroring so a malformed schema
+                    // hint does not take down the whole dispatch loop.
+                    _ => Tri::Unknown,
                 };
-
-                self.stack.push(StackValue::Tri(if matched {
-                    Tri::True
-                } else {
-                    Tri::False
-                }));
+                self.replace_top(2, result);
             }
 
             Instruction::Add(width) => {
-                self.execute_binary_value_op(arithmetic_add::<B>, *width)?;
+                self.execute_binary_value_op(src, arithmetic_add::<B>, *width)?;
             }
             Instruction::Subtract(width) => {
-                self.execute_binary_value_op(arithmetic_subtract::<B>, *width)?;
+                self.execute_binary_value_op(src, arithmetic_subtract::<B>, *width)?;
             }
             Instruction::Multiply(width) => {
-                self.execute_binary_value_op(arithmetic_multiply::<B>, *width)?;
+                self.execute_binary_value_op(src, arithmetic_multiply::<B>, *width)?;
             }
             Instruction::Divide(width, quotient) => {
                 let quotient = *quotient;
                 self.execute_binary_value_op(
+                    src,
                     |a, b| arithmetic_divide::<B>(a, b, quotient),
                     *width,
                 )?;
             }
             Instruction::Modulo(width) => {
-                self.execute_binary_value_op(arithmetic_modulo::<B>, *width)?;
+                self.execute_binary_value_op(src, arithmetic_modulo::<B>, *width)?;
             }
 
             Instruction::Negate(width) => {
-                self.execute_unary_value_op(arithmetic_negate::<B>, *width)?;
+                self.execute_unary_value_op(src, arithmetic_negate::<B>, *width)?;
             }
 
             // Jumps are handled in eval() before execute() is called.
@@ -575,13 +590,14 @@ impl<B: Backend> Vm<B> {
         Ok(())
     }
 
-    fn execute_binary_value_op(
+    fn execute_binary_value_op<E: CdcEvent<Backend = B>, DB: DatabaseLike>(
         &mut self,
+        src: &Operands<'_, B, E, DB>,
         op: impl FnOnce(Value<B>, Value<B>) -> Result<Value<B>, EvaluationRefusal>,
         width: FloatResult,
     ) -> Result<(), VmError> {
-        let b = self.pop_value()?;
-        let a = self.pop_value()?;
+        let b = self.pop_owned(src)?;
+        let a = self.pop_owned(src)?;
         let value = op(a, b).map_err(VmError::Refused)?;
         self.stack
             .push(StackValue::Value(hold_float_at::<B>(value, width)));
@@ -589,27 +605,43 @@ impl<B: Backend> Vm<B> {
     }
 
     /// The same for a fallible unary operation.
-    fn execute_unary_value_op(
+    fn execute_unary_value_op<E: CdcEvent<Backend = B>, DB: DatabaseLike>(
         &mut self,
+        src: &Operands<'_, B, E, DB>,
         op: FallibleUnaryOp<B>,
         width: FloatResult,
     ) -> Result<(), VmError> {
-        let a = self.pop_value()?;
+        let a = self.pop_owned(src)?;
         let value = op(a).map_err(VmError::Refused)?;
         self.stack
             .push(StackValue::Value(hold_float_at::<B>(value, width)));
         Ok(())
     }
 
-    fn pop_value(&mut self) -> Result<Value<B>, VmError> {
+    /// The value on top of the stack, owned, for an operation that consumes it.
+    fn pop_owned<E: CdcEvent<Backend = B>, DB: DatabaseLike>(
+        &mut self,
+        src: &Operands<'_, B, E, DB>,
+    ) -> Result<Value<B>, VmError> {
         match self.stack.pop() {
             Some(StackValue::Value(v)) => Ok(v),
-            Some(StackValue::Tri(_)) => Err(VmError::TypeMismatch {
-                expected: "Value",
-                got: "Tri",
-            }),
+            Some(referring) => referred(&referring, src).cloned().map_err(Into::into),
             None => Err(VmError::StackUnderflow),
         }
+    }
+
+    /// Drop the `consumed` operands on top of the stack and push `result`.
+    #[expect(
+        clippy::inline_always,
+        reason = "measured under cachegrind: the per-operator operand path costs more instructions when left to the heuristic"
+    )]
+    #[inline(always)]
+    fn replace_top(&mut self, consumed: usize, result: Tri) {
+        // Popped one by one: `truncate` does not inline, and this is per operator.
+        for _ in 0..consumed {
+            self.stack.pop();
+        }
+        self.stack.push(StackValue::Tri(result));
     }
 
     fn pop_tri(&mut self) -> Result<Tri, VmError> {
@@ -620,10 +652,12 @@ impl<B: Backend> Vm<B> {
             // NOT, the compiler must lower boolean columns via an
             // explicit comparison. `Bool` on the stack is a compiler bug.
             Some(StackValue::Value(v)) if v.is_absent() => Ok(Tri::Unknown),
-            Some(StackValue::Value(_)) => Err(VmError::TypeMismatch {
-                expected: "Tri",
-                got: "Value",
-            }),
+            Some(StackValue::Value(_) | StackValue::Literal(_) | StackValue::Cell(_)) => {
+                Err(VmError::TypeMismatch {
+                    expected: "Tri",
+                    got: "Value",
+                })
+            }
             None => Err(VmError::StackUnderflow),
         }
     }
@@ -632,17 +666,19 @@ impl<B: Backend> Vm<B> {
         match self.stack.last() {
             Some(StackValue::Tri(t)) => Ok(*t),
             Some(StackValue::Value(v)) if v.is_absent() => Ok(Tri::Unknown),
-            Some(StackValue::Value(_)) => Err(VmError::TypeMismatch {
-                expected: "Tri",
-                got: "Value",
-            }),
+            Some(StackValue::Value(_) | StackValue::Literal(_) | StackValue::Cell(_)) => {
+                Err(VmError::TypeMismatch {
+                    expected: "Tri",
+                    got: "Value",
+                })
+            }
             None => Err(VmError::StackUnderflow),
         }
     }
 
-    fn compare_values<F>(
+    fn compare_values<E: CdcEvent<Backend = B>, DB: DatabaseLike, F>(
         &mut self,
-        program: &BytecodeProgram<B>,
+        src: &Operands<'_, B, E, DB>,
         comparison: ComparisonRef,
         f: F,
     ) -> Result<Tri, VmError>
@@ -653,35 +689,125 @@ impl<B: Backend> Vm<B> {
             &Value<B>,
         ) -> Result<bool, crate::compiler::vm::refusal::EvaluationRefusal>,
     {
-        let b = self.pop_value()?;
-        let a = self.pop_value()?;
-
-        if a.is_absent() || b.is_absent() {
-            return Ok(Tri::Unknown);
-        }
-
-        let ctx = comparison_context(program, comparison)?;
-        Ok(if f(ctx, &a, &b).map_err(VmError::Refused)? {
+        let a = peek(&self.stack, 1, src)?;
+        let b = peek(&self.stack, 0, src)?;
+        let result = if a.is_absent() || b.is_absent() {
+            Tri::Unknown
+        } else if f(comparison_context(src.program, comparison)?, a, b).map_err(VmError::Refused)? {
             Tri::True
         } else {
             Tri::False
-        })
+        };
+        self.stack.pop();
+        self.stack.pop();
+        Ok(result)
     }
 
-    fn compare_ordered<F>(
+    fn compare_ordered<E: CdcEvent<Backend = B>, DB: DatabaseLike, F>(
         &mut self,
-        program: &BytecodeProgram<B>,
+        src: &Operands<'_, B, E, DB>,
         comparison: ComparisonRef,
         f: F,
     ) -> Result<Tri, VmError>
     where
         F: FnOnce(core::cmp::Ordering) -> bool,
     {
-        let b = self.pop_value()?;
-        let a = self.pop_value()?;
-        compare_ordered_values(comparison_context(program, comparison)?, &a, &b, f)
-            .map_err(VmError::Refused)
+        let a = peek(&self.stack, 1, src)?;
+        let b = peek(&self.stack, 0, src)?;
+        let result = compare_ordered_values(comparison_context(src.program, comparison)?, a, b, f)
+            .map_err(VmError::Refused)?;
+        self.stack.pop();
+        self.stack.pop();
+        Ok(result)
     }
+}
+
+/// Why a stack slot names no value, kept small so the operand path returns
+/// in registers and widened to [`VmError`] at the instruction.
+#[derive(Clone, Copy)]
+enum BadOperand {
+    Underflow,
+    NotAValue,
+    Malformed,
+}
+
+impl From<BadOperand> for VmError {
+    fn from(bad: BadOperand) -> Self {
+        match bad {
+            BadOperand::Underflow => Self::StackUnderflow,
+            BadOperand::NotAValue => Self::TypeMismatch {
+                expected: "Value",
+                got: "Tri",
+            },
+            BadOperand::Malformed => Self::MalformedProgram,
+        }
+    }
+}
+
+/// The value the slot `depth` below the stack top stands for.
+#[expect(
+    clippy::inline_always,
+    reason = "measured under cachegrind: the per-operator operand path costs more instructions when left to the heuristic"
+)]
+#[inline(always)]
+fn peek<'s, B: Backend, E: CdcEvent<Backend = B>, DB: DatabaseLike>(
+    stack: &'s [StackValue<B>],
+    depth: usize,
+    src: &'s Operands<'_, B, E, DB>,
+) -> Result<&'s Value<B>, BadOperand> {
+    let slot = stack
+        .len()
+        .checked_sub(depth + 1)
+        .and_then(|index| stack.get(index))
+        .ok_or(BadOperand::Underflow)?;
+    match slot {
+        StackValue::Value(value) => Ok(value),
+        referring => referred(referring, src),
+    }
+}
+
+/// The value a referring slot names, in the program's literals or the
+/// event's lent cells. Out of line so the held-value path stays small.
+#[inline(never)]
+fn referred<'s, B: Backend, E: CdcEvent<Backend = B>, DB: DatabaseLike>(
+    slot: &StackValue<B>,
+    src: &'s Operands<'_, B, E, DB>,
+) -> Result<&'s Value<B>, BadOperand> {
+    match *slot {
+        StackValue::Literal(ip) => match src.program.instructions.get(ip) {
+            Some(Instruction::PushLiteral(value)) => Ok(value),
+            _ => Err(BadOperand::Malformed),
+        },
+        // `LoadColumn` refers only to a cell it read lent, and a lent cell stays lent.
+        StackValue::Cell(col) => match src.event.cell_at(src.db, src.row, col) {
+            Ok(Cow::Borrowed(value)) => Ok(value),
+            _ => Err(BadOperand::Malformed),
+        },
+        StackValue::Value(_) | StackValue::Tri(_) => Err(BadOperand::NotAValue),
+    }
+}
+
+/// Where a referring stack slot's value lives: the program's literals and
+/// the cells the event lends for the evaluated row image.
+struct Operands<'a, B: Backend, E, DB> {
+    program: &'a BytecodeProgram<B>,
+    event: &'a E,
+    row: RowKind,
+    db: &'a DB,
+}
+
+/// Whether a present value costs more to copy onto the stack than to refer
+/// to: the text, byte, decimal, document and custom carriers allocate on clone.
+const fn worth_referring<B: Backend>(value: &Value<B>) -> bool {
+    matches!(
+        value,
+        Value::String(_)
+            | Value::Bytes(_)
+            | Value::Decimal(_)
+            | Value::Json(_)
+            | Value::Jsonb(_)
+            | Value::Custom(_)
+    )
 }
 
 /// One arithmetic result, held at the width the compiler resolved for it.
@@ -764,93 +890,108 @@ enum PatternError {
     TrailingEscape,
 }
 
-/// Compile `pattern` under `escape`, the engine's default escape character.
-///
-/// With `escape` `None` every character is ordinary, which is SQLite's
-/// rule: a backslash in a pattern matches a backslash.
-fn compile_pattern(pattern: &str, escape: Option<char>) -> Vec<PatternAtom> {
-    let mut atoms = Vec::with_capacity(pattern.len());
-    let mut chars = pattern.chars();
-    while let Some(ch) = chars.next() {
-        if Some(ch) == escape {
-            // The escape applies to whatever follows, wildcard or not:
-            // both engines that have it answer `'ab' LIKE 'a\b'` true.
-            atoms.push(
-                chars
-                    .next()
-                    .map_or(PatternAtom::DanglingEscape, PatternAtom::Literal),
-            );
-            continue;
-        }
-        atoms.push(match ch {
-            '%' => PatternAtom::AnySequence,
-            '_' => PatternAtom::AnyChar,
-            literal => PatternAtom::Literal(literal),
-        });
-    }
-    atoms
+/// The buffers one `LIKE` walk needs, kept between walks.
+#[derive(Default)]
+struct LikeScratch {
+    atoms: Vec<PatternAtom>,
+    reached: Vec<bool>,
+    next: Vec<bool>,
 }
 
-/// SQL `LIKE` pattern matching under one engine's default escape character.
-///
-/// Supports `%` (zero or more characters), `_` (exactly one character) and
-/// the default escape. An explicit `ESCAPE` clause is refused before
-/// reaching here.
-fn simple_like(
-    string: &str,
-    pattern: &str,
-    escape: Option<char>,
-    case: crate::backend::TextCase,
-) -> Result<bool, PatternError> {
-    let s: Vec<char> = string.chars().collect();
-    let p = compile_pattern(pattern, escape);
-    let pn = p.len();
-
-    // dp[j] = true when s[0..i] matches p[0..j].
-    let mut dp = vec![false; pn + 1];
-    dp[0] = true;
-
-    // Leading '%' can match the empty string.
-    for (j, atom) in p.iter().enumerate() {
-        if *atom == PatternAtom::AnySequence {
-            dp[j + 1] = dp[j];
-        } else {
-            break;
-        }
-    }
-
-    for &sc in &s {
-        let mut new_dp = vec![false; pn + 1];
-        for j in 0..pn {
-            if !(dp[j] || (p[j] == PatternAtom::AnySequence && new_dp[j])) {
+impl LikeScratch {
+    /// Compile `pattern` into `atoms` under `escape`, the engine's default
+    /// escape character.
+    ///
+    /// With `escape` `None` every character is ordinary, which is SQLite's
+    /// rule: a backslash in a pattern matches a backslash.
+    fn compile(&mut self, pattern: &str, escape: Option<char>) {
+        self.atoms.clear();
+        let mut chars = pattern.chars();
+        while let Some(ch) = chars.next() {
+            if Some(ch) == escape {
+                // The escape applies to whatever follows, wildcard or not:
+                // both engines that have it answer `'ab' LIKE 'a\b'` true.
+                self.atoms.push(
+                    chars
+                        .next()
+                        .map_or(PatternAtom::DanglingEscape, PatternAtom::Literal),
+                );
                 continue;
             }
-            match p[j] {
-                PatternAtom::AnySequence => {
-                    new_dp[j] = true;
-                    new_dp[j + 1] = true;
-                }
-                PatternAtom::AnyChar => {
-                    if dp[j] {
-                        new_dp[j + 1] = true;
-                    }
-                }
-                PatternAtom::Literal(ch) => {
-                    if dp[j] && same_character(sc, ch, case) {
-                        new_dp[j + 1] = true;
-                    }
-                }
-                // Reached with `sc` still to read, which is the exact
-                // condition PostgreSQL refuses. Input that ran out before
-                // this point never gets here, and the atom matches
-                // nothing, so such a pattern answers no-match below.
-                PatternAtom::DanglingEscape => return Err(PatternError::TrailingEscape),
-            }
+            self.atoms.push(match ch {
+                '%' => PatternAtom::AnySequence,
+                '_' => PatternAtom::AnyChar,
+                literal => PatternAtom::Literal(literal),
+            });
         }
-        dp = new_dp;
     }
 
-    Ok(dp[pn])
+    /// SQL `LIKE` pattern matching under one engine's default escape character.
+    ///
+    /// Supports `%` (zero or more characters), `_` (exactly one character) and
+    /// the default escape. An explicit `ESCAPE` clause is refused before
+    /// reaching here.
+    fn matches(
+        &mut self,
+        string: &str,
+        pattern: &str,
+        escape: Option<char>,
+        case: crate::backend::TextCase,
+    ) -> Result<bool, PatternError> {
+        self.compile(pattern, escape);
+        let p = &self.atoms;
+        let pn = p.len();
+
+        // reached[j] = true when the input read so far matches p[0..j].
+        let reached = &mut self.reached;
+        let next = &mut self.next;
+        reached.clear();
+        reached.resize(pn + 1, false);
+        reached[0] = true;
+
+        // Leading '%' can match the empty string.
+        for (j, atom) in p.iter().enumerate() {
+            if *atom == PatternAtom::AnySequence {
+                reached[j + 1] = reached[j];
+            } else {
+                break;
+            }
+        }
+
+        for sc in string.chars() {
+            next.clear();
+            next.resize(pn + 1, false);
+            for j in 0..pn {
+                if !(reached[j] || (p[j] == PatternAtom::AnySequence && next[j])) {
+                    continue;
+                }
+                match p[j] {
+                    PatternAtom::AnySequence => {
+                        next[j] = true;
+                        next[j + 1] = true;
+                    }
+                    PatternAtom::AnyChar => {
+                        if reached[j] {
+                            next[j + 1] = true;
+                        }
+                    }
+                    PatternAtom::Literal(ch) => {
+                        if reached[j] && same_character(sc, ch, case) {
+                            next[j + 1] = true;
+                        }
+                    }
+                    // Reached with `sc` still to read, which is the exact
+                    // condition PostgreSQL refuses. Input that ran out before
+                    // this point never gets here, and the atom matches
+                    // nothing, so such a pattern answers no-match below.
+                    PatternAtom::DanglingEscape => return Err(PatternError::TrailingEscape),
+                }
+            }
+            core::mem::swap(reached, next);
+        }
+
+        Ok(reached[pn])
+    }
 }
 
 /// Whether two pattern characters match under this engine's case rule.
@@ -887,7 +1028,7 @@ mod tests {
     //! `backend.rs` and the parser tests once Phase 4 lands.
 
     use super::arithmetic::is_zero_scalar;
-    use super::{simple_like, ComparisonRef, PatternError, Vm, VmError};
+    use super::{ComparisonRef, LikeScratch, PatternError, Vm, VmError};
     use crate::backend::{Postgres, RowKind, Value};
     use crate::compiler::{BytecodeProgram, Instruction, Tri};
     use crate::testing::TestEvent;
@@ -1300,17 +1441,27 @@ mod tests {
     #[test]
     fn a_trailing_escape_is_reported_when_the_walk_reaches_it() {
         assert_eq!(
-            simple_like("ab", r"a\", Some('\\'), crate::backend::TextCase::Exact),
+            LikeScratch::default().matches(
+                "ab",
+                r"a\",
+                Some('\\'),
+                crate::backend::TextCase::Exact
+            ),
             Err(PatternError::TrailingEscape),
             "input remains when the matcher arrives, which is what PostgreSQL refuses"
         );
         assert_eq!(
-            simple_like("a", r"a\", Some('\\'), crate::backend::TextCase::Exact),
+            LikeScratch::default().matches("a", r"a\", Some('\\'), crate::backend::TextCase::Exact),
             Ok(false),
             "the input ran out first, and PostgreSQL answers false rather than raising"
         );
         assert_eq!(
-            simple_like("axb", r"a%\", Some('\\'), crate::backend::TextCase::Exact),
+            LikeScratch::default().matches(
+                "axb",
+                r"a%\",
+                Some('\\'),
+                crate::backend::TextCase::Exact
+            ),
             Err(PatternError::TrailingEscape),
             "a wildcard ahead of it does not hide the dangling escape"
         );
@@ -1321,11 +1472,11 @@ mod tests {
     #[test]
     fn a_trailing_backslash_is_ordinary_without_an_escape() {
         assert_eq!(
-            simple_like(r"a\", r"a\", None, crate::backend::TextCase::Exact),
+            LikeScratch::default().matches(r"a\", r"a\", None, crate::backend::TextCase::Exact),
             Ok(true)
         );
         assert_eq!(
-            simple_like("ab", r"a\", None, crate::backend::TextCase::Exact),
+            LikeScratch::default().matches("ab", r"a\", None, crate::backend::TextCase::Exact),
             Ok(false)
         );
     }
@@ -1335,7 +1486,7 @@ mod tests {
     #[test]
     fn escaping_one_wildcard_leaves_the_others_alone() {
         assert_eq!(
-            simple_like(
+            LikeScratch::default().matches(
                 "a%xb",
                 r"a\%%b",
                 Some('\\'),
@@ -1344,7 +1495,7 @@ mod tests {
             Ok(true)
         );
         assert_eq!(
-            simple_like(
+            LikeScratch::default().matches(
                 "axxb",
                 r"a\%%b",
                 Some('\\'),
