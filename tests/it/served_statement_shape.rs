@@ -200,6 +200,86 @@ fn an_undeclared_collation_is_named_as_the_default() {
     assert!(!message.contains("declares"), "{message}");
 }
 
+/// `q.*` is `*` when `q` names the one table the statement reads: its
+/// alias when it has one, its name otherwise. Served in process, and
+/// notified exactly as `*` is.
+#[test]
+fn a_wildcard_qualified_by_the_table_is_served_as_the_wildcard() {
+    for sql in [
+        "SELECT t.* FROM t WHERE amount > 3",
+        "SELECT public.t.* FROM t WHERE amount > 3",
+        "SELECT x.* FROM t x WHERE amount > 3",
+        "SELECT X.* FROM t AS x WHERE amount > 3",
+    ] {
+        let mut engine = engine();
+        let registered = engine
+            .register(SubscriptionRequest::new(1u64, sql))
+            .unwrap_or_else(|error| panic!("{sql} should register, got {error:?}"));
+        assert!(
+            matches!(registered.tier, Tier::InProcess(_)),
+            "{sql} should be served in process, got {:?}",
+            registered.not_served_because
+        );
+        engine
+            .register(SubscriptionRequest::new(
+                2u64,
+                "SELECT * FROM t WHERE amount > 3",
+            ))
+            .unwrap();
+        let table = subql::catalog_helpers::table_id::<Postgres, _>(
+            &ParserDB::parse::<PostgreSqlDialect>(DDL).unwrap(),
+            "t",
+        )
+        .unwrap();
+        let row = |amount: i64| vec![Value::Int(1), Value::String("a".into()), Value::Int(amount)];
+        let inserted = engine.consumers(&TestEvent::insert(table, row(5))).unwrap();
+        assert_eq!(
+            inserted.inserted(),
+            [1, 2],
+            "{sql} insert is notified as `*` is"
+        );
+        let updated = engine
+            .consumers(&TestEvent::update(table, row(5), row(6)))
+            .unwrap();
+        assert_eq!(
+            updated.updated(),
+            [1, 2],
+            "{sql} update is notified as `*` is"
+        );
+        let deleted = engine.consumers(&TestEvent::delete(table, row(6))).unwrap();
+        assert_eq!(
+            deleted.deleted(),
+            [1, 2],
+            "{sql} delete is notified as `*` is"
+        );
+    }
+    // An alias hides the table's name, and another table is not read at all.
+    refused_naming("SELECT t.* FROM t x WHERE amount > 3", "Qualified wildcard");
+    refused_naming("SELECT m.* FROM t WHERE amount > 3", "Qualified wildcard");
+    refused_naming(
+        "SELECT nope.* FROM t WHERE amount > 3",
+        "Qualified wildcard",
+    );
+
+    // Unaliased, the written name qualifies even where the search path cannot
+    // resolve it to the table.
+    let db = ParserDB::parse::<PostgreSqlDialect>(
+        "CREATE SCHEMA s; CREATE TABLE s.u (id INT PRIMARY KEY, amount INT);",
+    )
+    .unwrap();
+    let registered = Engine::new(db, PostgreSqlDialect {})
+        .register(SubscriptionRequest::new(
+            1u64,
+            "SELECT u.* FROM s.u WHERE amount > 3",
+        ))
+        .unwrap();
+    assert!(
+        matches!(registered.tier, Tier::InProcess(_)),
+        "{:?}",
+        registered.not_served_because
+    );
+}
+
 /// A bound on how many rows come back is a question about the other rows, and
 /// a change event carries one row.
 #[test]

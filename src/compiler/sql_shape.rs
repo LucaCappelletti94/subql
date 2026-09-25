@@ -8,7 +8,8 @@ use sql_traits::{
 use sqlparser::ast::{
     BinaryOperator, Distinct, DuplicateTreatment, Expr, Function, FunctionArg, FunctionArgExpr,
     FunctionArgumentList, FunctionArguments, GroupByExpr, Ident, LimitClause, ObjectName, Query,
-    Select, SelectItem, SelectModifiers, SetExpr, Statement, TableFactor, Visit, Visitor,
+    Select, SelectItem, SelectItemQualifiedWildcardKind, SelectModifiers, SetExpr, Statement,
+    TableFactor, Visit, Visitor,
 };
 
 const WINDOW_FUNCTIONS_NOT_SUPPORTED: &str = "Window functions not supported";
@@ -551,9 +552,11 @@ pub(super) fn extract_projection<B: crate::backend::Backend, DB: DatabaseLike>(
 
     let items = &select.projection;
 
-    // SELECT *: single wildcard item
-    if items.len() == 1 {
-        if let SelectItem::Wildcard(_) = &items[0] {
+    // SELECT *, or `q.*` with `q` naming the one table read: a single wildcard item
+    if let [item] = items.as_slice() {
+        if matches!(item, SelectItem::Wildcard(_))
+            || wildcard_of_read_table::<B, DB>(item, select, table_id, database)
+        {
             return Ok(QueryProjection::Rows);
         }
     }
@@ -578,7 +581,8 @@ pub(super) fn extract_projection<B: crate::backend::Backend, DB: DatabaseLike>(
             | SelectItem::ExprWithAliases { expr: e, .. } => e,
             SelectItem::QualifiedWildcard(_, _) => {
                 return Err(RegisterError::UnsupportedSql(
-                    "Qualified wildcard (e.g. table.*) not supported in projection".to_string(),
+                    "Qualified wildcard does not name the table read, or its alias when one is written"
+                        .to_string(),
                 ));
             }
             SelectItem::Wildcard(_) => unreachable!("handled above"),
@@ -589,6 +593,54 @@ pub(super) fn extract_projection<B: crate::backend::Backend, DB: DatabaseLike>(
             UNSUPPORTED_PROJECTION.to_string(),
         ))
     }
+}
+
+/// Whether `item` is `q.*` with `q` naming the one table `select` reads,
+/// resolved to `table_id`.
+///
+/// An alias hides the table's name, so once one is written only the alias
+/// qualifies. Unaliased, the table's written name does, which SQL exposes
+/// whatever schema it lives in, and so does any name resolving to the table.
+pub(crate) fn wildcard_of_read_table<B: crate::backend::Backend, DB: DatabaseLike>(
+    item: &SelectItem,
+    select: &Select,
+    table_id: crate::TableId,
+    database: &DB,
+) -> bool {
+    let SelectItem::QualifiedWildcard(SelectItemQualifiedWildcardKind::ObjectName(qualifier), _) =
+        item
+    else {
+        return false;
+    };
+    let Some(TableFactor::Table { name, alias, .. }) =
+        select.from.first().map(|from| &from.relation)
+    else {
+        return false;
+    };
+    let single = match qualifier.0.as_slice() {
+        [part] => part.as_ident(),
+        _ => None,
+    };
+    let spelled_as = |written: &Ident| {
+        single.is_some_and(|single| {
+            identifiers_match(
+                written.value.as_str(),
+                written.quote_style.is_some(),
+                single.value.as_str(),
+                single.quote_style.is_some(),
+            )
+        })
+    };
+    if let Some(alias) = alias {
+        return spelled_as(&alias.name);
+    }
+    name.0
+        .last()
+        .and_then(sqlparser::ast::ObjectNamePart::as_ident)
+        .is_some_and(spelled_as)
+        || written_table_name(qualifier)
+            .and_then(|written| catalog_helpers::table_id_for_name::<B, DB>(database, written))
+            == Some(table_id)
 }
 
 /// Classify one projected expression as an aggregate of the accumulable family.
