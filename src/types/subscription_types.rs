@@ -818,8 +818,8 @@ impl<B: Backend> core::fmt::Display for NotServed<B> {
                 ),
                 None => write!(
                     f,
-                    "column {column} declares a collation the catalog cannot name, \
-                     so subql cannot reproduce its comparison in process"
+                    "column {column} compares under the database default collation or one the \
+                     catalog cannot name, so subql cannot reproduce its comparison in process"
                 ),
             },
             Self::CrossKindComparison {

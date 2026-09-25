@@ -10,6 +10,12 @@ pub(super) fn err_shape<C: core::fmt::Debug + Copy>(
     sql: &SqlValue,
     target: ValueKind<C>,
 ) -> RegisterError {
+    // Binds are substituted before literals are read, so a placeholder here had none.
+    if let SqlValue::Placeholder(placeholder) = sql {
+        return RegisterError::UnboundPlaceholder {
+            placeholder: placeholder.clone(),
+        };
+    }
     RegisterError::TypeError(format!("cannot use SQL literal {sql:?} as {target:?}"))
 }
 

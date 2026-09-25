@@ -187,6 +187,19 @@ fn count_is_refused_in_the_aggregates_shared_words() {
     }
 }
 
+/// A column that declares no collation compares under the database
+/// default, which the catalog cannot name, and the refusal says so rather
+/// than claiming the column declares one.
+#[test]
+fn an_undeclared_collation_is_named_as_the_default() {
+    let message = refusal("SELECT * FROM t WHERE status ILIKE 'a%'");
+    assert!(
+        message.contains("the database default collation or one the catalog cannot name"),
+        "{message}"
+    );
+    assert!(!message.contains("declares"), "{message}");
+}
+
 /// A bound on how many rows come back is a question about the other rows, and
 /// a change event carries one row.
 #[test]

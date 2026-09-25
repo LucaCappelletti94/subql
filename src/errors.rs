@@ -99,9 +99,7 @@ pub enum Refusal {
     },
     /// The operands' collations describe a text comparison this build does
     /// not reproduce.
-    #[error(
-        "column {column} declares a collation whose comparison is not reproducible in process"
-    )]
+    #[error("column {column} compares under a collation that is not reproducible in process")]
     CollationNotReproducible {
         /// The compared column.
         column: crate::ColumnId,
@@ -248,6 +246,14 @@ pub enum RegisterError {
     /// provided bind values (index out of range, malformed, or count mismatch).
     #[error("Bind resolution error: {0}")]
     BindResolution(String),
+
+    /// A SQL bind placeholder (`$N` or `?`) that no bind value resolves,
+    /// because the request carries no binds or too few.
+    #[error("placeholder {placeholder} has no bind value in this request")]
+    UnboundPlaceholder {
+        /// The placeholder as the statement spells it.
+        placeholder: String,
+    },
 
     /// A statement given to a follow-registration API was neither INSERT nor
     /// UPDATE (e.g. a SELECT, DELETE, or DDL statement).

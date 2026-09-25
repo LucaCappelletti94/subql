@@ -393,3 +393,87 @@ fn not_equal_bytes_bind_matches_complement() {
         "payload matching the bind does not satisfy inequality",
     );
 }
+
+/// A placeholder no bind resolves is refused by name, whether the request
+/// carries no binds or too few, on every dialect's spelling.
+#[test]
+fn a_placeholder_without_a_bind_is_refused_by_name() {
+    fn refusal<B, D>(dialect: D, ddl: &str, sql: &str, binds: Vec<Value<B>>) -> subql::RegisterError
+    where
+        B: subql::backend::Backend<Dialect = D> + subql::compiler::SqlLiteralParse,
+        D: sqlparser::dialect::Dialect + Default,
+    {
+        let db = ParserDB::parse::<D>(ddl).expect("DDL parses");
+        let mut engine: SubscriptionEngine<TestEvent<B>, DefaultIds, ParserDB> =
+            SubscriptionEngine::new(db, dialect);
+        match engine.register(SubscriptionRequest::new(1u64, sql).binds(binds)) {
+            Ok(_) => panic!("{sql} registered with an unbound placeholder"),
+            Err(error) => error,
+        }
+    }
+    const DDL: &str = "CREATE TABLE t (id INT PRIMARY KEY, qty INT)";
+    for (error, placeholder) in [
+        (
+            refusal::<Postgres, _>(
+                PostgreSqlDialect {},
+                DDL,
+                "SELECT * FROM t WHERE qty = $1",
+                vec![],
+            ),
+            "$1",
+        ),
+        (
+            refusal::<Postgres, _>(
+                PostgreSqlDialect {},
+                DDL,
+                "SELECT * FROM t WHERE qty = $1 OR id = $2",
+                vec![Value::Int(1)],
+            ),
+            "$2",
+        ),
+        (
+            refusal::<subql::backend::MySql, _>(
+                sqlparser::dialect::MySqlDialect {},
+                DDL,
+                "SELECT * FROM t WHERE qty = ?",
+                vec![],
+            ),
+            "?",
+        ),
+        (
+            refusal::<SQLite, _>(
+                SQLiteDialect {},
+                DDL,
+                "SELECT * FROM t WHERE qty = ?",
+                vec![],
+            ),
+            "?",
+        ),
+    ] {
+        assert!(
+            matches!(&error, subql::RegisterError::UnboundPlaceholder { placeholder: named } if named == placeholder),
+            "expected the unbound {placeholder} to be named, got {error:?}"
+        );
+        assert!(error.to_string().contains(placeholder), "{error}");
+    }
+}
+
+/// Ending by statement only hashes the SQL and never compiles it, so a
+/// statement still carrying its placeholders is not refused as unbound. It
+/// names no predicate the resolved registration hashed to, and ends nothing.
+#[test]
+fn ending_by_a_statement_with_placeholders_is_not_refused() {
+    let db = ParserDB::parse::<PostgreSqlDialect>("CREATE TABLE t (id INT PRIMARY KEY, qty INT)")
+        .expect("DDL parses");
+    let mut engine: SubscriptionEngine<TestEvent<Postgres>, DefaultIds, ParserDB> =
+        SubscriptionEngine::new(db, PostgreSqlDialect {});
+    let sql = "SELECT * FROM t WHERE qty = $1";
+    engine
+        .register(SubscriptionRequest::new(1u64, sql).binds(vec![Value::Int(3)]))
+        .expect("the bound statement registers");
+    let report = engine
+        .unregister_query(1u64, sql)
+        .expect("hashing a statement tolerates its placeholders");
+    assert_eq!(report.removed_bindings, 0, "{report:?}");
+    assert_eq!(engine.subscription_count(), 1);
+}

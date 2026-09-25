@@ -632,9 +632,9 @@ fn placeholder_index(
         )));
     };
     if idx >= binds_len {
-        return Err(RegisterError::BindResolution(format!(
-            "placeholder {token:?} has no bind value ({binds_len} provided)"
-        )));
+        return Err(RegisterError::UnboundPlaceholder {
+            placeholder: token.to_string(),
+        });
     }
     Ok(idx)
 }
