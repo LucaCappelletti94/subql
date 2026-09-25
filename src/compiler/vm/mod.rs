@@ -368,6 +368,29 @@ impl<B: Backend> Vm<B> {
                 self.stack.push(StackValue::Tri(result));
             }
 
+            // `Null` is a value here and `Missing` is still no answer: the
+            // row may hold anything in a cell the source did not carry.
+            Instruction::NotDistinct(comparison) => {
+                let a = peek(&self.stack, 1, src)?;
+                let b = peek(&self.stack, 0, src)?;
+                let result = if a.is_missing() || b.is_missing() {
+                    Tri::Unknown
+                } else if a.is_null() || b.is_null() {
+                    if a.is_null() && b.is_null() {
+                        Tri::True
+                    } else {
+                        Tri::False
+                    }
+                } else if values_equal(comparison_context(src.program, *comparison)?, a, b)
+                    .map_err(VmError::Refused)?
+                {
+                    Tri::True
+                } else {
+                    Tri::False
+                };
+                self.replace_top(2, result);
+            }
+
             Instruction::LessThan(comparison) => {
                 let result = self.compare_ordered(src, *comparison, |ord| {
                     matches!(ord, core::cmp::Ordering::Less)

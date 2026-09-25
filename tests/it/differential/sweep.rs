@@ -530,6 +530,137 @@ mod tests {
         );
     }
 
+    /// Null-safe equality in the spelling `engine` accepts, both polarities,
+    /// against a column, a literal and a literal `NULL`.
+    fn null_safe_forms(engine: Engine) -> Vec<&'static str> {
+        match engine {
+            Engine::MySql => vec![
+                "narrow <=> wide",
+                "NOT (narrow <=> wide)",
+                "narrow <=> 3",
+                "NOT (narrow <=> 3)",
+                "narrow <=> NULL",
+                "NOT (narrow <=> NULL)",
+            ],
+            Engine::Postgres | Engine::Sqlite => vec![
+                "narrow IS NOT DISTINCT FROM wide",
+                "narrow IS DISTINCT FROM wide",
+                "narrow IS NOT DISTINCT FROM 3",
+                "narrow IS DISTINCT FROM 3",
+                "narrow IS NOT DISTINCT FROM NULL",
+                "narrow IS DISTINCT FROM NULL",
+                "NOT (narrow IS DISTINCT FROM wide)",
+            ],
+        }
+    }
+
+    /// Every NULL pairing of two integer columns and a boolean one, asked of
+    /// the engine and of subql in process, which must both answer and agree
+    /// on each.
+    ///
+    /// Enumerated rather than generated: a pairing with both sides `NULL`
+    /// is the one a lookalike built from `=` gets wrong, and sampling may
+    /// not draw it.
+    fn assert_null_pairings_agree<O>(oracle: &mut O, engine: Engine, forms: &[&str])
+    where
+        O: crate::differential::oracle::Oracle,
+        O::Backend: subql::backend::Backend<
+                Int = i64,
+                Float = f64,
+                Decimal = bigdecimal::BigDecimal,
+                String = String,
+            > + 'static,
+        <O::Backend as subql::backend::Backend>::Bool: From<bool>,
+        <O::Backend as subql::backend::Backend>::Bytes: From<Vec<u8>>,
+        <O::Backend as subql::backend::Backend>::Dialect: sqlparser::dialect::Dialect + Default,
+    {
+        use crate::differential::generators::{Cell, Row};
+        use crate::differential::oracle::OracleVerdict;
+        use subql::compiler::Tri;
+        let values = [Cell::Null, Cell::Int(3), Cell::Int(4)];
+        let flags = [Cell::Null, Cell::Bool(true), Cell::Bool(false)];
+        let mut rows = Vec::new();
+        for narrow in &values {
+            for wide in &values {
+                for flag in &flags {
+                    rows.push(Row {
+                        cells: vec![
+                            ("narrow", narrow.clone()),
+                            ("wide", wide.clone()),
+                            ("flag", flag.clone()),
+                        ],
+                    });
+                }
+            }
+        }
+        for predicate in forms {
+            for row in &rows {
+                let case = Case {
+                    schema: schema_statements(engine),
+                    row: row.clone(),
+                    predicate: (*predicate).to_string(),
+                };
+                let OracleVerdict::Answered(said) = case.engine_says(oracle) else {
+                    panic!("{engine:?} did not answer:\n{}", case.reproduction());
+                };
+                let answered = case.subql_says::<O>();
+                assert_eq!(
+                    answered,
+                    super::SubqlAnswer::Answered(if said == Tri::True {
+                        Tri::True
+                    } else {
+                        Tri::False
+                    }),
+                    "{engine:?} answered {said:?}:\n{}",
+                    case.reproduction()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn null_safe_equality_agrees_with_sqlite_on_every_null_pairing() {
+        assert_null_pairings_agree(
+            &mut SqliteOracle::open(),
+            Engine::Sqlite,
+            &null_safe_forms(Engine::Sqlite),
+        );
+    }
+
+    #[test]
+    #[ignore = "requires Docker; run with --ignored"]
+    fn null_safe_equality_agrees_with_postgres_on_every_null_pairing() {
+        let db = crate::common::pg_database();
+        let mut oracle = crate::differential::oracle::PgOracle {
+            connection: db.connect(),
+        };
+        assert_null_pairings_agree(
+            &mut oracle,
+            Engine::Postgres,
+            &null_safe_forms(Engine::Postgres),
+        );
+    }
+
+    #[cfg(any(
+        feature = "executor-diesel-postgres",
+        feature = "executor-diesel-async-postgres",
+        feature = "executor-diesel-postgres-r2d2",
+        feature = "executor-diesel-mysql",
+        feature = "executor-diesel-async-mysql",
+        feature = "diesel-typed-mysql",
+        feature = "apply-patchset-mysql",
+        feature = "apply-patchset-mysql-async",
+    ))]
+    #[test]
+    #[ignore = "requires Docker; run with --ignored"]
+    fn null_safe_equality_agrees_with_mysql_on_every_null_pairing() {
+        let db = crate::common::mysql_database();
+        let mut oracle = crate::differential::oracle::MySqlOracle {
+            connection: db.connect(),
+        };
+        assert_null_pairings_agree(&mut oracle, Engine::MySql, &null_safe_forms(Engine::MySql));
+    }
+
     /// A case renders as the triple that reproduces it.
     #[test]
     fn a_case_reproduces_itself() {

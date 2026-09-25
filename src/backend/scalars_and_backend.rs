@@ -444,6 +444,12 @@ pub trait Backend: 'static {
     /// [`DivisionRule`](super::scalar_value::DivisionRule).
     const DIVISION: super::scalar_value::DivisionRule;
 
+    /// How this engine spells null-safe equality.
+    ///
+    /// Required, and per backend, because no spelling is accepted by every
+    /// engine. See [`NullSafeEquality`](super::scalar_value::NullSafeEquality).
+    const NULL_SAFE_EQUALITY: super::scalar_value::NullSafeEquality;
+
     /// What this engine answers when a floating total leaves its range.
     ///
     /// Required, and per backend, because no two agree: measured,

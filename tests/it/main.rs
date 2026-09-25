@@ -379,6 +379,8 @@ mod semantics_ilike;
 
 mod semantics_missing_cell;
 
+mod null_safe_equality;
+
 mod semantics_float_width;
 
 // Docker-free coverage for the connector session-setup seam (U8) over in-memory

@@ -395,3 +395,40 @@ fn a_batch_that_cannot_be_written_survives_best_effort() {
     );
     assert_eq!(engine.subscription_count(), 2, "and both stay registered");
 }
+
+/// A null-safe equality comes back from its shard answering as it did, a
+/// `NULL` status selected and a present one not.
+#[test]
+fn a_null_safe_equality_comes_back_answering_as_it_did() {
+    let store = TempStore::new();
+    let mut engine = store.open(catalog());
+    engine
+        .register(SubscriptionRequest::new(
+            1u64,
+            "SELECT * FROM orders WHERE status IS NOT DISTINCT FROM NULL",
+        ))
+        .expect("the filter registers");
+    engine.snapshot_table(table("orders")).expect("snapshot");
+    drop(engine);
+
+    let mut restored = store.open(catalog());
+    assert_eq!(restored.subscription_count(), 1);
+    let row = |status: subql::backend::Value<Postgres>| {
+        TestEvent::insert(
+            table("orders"),
+            vec![
+                subql::backend::Value::Int(1),
+                subql::backend::Value::Float(1.0),
+                status,
+            ],
+        )
+    };
+    let unset = restored
+        .consumers(&row(subql::backend::Value::Null))
+        .expect("dispatch");
+    assert_eq!(unset.inserted(), [1u64]);
+    let paid = restored
+        .consumers(&row(subql::backend::Value::String("paid".into())))
+        .expect("dispatch");
+    assert!(paid.inserted().is_empty());
+}

@@ -136,6 +136,10 @@ pub struct DanglingComparisonRef(pub u16);
 /// Parameterised on the observed [`Backend`] so that `PushLiteral` and
 /// `In` carry backend-typed payloads. Every other variant
 /// is backend-agnostic but shares the type parameter for uniform storage.
+///
+/// Variants are only ever appended. A persisted program is postcard, which
+/// tags a variant with its declaration index, so a variant inserted before
+/// another would decode every stored program under the wrong instructions.
 #[derive(Serialize, Deserialize)]
 #[serde(bound = "")]
 pub enum Instruction<B: Backend> {
@@ -350,6 +354,21 @@ pub enum Instruction<B: Backend> {
     /// [`Vm::eval_with_terms`]: crate::compiler::Vm::eval_with_terms
     /// [`VmError::MissingTermTruth`]: crate::compiler::VmError::MissingTermTruth
     TermTruth(u16),
+
+    // Null-safe comparison (pop 2 values, push Tri)
+    /// Not distinct: `a IS NOT DISTINCT FROM b`, MySQL's `a <=> b`.
+    ///
+    /// [`Equal`](Self::Equal) that reads `Null` as a value: two `Null`s are
+    /// `Tri::True` and a `Null` against a present value is `Tri::False`. A
+    /// `Missing` operand is still `Tri::Unknown`, since the row may hold
+    /// anything there. Carries the facts `Equal` would, so the two agree on
+    /// every pair of present values.
+    ///
+    /// Last among the variants so every program persisted before it keeps
+    /// its encoding.
+    ///
+    /// Stack: `[..., a, b] -> [..., Tri]`.
+    NotDistinct(ComparisonRef),
 }
 
 /// A compiled bytecode program.
@@ -525,6 +544,7 @@ impl<B: Backend> Clone for Instruction<B> {
             Self::JumpIfFalse(offset) => Self::JumpIfFalse(*offset),
             Self::JumpIfTrue(offset) => Self::JumpIfTrue(*offset),
             Self::TermTruth(slot) => Self::TermTruth(*slot),
+            Self::NotDistinct(r) => Self::NotDistinct(*r),
         }
     }
 }
@@ -575,6 +595,7 @@ impl<B: Backend> core::fmt::Debug for Instruction<B> {
             Self::JumpIfFalse(offset) => f.debug_tuple("JumpIfFalse").field(offset).finish(),
             Self::JumpIfTrue(offset) => f.debug_tuple("JumpIfTrue").field(offset).finish(),
             Self::TermTruth(slot) => f.debug_tuple("TermTruth").field(slot).finish(),
+            Self::NotDistinct(r) => f.debug_tuple("NotDistinct").field(r).finish(),
         }
     }
 }
@@ -590,6 +611,7 @@ impl<B: Backend> PartialEq for Instruction<B> {
             | (Self::LessThanOrEqual(a), Self::LessThanOrEqual(b))
             | (Self::GreaterThan(a), Self::GreaterThan(b))
             | (Self::GreaterThanOrEqual(a), Self::GreaterThanOrEqual(b))
+            | (Self::NotDistinct(a), Self::NotDistinct(b))
             | (Self::Like { comparison: a }, Self::Like { comparison: b }) => a == b,
             (Self::IsNull, Self::IsNull)
             | (Self::IsNotNull, Self::IsNotNull)
@@ -666,6 +688,51 @@ impl<B: Backend> PartialEq for BytecodeProgram<B> {
 mod tests {
     use super::*;
     use crate::backend::Postgres;
+
+    /// The tag each variant is persisted under, which a stored program is
+    /// read back by and which therefore never moves.
+    #[test]
+    fn every_instruction_keeps_its_persisted_tag() {
+        let r = ComparisonRef::NONE;
+        let tagged: [(Instruction<Postgres>, u8); 26] = [
+            (Instruction::PushLiteral(Value::Null), 0),
+            (Instruction::LoadColumn(0), 1),
+            (Instruction::Equal(r), 2),
+            (Instruction::NotEqual(r), 3),
+            (Instruction::LessThan(r), 4),
+            (Instruction::LessThanOrEqual(r), 5),
+            (Instruction::GreaterThan(r), 6),
+            (Instruction::GreaterThanOrEqual(r), 7),
+            (Instruction::IsNull, 8),
+            (Instruction::IsNotNull, 9),
+            (Instruction::And, 10),
+            (Instruction::Or, 11),
+            (Instruction::Not, 12),
+            (Instruction::Add(None), 13),
+            (Instruction::Subtract(None), 14),
+            (Instruction::Multiply(None), 15),
+            (Instruction::Divide(None, Quotient::FromTheOperands), 16),
+            (Instruction::Modulo(None), 17),
+            (Instruction::Negate(None), 18),
+            (
+                Instruction::In {
+                    literals: Vec::new(),
+                    comparison: r,
+                },
+                19,
+            ),
+            (Instruction::Between { lower: r, upper: r }, 20),
+            (Instruction::Like { comparison: r }, 21),
+            (Instruction::JumpIfFalse(1), 22),
+            (Instruction::JumpIfTrue(1), 23),
+            (Instruction::TermTruth(0), 24),
+            (Instruction::NotDistinct(r), 25),
+        ];
+        for (instruction, tag) in tagged {
+            let bytes = postcard::to_allocvec(&instruction).expect("an instruction serializes");
+            assert_eq!(bytes.first(), Some(&tag), "{instruction:?}");
+        }
+    }
 
     #[test]
     fn test_extract_dependencies() {

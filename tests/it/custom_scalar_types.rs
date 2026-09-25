@@ -183,6 +183,9 @@ impl Backend for Custom {
     /// decimal quotient takes the significant-digit scale.
     const DIVISION: subql::backend::DivisionRule = subql::backend::DivisionRule::IntegersTruncate;
 
+    const NULL_SAFE_EQUALITY: subql::backend::NullSafeEquality =
+        subql::backend::NullSafeEquality::DistinctFrom;
+
     fn decimal_quotient(
         dividend: bigdecimal::BigDecimal,
         divisor: bigdecimal::BigDecimal,

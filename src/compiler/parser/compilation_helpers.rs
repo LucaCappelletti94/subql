@@ -1,7 +1,7 @@
 //! Expression compilation helpers split out of the parser.
 
 use super::{Compiling, MAX_TERMS_PER_FILTER};
-use crate::backend::{Backend, ScalarFamily, Value, ValueKindOf};
+use crate::backend::{Backend, NullSafeEquality, ScalarFamily, Value, ValueKindOf};
 use crate::compiler::bytecode::{ComparisonRef, FloatResult};
 use crate::compiler::literals::{resolve_column_ref, SqlLiteralParse};
 use crate::compiler::{canonicalize, sql_shape, BytecodeProgram, Instruction};
@@ -113,6 +113,7 @@ const fn instruction_is_tri_typed<B: Backend>(instr: &Instruction<B>) -> bool {
             | Instruction::JumpIfFalse(_)
             | Instruction::JumpIfTrue(_)
             | Instruction::TermTruth(_)
+            | Instruction::NotDistinct(_)
     )
 }
 
@@ -363,6 +364,15 @@ where
                     let rhs_len = out.len() - rhs_start;
                     out[jump_idx] = Instruction::JumpIfTrue(rhs_len + 1);
                 }
+                BinaryOperator::Spaceship => compile_null_safe_equality::<B, DB>(
+                    (left, right),
+                    NullSafeEquality::Spaceship,
+                    false,
+                    table_id,
+                    database,
+                    out,
+                    depth,
+                )?,
                 _ => {
                     // A name resolving to no column falls to the generic arms, whose refusal names it.
                     if caller_term::<B, DB>(expr, table_id, database, out)? {
@@ -806,6 +816,17 @@ where
             depth,
         )?,
 
+        Expr::IsNotDistinctFrom(left, right) | Expr::IsDistinctFrom(left, right) => {
+            compile_null_safe_equality::<B, DB>(
+                (left, right),
+                NullSafeEquality::DistinctFrom,
+                matches!(expr, Expr::IsDistinctFrom(..)),
+                table_id,
+                database,
+                out,
+                depth,
+            )?;
+        }
         // Nested Expressions (parentheses)
         Expr::Nested(inner) => {
             compile_expr_recursive::<B, DB>(
@@ -917,6 +938,52 @@ where
         out.comparison_for(node.expr, node.pattern, table_id, database, node.operation)?;
     out.push(Instruction::Like { comparison });
     if node.negated {
+        out.push(Instruction::Not);
+    }
+    Ok(())
+}
+
+/// Compile a null-safe equality written in `spelling`, negated for
+/// `IS DISTINCT FROM`.
+///
+/// A spelling the engine rejects is not served, so the engine's own error
+/// is what the caller meets. The comparison facts are the ones `=` resolves,
+/// so both refuse the same operand pairs.
+fn compile_null_safe_equality<B, DB>(
+    (left, right): (&Expr, &Expr),
+    spelling: NullSafeEquality,
+    negated: bool,
+    table_id: TableId,
+    database: &DB,
+    out: &mut Compiling<B>,
+    depth: usize,
+) -> Result<(), RegisterError>
+where
+    B: Backend + SqlLiteralParse,
+    DB: DatabaseLike,
+{
+    if spelling != B::NULL_SAFE_EQUALITY {
+        return Err(RegisterError::UnsupportedSql(format!(
+            "`{}` is not this engine's null-safe equality, which it spells `{}`",
+            spelling.spelling(),
+            B::NULL_SAFE_EQUALITY.spelling()
+        )));
+    }
+    let target = nested_column_scalar_of::<B, DB>(left, table_id, database, depth)
+        .or_else(|| nested_column_scalar_of::<B, DB>(right, table_id, database, depth))
+        .unwrap_or_else(|| ScalarFamily::String.into());
+    for operand in [left, right] {
+        compile_expr_recursive::<B, DB>(operand, table_id, database, out, depth + 1, target)?;
+    }
+    let comparison = out.comparison_for(
+        left,
+        right,
+        table_id,
+        database,
+        crate::backend::TextOperation::Equality,
+    )?;
+    out.push(Instruction::NotDistinct(comparison));
+    if negated {
         out.push(Instruction::Not);
     }
     Ok(())

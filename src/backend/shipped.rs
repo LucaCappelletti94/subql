@@ -162,6 +162,10 @@ impl<V: postgres_jsonb_canonical::PgVersion + 'static> Backend for Postgres<V> {
     const DIVISION: super::scalar_value::DivisionRule =
         super::scalar_value::DivisionRule::IntegersTruncate;
 
+    /// Measured: `<=>` is `operator does not exist`.
+    const NULL_SAFE_EQUALITY: super::scalar_value::NullSafeEquality =
+        super::scalar_value::NullSafeEquality::DistinctFrom;
+
     /// The quotient's scale is the engine's, resolved at registration.
     fn decimal_quotient(
         dividend: bigdecimal::BigDecimal,
@@ -546,6 +550,10 @@ impl<C: MySqlTableNameCase> Backend for MySql<C> {
     const DIVISION: super::scalar_value::DivisionRule =
         super::scalar_value::DivisionRule::QuotientsAreDecimalInWords;
 
+    /// Measured: `IS DISTINCT FROM` is `ERROR 1064`, a syntax error.
+    const NULL_SAFE_EQUALITY: super::scalar_value::NullSafeEquality =
+        super::scalar_value::NullSafeEquality::Spaceship;
+
     /// The quotient's scale is the engine's, resolved at registration.
     fn decimal_quotient(
         dividend: bigdecimal::BigDecimal,
@@ -789,6 +797,10 @@ impl Backend for SQLite {
     /// run, since SQLite has no decimal type.
     const DIVISION: super::scalar_value::DivisionRule =
         super::scalar_value::DivisionRule::IntegersTruncate;
+
+    /// Measured: `<=>` is a syntax error.
+    const NULL_SAFE_EQUALITY: super::scalar_value::NullSafeEquality =
+        super::scalar_value::NullSafeEquality::DistinctFrom;
 
     /// SQLite decodes no decimal cell, so this states the rule it declares rather than a second one.
     fn decimal_quotient(

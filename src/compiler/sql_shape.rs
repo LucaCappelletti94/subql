@@ -1986,7 +1986,9 @@ fn contains_matching(expr: &Expr, matches: fn(&Expr) -> bool) -> bool {
         | Expr::UnaryOp { expr: inner, .. }
         | Expr::IsNull(inner)
         | Expr::IsNotNull(inner) => contains_matching(inner, matches),
-        Expr::BinaryOp { left, right, .. } => {
+        Expr::BinaryOp { left, right, .. }
+        | Expr::IsDistinctFrom(left, right)
+        | Expr::IsNotDistinctFrom(left, right) => {
             contains_matching(left, matches) || contains_matching(right, matches)
         }
         Expr::Between {

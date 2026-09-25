@@ -792,6 +792,17 @@ pub fn predicate_forms(engine: Engine) -> Vec<String> {
         "unbounded_named < 'AB'".to_string(),
         "unbounded_default < 'AB'".to_string(),
     ];
+    // E3: null-safe equality, in the one spelling each engine accepts,
+    // over two columns, a literal and a collated text column.
+    if engine == Engine::MySql {
+        forms.push("narrow <=> wide".to_string());
+        forms.push("NOT (narrow <=> 3)".to_string());
+        forms.push("unbounded_nocase <=> 'AB'".to_string());
+    } else {
+        forms.push("narrow IS NOT DISTINCT FROM wide".to_string());
+        forms.push("narrow IS DISTINCT FROM 3".to_string());
+        forms.push("unbounded_nocase IS NOT DISTINCT FROM 'AB'".to_string());
+    }
     if engine == Engine::Postgres {
         // C3: `jsonb` ordering, and D5: a case-insensitive pattern, both
         // of which only this engine has.
