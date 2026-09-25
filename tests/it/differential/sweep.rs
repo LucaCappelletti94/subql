@@ -554,6 +554,31 @@ mod tests {
         }
     }
 
+    /// Truth tests in the forms `engine` accepts, over a comparison, a
+    /// boolean column and a compound condition. SQLite has no
+    /// `IS [NOT] UNKNOWN`: it reads `UNKNOWN` as a column name.
+    fn truth_test_forms(engine: Engine) -> Vec<&'static str> {
+        let mut forms = vec![
+            "(narrow = wide) IS TRUE",
+            "(narrow = wide) IS NOT TRUE",
+            "(narrow = wide) IS FALSE",
+            "(narrow = wide) IS NOT FALSE",
+            "flag IS TRUE",
+            "flag IS NOT FALSE",
+            "(narrow > 3 OR wide > 3) IS NOT TRUE",
+            "NOT ((narrow = 3) IS FALSE)",
+        ];
+        if engine != Engine::Sqlite {
+            forms.extend([
+                "(narrow = wide) IS UNKNOWN",
+                "(narrow = wide) IS NOT UNKNOWN",
+                "flag IS UNKNOWN",
+                "(narrow = 3 AND flag) IS NOT UNKNOWN",
+            ]);
+        }
+        forms
+    }
+
     /// Every NULL pairing of two integer columns and a boolean one, asked of
     /// the engine and of subql in process, which must both answer and agree
     /// on each.
@@ -625,6 +650,49 @@ mod tests {
             Engine::Sqlite,
             &null_safe_forms(Engine::Sqlite),
         );
+    }
+
+    #[test]
+    fn truth_tests_agree_with_sqlite_on_every_null_pairing() {
+        assert_null_pairings_agree(
+            &mut SqliteOracle::open(),
+            Engine::Sqlite,
+            &truth_test_forms(Engine::Sqlite),
+        );
+    }
+
+    #[test]
+    #[ignore = "requires Docker; run with --ignored"]
+    fn truth_tests_agree_with_postgres_on_every_null_pairing() {
+        let db = crate::common::pg_database();
+        let mut oracle = crate::differential::oracle::PgOracle {
+            connection: db.connect(),
+        };
+        assert_null_pairings_agree(
+            &mut oracle,
+            Engine::Postgres,
+            &truth_test_forms(Engine::Postgres),
+        );
+    }
+
+    #[cfg(any(
+        feature = "executor-diesel-postgres",
+        feature = "executor-diesel-async-postgres",
+        feature = "executor-diesel-postgres-r2d2",
+        feature = "executor-diesel-mysql",
+        feature = "executor-diesel-async-mysql",
+        feature = "diesel-typed-mysql",
+        feature = "apply-patchset-mysql",
+        feature = "apply-patchset-mysql-async",
+    ))]
+    #[test]
+    #[ignore = "requires Docker; run with --ignored"]
+    fn truth_tests_agree_with_mysql_on_every_null_pairing() {
+        let db = crate::common::mysql_database();
+        let mut oracle = crate::differential::oracle::MySqlOracle {
+            connection: db.connect(),
+        };
+        assert_null_pairings_agree(&mut oracle, Engine::MySql, &truth_test_forms(Engine::MySql));
     }
 
     #[test]

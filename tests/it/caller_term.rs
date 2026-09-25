@@ -557,6 +557,74 @@ mod refusals {
         }
     }
 
+    /// A truth test or a null-safe equality over a caller comparison can negate
+    /// it, as `IS NOT TRUE` does, so neither is served in process.
+    #[test]
+    fn a_caller_comparison_under_a_truth_test_is_not_served_in_process() {
+        for sql in [
+            "SELECT * FROM notes WHERE (owner = current_setting('app.user_id', true)) IS NOT TRUE",
+            "SELECT * FROM notes WHERE (owner = current_setting('app.user_id', true)) IS TRUE",
+            "SELECT * FROM notes WHERE (owner = current_setting('app.user_id', true)) \
+             IS DISTINCT FROM true",
+            // The right operand is read as closely as the left.
+            "SELECT * FROM notes WHERE false IS DISTINCT FROM \
+             (owner = current_setting('app.user_id', true))",
+            // The set spelling is a caller comparison too.
+            "SELECT * FROM notes WHERE (owner = ANY(string_to_array(\
+             current_setting('app.subjects', true), ','))) IS NOT TRUE",
+            "SELECT * FROM notes WHERE (owner = ANY(string_to_array(\
+             current_setting('app.subjects', true), ','))) IS DISTINCT FROM true",
+        ] {
+            let (mut engine, _) = engine();
+            let spec = SubscriptionRequest::<DefaultIds, Postgres>::new(1u64, sql)
+                .subscriber(Value::String("alice".into()))
+                .subjects([Value::String("alice".into())]);
+            let registered = engine
+                .register(spec)
+                .expect("a shape the evaluator refuses is re-read, not turned away");
+            assert!(
+                !matches!(registered.tier, Tier::InProcess(_)),
+                "{sql} got {:?}",
+                registered.tier
+            );
+            let reason = registered
+                .not_served_because
+                .map(|reason| reason.to_string())
+                .expect("a read tier says why");
+            assert!(
+                reason.contains("membership subquery or a comparison to the caller"),
+                "{sql} names the hazard: {reason}"
+            );
+        }
+    }
+
+    /// Under `NOT` the caller comparison is found through a truth test and a
+    /// null-safe equality alike, so the negation is refused for what it is.
+    #[test]
+    fn a_negated_caller_comparison_is_found_through_a_truth_test() {
+        for sql in [
+            "SELECT * FROM notes WHERE NOT ((owner = current_setting('app.user_id', true)) IS TRUE)",
+            "SELECT * FROM notes WHERE NOT ((owner = current_setting('app.user_id', true)) \
+             IS DISTINCT FROM false)",
+        ] {
+            let (mut engine, _) = engine();
+            let registered = engine
+                .register(
+                    SubscriptionRequest::<DefaultIds, Postgres>::new(1u64, sql)
+                        .subscriber(Value::String("alice".into())),
+                )
+                .expect("a shape the evaluator refuses is re-read, not turned away");
+            let reason = registered
+                .not_served_because
+                .map(|reason| reason.to_string())
+                .expect("a read tier says why it is one");
+            assert!(
+                reason.starts_with("NOT over a comparison to the caller"),
+                "{sql}: {reason}"
+            );
+        }
+    }
+
     /// The set spelling reads the subject set and nothing else, so a subscriber
     /// alone, or no subjects, leaves it nothing to admit.
     #[test]

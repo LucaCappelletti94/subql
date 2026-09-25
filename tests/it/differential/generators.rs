@@ -803,6 +803,12 @@ pub fn predicate_forms(engine: Engine) -> Vec<String> {
         forms.push("narrow IS DISTINCT FROM 3".to_string());
         forms.push("unbounded_nocase IS NOT DISTINCT FROM 'AB'".to_string());
     }
+    // E4: truth tests, with `IS UNKNOWN` where the engine has it.
+    forms.push("(narrow = wide) IS NOT TRUE".to_string());
+    forms.push("flag IS FALSE".to_string());
+    if engine != Engine::Sqlite {
+        forms.push("(unbounded_nocase = 'AB') IS UNKNOWN".to_string());
+    }
     if engine == Engine::Postgres {
         // C3: `jsonb` ordering, and D5: a case-insensitive pattern, both
         // of which only this engine has.

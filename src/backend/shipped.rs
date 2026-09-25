@@ -166,6 +166,9 @@ impl<V: postgres_jsonb_canonical::PgVersion + 'static> Backend for Postgres<V> {
     const NULL_SAFE_EQUALITY: super::scalar_value::NullSafeEquality =
         super::scalar_value::NullSafeEquality::DistinctFrom;
 
+    /// Measured: `(NULL = 1) IS UNKNOWN` is true.
+    const READS_IS_UNKNOWN: bool = true;
+
     /// The quotient's scale is the engine's, resolved at registration.
     fn decimal_quotient(
         dividend: bigdecimal::BigDecimal,
@@ -554,6 +557,9 @@ impl<C: MySqlTableNameCase> Backend for MySql<C> {
     const NULL_SAFE_EQUALITY: super::scalar_value::NullSafeEquality =
         super::scalar_value::NullSafeEquality::Spaceship;
 
+    /// Measured: `(NULL = 1) IS UNKNOWN` is `1`.
+    const READS_IS_UNKNOWN: bool = true;
+
     /// The quotient's scale is the engine's, resolved at registration.
     fn decimal_quotient(
         dividend: bigdecimal::BigDecimal,
@@ -801,6 +807,10 @@ impl Backend for SQLite {
     /// Measured: `<=>` is a syntax error.
     const NULL_SAFE_EQUALITY: super::scalar_value::NullSafeEquality =
         super::scalar_value::NullSafeEquality::DistinctFrom;
+
+    /// Measured on 3.51: `x IS UNKNOWN` fails with `no such column: UNKNOWN`,
+    /// since the word is read as a name.
+    const READS_IS_UNKNOWN: bool = false;
 
     /// SQLite decodes no decimal cell, so this states the rule it declares rather than a second one.
     fn decimal_quotient(

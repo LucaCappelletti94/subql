@@ -369,6 +369,22 @@ pub enum Instruction<B: Backend> {
     ///
     /// Stack: `[..., a, b] -> [..., Tri]`.
     NotDistinct(ComparisonRef),
+
+    // Truth test (pop 1 Tri, push Tri)
+    /// `c IS [NOT] TRUE`, `IS [NOT] FALSE` and `IS [NOT] UNKNOWN`: whether
+    /// the condition's value is `value`, negated for `IS NOT`.
+    ///
+    /// Two-valued on a present answer, so an unknown condition is `False`
+    /// under `IS TRUE`. An unknown condition that read a cell the source did
+    /// not carry stays `Tri::Unknown`, since that cell may hold anything.
+    ///
+    /// Stack: `[..., tri] -> [..., Tri]`.
+    IsTruth {
+        /// The value the condition is tested for.
+        value: crate::compiler::Tri,
+        /// Whether `NOT` was written, which flips a present answer.
+        negated: bool,
+    },
 }
 
 /// A compiled bytecode program.
@@ -545,6 +561,10 @@ impl<B: Backend> Clone for Instruction<B> {
             Self::JumpIfTrue(offset) => Self::JumpIfTrue(*offset),
             Self::TermTruth(slot) => Self::TermTruth(*slot),
             Self::NotDistinct(r) => Self::NotDistinct(*r),
+            Self::IsTruth { value, negated } => Self::IsTruth {
+                value: *value,
+                negated: *negated,
+            },
         }
     }
 }
@@ -596,6 +616,11 @@ impl<B: Backend> core::fmt::Debug for Instruction<B> {
             Self::JumpIfTrue(offset) => f.debug_tuple("JumpIfTrue").field(offset).finish(),
             Self::TermTruth(slot) => f.debug_tuple("TermTruth").field(slot).finish(),
             Self::NotDistinct(r) => f.debug_tuple("NotDistinct").field(r).finish(),
+            Self::IsTruth { value, negated } => f
+                .debug_struct("IsTruth")
+                .field("value", value)
+                .field("negated", negated)
+                .finish(),
         }
     }
 }
@@ -649,6 +674,16 @@ impl<B: Backend> PartialEq for Instruction<B> {
             (Self::JumpIfFalse(a), Self::JumpIfFalse(b))
             | (Self::JumpIfTrue(a), Self::JumpIfTrue(b)) => a == b,
             (Self::TermTruth(a), Self::TermTruth(b)) => a == b,
+            (
+                Self::IsTruth {
+                    value: av,
+                    negated: an,
+                },
+                Self::IsTruth {
+                    value: bv,
+                    negated: bn,
+                },
+            ) => av == bv && an == bn,
             _ => false,
         }
     }
@@ -694,7 +729,7 @@ mod tests {
     #[test]
     fn every_instruction_keeps_its_persisted_tag() {
         let r = ComparisonRef::NONE;
-        let tagged: [(Instruction<Postgres>, u8); 26] = [
+        let tagged: [(Instruction<Postgres>, u8); 27] = [
             (Instruction::PushLiteral(Value::Null), 0),
             (Instruction::LoadColumn(0), 1),
             (Instruction::Equal(r), 2),
@@ -727,6 +762,13 @@ mod tests {
             (Instruction::JumpIfTrue(1), 23),
             (Instruction::TermTruth(0), 24),
             (Instruction::NotDistinct(r), 25),
+            (
+                Instruction::IsTruth {
+                    value: crate::compiler::Tri::Unknown,
+                    negated: false,
+                },
+                26,
+            ),
         ];
         for (instruction, tag) in tagged {
             let bytes = postcard::to_allocvec(&instruction).expect("an instruction serializes");

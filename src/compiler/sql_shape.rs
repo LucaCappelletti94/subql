@@ -1985,7 +1985,13 @@ fn contains_matching(expr: &Expr, matches: fn(&Expr) -> bool) -> bool {
         Expr::Nested(inner)
         | Expr::UnaryOp { expr: inner, .. }
         | Expr::IsNull(inner)
-        | Expr::IsNotNull(inner) => contains_matching(inner, matches),
+        | Expr::IsNotNull(inner)
+        | Expr::IsTrue(inner)
+        | Expr::IsNotTrue(inner)
+        | Expr::IsFalse(inner)
+        | Expr::IsNotFalse(inner)
+        | Expr::IsUnknown(inner)
+        | Expr::IsNotUnknown(inner) => contains_matching(inner, matches),
         Expr::BinaryOp { left, right, .. }
         | Expr::IsDistinctFrom(left, right)
         | Expr::IsNotDistinctFrom(left, right) => {

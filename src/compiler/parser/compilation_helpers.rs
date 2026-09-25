@@ -4,7 +4,7 @@ use super::{Compiling, MAX_TERMS_PER_FILTER};
 use crate::backend::{Backend, NullSafeEquality, ScalarFamily, Value, ValueKindOf};
 use crate::compiler::bytecode::{ComparisonRef, FloatResult};
 use crate::compiler::literals::{resolve_column_ref, SqlLiteralParse};
-use crate::compiler::{canonicalize, sql_shape, BytecodeProgram, Instruction};
+use crate::compiler::{canonicalize, sql_shape, BytecodeProgram, Instruction, Tri};
 use crate::term::{term_columns, CompiledTerm};
 use crate::{RegisterError, TableId};
 use alloc::string::{String, ToString};
@@ -114,6 +114,7 @@ const fn instruction_is_tri_typed<B: Backend>(instr: &Instruction<B>) -> bool {
             | Instruction::JumpIfTrue(_)
             | Instruction::TermTruth(_)
             | Instruction::NotDistinct(_)
+            | Instruction::IsTruth { .. }
     )
 }
 
@@ -816,6 +817,23 @@ where
             depth,
         )?,
 
+        Expr::IsTrue(condition)
+        | Expr::IsNotTrue(condition)
+        | Expr::IsFalse(condition)
+        | Expr::IsNotFalse(condition)
+        | Expr::IsUnknown(condition)
+        | Expr::IsNotUnknown(condition) => {
+            let (value, negated) = match expr {
+                Expr::IsTrue(_) => (Tri::True, false),
+                Expr::IsNotTrue(_) => (Tri::True, true),
+                Expr::IsFalse(_) => (Tri::False, false),
+                Expr::IsNotFalse(_) => (Tri::False, true),
+                Expr::IsUnknown(_) => (Tri::Unknown, false),
+                _ => (Tri::Unknown, true),
+            };
+            compile_truth_test::<B, DB>(condition, value, negated, table_id, database, out, depth)?;
+        }
+
         Expr::IsNotDistinctFrom(left, right) | Expr::IsDistinctFrom(left, right) => {
             compile_null_safe_equality::<B, DB>(
                 (left, right),
@@ -943,6 +961,85 @@ where
     Ok(())
 }
 
+/// Refuse a membership subquery or a caller comparison as the operand of a
+/// truth test or a null-safe equality.
+///
+/// Either can negate what it wraps, as `IS NOT TRUE` and `IS DISTINCT FROM
+/// true` do, which is the subtraction `NOT` over a term is refused for, and a
+/// term answers per subscriber rather than as one value.
+fn refuse_term_operand(operand: &Expr) -> Result<(), RegisterError> {
+    if sql_shape::contains_membership_subquery(operand)
+        || sql_shape::contains_caller_comparison(operand)
+    {
+        return Err(RegisterError::UnsupportedSql(
+            "A membership subquery or a comparison to the caller under a truth test (IS TRUE, \
+             IS FALSE, IS UNKNOWN) or a null-safe equality is not supported. SubQL serves the \
+             relationship itself, and these can negate it. Run this as a regular SQL query in \
+             your database."
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// Compile a truth test of `condition` for `value`, negated for `IS NOT`.
+///
+/// The operand is a condition or a boolean column, the one kind every engine
+/// reads alike: PostgreSQL raises on a number where MySQL and SQLite read
+/// its truth, so any other operand is left to the engine.
+fn compile_truth_test<B, DB>(
+    condition: &Expr,
+    value: Tri,
+    negated: bool,
+    table_id: TableId,
+    database: &DB,
+    out: &mut Compiling<B>,
+    depth: usize,
+) -> Result<(), RegisterError>
+where
+    B: Backend + SqlLiteralParse,
+    DB: DatabaseLike,
+{
+    refuse_term_operand(condition)?;
+    if value == Tri::Unknown && !B::READS_IS_UNKNOWN {
+        return Err(RegisterError::UnsupportedSql(
+            "`IS [NOT] UNKNOWN` is not a truth test on this engine, which reads `UNKNOWN` as a \
+             name"
+                .to_string(),
+        ));
+    }
+    compile_expr_recursive::<B, DB>(
+        condition,
+        table_id,
+        database,
+        out,
+        depth + 1,
+        ScalarFamily::Bool.into(),
+    )?;
+    if !out.out.last().is_some_and(instruction_is_tri_typed) {
+        let mut bare = condition;
+        while let Expr::Nested(inner) = bare {
+            bare = inner;
+        }
+        let boolean_column =
+            resolve_column_ref::<B, DB>(bare, table_id, database).is_some_and(|column| {
+                crate::catalog_helpers::column_scalar_family(database, table_id, column)
+                    == Some(ScalarFamily::Bool)
+            });
+        if !boolean_column {
+            return Err(RegisterError::UnsupportedSql(
+                "a truth test is served over a condition or a boolean column, and the engines \
+                 disagree about any other operand"
+                    .to_string(),
+            ));
+        }
+        let comparison = ComparisonRef::new(out.intern_comparison(bare, table_id, database), None);
+        wrap_bare_value_as_tri::<B>(&mut out.out, comparison)?;
+    }
+    out.push(Instruction::IsTruth { value, negated });
+    Ok(())
+}
+
 /// Compile a null-safe equality written in `spelling`, negated for
 /// `IS DISTINCT FROM`.
 ///
@@ -969,6 +1066,8 @@ where
             B::NULL_SAFE_EQUALITY.spelling()
         )));
     }
+    refuse_term_operand(left)?;
+    refuse_term_operand(right)?;
     let target = nested_column_scalar_of::<B, DB>(left, table_id, database, depth)
         .or_else(|| nested_column_scalar_of::<B, DB>(right, table_id, database, depth))
         .unwrap_or_else(|| ScalarFamily::String.into());

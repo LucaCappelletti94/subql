@@ -391,6 +391,20 @@ impl<B: Backend> Vm<B> {
                 self.replace_top(2, result);
             }
 
+            // Whether an unknown came from an absent cell is not carried on the
+            // stack, so any absent cell read so far keeps an unknown unanswered.
+            Instruction::IsTruth { value, negated } => {
+                let condition = self.pop_tri()?;
+                let result = if condition == Tri::Unknown && self.absent_column.is_some() {
+                    Tri::Unknown
+                } else if (condition == *value) != *negated {
+                    Tri::True
+                } else {
+                    Tri::False
+                };
+                self.stack.push(StackValue::Tri(result));
+            }
+
             Instruction::LessThan(comparison) => {
                 let result = self.compare_ordered(src, *comparison, |ord| {
                     matches!(ord, core::cmp::Ordering::Less)

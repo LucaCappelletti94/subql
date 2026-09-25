@@ -186,6 +186,8 @@ impl Backend for Custom {
     const NULL_SAFE_EQUALITY: subql::backend::NullSafeEquality =
         subql::backend::NullSafeEquality::DistinctFrom;
 
+    const READS_IS_UNKNOWN: bool = true;
+
     fn decimal_quotient(
         dividend: bigdecimal::BigDecimal,
         divisor: bigdecimal::BigDecimal,

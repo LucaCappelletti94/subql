@@ -217,6 +217,7 @@ fn spellings_of_one_null_safe_equality_share_a_predicate() {
     for spellings in [
         ["n IS NOT DISTINCT FROM m", "M IS NOT DISTINCT FROM (N)"],
         ["n IS DISTINCT FROM 3", "(N) IS DISTINCT FROM 3"],
+        ["(n = m) IS TRUE", "(M = N) IS TRUE"],
     ] {
         assert_eq!(
             created::<Postgres, _>(PostgreSqlDialect {}, spellings),

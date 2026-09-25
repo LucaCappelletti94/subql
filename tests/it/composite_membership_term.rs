@@ -480,6 +480,59 @@ mod refusals {
         );
     }
 
+    /// A truth test or a null-safe equality over a term can negate it, as
+    /// `IS NOT TRUE` and `IS DISTINCT FROM true` do, and a term does not answer
+    /// as a value, so neither is served in process whichever spelling is used.
+    #[test]
+    fn a_term_under_a_truth_test_or_null_safe_equality_falls_to_the_reread_tier() {
+        let exists = TERM.trim_start_matches("SELECT * FROM docs WHERE ");
+        for form in [
+            "({}) IS TRUE",
+            "({}) IS NOT TRUE",
+            "({}) IS FALSE",
+            "({}) IS NOT UNKNOWN",
+            "({}) IS DISTINCT FROM true",
+            "({}) IS NOT DISTINCT FROM true",
+            // The right operand is read as closely as the left. A truth test
+            // has no right operand to write one on.
+            "true IS NOT DISTINCT FROM ({})",
+        ] {
+            let (mut engine, _, _) = engine();
+            let reason = reread_reason(
+                &mut engine,
+                &format!("SELECT * FROM docs WHERE {}", form.replace("{}", exists)),
+            );
+            assert!(
+                reason.contains("membership subquery or a comparison to the caller"),
+                "{form} names the hazard: {reason}"
+            );
+        }
+    }
+
+    /// Under `NOT` the negation is found first, so each spelling is refused
+    /// in the words `NOT EXISTS` gets.
+    #[test]
+    fn a_negated_truth_test_over_a_term_is_refused_as_subtraction() {
+        let exists = TERM.trim_start_matches("SELECT * FROM docs WHERE ");
+        let (mut first, _, _) = engine();
+        let outer = reread_reason(
+            &mut first,
+            &format!("SELECT * FROM docs WHERE NOT ({exists})"),
+        );
+        for form in [
+            "NOT (({}) IS NOT UNKNOWN)",
+            "NOT (({}) IS TRUE)",
+            "NOT (({}) IS NOT DISTINCT FROM true)",
+        ] {
+            let (mut engine, _, _) = engine();
+            let reason = reread_reason(
+                &mut engine,
+                &format!("SELECT * FROM docs WHERE {}", form.replace("{}", exists)),
+            );
+            assert_eq!(reason, outer, "{form}");
+        }
+    }
+
     /// A bare outer column inside the subquery resolves to the membership table
     /// under SQL's own rules, so the pair must spell the subscribed side
     /// qualified. The filter leaves the bounded form, lands on the reread tier,

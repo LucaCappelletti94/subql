@@ -6042,6 +6042,19 @@ mod tests {
         );
     }
 
+    /// The nesting search reaches inside a truth test, which the compiler
+    /// serves and so the search walks.
+    #[test]
+    fn a_subquery_inside_a_truth_test_is_still_found() {
+        let message = refusal(
+            "id IN (SELECT id FROM orders WHERE (amount = (SELECT amount FROM orders)) IS TRUE)",
+        );
+        assert!(
+            message.contains("cannot contain another subquery"),
+            "the refusal should name the nesting, got {message:?}"
+        );
+    }
+
     /// `EXISTS` is a subquery too, and it nests just as much as `IN` does. It
     /// reaches the nesting search through its own AST variant, so covering only
     /// the `IN` spelling leaves that arm undefended.

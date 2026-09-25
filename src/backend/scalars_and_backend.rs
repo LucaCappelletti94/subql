@@ -450,6 +450,12 @@ pub trait Backend: 'static {
     /// engine. See [`NullSafeEquality`](super::scalar_value::NullSafeEquality).
     const NULL_SAFE_EQUALITY: super::scalar_value::NullSafeEquality;
 
+    /// Whether this engine reads `IS [NOT] UNKNOWN` as a truth test.
+    ///
+    /// Required, and per backend, because one engine has no such test and
+    /// reads the word as a column name instead.
+    const READS_IS_UNKNOWN: bool;
+
     /// What this engine answers when a floating total leaves its range.
     ///
     /// Required, and per backend, because no two agree: measured,
