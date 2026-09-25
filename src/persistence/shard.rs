@@ -30,19 +30,10 @@ use sql_traits::{
     structs::{AlgorithmId, SchemaFingerprint},
 };
 
-/// Shard format version. v14: a stored `LIKE` carries no case flag,
-/// because the case rule rides its comparison descriptor. v13: a stored
-/// integer column type carries the width its declaration fixes. v12: a stored `/` carries the rule its
-/// quotient
-/// is computed by, including the declared increment where the engine's
-/// rule wants one. v11: a stored arithmetic instruction carries the
-/// width its float result is held at. v10: a stored column kind carries the
-/// refinements
-/// its declaration fixes, so a `real` column reloads as float4 rather than
-/// as float8. v9: a stored comparison carries the text rule resolved for its
-/// operation, so no evaluation consults a collation. v8: a stored bytecode
-/// program carries the comparison facts of every column it loads. v7: full
-/// fingerprint envelope replaced the legacy `u64` field.
+/// Shard format version, written into every shard header.
+///
+/// Loading refuses a shard carrying any other version, so a change to what a
+/// stored field means bumps it.
 const SHARD_VERSION: u16 = 14;
 
 /// Hard cap for decompressed shard payload size (defense in depth).

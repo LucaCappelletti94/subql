@@ -440,26 +440,6 @@ fn resolve_numeric_agg_column<B: crate::backend::Backend, DB: DatabaseLike>(
     Ok(column)
 }
 
-/// Extract the `QueryProjection` from a parsed SELECT statement.
-///
-/// Accepts:
-/// - `SELECT *`                            -> `QueryProjection::Rows`
-/// - `SELECT COUNT(*) [AS alias]`          -> `Aggregate(CountStar)`
-/// - `SELECT COUNT(col) [AS alias]`        -> `Aggregate(CountColumn { column })`
-/// - `SELECT SUM(col) [AS alias]`          -> `Aggregate(Sum { column })`
-/// - `SELECT AVG(col) [AS alias]`          -> `Aggregate(Avg { column })`
-/// - `SELECT VAR_POP(col) [AS alias]`      -> `Aggregate(VarPop { column })`
-/// - `SELECT VAR_SAMP(col) [AS alias]`     -> `Aggregate(VarSamp { column })`
-/// - `SELECT STDDEV_POP(col) [AS alias]`   -> `Aggregate(StddevPop { column })`
-/// - `SELECT STDDEV_SAMP(col) [AS alias]`  -> `Aggregate(StddevSamp { column })`
-/// - `VARIANCE(col)` is accepted as a `VAR_SAMP` alias.
-/// - `STDDEV(col)` is accepted as a `STDDEV_SAMP` alias.
-///
-/// Returns `Err(UnsupportedSql)` for any other projection.
-/// Returns `Err(UnknownColumn)` when the aggregate column does not exist in the catalog.
-/// Returns `Err(UnsupportedSql)` when `SUM`/`AVG`/`VAR_*`/`STDDEV_*` is used on a
-/// non-numeric column type (only when the catalog exposes type information via
-/// [`catalog_helpers::column_type`]).
 /// Whether `items` is a complete, duplicate-free list of the table's columns,
 /// each projected as a bare or table-qualified column reference. Such a
 /// projection is equivalent to `SELECT *` for subql (which delivers full row
@@ -495,6 +475,26 @@ fn is_complete_column_list<B: crate::backend::Backend, DB: DatabaseLike>(
     seen.len() == arity
 }
 
+/// Extract the `QueryProjection` from a parsed SELECT statement.
+///
+/// Accepts:
+/// - `SELECT *`, or a complete list of the table's columns -> `QueryProjection::Rows`
+/// - a statement with `GROUP BY`                -> `GroupedAggregate`, per `grouped_projection`
+/// - `SELECT COUNT(*) [AS alias]`          -> `Aggregate(CountStar)`
+/// - `SELECT COUNT(col) [AS alias]`        -> `Aggregate(CountColumn { column })`
+/// - `SELECT SUM(col) [AS alias]`          -> `Aggregate(Sum { column })`
+/// - `SELECT AVG(col) [AS alias]`          -> `Aggregate(Avg { column })`
+/// - `SELECT VAR_POP(col) [AS alias]`      -> `Aggregate(VarPop { column })`
+/// - `SELECT VAR_SAMP(col) [AS alias]`     -> `Aggregate(VarSamp { column })`
+/// - `SELECT STDDEV_POP(col) [AS alias]`   -> `Aggregate(StddevPop { column })`
+/// - `SELECT STDDEV_SAMP(col) [AS alias]`  -> `Aggregate(StddevSamp { column })`
+/// - `VARIANCE(col)` is accepted as a `VAR_SAMP` alias.
+/// - `STDDEV(col)` is accepted as a `STDDEV_SAMP` alias.
+///
+/// Returns `Err(UnsupportedSql)` for any other projection, for `HAVING`
+/// outside a grouped statement, and when `SUM`/`AVG`/`VAR_*`/`STDDEV_*` is
+/// used on a non-numeric column type.
+/// Returns `Err(UnknownColumn)` when the aggregate column does not exist in the catalog.
 #[allow(clippy::too_many_lines)]
 pub(super) fn extract_projection<B: crate::backend::Backend, DB: DatabaseLike>(
     stmt: &Statement,

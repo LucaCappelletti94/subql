@@ -3,8 +3,8 @@
 use super::{
     absorb_keyed_page, decode_grouped_seed_rows, deltas_from, one_grouped_row,
     reconcile_checkpoint, AutoResolvingEngine, CdcEvent, Connector, DatabaseLike, IdTypes,
-    InProcessKind, KeyBatches, KeyedPage, ReExecError, RowDelta, RowsUpdate, ScalarFamily,
-    SeenKeys, SnapshotResult, SqlLiteralParse, String, SubscriptionId, SyncMode, Value, Vec,
+    InProcessKind, KeyBatches, KeyedPage, ReExecError, RowDelta, RowsUpdate, SeenKeys,
+    SnapshotResult, SqlLiteralParse, String, SubscriptionId, SyncMode, Value, Vec,
 };
 
 /// Closes a cursor if the read using it is abandoned by an unwinding panic.
@@ -93,16 +93,11 @@ where
             let mut pending = core::mem::take(&mut installed.triggers);
             while let Some(trigger) = pending.pop() {
                 match &trigger.read {
-                    crate::reexec::ReExecutionRead::GroupedScalar {
-                        group,
-                        query,
-                        column_kinds,
-                    } => {
+                    crate::reexec::ReExecutionRead::GroupedScalar { group, query, .. } => {
                         let resolved = self.resolve_grouped_scalar(
                             subscription_id,
                             group,
                             query,
-                            *column_kinds,
                             trigger.checkpoint.clone(),
                         )?;
                         self.apply_transitions(&resolved.transitions);
@@ -316,17 +311,11 @@ where
     where
         S: FnMut(crate::reexec::ReadDelivery<I, E::Backend, E::Checkpoint>),
     {
-        if let crate::reexec::ReExecutionRead::GroupedScalar {
-            group,
-            query,
-            column_kinds,
-        } = &trigger.read
-        {
+        if let crate::reexec::ReExecutionRead::GroupedScalar { group, query, .. } = &trigger.read {
             let installed = self.resolve_grouped_scalar(
                 trigger.subscription_id,
                 group,
                 query,
-                *column_kinds,
                 trigger.checkpoint.clone(),
             )?;
             self.apply_transitions(&installed.transitions);
@@ -391,7 +380,6 @@ where
         subscription_id: SubscriptionId,
         group: &[u8],
         query: &crate::reexec::BoundQuery<E::Backend>,
-        _column_kinds: [ScalarFamily; 2],
         checkpoint: Option<E::Checkpoint>,
     ) -> Result<
         crate::AggregateMaintenanceOutput<I, E::Backend, E::Checkpoint>,
