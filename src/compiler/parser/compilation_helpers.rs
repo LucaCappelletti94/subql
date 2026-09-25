@@ -115,6 +115,7 @@ const fn instruction_is_tri_typed<B: Backend>(instr: &Instruction<B>) -> bool {
             | Instruction::TermTruth(_)
             | Instruction::NotDistinct(_)
             | Instruction::IsTruth { .. }
+            | Instruction::Truth
     )
 }
 
@@ -144,6 +145,49 @@ where
             "empty WHERE clause after compilation".to_string(),
         )),
     }
+}
+
+/// Whether `expr`, parentheses aside, names a boolean column of the table.
+fn is_boolean_column<B: Backend, DB: DatabaseLike>(
+    expr: &Expr,
+    table_id: TableId,
+    database: &DB,
+) -> bool {
+    let mut bare = expr;
+    while let Expr::Nested(inner) = bare {
+        bare = inner;
+    }
+    resolve_column_ref::<B, DB>(bare, table_id, database).is_some_and(|column| {
+        crate::catalog_helpers::column_scalar_family(database, table_id, column)
+            == Some(ScalarFamily::Bool)
+    })
+}
+
+/// Turn the value `expr` just compiled to into a condition, where one is read.
+///
+/// A boolean column reads as its own truth, which is how each engine reads
+/// one there. `= true` is not that on SQLite, whose boolean column keeps the
+/// stored integer and compares it with `1`. Any other bare value keeps the
+/// `= true` comparison.
+fn ensure_condition<B, DB>(
+    expr: &Expr,
+    table_id: TableId,
+    database: &DB,
+    out: &mut Compiling<B>,
+) -> Result<(), RegisterError>
+where
+    B: Backend + SqlLiteralParse,
+    DB: DatabaseLike,
+{
+    if out.out.last().is_some_and(instruction_is_tri_typed) {
+        return Ok(());
+    }
+    if is_boolean_column::<B, DB>(expr, table_id, database) {
+        out.push(Instruction::Truth);
+        return Ok(());
+    }
+    let comparison = ComparisonRef::new(out.intern_comparison(expr, table_id, database), None);
+    wrap_bare_value_as_tri::<B>(&mut out.out, comparison)
 }
 
 /// Compile a SQL expression into bytecode, plus the membership terms it names.
@@ -176,8 +220,7 @@ where
         0,
         ScalarFamily::String.into(),
     )?;
-    let bare = ComparisonRef::new(compiling.intern_comparison(expr, table_id, database), None);
-    wrap_bare_value_as_tri::<B>(&mut compiling.out, bare)?;
+    ensure_condition::<B, DB>(expr, table_id, database, &mut compiling)?;
     let terms = canonicalize_term_slots(&mut compiling, canonicalizer)?;
     let columns = term_columns(&terms);
     Ok((
@@ -320,6 +363,7 @@ where
                         depth + 1,
                         ScalarFamily::String.into(),
                     )?;
+                    ensure_condition::<B, DB>(left, table_id, database, out)?;
 
                     let jump_idx = out.len();
                     out.push(Instruction::JumpIfFalse(0)); // offset backfilled once rhs length is known (line 213)
@@ -333,6 +377,7 @@ where
                         depth + 1,
                         ScalarFamily::String.into(),
                     )?;
+                    ensure_condition::<B, DB>(right, table_id, database, out)?;
                     out.push(Instruction::And);
 
                     let rhs_len = out.len() - rhs_start;
@@ -347,6 +392,7 @@ where
                         depth + 1,
                         ScalarFamily::String.into(),
                     )?;
+                    ensure_condition::<B, DB>(left, table_id, database, out)?;
 
                     let jump_idx = out.len();
                     out.push(Instruction::JumpIfTrue(0)); // offset backfilled once rhs length is known (line 240)
@@ -360,6 +406,7 @@ where
                         depth + 1,
                         ScalarFamily::String.into(),
                     )?;
+                    ensure_condition::<B, DB>(right, table_id, database, out)?;
                     out.push(Instruction::Or);
 
                     let rhs_len = out.len() - rhs_start;
@@ -379,6 +426,8 @@ where
                     if caller_term::<B, DB>(expr, table_id, database, out)? {
                         return Ok(());
                     }
+                    refuse_condition_operand(left)?;
+                    refuse_condition_operand(right)?;
 
                     // Non-short-circuit operators: compile both sides,
                     // then emit the op. Target-typed literal inference
@@ -757,7 +806,10 @@ where
             )?;
 
             match op {
-                UnaryOperator::Not => out.push(Instruction::Not),
+                UnaryOperator::Not => {
+                    ensure_condition::<B, DB>(inner, table_id, database, out)?;
+                    out.push(Instruction::Not);
+                }
                 UnaryOperator::Plus => {
                     // Unary + is no-op.
                 }
@@ -961,6 +1013,60 @@ where
     Ok(())
 }
 
+/// Refuse a condition where a value is read, as in `(a = b) = true`.
+///
+/// Every engine answers it, and the language compares and computes with
+/// values only, so it is routed to a read rather than typed against the
+/// sibling column and refused as a bad literal.
+fn refuse_condition_operand(operand: &Expr) -> Result<(), RegisterError> {
+    let mut bare = operand;
+    while let Expr::Nested(inner) = bare {
+        bare = inner;
+    }
+    let condition = match bare {
+        Expr::BinaryOp { op, .. } => matches!(
+            op,
+            BinaryOperator::Eq
+                | BinaryOperator::NotEq
+                | BinaryOperator::Lt
+                | BinaryOperator::LtEq
+                | BinaryOperator::Gt
+                | BinaryOperator::GtEq
+                | BinaryOperator::And
+                | BinaryOperator::Or
+                | BinaryOperator::Spaceship
+        ),
+        Expr::UnaryOp { op, .. } => matches!(op, UnaryOperator::Not),
+        _ => matches!(
+            bare,
+            Expr::IsNull(_)
+                | Expr::IsNotNull(_)
+                | Expr::IsTrue(_)
+                | Expr::IsNotTrue(_)
+                | Expr::IsFalse(_)
+                | Expr::IsNotFalse(_)
+                | Expr::IsUnknown(_)
+                | Expr::IsNotUnknown(_)
+                | Expr::IsDistinctFrom(..)
+                | Expr::IsNotDistinctFrom(..)
+                | Expr::Like { .. }
+                | Expr::ILike { .. }
+                | Expr::InList { .. }
+                | Expr::InSubquery { .. }
+                | Expr::Between { .. }
+                | Expr::Exists { .. }
+        ),
+    };
+    if condition {
+        return Err(RegisterError::UnsupportedSql(
+            "a condition compared or computed with as a value is not supported in process, \
+             which compares and computes with values only"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
 /// Refuse a membership subquery or a caller comparison as the operand of a
 /// truth test or a null-safe equality.
 ///
@@ -1016,26 +1122,16 @@ where
         depth + 1,
         ScalarFamily::Bool.into(),
     )?;
-    if !out.out.last().is_some_and(instruction_is_tri_typed) {
-        let mut bare = condition;
-        while let Expr::Nested(inner) = bare {
-            bare = inner;
-        }
-        let boolean_column =
-            resolve_column_ref::<B, DB>(bare, table_id, database).is_some_and(|column| {
-                crate::catalog_helpers::column_scalar_family(database, table_id, column)
-                    == Some(ScalarFamily::Bool)
-            });
-        if !boolean_column {
-            return Err(RegisterError::UnsupportedSql(
-                "a truth test is served over a condition or a boolean column, and the engines \
-                 disagree about any other operand"
-                    .to_string(),
-            ));
-        }
-        let comparison = ComparisonRef::new(out.intern_comparison(bare, table_id, database), None);
-        wrap_bare_value_as_tri::<B>(&mut out.out, comparison)?;
+    if !out.out.last().is_some_and(instruction_is_tri_typed)
+        && !is_boolean_column::<B, DB>(condition, table_id, database)
+    {
+        return Err(RegisterError::UnsupportedSql(
+            "a truth test is served over a condition or a boolean column, and the engines \
+             disagree about any other operand"
+                .to_string(),
+        ));
     }
+    ensure_condition::<B, DB>(condition, table_id, database, out)?;
     out.push(Instruction::IsTruth { value, negated });
     Ok(())
 }
@@ -1068,6 +1164,8 @@ where
     }
     refuse_term_operand(left)?;
     refuse_term_operand(right)?;
+    refuse_condition_operand(left)?;
+    refuse_condition_operand(right)?;
     let target = nested_column_scalar_of::<B, DB>(left, table_id, database, depth)
         .or_else(|| nested_column_scalar_of::<B, DB>(right, table_id, database, depth))
         .unwrap_or_else(|| ScalarFamily::String.into());

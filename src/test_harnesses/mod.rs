@@ -90,6 +90,7 @@ mod tests {
             Instruction::TermTruth(_) => 24,
             Instruction::NotDistinct(_) => 25,
             Instruction::IsTruth { .. } => 26,
+            Instruction::Truth => 27,
         }
     }
 
@@ -152,7 +153,7 @@ mod tests {
 
         assert_eq!(
             seen.len(),
-            26,
+            27,
             "expected all Instruction variants, saw {seen:?}"
         );
     }

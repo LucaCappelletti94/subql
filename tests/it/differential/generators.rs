@@ -806,6 +806,7 @@ pub fn predicate_forms(engine: Engine) -> Vec<String> {
     // E4: truth tests, with `IS UNKNOWN` where the engine has it.
     forms.push("(narrow = wide) IS NOT TRUE".to_string());
     forms.push("flag IS FALSE".to_string());
+    forms.push("narrow > 0 AND flag".to_string());
     if engine != Engine::Sqlite {
         forms.push("(unbounded_nocase = 'AB') IS UNKNOWN".to_string());
     }

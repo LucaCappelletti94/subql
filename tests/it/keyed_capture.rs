@@ -504,6 +504,37 @@ fn a_key_column_under_an_alias_is_still_the_key() {
     );
 }
 
+/// A condition used as a value, compared or computed with, is SQL each
+/// engine answers and the in-process language does not, so it is routed to a
+/// read with a reason rather than failing registration.
+#[test]
+fn a_condition_used_as_a_value_is_routed_to_a_read() {
+    for sql in [
+        "SELECT * FROM orders WHERE (status = 'paid') = true",
+        "SELECT * FROM orders WHERE true = (status = 'paid')",
+        "SELECT * FROM orders WHERE (status = 'paid') IS NOT DISTINCT FROM true",
+        "SELECT * FROM orders WHERE (id > 1) <> (status = 'paid')",
+    ] {
+        let (mut engine, _table) = setup(&[(1, "paid")]);
+        let registered = engine
+            .register(
+                SubscriptionRequest::<DefaultIds, SQLite>::new(9u64, sql),
+                (),
+            )
+            .unwrap_or_else(|error| panic!("{sql} is routed, not refused: {error:?}"));
+        assert!(
+            !matches!(registered.tier, Tier::InProcess(_)),
+            "{sql}: {:?}",
+            registered.tier
+        );
+        let reason = registered
+            .not_served_because
+            .map(|reason| reason.to_string())
+            .expect("a read tier says why");
+        assert!(reason.contains("condition"), "{sql}: {reason}");
+    }
+}
+
 /// A filter that reads a second table cannot be served by asking about the
 /// changed rows of the first.
 ///

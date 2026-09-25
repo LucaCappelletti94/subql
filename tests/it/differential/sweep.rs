@@ -579,6 +579,25 @@ mod tests {
         forms
     }
 
+    /// A bare boolean column wherever a condition is read: beside `AND` and
+    /// `OR` on either side, under `NOT`, and inside a truth test.
+    fn bare_boolean_forms(engine: Engine) -> Vec<&'static str> {
+        let mut forms = vec![
+            "flag",
+            "narrow = 3 AND flag",
+            "flag AND narrow = 3",
+            "flag OR narrow = 3",
+            "narrow = 3 OR flag",
+            "NOT flag",
+            "NOT (flag AND narrow = 3)",
+            "(narrow = 3 OR flag) IS NOT TRUE",
+        ];
+        if engine != Engine::Sqlite {
+            forms.push("(narrow = 3 AND flag) IS UNKNOWN");
+        }
+        forms
+    }
+
     /// Every NULL pairing of two integer columns and a boolean one, asked of
     /// the engine and of subql in process, which must both answer and agree
     /// on each.
@@ -649,6 +668,53 @@ mod tests {
             &mut SqliteOracle::open(),
             Engine::Sqlite,
             &null_safe_forms(Engine::Sqlite),
+        );
+    }
+
+    #[test]
+    fn bare_booleans_agree_with_sqlite_on_every_null_pairing() {
+        assert_null_pairings_agree(
+            &mut SqliteOracle::open(),
+            Engine::Sqlite,
+            &bare_boolean_forms(Engine::Sqlite),
+        );
+    }
+
+    #[test]
+    #[ignore = "requires Docker; run with --ignored"]
+    fn bare_booleans_agree_with_postgres_on_every_null_pairing() {
+        let db = crate::common::pg_database();
+        let mut oracle = crate::differential::oracle::PgOracle {
+            connection: db.connect(),
+        };
+        assert_null_pairings_agree(
+            &mut oracle,
+            Engine::Postgres,
+            &bare_boolean_forms(Engine::Postgres),
+        );
+    }
+
+    #[cfg(any(
+        feature = "executor-diesel-postgres",
+        feature = "executor-diesel-async-postgres",
+        feature = "executor-diesel-postgres-r2d2",
+        feature = "executor-diesel-mysql",
+        feature = "executor-diesel-async-mysql",
+        feature = "diesel-typed-mysql",
+        feature = "apply-patchset-mysql",
+        feature = "apply-patchset-mysql-async",
+    ))]
+    #[test]
+    #[ignore = "requires Docker; run with --ignored"]
+    fn bare_booleans_agree_with_mysql_on_every_null_pairing() {
+        let db = crate::common::mysql_database();
+        let mut oracle = crate::differential::oracle::MySqlOracle {
+            connection: db.connect(),
+        };
+        assert_null_pairings_agree(
+            &mut oracle,
+            Engine::MySql,
+            &bare_boolean_forms(Engine::MySql),
         );
     }
 

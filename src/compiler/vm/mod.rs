@@ -368,40 +368,23 @@ impl<B: Backend> Vm<B> {
                 self.stack.push(StackValue::Tri(result));
             }
 
-            // `Null` is a value here and `Missing` is still no answer: the
-            // row may hold anything in a cell the source did not carry.
             Instruction::NotDistinct(comparison) => {
-                let a = peek(&self.stack, 1, src)?;
-                let b = peek(&self.stack, 0, src)?;
-                let result = if a.is_missing() || b.is_missing() {
-                    Tri::Unknown
-                } else if a.is_null() || b.is_null() {
-                    if a.is_null() && b.is_null() {
-                        Tri::True
-                    } else {
-                        Tri::False
-                    }
-                } else if values_equal(comparison_context(src.program, *comparison)?, a, b)
-                    .map_err(VmError::Refused)?
-                {
-                    Tri::True
-                } else {
-                    Tri::False
-                };
+                let result = not_distinct(
+                    comparison_context(src.program, *comparison)?,
+                    peek(&self.stack, 1, src)?,
+                    peek(&self.stack, 0, src)?,
+                )?;
                 self.replace_top(2, result);
             }
 
-            // Whether an unknown came from an absent cell is not carried on the
-            // stack, so any absent cell read so far keeps an unknown unanswered.
+            Instruction::Truth => {
+                let result = value_truth(peek(&self.stack, 0, src)?)?;
+                self.replace_top(1, result);
+            }
+
             Instruction::IsTruth { value, negated } => {
                 let condition = self.pop_tri()?;
-                let result = if condition == Tri::Unknown && self.absent_column.is_some() {
-                    Tri::Unknown
-                } else if (condition == *value) != *negated {
-                    Tri::True
-                } else {
-                    Tri::False
-                };
+                let result = truth_test(condition, *value, *negated, self.absent_column.is_some());
                 self.stack.push(StackValue::Tri(result));
             }
 
@@ -821,6 +804,59 @@ fn referred<'s, B: Backend, E: CdcEvent<Backend = B>, DB: DatabaseLike>(
             _ => Err(BadOperand::Malformed),
         },
         StackValue::Value(_) | StackValue::Tri(_) => Err(BadOperand::NotAValue),
+    }
+}
+
+/// `a IS NOT DISTINCT FROM b`: `Null` is a value here and `Missing` is still
+/// no answer, since the row may hold anything in a cell the source did not
+/// carry.
+fn not_distinct<B: Backend>(
+    context: ComparisonContext<'_, B>,
+    a: &Value<B>,
+    b: &Value<B>,
+) -> Result<Tri, VmError> {
+    Ok(if a.is_missing() || b.is_missing() {
+        Tri::Unknown
+    } else if a.is_null() || b.is_null() {
+        if a.is_null() && b.is_null() {
+            Tri::True
+        } else {
+            Tri::False
+        }
+    } else if values_equal(context, a, b).map_err(VmError::Refused)? {
+        Tri::True
+    } else {
+        Tri::False
+    })
+}
+
+/// A boolean value's truth where a condition is read, unknown when absent.
+fn value_truth<B: Backend>(value: &Value<B>) -> Result<Tri, VmError> {
+    match value {
+        Value::Bool(flag) => Ok(if crate::backend::ScalarTruth::scalar_truth(flag) {
+            Tri::True
+        } else {
+            Tri::False
+        }),
+        absent if absent.is_absent() => Ok(Tri::Unknown),
+        _ => Err(VmError::TypeMismatch {
+            expected: "Bool",
+            got: "Value",
+        }),
+    }
+}
+
+/// Whether `condition` is `value`, negated for `IS NOT`.
+///
+/// Whether an unknown came from an absent cell is not carried on the stack,
+/// so any absent cell read so far keeps an unknown unanswered.
+fn truth_test(condition: Tri, value: Tri, negated: bool, read_absent_cell: bool) -> Tri {
+    if condition == Tri::Unknown && read_absent_cell {
+        Tri::Unknown
+    } else if (condition == value) != negated {
+        Tri::True
+    } else {
+        Tri::False
     }
 }
 

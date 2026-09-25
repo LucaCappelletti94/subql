@@ -100,6 +100,35 @@ fn each_engine_serves_the_truth_tests_it_accepts() {
 /// selected     1              1                   0          0
 /// ```
 #[test]
+fn sqlite_reads_a_stored_nonzero_boolean_as_true() {
+    for (predicate, selected) in [
+        ("flag", true),
+        ("flag IS TRUE", true),
+        ("flag IS NOT FALSE", true),
+        ("n = 1 AND flag", true),
+        ("NOT flag", false),
+        ("flag = true", false),
+    ] {
+        let database = ParserDB::parse::<SQLiteDialect>(DDL).unwrap();
+        let table = catalog_helpers::table_id::<Postgres, _>(&database, "t").unwrap();
+        let mut engine: SubscriptionEngine<TestEvent<SQLite>, DefaultIds, ParserDB> =
+            SubscriptionEngine::new(database, SQLiteDialect {});
+        engine
+            .register(SubscriptionRequest::new(
+                1u64,
+                format!("SELECT * FROM t WHERE {predicate}"),
+            ))
+            .unwrap();
+        // The decoder hands a `BOOLEAN` integer over as the integer it is.
+        let row = vec![Value::Int(1), Value::Int(1), Value::Int(3), Value::Bool(5)];
+        let inserted = engine.consumers(&TestEvent::insert(table, row)).unwrap();
+        assert_eq!(!inserted.inserted().is_empty(), selected, "{predicate}");
+    }
+}
+
+/// A non-boolean operand is where the engines disagree, so it is left to
+/// the engine: PostgreSQL raises and the others read a number's truth.
+#[test]
 fn a_non_boolean_operand_is_left_to_the_engine() {
     for predicate in ["n IS TRUE", "(n + 1) IS NOT FALSE"] {
         assert!(

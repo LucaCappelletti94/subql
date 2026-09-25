@@ -385,6 +385,19 @@ pub enum Instruction<B: Backend> {
         /// Whether `NOT` was written, which flips a present answer.
         negated: bool,
     },
+
+    // Truth of a value (pop 1 value, push Tri)
+    /// A boolean value read where a condition is read, as `flag` is in
+    /// `WHERE n = 3 AND flag`: its truth under the backend's
+    /// [`ScalarTruth`](crate::backend::ScalarTruth), `Tri::Unknown` for
+    /// `Null` or `Missing`.
+    ///
+    /// Not `= true`: SQLite keeps a boolean column as the integer stored in
+    /// it and reads any nonzero one as true here, where `= true` compares it
+    /// with `1`.
+    ///
+    /// Stack: `[..., value] -> [..., Tri]`.
+    Truth,
 }
 
 /// A compiled bytecode program.
@@ -565,6 +578,7 @@ impl<B: Backend> Clone for Instruction<B> {
                 value: *value,
                 negated: *negated,
             },
+            Self::Truth => Self::Truth,
         }
     }
 }
@@ -621,6 +635,7 @@ impl<B: Backend> core::fmt::Debug for Instruction<B> {
                 .field("value", value)
                 .field("negated", negated)
                 .finish(),
+            Self::Truth => f.write_str("Truth"),
         }
     }
 }
@@ -642,7 +657,8 @@ impl<B: Backend> PartialEq for Instruction<B> {
             | (Self::IsNotNull, Self::IsNotNull)
             | (Self::And, Self::And)
             | (Self::Or, Self::Or)
-            | (Self::Not, Self::Not) => true,
+            | (Self::Not, Self::Not)
+            | (Self::Truth, Self::Truth) => true,
             (Self::Add(a), Self::Add(b))
             | (Self::Subtract(a), Self::Subtract(b))
             | (Self::Multiply(a), Self::Multiply(b))
@@ -729,7 +745,7 @@ mod tests {
     #[test]
     fn every_instruction_keeps_its_persisted_tag() {
         let r = ComparisonRef::NONE;
-        let tagged: [(Instruction<Postgres>, u8); 27] = [
+        let tagged: [(Instruction<Postgres>, u8); 28] = [
             (Instruction::PushLiteral(Value::Null), 0),
             (Instruction::LoadColumn(0), 1),
             (Instruction::Equal(r), 2),
@@ -769,6 +785,7 @@ mod tests {
                 },
                 26,
             ),
+            (Instruction::Truth, 27),
         ];
         for (instruction, tag) in tagged {
             let bytes = postcard::to_allocvec(&instruction).expect("an instruction serializes");
