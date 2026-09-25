@@ -75,7 +75,8 @@ pub enum IntegerOverflow {
 }
 
 /// What a backend answers for a `LIKE` pattern whose last character is the
-/// escape character, so that it escapes nothing.
+/// escape character, so that it escapes nothing, whether that character is
+/// the default escape or one an `ESCAPE` clause names.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DanglingEscape {
     /// Raise once the matcher reaches it with input still to read, which is
@@ -84,17 +85,4 @@ pub enum DanglingEscape {
     /// Answer no-match, which is what MySQL answers whether or not input
     /// remains.
     NoMatch,
-}
-
-/// One engine's default `LIKE` escape, and what a dangling one does.
-///
-/// Together rather than as two constants: an engine with no default escape
-/// cannot have a dangling one, and this makes that a type-level fact rather
-/// than an unused second answer.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct LikeEscape {
-    /// The character that escapes the next character in a pattern.
-    pub character: char,
-    /// What a pattern ending with that character answers.
-    pub dangling: DanglingEscape,
 }

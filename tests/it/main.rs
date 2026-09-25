@@ -383,6 +383,8 @@ mod null_safe_equality;
 
 mod truth_tests;
 
+mod like_escape_clause;
+
 mod semantics_float_width;
 
 // Docker-free coverage for the connector session-setup seam (U8) over in-memory

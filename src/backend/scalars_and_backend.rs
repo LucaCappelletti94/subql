@@ -276,9 +276,30 @@ pub trait Backend: 'static {
     /// backslash, SQLite escapes with nothing, and guessing either way
     /// answers some pattern wrongly.
     ///
-    /// One answer rather than two constants: an engine with no default
-    /// escape cannot have a dangling one, so the two facts belong together.
-    const LIKE_ESCAPE: Option<crate::compiler::vm::refusal::LikeEscape>;
+    /// An `ESCAPE` clause replaces it, as [`Backend::like_escape_clause`]
+    /// reads the clause.
+    const LIKE_DEFAULT_ESCAPE: Option<char>;
+
+    /// What a `LIKE` pattern ending with its escape character answers.
+    ///
+    /// Required, and per backend, because the engines disagree: measured,
+    /// PostgreSQL raises once the matcher reaches it with input left, and
+    /// MySQL and SQLite answer no-match. Separate from the default escape
+    /// because an engine with none still has the rule once a clause names one.
+    const LIKE_DANGLING_ESCAPE: crate::compiler::vm::refusal::DanglingEscape;
+
+    /// The escape a written `ESCAPE 'x'` names, `None` for no escape.
+    ///
+    /// Required, and per backend, because the engines disagree beyond one
+    /// character: measured, `ESCAPE ''` is no escape on PostgreSQL, an error
+    /// on SQLite and a session setting on MySQL, which also rejects a
+    /// character outside ASCII.
+    ///
+    /// # Errors
+    ///
+    /// Why this engine does not read `written` as an escape the language
+    /// reproduces, which the refusal routing it to the engine names.
+    fn like_escape_clause(written: &str) -> Result<Option<char>, &'static str>;
 
     /// Column-name comparison for a written identifier against the catalog.
     ///

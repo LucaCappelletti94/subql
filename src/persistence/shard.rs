@@ -660,6 +660,8 @@ mod tests {
     /// wrong field entirely. v14 reads a bare boolean column as `= true`,
     /// which fails every dispatch under `AND`, `OR` and `NOT`, and a program
     /// kept from it would also absorb a fresh registration of the same filter.
+    /// Its `LIKE` also carries no escape field, so its bytes would decode
+    /// against a different shape.
     #[test]
     fn test_older_versions_rejected() {
         let catalog = make_catalog();

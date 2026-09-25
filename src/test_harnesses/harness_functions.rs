@@ -147,6 +147,11 @@ pub fn arb_instruction(u: &mut Unstructured<'_>) -> arbitrary::Result<Instructio
         }),
         21 => Ok(Instruction::Like {
             comparison: arb_comparison_ref(u)?,
+            escape: match u.int_in_range(0u8..=2)? {
+                0 => None,
+                1 => Some('\\'),
+                _ => Some('!'),
+            },
         }),
         // Jump instructions with bounded offsets (0..=31 to stay within any reasonable program)
         22 => Ok(Instruction::JumpIfFalse(u.int_in_range(0usize..=31)?)),

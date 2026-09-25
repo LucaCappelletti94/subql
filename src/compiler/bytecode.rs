@@ -317,6 +317,11 @@ pub enum Instruction<B: Backend> {
         /// its `ILIKE` folds ASCII under `C`, while SQLite's `LIKE` folds
         /// ASCII and has no `ILIKE` at all.
         comparison: ComparisonRef,
+        /// The escape character, from the written `ESCAPE` clause or the
+        /// engine's default. Resolved at registration only, so `None` means the
+        /// pattern has no escape character at all, never the engine's default.
+        /// A program built by hand spells PostgreSQL's backslash as `Some`.
+        escape: Option<char>,
     },
 
     // Control Flow (short-circuit evaluation)
@@ -567,8 +572,9 @@ impl<B: Backend> Clone for Instruction<B> {
                 lower: *lower,
                 upper: *upper,
             },
-            Self::Like { comparison } => Self::Like {
+            Self::Like { comparison, escape } => Self::Like {
                 comparison: *comparison,
+                escape: *escape,
             },
             Self::JumpIfFalse(offset) => Self::JumpIfFalse(*offset),
             Self::JumpIfTrue(offset) => Self::JumpIfTrue(*offset),
@@ -622,9 +628,10 @@ impl<B: Backend> core::fmt::Debug for Instruction<B> {
                 .field("lower", lower)
                 .field("upper", upper)
                 .finish(),
-            Self::Like { comparison } => f
+            Self::Like { comparison, escape } => f
                 .debug_struct("Like")
                 .field("comparison", comparison)
+                .field("escape", escape)
                 .finish(),
             Self::JumpIfFalse(offset) => f.debug_tuple("JumpIfFalse").field(offset).finish(),
             Self::JumpIfTrue(offset) => f.debug_tuple("JumpIfTrue").field(offset).finish(),
@@ -651,8 +658,17 @@ impl<B: Backend> PartialEq for Instruction<B> {
             | (Self::LessThanOrEqual(a), Self::LessThanOrEqual(b))
             | (Self::GreaterThan(a), Self::GreaterThan(b))
             | (Self::GreaterThanOrEqual(a), Self::GreaterThanOrEqual(b))
-            | (Self::NotDistinct(a), Self::NotDistinct(b))
-            | (Self::Like { comparison: a }, Self::Like { comparison: b }) => a == b,
+            | (Self::NotDistinct(a), Self::NotDistinct(b)) => a == b,
+            (
+                Self::Like {
+                    comparison: a,
+                    escape: ae,
+                },
+                Self::Like {
+                    comparison: b,
+                    escape: be,
+                },
+            ) => a == b && ae == be,
             (Self::IsNull, Self::IsNull)
             | (Self::IsNotNull, Self::IsNotNull)
             | (Self::And, Self::And)
@@ -773,7 +789,13 @@ mod tests {
                 19,
             ),
             (Instruction::Between { lower: r, upper: r }, 20),
-            (Instruction::Like { comparison: r }, 21),
+            (
+                Instruction::Like {
+                    comparison: r,
+                    escape: None,
+                },
+                21,
+            ),
             (Instruction::JumpIfFalse(1), 22),
             (Instruction::JumpIfTrue(1), 23),
             (Instruction::TermTruth(0), 24),

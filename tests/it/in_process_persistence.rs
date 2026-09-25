@@ -432,3 +432,41 @@ fn a_null_safe_equality_comes_back_answering_as_it_did() {
         .expect("dispatch");
     assert!(paid.inserted().is_empty());
 }
+
+/// A written `LIKE` escape comes back from its shard with the pattern it
+/// escapes, a literal `%` selected and any other character not.
+#[test]
+fn a_written_like_escape_comes_back_answering_as_it_did() {
+    let store = TempStore::new();
+    let mut engine = store.open(catalog());
+    engine
+        .register(SubscriptionRequest::new(
+            1u64,
+            "SELECT * FROM orders WHERE status LIKE 'p!%' ESCAPE '!'",
+        ))
+        .expect("the filter registers");
+    engine.snapshot_table(table("orders")).expect("snapshot");
+    drop(engine);
+
+    let mut restored = store.open(catalog());
+    assert_eq!(restored.subscription_count(), 1);
+    let row = |status: &str| {
+        TestEvent::insert(
+            table("orders"),
+            vec![
+                subql::backend::Value::Int(1),
+                subql::backend::Value::Float(1.0),
+                subql::backend::Value::String(status.into()),
+            ],
+        )
+    };
+    assert_eq!(
+        restored.consumers(&row("p%")).expect("dispatch").inserted(),
+        [1u64]
+    );
+    assert!(restored
+        .consumers(&row("px"))
+        .expect("dispatch")
+        .inserted()
+        .is_empty());
+}

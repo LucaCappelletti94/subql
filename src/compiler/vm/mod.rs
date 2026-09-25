@@ -41,7 +41,7 @@ use arithmetic::{
     arithmetic_add, arithmetic_divide, arithmetic_modulo, arithmetic_multiply, arithmetic_negate,
     arithmetic_subtract,
 };
-use refusal::{DanglingEscape, EvaluationRefusal, LikeEscape};
+use refusal::{DanglingEscape, EvaluationRefusal};
 use sql_traits::prelude::DatabaseLike;
 
 /// One fallible unary arithmetic operation, as the VM dispatches it.
@@ -523,7 +523,7 @@ impl<B: Backend> Vm<B> {
                 self.replace_top(3, result);
             }
 
-            Instruction::Like { comparison } => {
+            Instruction::Like { comparison, escape } => {
                 // The rule travels on the instruction, resolved at
                 // registration from both operands and from which of
                 // `LIKE` or `ILIKE` was written.
@@ -536,23 +536,19 @@ impl<B: Backend> Vm<B> {
                 let result = match (string, pattern) {
                     (string, pattern) if string.is_absent() || pattern.is_absent() => Tri::Unknown,
                     (Value::String(s), Value::String(p)) => {
-                        let escape = B::LIKE_ESCAPE.map(|escape| escape.character);
                         // The walk reports a dangling escape only where the engine
                         // refuses it, which is where the matcher reached it with
                         // input left. What that means is the engine's: PostgreSQL
                         // raises, MySQL answers no-match.
-                        let matched = match like.matches(s.as_ref(), p.as_ref(), escape, case) {
+                        let matched = match like.matches(s.as_ref(), p.as_ref(), *escape, case) {
                             Ok(matched) => matched,
-                            Err(PatternError::TrailingEscape) => match B::LIKE_ESCAPE {
-                                Some(LikeEscape {
-                                    dangling: DanglingEscape::Fails,
-                                    ..
-                                }) => {
+                            Err(PatternError::TrailingEscape) => match B::LIKE_DANGLING_ESCAPE {
+                                DanglingEscape::Fails => {
                                     return Err(VmError::Refused(
                                         EvaluationRefusal::LikePatternEndsWithEscape,
                                     ))
                                 }
-                                _ => false,
+                                DanglingEscape::NoMatch => false,
                             },
                         };
                         if matched {
@@ -1334,6 +1330,7 @@ mod tests {
             Instruction::PushLiteral(Value::String("h%".into())),
             Instruction::Like {
                 comparison: ComparisonRef::NONE,
+                escape: Some('\\'),
             },
         ]);
 

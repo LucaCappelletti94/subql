@@ -10,7 +10,7 @@ use crate::{RegisterError, TableId};
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use sql_traits::prelude::DatabaseLike;
-use sqlparser::ast::{BinaryOperator, Expr, UnaryOperator, Value as SqlValue};
+use sqlparser::ast::{BinaryOperator, Expr, UnaryOperator, Value as SqlValue, ValueWithSpan};
 use sqlparser_canonicalize::Canonicalizer;
 
 /// If `expr` is a bare column reference, return what a value of that column
@@ -838,7 +838,7 @@ where
                 expr,
                 pattern,
                 negated: *negated,
-                escaped: escape_char.is_some(),
+                escape: escape_char.as_deref(),
                 keyword: "LIKE",
                 operation: crate::backend::TextOperation::Pattern,
             },
@@ -859,7 +859,7 @@ where
                 expr,
                 pattern,
                 negated: *negated,
-                escaped: escape_char.is_some(),
+                escape: escape_char.as_deref(),
                 keyword: "ILIKE",
                 operation: crate::backend::TextOperation::CaseInsensitivePattern,
             },
@@ -969,7 +969,8 @@ struct PatternMatch<'sql> {
     expr: &'sql Expr,
     pattern: &'sql Expr,
     negated: bool,
-    escaped: bool,
+    /// The written `ESCAPE` clause, if any.
+    escape: Option<&'sql Expr>,
     /// The keyword to name in a refusal, `LIKE` or `ILIKE`.
     keyword: &'static str,
     operation: crate::backend::TextOperation,
@@ -988,12 +989,24 @@ where
     B: Backend + SqlLiteralParse,
     DB: DatabaseLike,
 {
-    if node.escaped {
-        return Err(RegisterError::UnsupportedSql(format!(
-            "{} ESCAPE not yet supported",
-            node.keyword
-        )));
-    }
+    // The written clause replaces the engine's default escape.
+    let escape = match node.escape {
+        None => B::LIKE_DEFAULT_ESCAPE,
+        Some(written) => match written {
+            Expr::Value(ValueWithSpan {
+                value: SqlValue::SingleQuotedString(character),
+                ..
+            }) => B::like_escape_clause(character).map_err(|reason| {
+                RegisterError::UnsupportedSql(format!("{} ESCAPE: {reason}", node.keyword))
+            })?,
+            _ => {
+                return Err(RegisterError::UnsupportedSql(format!(
+                    "{} ESCAPE is served with a quoted character only",
+                    node.keyword
+                )))
+            }
+        },
+    };
     for operand in [node.expr, node.pattern] {
         compile_expr_recursive::<B, DB>(
             operand,
@@ -1006,7 +1019,7 @@ where
     }
     let comparison =
         out.comparison_for(node.expr, node.pattern, table_id, database, node.operation)?;
-    out.push(Instruction::Like { comparison });
+    out.push(Instruction::Like { comparison, escape });
     if node.negated {
         out.push(Instruction::Not);
     }

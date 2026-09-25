@@ -19,7 +19,7 @@ use subql::backend::{
 use subql::backend::{NumericWidening, TextOperation, TextRule, ValueKind, ValueKindOf};
 use subql::compiler::vm::arithmetic::{checked_integer_binary, checked_integer_negate};
 use subql::compiler::vm::refusal::{
-    ArithmeticOp, DanglingEscape, DivisionByZero, EvaluationRefusal, IntegerOverflow, LikeEscape,
+    ArithmeticOp, DanglingEscape, DivisionByZero, EvaluationRefusal, IntegerOverflow,
 };
 use subql::compiler::SqlLiteralParse;
 use subql::testing::TestEvent;
@@ -119,10 +119,13 @@ impl Backend for Custom {
 
     /// This backend speaks the PostgreSQL dialect, so it takes
     /// PostgreSQL's `LIKE` escape rule with it.
-    const LIKE_ESCAPE: Option<LikeEscape> = Some(LikeEscape {
-        character: '\\',
-        dangling: DanglingEscape::Fails,
-    });
+    const LIKE_DEFAULT_ESCAPE: Option<char> = Some('\\');
+
+    const LIKE_DANGLING_ESCAPE: DanglingEscape = DanglingEscape::Fails;
+
+    fn like_escape_clause(written: &str) -> Result<Option<char>, &'static str> {
+        <subql::backend::Postgres as Backend>::like_escape_clause(written)
+    }
 
     /// PostgreSQL's dialect, so PostgreSQL's rule.
     const DIVISION_BY_ZERO: DivisionByZero = DivisionByZero::Fails;

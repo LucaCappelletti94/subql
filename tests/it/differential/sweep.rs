@@ -301,6 +301,7 @@ where
     let mut outcome = Ok(());
     for predicate in predicate_forms(engine) {
         counts.borrow_mut().forms += 1;
+        let form = predicate.clone();
         let mut runner = TestRunner::new(ProptestConfig {
             cases: rows_per_form,
             failure_persistence: Some(Box::new(
@@ -351,6 +352,7 @@ where
                     let subql_selects = *subql_tri == Tri::True;
                     if engine_selects == subql_selects {
                         counts.agreed += 1;
+                        counts.compared.insert(form.clone());
                     } else {
                         return Err(TestCaseError::fail(format!(
                             "{engine:?} answered {engine_tri:?} and subql answered \
@@ -389,6 +391,9 @@ pub struct Sweep {
     pub needs_read: u32,
     /// Cases subql refused the arithmetic for.
     pub subql_refused: u32,
+    /// Forms that produced at least one compared row, so a form subql routes
+    /// on every row cannot pass for one it serves.
+    pub compared: std::collections::BTreeSet<String>,
     /// The first divergence, with its reproduction.
     pub failure: Option<String>,
 }
@@ -432,6 +437,16 @@ mod tests {
     use proptest::strategy::{Strategy as _, ValueTree as _};
     use proptest::test_runner::TestRunner;
 
+    /// Every form `engine` serves in process produced a compared row.
+    fn assert_served_forms_compared(found: &super::Sweep, engine: Engine) {
+        for form in crate::differential::generators::served_forms(engine) {
+            assert!(
+                found.compared.contains(form),
+                "{engine:?} compared no row of `{form}`, so it was routed on every row: {found:?}"
+            );
+        }
+    }
+
     /// The sweep compares, and says how much it compared.
     ///
     /// A harness that skipped every case would pass every assertion
@@ -456,6 +471,7 @@ mod tests {
             crate::differential::generators::predicate_forms(Engine::Sqlite).len(),
             "every predicate form is swept, not sampled: {found:?}"
         );
+        assert_served_forms_compared(&found, Engine::Sqlite);
     }
 
     /// The depth CI sets is the depth the sweep runs.
@@ -496,6 +512,7 @@ mod tests {
             usize::try_from(found.forms).expect("a form count fits a usize"),
             crate::differential::generators::predicate_forms(Engine::Postgres).len()
         );
+        assert_served_forms_compared(&found, Engine::Postgres);
     }
 
     /// And against MySQL, whose division scale and padding collations no
@@ -528,6 +545,7 @@ mod tests {
             usize::try_from(found.forms).expect("a form count fits a usize"),
             crate::differential::generators::predicate_forms(Engine::MySql).len()
         );
+        assert_served_forms_compared(&found, Engine::MySql);
     }
 
     /// Null-safe equality in the spelling `engine` accepts, both polarities,
