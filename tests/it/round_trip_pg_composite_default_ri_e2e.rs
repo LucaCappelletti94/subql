@@ -38,7 +38,7 @@ use subql::backend::SQLite as SqliteBackend;
 use subql::emit::{wal2json_patchset_builder, WireTable};
 use subql::patchset::{PgAdapter, SqliteAdapter};
 use subql::testing::TestEvent;
-use subql::{parse_wal2json_v2, ChangeEvent, DefaultIds, MessageV2, SubscriptionEngine};
+use subql::{DefaultIds, MessageV2, PgChangeEvent, SubscriptionEngine, Wal2JsonV2Event};
 
 const SLOT: &str = "rt_composite_slot";
 
@@ -179,11 +179,10 @@ fn mutate_dml(pg: &mut PgConnection) {
 
 /// Drain every pending wal2json v2 change and parse it to row events.
 fn drain(pg: &mut PgConnection, slot: &str) -> Vec<MessageV2> {
-    let mut events = Vec::new();
-    for line in &common::drain_slot(pg, slot) {
-        events.extend(parse_wal2json_v2(line.as_bytes()).unwrap());
-    }
-    events
+    common::read_wal2json_v2(&common::drain_slot(pg, slot))
+        .into_iter()
+        .map(Wal2JsonV2Event::into_message)
+        .collect()
 }
 
 fn finish_loop(
@@ -229,7 +228,7 @@ fn finish_loop(
 
     sql_query("TRUNCATE regions").execute(pg).unwrap();
 
-    let pg_engine: SubscriptionEngine<ChangeEvent, DefaultIds, ParserDB> =
+    let pg_engine: SubscriptionEngine<PgChangeEvent, DefaultIds, ParserDB> =
         SubscriptionEngine::new(subql_catalog(), PostgreSqlDialect {});
     let pg_adapter = PgAdapter::new(pg_engine.database()).expect("the catalog indexes");
 

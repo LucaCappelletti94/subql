@@ -32,7 +32,7 @@ use diesel_sqlite_session::SqliteSessionExt;
 use sql_traits::structs::ParserDB;
 use sqlparser::dialect::PostgreSqlDialect;
 use subql::patchset::PgAdapter;
-use subql::{ChangeEvent, DefaultIds, SubscriptionEngine};
+use subql::{DefaultIds, PgChangeEvent, SubscriptionEngine};
 
 const PG_DDL: &str = "CREATE TABLE items (id INT PRIMARY KEY, label TEXT, qty INT)";
 const SUBQL_PG_DDL: &str = "CREATE TABLE items (id INT PRIMARY KEY, label TEXT, qty INT);";
@@ -118,10 +118,11 @@ fn round_trip_pk_change_via_changeset() {
     assert!(!changeset.is_empty(), "session recorded no changes");
 
     // Apply the client changeset to the server
-    let pg_engine: SubscriptionEngine<ChangeEvent, DefaultIds, ParserDB> = SubscriptionEngine::new(
-        ParserDB::parse::<PostgreSqlDialect>(SUBQL_PG_DDL).unwrap(),
-        PostgreSqlDialect {},
-    );
+    let pg_engine: SubscriptionEngine<PgChangeEvent, DefaultIds, ParserDB> =
+        SubscriptionEngine::new(
+            ParserDB::parse::<PostgreSqlDialect>(SUBQL_PG_DDL).unwrap(),
+            PostgreSqlDialect {},
+        );
     let pg_adapter = PgAdapter::new(pg_engine.database()).expect("the catalog indexes");
     pg_engine
         .apply_diffset_bytes(&changeset, &mut pg, &pg_adapter)

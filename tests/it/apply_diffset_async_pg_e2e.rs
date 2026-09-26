@@ -31,7 +31,7 @@ use sqlite_diff_rs::{
 };
 use sqlparser::dialect::PostgreSqlDialect;
 use subql::patchset::PgAdapter;
-use subql::{ChangeEvent, DefaultIds, SubscriptionEngine};
+use subql::{DefaultIds, PgChangeEvent, SubscriptionEngine};
 
 const DDL: &str = "CREATE TABLE items (id INT PRIMARY KEY, label TEXT, qty INT);";
 const PG_DDL: &str = "CREATE TABLE items (id INT PRIMARY KEY, label TEXT, qty INT)";
@@ -56,7 +56,7 @@ fn items_table() -> SimpleTable {
     SimpleTable::new("items", &["id", "label", "qty"], &[0])
 }
 
-fn engine() -> SubscriptionEngine<ChangeEvent, DefaultIds, ParserDB> {
+fn engine() -> SubscriptionEngine<PgChangeEvent, DefaultIds, ParserDB> {
     let catalog = ParserDB::parse::<PostgreSqlDialect>(DDL).expect("parse subql DDL");
     SubscriptionEngine::new(catalog, PostgreSqlDialect {})
 }

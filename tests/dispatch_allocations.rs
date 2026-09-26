@@ -9,7 +9,7 @@ use sqlparser::dialect::PostgreSqlDialect;
 use std::sync::Mutex;
 use subql::backend::{CdcEvent, Postgres};
 use subql::testing::dispatch_fixtures::{bench_catalog_folded, make_test_event_folded, mix_seed};
-use subql::wal::{parse_wal2json_v2, MessageV2};
+use subql::wal::{Wal2JsonV2Event, Wal2JsonV2Reader};
 use subql::{DefaultIds, SubscriptionEngine, SubscriptionRequest};
 
 #[global_allocator]
@@ -66,12 +66,14 @@ fn assert_flat_in_subscriptions<E: CdcEvent<Backend = Postgres>>(
 
 /// A wal2json insert carrying only the key and the `folded` text cell,
 /// which the wire format decodes into a fresh `String` on every read.
-fn wal2json_insert(seed: u64) -> MessageV2 {
+fn wal2json_insert(seed: u64) -> Wal2JsonV2Event {
     let json = format!(
         r#"{{"action":"I","schema":"public","table":"orders","columns":[{{"name":"id","type":"integer","value":{seed}}},{{"name":"folded","type":"text","value":"ship{seed}"}}]}}"#,
         seed = seed % 1_000
     );
-    parse_wal2json_v2(json.as_bytes()).unwrap().remove(0)
+    let mut reader = Wal2JsonV2Reader::new();
+    reader.parse(br#"{"action":"B"}"#).unwrap();
+    reader.parse(json.as_bytes()).unwrap().unwrap()
 }
 
 #[test]

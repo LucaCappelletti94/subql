@@ -1,10 +1,12 @@
 //! Push-based Postgres CDC source driven by `pg_walstream`'s native backend.
 //!
 //! Owns a `pg_walstream::PgReplicationConnection` opened in replication
-//! mode plus an attached `START_REPLICATION` stream. Surfaces typed
-//! [`crate::ChangeEvent`] values through the [`crate::CdcSource`]
-//! trait, each stamped with the `XLogData` header's LSN. Acks flow back
-//! so the slot's `confirmed_flush_lsn` tracks reality.
+//! mode plus an attached `START_REPLICATION` stream. Surfaces each row
+//! change as a [`crate::PgChangeEvent`] through the [`crate::CdcSource`]
+//! trait, placed in commit order by its transaction's commit position and
+//! its ordinal in that transaction. Acks flow back so the slot's
+//! `confirmed_flush_lsn` tracks what the consumer has applied, one whole
+//! transaction at a time.
 
 use alloc::format;
 use alloc::string::{String, ToString};
@@ -14,12 +16,12 @@ use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use core::time::Duration;
 
 use pg_walstream::error::ReplicationError;
-use pg_walstream::{ChangeEvent, Lsn, PgOutputDecoder, PgReplicationConnection};
+use pg_walstream::{Lsn, PgOutputDecoder, PgReplicationConnection};
 use sql_traits::prelude::DatabaseLike;
 use tokio_util::sync::CancellationToken;
 
-use super::into_engine_events;
-use crate::PgLsn;
+use super::{PgChangeEvent, PgOutputOrder, ReleaseQueue, TransactionOrderError};
+use crate::{PgCommitPosition, PgLsn};
 
 mod wire_format_helpers;
 use wire_format_helpers::{
@@ -46,9 +48,12 @@ pub struct PgStreamingConfig {
     /// Name of the publication the slot should follow
     /// (`CREATE PUBLICATION pub FOR TABLE ...`).
     pub publication_name: String,
-    /// Optional resume position. `None` starts from the slot's current
-    /// `confirmed_flush_lsn`.
-    pub start_lsn: Option<PgLsn>,
+    /// Optional resume position. The source delivers only the events after
+    /// it. `None` starts from the slot's current `confirmed_flush_lsn`.
+    ///
+    /// Any checkpoint a source delivered resumes exactly after that event,
+    /// including one in the middle of a transaction.
+    pub start: Option<PgCommitPosition>,
     /// Cadence at which the source sends `StandbyStatusUpdate` ack
     /// messages even without explicit consumer acks. Must be shorter
     /// than the server's `wal_sender_timeout` (default 60s).
@@ -61,7 +66,7 @@ pub struct PgStreamingConfig {
 
 impl PgStreamingConfig {
     /// Build a config with sensible defaults for the optional fields:
-    /// `start_lsn = None` (resume from the slot's current position),
+    /// `start = None` (resume from the slot's current position),
     /// `status_interval = 10s`, `buffer_capacity = 1024`.
     #[must_use]
     pub fn new(
@@ -73,7 +78,7 @@ impl PgStreamingConfig {
             url: url.into(),
             slot_name: slot_name.into(),
             publication_name: publication_name.into(),
-            start_lsn: None,
+            start: None,
             status_interval: Duration::from_secs(10),
             buffer_capacity: 1024,
         }
@@ -82,8 +87,8 @@ impl PgStreamingConfig {
     /// Override the resume position. `None` means "start from the
     /// slot's current `confirmed_flush_lsn`".
     #[must_use]
-    pub const fn start_lsn(mut self, start_lsn: Option<PgLsn>) -> Self {
-        self.start_lsn = start_lsn;
+    pub const fn start(mut self, start: Option<PgCommitPosition>) -> Self {
+        self.start = start;
         self
     }
 
@@ -117,6 +122,10 @@ pub enum PgStreamingError {
     /// upstream connection was lost or the source was dropped.
     #[error("streaming source shut down")]
     SourceClosed,
+    /// The stream's transaction frames were out of place, so its rows could
+    /// not be placed in commit order.
+    #[error("replication stream out of order: {0}")]
+    TransactionOrder(#[from] TransactionOrderError),
 }
 
 /// One point where a later timeline branched from `timeline`.
@@ -148,8 +157,8 @@ pub struct ClusterIdentity {
 /// the lifecycle contract.
 pub struct PgStreamingCdcSource {
     config: PgStreamingConfig,
-    event_rx: tokio::sync::mpsc::Receiver<Result<ChangeEvent, PgStreamingError>>,
-    ack_tx: tokio::sync::mpsc::UnboundedSender<PgLsn>,
+    event_rx: tokio::sync::mpsc::Receiver<Result<PgChangeEvent, PgStreamingError>>,
+    ack_tx: tokio::sync::mpsc::UnboundedSender<PgCommitPosition>,
     status_updates_sent: Arc<AtomicU64>,
     events_received: Arc<AtomicU64>,
     /// The furthest position seen on a frame, and the position last
@@ -187,8 +196,8 @@ impl PgStreamingCdcSource {
     ///   `replication=database` if the caller did not.
     ///
     /// `catalog` is retained for API stability and is currently unused.
-    /// The source yields raw `ChangeEvent`s that the engine resolves
-    /// against its own catalog at dispatch time.
+    /// The engine resolves the events against its own catalog at dispatch
+    /// time.
     #[allow(clippy::needless_pass_by_value)]
     pub async fn connect<DB: DatabaseLike + 'static>(
         config: PgStreamingConfig,
@@ -197,7 +206,8 @@ impl PgStreamingCdcSource {
         let conninfo = ensure_replication_param(&config.url);
         let slot_name = config.slot_name.clone();
         let publication_names = config.publication_name.clone();
-        let start_lsn = config.start_lsn.unwrap_or(PgLsn(0)).0;
+        let start = config.start;
+        let replication_start = start.map_or(0, |position| position.commit_lsn().0);
 
         // libpq connect + IDENTIFY_SYSTEM + START_REPLICATION are all
         // synchronous calls that block on socket I/O. Bounce through the
@@ -222,7 +232,7 @@ impl PgStreamingCdcSource {
                     .get_value(0, 0)
                     .and_then(|text| pg_walstream::parse_lsn(&text).ok())
                     .unwrap_or(0);
-                conn.start_replication(&slot_name, start_lsn, &options)?;
+                conn.start_replication(&slot_name, replication_start, &options)?;
                 Ok((conn, base, cluster_identity))
             })
             .await
@@ -250,6 +260,7 @@ impl PgStreamingCdcSource {
         let task = tokio::spawn(streaming_task(
             conn,
             base_lsn,
+            start,
             event_tx,
             ack_rx,
             task_status_counter,
@@ -287,7 +298,7 @@ impl PgStreamingCdcSource {
         self.status_updates_sent.load(Ordering::Relaxed)
     }
 
-    /// Cumulative number of typed [`ChangeEvent`]s the inner task has
+    /// Cumulative number of [`PgChangeEvent`]s the inner task has
     /// pushed onto the consumer-facing channel since `connect`.
     /// Symmetric with
     /// [`crate::polling::PollingPgCdcSource::events_received`].
@@ -312,12 +323,10 @@ impl PgStreamingCdcSource {
 
     /// Latest position this source has reported to the server as flushed.
     ///
-    /// `None` until the first [`CdcSource::ack`](crate::CdcSource::ack),
-    /// which is also the state in which the slot has released nothing.
-    ///
-    /// What the streaming task has sent, not what a caller has asked for.
-    /// `ack` returns once the position is queued for the task, so a read
-    /// taken immediately after it can still report the previous position.
+    /// `None` until the first [`CdcSource::ack`](crate::CdcSource::ack). It
+    /// advances to the end of the last transaction acknowledged in full, and
+    /// the task publishes it once the server has it, so a read right after
+    /// `ack` can still report the previous position.
     #[must_use]
     pub fn acknowledged_position(&self) -> Option<PgLsn> {
         self.acked_seen
@@ -372,7 +381,7 @@ impl Drop for PgStreamingCdcSource {
 }
 
 impl crate::CdcSource for PgStreamingCdcSource {
-    type Event = ChangeEvent;
+    type Event = PgChangeEvent;
     type Error = PgStreamingError;
 
     #[allow(clippy::manual_async_fn)]
@@ -389,7 +398,7 @@ impl crate::CdcSource for PgStreamingCdcSource {
     #[allow(clippy::manual_async_fn, clippy::unused_async)]
     fn ack(
         &mut self,
-        upto: PgLsn,
+        upto: PgCommitPosition,
     ) -> impl core::future::Future<Output = Result<(), Self::Error>> + Send {
         let send_result = self.ack_tx.send(upto);
         async move {
@@ -405,8 +414,9 @@ impl crate::CdcSource for PgStreamingCdcSource {
 async fn streaming_task(
     mut conn: PgReplicationConnection,
     base_lsn: u64,
-    event_tx: tokio::sync::mpsc::Sender<Result<ChangeEvent, PgStreamingError>>,
-    mut ack_rx: tokio::sync::mpsc::UnboundedReceiver<PgLsn>,
+    start: Option<PgCommitPosition>,
+    event_tx: tokio::sync::mpsc::Sender<Result<PgChangeEvent, PgStreamingError>>,
+    mut ack_rx: tokio::sync::mpsc::UnboundedReceiver<PgCommitPosition>,
     status_counter: Arc<AtomicU64>,
     events_counter: Arc<AtomicU64>,
     received_gauge: Arc<AtomicU64>,
@@ -419,6 +429,11 @@ async fn streaming_task(
     let _exit_guard = crate::wal::ExitFlagGuard(task_exited);
 
     let mut decoder = PgOutputDecoder::with_protocol_version(1);
+    let mut order = PgOutputOrder::new();
+    let mut rows: Vec<PgChangeEvent> = Vec::new();
+    let mut releases = ReleaseQueue::new();
+    // Whether the open transaction delivered a row past `start`.
+    let mut delivered = false;
     // Both start where the slot already is, which is what the gauges
     // published at connect. Starting at zero reports a client that has
     // received nothing and lets the first frame store a position below the
@@ -481,21 +496,51 @@ async fn streaming_task(
                         latest_received_lsn = latest_received_lsn.max(wal_end);
                         received_gauge.store(latest_received_lsn, Ordering::Relaxed);
 
-                        match decoder.decode_message(payload, Lsn::new(start_lsn)) {
-                            Ok(Some(change)) => {
-                                for ev in into_engine_events(change) {
-                                    events_counter.fetch_add(1, Ordering::Relaxed);
-                                    if event_tx.send(Ok(ev)).await.is_err() {
-                                        return;
-                                    }
-                                }
-                            }
-                            Ok(None) => {}
+                        let change = match decoder.decode_message(payload, Lsn::new(start_lsn)) {
+                            Ok(Some(change)) => change,
+                            Ok(None) => continue,
                             Err(e) => {
                                 let _ = event_tx.send(Err(PgStreamingError::Postgres(e))).await;
                                 return;
                             }
+                        };
+                        let committed = match order.apply(change, &mut rows) {
+                            Ok(committed) => committed,
+                            Err(e) => {
+                                let _ = event_tx.send(Err(e.into())).await;
+                                return;
+                            }
+                        };
+                        #[expect(clippy::iter_with_drain, reason = "the buffer is reused for every message")]
+                        for ev in rows.drain(..) {
+                            if start.is_some_and(|start| ev.position() <= start) {
+                                continue;
+                            }
+                            delivered = true;
+                            events_counter.fetch_add(1, Ordering::Relaxed);
+                            if event_tx.send(Ok(ev)).await.is_err() {
+                                return;
+                            }
                         }
+                        let Some(committed) = committed else { continue };
+                        if core::mem::take(&mut delivered) {
+                            releases.committed(committed);
+                        }
+                        // The consumer may have acknowledged the last row before its commit arrived.
+                        let Some(end) = releases.release() else { continue };
+                        latest_acked_lsn = latest_acked_lsn.max(end.0);
+                        if send_status_update(
+                            &mut conn,
+                            &status_counter,
+                            latest_received_lsn,
+                            latest_acked_lsn,
+                        )
+                        .await
+                        .is_err()
+                        {
+                            return;
+                        }
+                        acked_gauge.store(latest_acked_lsn, Ordering::Relaxed);
                     }
                     b'k' => {
                         if bytes.len() < PRIMARY_KEEPALIVE_LEN {
@@ -536,7 +581,10 @@ async fn streaming_task(
             }
             ack = ack_rx.recv() => {
                 let Some(upto) = ack else { continue; };
-                latest_acked_lsn = latest_acked_lsn.max(upto.0);
+                releases.acknowledge(upto);
+                if let Some(end) = releases.release() {
+                    latest_acked_lsn = latest_acked_lsn.max(end.0);
+                }
                 if send_status_update(
                     &mut conn,
                     &status_counter,

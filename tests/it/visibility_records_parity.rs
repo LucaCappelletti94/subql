@@ -44,7 +44,7 @@ use subql::visibility::records::{is_evaluable, records_from_row_view};
 use subql::visibility::shapes::Shapes;
 use subql::visibility::store::{Enumeration, Requery};
 use subql::visibility::EventRow;
-use subql::{catalog_helpers, parse_wal2json_v2, MessageV2, ParserDB};
+use subql::{catalog_helpers, ParserDB, Wal2JsonV2Event};
 
 const SLOT: &str = "records_parity_slot";
 
@@ -307,11 +307,8 @@ fn records_from_sql(conn: &mut PgConnection, sql: &str, conditional: bool) -> BT
         .collect()
 }
 
-fn drain(conn: &mut PgConnection, slot: &str) -> Vec<MessageV2> {
-    common::drain_slot(conn, slot)
-        .iter()
-        .flat_map(|line| parse_wal2json_v2(line.as_bytes()).unwrap())
-        .collect()
+fn drain(conn: &mut PgConnection, slot: &str) -> Vec<Wal2JsonV2Event> {
+    common::read_wal2json_v2(&common::drain_slot(conn, slot))
 }
 
 /// One fact, as both sides can spell it, the condition and its context
@@ -346,7 +343,7 @@ fn fact(record: &Record) -> Fact {
 /// Every record `description` implies over the `row` image of each event on
 /// its table.
 fn records_from_events(
-    events: &[MessageV2],
+    events: &[Wal2JsonV2Event],
     description: &RecordDescription,
     catalog: &ParserDB,
     row: RowKind,

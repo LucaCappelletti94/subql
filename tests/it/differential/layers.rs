@@ -587,7 +587,7 @@ mod streamed_tests {
         db: &common::PgDatabase,
         slot: &str,
         dml: &str,
-    ) -> (diesel::PgConnection, subql::ChangeEvent) {
+    ) -> (diesel::PgConnection, subql::PgChangeEvent) {
         let mut setup = db.connect();
         let mut writer = db.connect();
 
@@ -657,7 +657,7 @@ mod streamed_tests {
         );
         assert!(
             event.checkpoint().is_some(),
-            "a streamed event carries the LSN it was read at, which is what an ack advances"
+            "a streamed event carries its commit position, which is what an ack advances"
         );
         common::drop_slot(&mut setup, &slot);
     }

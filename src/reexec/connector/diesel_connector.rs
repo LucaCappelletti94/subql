@@ -248,7 +248,7 @@ where
     type Error = diesel::result::Error;
     /// Backend-agnostic v1 default: this connector does not read the
     /// underlying source's position. PG-aware variants
-    /// (`PgDieselConnector`) override this to `PgLsn` and read
+    /// (`PgDieselConnector`) override this to `PgCommitPosition` and read
     /// `pg_current_wal_lsn()` before the snapshot transaction.
     type Checkpoint = crate::NoCheckpoint;
     type Backend = B;

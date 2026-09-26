@@ -43,9 +43,14 @@ fn event(text: &str) -> impl CdcEvent<Backend = subql::backend::Postgres> {
                         {{"name":"single","type":"real","value":{text}}},
                         {{"name":"double","type":"double precision","value":{text}}}]}}"#
     );
-    let mut msgs = subql::wal::parse_wal2json_v2(payload.as_bytes()).expect("the payload parses");
-    assert_eq!(msgs.len(), 1);
-    msgs.remove(0)
+    let mut reader = subql::Wal2JsonV2Reader::new();
+    reader
+        .parse(br#"{"action":"B"}"#)
+        .expect("the begin parses");
+    reader
+        .parse(payload.as_bytes())
+        .expect("the payload parses")
+        .expect("an insert is a row event")
 }
 
 /// The cell a `real` column carries is the float4 value, widened, not the

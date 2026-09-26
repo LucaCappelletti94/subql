@@ -33,6 +33,9 @@ pub enum PgSqliteEmuError {
     /// `ChangeEvent` through the `PgOutputDecoder`.
     #[error("pgoutput decode: {0}")]
     PgOutput(#[from] ReplicationError),
+    /// The re-encoded frames were out of place in their transaction.
+    #[error("pgoutput transaction order: {0}")]
+    TransactionOrder(#[from] crate::TransactionOrderError),
     /// The changeset referenced a table the emulator's PG catalog does
     /// not know about. Fires when the caller ran DDL directly against
     /// the underlying `SqliteConnection` instead of routing it through

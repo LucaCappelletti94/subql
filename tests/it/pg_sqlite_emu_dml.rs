@@ -16,7 +16,7 @@
 #![allow(clippy::unwrap_used)]
 
 use subql::backend::{CdcEvent, RowKind, Value};
-use subql::{catalog_helpers, ChangeEvent, EventKind, PgSqliteEmuSource};
+use subql::{catalog_helpers, EventKind, PgChangeEvent, PgSqliteEmuSource};
 
 const SINGLE_PK_PG_DDL: &str =
     "CREATE TABLE orders (id INT PRIMARY KEY, price FLOAT, status TEXT);";
@@ -25,7 +25,7 @@ const COMPOSITE_PK_PG_DDL: &str = "CREATE TABLE items (\
     region_id INT, item_id INT, name TEXT, \
     PRIMARY KEY (region_id, item_id));";
 
-fn drain_one(source: &mut PgSqliteEmuSource) -> ChangeEvent {
+fn drain_one(source: &mut PgSqliteEmuSource) -> PgChangeEvent {
     source
         .poll_next_event()
         .expect("poll succeeds")

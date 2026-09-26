@@ -1,10 +1,12 @@
 //! WAL stream parsing: convert raw CDC bytes into typed
 //! [`CdcEvent`](crate::backend::CdcEvent)s.
 //!
-//! The pgoutput, wal2json, and Maxwell paths implement `CdcEvent` directly on
-//! the ecosystem message types (`pg_walstream::ChangeEvent`,
-//! `wal2json_events::{MessageV2, ChangeV1}`, and `maxwell_cdc::Message`). The
-//! [`WalParser`] trait remains for the SQLite changeset path.
+//! The pgoutput and wal2json v2 paths wrap the ecosystem message types
+//! (`pg_walstream::ChangeEvent`, `wal2json_events::MessageV2`) with the
+//! position each row takes in commit order, and the wal2json v1 and Maxwell
+//! paths implement `CdcEvent` directly on theirs (`ChangeV1`,
+//! `maxwell_cdc::Message`). The [`WalParser`] trait remains for the SQLite
+//! changeset path.
 
 mod change_event;
 mod maxwell;
@@ -14,11 +16,15 @@ pub(crate) mod pg_type;
 pub(crate) mod shared_helpers;
 #[cfg(feature = "std")]
 mod streaming;
+mod transaction_order;
 mod wal2json;
 pub(crate) mod wire_event;
 
+pub use change_event::PgChangeEvent;
 #[cfg(any(feature = "pg-streaming", feature = "pg-sqlite-emu"))]
-pub(crate) use change_event::into_engine_events;
+pub(crate) use change_event::PgOutputOrder;
+#[cfg(feature = "pg-streaming")]
+pub(crate) use change_event::ReleaseQueue;
 pub use maxwell::parse_messages as parse_maxwell;
 pub use maxwell::MaxwellEvent;
 pub use maxwell_cdc::Message as MaxwellMessage;
@@ -32,7 +38,8 @@ pub(crate) use shared_helpers::{changed_columns_by_name, resolve_table};
 pub use streaming::CdcSource;
 #[cfg(feature = "pg-streaming")]
 pub(crate) use streaming::ExitFlagGuard;
-pub use wal2json::{parse_wal2json_v1, parse_wal2json_v2};
+pub use transaction_order::TransactionOrderError;
+pub use wal2json::{parse_wal2json_v1, Wal2JsonV2Event, Wal2JsonV2Reader};
 pub use wal2json_events::{ChangeV1, MessageV2};
 
 use crate::{Checkpoint, TableId};
@@ -56,7 +63,7 @@ pub trait WalParser<DB: DatabaseLike>: Send + Sync {
     /// The [`Checkpoint`] type events from this parser anchor at.
     ///
     /// Must equal [`crate::backend::CdcEvent::Checkpoint`] on
-    /// [`Self::Event`]. PostgreSQL-flavored parsers choose [`crate::PgLsn`];
+    /// [`Self::Event`]. PostgreSQL-flavored parsers choose [`crate::PgCommitPosition`];
     /// MySQL parsers choose [`crate::MysqlBinlogPos`]; position-free
     /// parsers use [`crate::NoCheckpoint`].
     type Checkpoint: Checkpoint;
@@ -147,4 +154,8 @@ pub enum WalParseError {
     /// Unrecognized tuple data tag byte (expected 'n', 'u', or 't').
     #[error("Unknown tuple data tag: 0x{0:02X}")]
     UnknownTupleTag(u8),
+
+    /// A transaction boundary or row out of place in the stream.
+    #[error(transparent)]
+    TransactionOrder(#[from] TransactionOrderError),
 }

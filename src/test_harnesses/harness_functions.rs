@@ -23,7 +23,7 @@ use crate::compiler::vm::Vm;
 use crate::persistence::codec;
 use crate::persistence::shard::{deserialize_shard, ShardPayload};
 use crate::testing::TestEvent;
-use crate::wal::{parse_maxwell, parse_wal2json_v1, parse_wal2json_v2};
+use crate::wal::{parse_maxwell, parse_wal2json_v1, Wal2JsonV2Reader};
 use crate::DefaultIds;
 
 /// The permissive fuzz schema as a [`ParserDB`], parsed once per process.
@@ -512,7 +512,10 @@ pub fn harness_wal_json_postparse(data: &[u8]) {
             let _ = parse_wal2json_v1(&bytes);
         }
         1 => {
-            let _ = parse_wal2json_v2(&bytes);
+            // Opened first, so a row message reaches the row path rather than the order check.
+            let mut reader = Wal2JsonV2Reader::new();
+            let _ = reader.parse(br#"{"action":"B"}"#);
+            let _ = reader.parse(&bytes);
         }
         _ => {
             let _ = parse_maxwell(&bytes);
