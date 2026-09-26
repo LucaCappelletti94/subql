@@ -5,7 +5,7 @@ cd "$SRC/subql"
 cargo fuzz build -O --debug-assertions --fuzz-dir fuzz
 
 targets=$(cargo fuzz list --fuzz-dir fuzz)
-if [ -z "$targets" ]; then
+if [[ -z "$targets" ]]; then
     echo "cargo fuzz list named no target" >&2
     exit 1
 fi
