@@ -391,6 +391,8 @@ mod between_null_bound;
 
 mod pattern_operands;
 
+mod arithmetic_operands;
+
 mod column_subset;
 
 mod semantics_float_width;

@@ -565,6 +565,11 @@ where
                         | BinaryOperator::Multiply
                         | BinaryOperator::Divide
                         | BinaryOperator::Modulo => {
+                            refuse_non_numeric_operand::<B, DB>(left, table_id, database, depth)?;
+                            refuse_non_numeric_operand::<B, DB>(right, table_id, database, depth)?;
+                            refuse_mixed_arithmetic::<B, DB>(
+                                op, left, right, table_id, database, depth,
+                            )?;
                             let width = B::float_arithmetic_width(
                                 float_result_width::<B, DB>(left, table_id, database, depth),
                                 float_result_width::<B, DB>(right, table_id, database, depth),
@@ -868,6 +873,7 @@ where
                     // Unary + is no-op.
                 }
                 UnaryOperator::Minus => {
+                    refuse_non_numeric_operand::<B, DB>(inner, table_id, database, depth)?;
                     out.push(Instruction::Negate(float_result_width::<B, DB>(
                         expr, table_id, database, depth,
                     )));
@@ -1110,6 +1116,108 @@ fn is_text_operand<B: Backend, DB: DatabaseLike>(
         }) => true,
         _ => column_scalar_of::<B, DB>(operand, table_id, database)
             .is_some_and(|kind| kind.family() == Some(ScalarFamily::String)),
+    }
+}
+
+/// Refuse arithmetic over anything but a number. MySQL and SQLite read text
+/// as the number it starts with and a boolean as its integer, and PostgreSQL
+/// refuses both, a coercion subql does not reproduce.
+fn refuse_non_numeric_operand<B: Backend, DB: DatabaseLike>(
+    operand: &Expr,
+    table_id: TableId,
+    database: &DB,
+    depth: usize,
+) -> Result<(), RegisterError> {
+    if is_numeric_operand::<B, DB>(operand, table_id, database, depth) {
+        Ok(())
+    } else {
+        Err(RegisterError::UnsupportedSql(
+            "arithmetic is served over numbers only".to_string(),
+        ))
+    }
+}
+
+/// Refuse arithmetic whose operands carry two kinds, and `%` over anything
+/// but integers. Every engine widens `1 * 2.0` to a float where subql
+/// computes each kind with itself only, and `%` over a float is an error on
+/// PostgreSQL, a truncation to integers on SQLite and a remainder on MySQL.
+fn refuse_mixed_arithmetic<B: Backend, DB: DatabaseLike>(
+    op: &BinaryOperator,
+    left: &Expr,
+    right: &Expr,
+    table_id: TableId,
+    database: &DB,
+    depth: usize,
+) -> Result<(), RegisterError> {
+    let kind = |side: &Expr| {
+        nested_column_scalar_of::<B, DB>(side, table_id, database, depth)
+            .and_then(|kind| kind.family())
+    };
+    let (left_kind, right_kind) = (kind(left), kind(right));
+    if let (Some(left_kind), Some(right_kind)) = (left_kind, right_kind) {
+        if left_kind != right_kind {
+            return Err(RegisterError::UnsupportedSql(format!(
+                "arithmetic between a {left_kind:?} and a {right_kind:?} is not computed in process"
+            )));
+        }
+    }
+    let fractional = |side: &Expr, kind: Option<ScalarFamily>| {
+        kind.is_some_and(|kind| kind != ScalarFamily::Int)
+            || matches!(value_column(side), Expr::Value(ValueWithSpan {
+                value: SqlValue::Number(digits, _),
+                ..
+            }) if digits.contains(['.', 'e', 'E']))
+    };
+    if matches!(op, BinaryOperator::Modulo)
+        && (fractional(left, left_kind) || fractional(right, right_kind))
+    {
+        return Err(RegisterError::UnsupportedSql(
+            "% is computed in process over integers only".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// Whether `operand` is a number on every engine: a numeric column or
+/// literal, a bound parameter, `NULL`, or arithmetic over those.
+fn is_numeric_operand<B: Backend, DB: DatabaseLike>(
+    operand: &Expr,
+    table_id: TableId,
+    database: &DB,
+    depth: usize,
+) -> bool {
+    if depth >= sql_shape::MAX_EXPR_DEPTH {
+        return false;
+    }
+    match operand {
+        Expr::Value(ValueWithSpan {
+            value: SqlValue::Number(..) | SqlValue::Null | SqlValue::Placeholder(_),
+            ..
+        }) => true,
+        Expr::Nested(inner)
+        | Expr::UnaryOp {
+            op: UnaryOperator::Minus | UnaryOperator::Plus,
+            expr: inner,
+        } => is_numeric_operand::<B, DB>(inner, table_id, database, depth + 1),
+        Expr::BinaryOp {
+            left,
+            op:
+                BinaryOperator::Plus
+                | BinaryOperator::Minus
+                | BinaryOperator::Multiply
+                | BinaryOperator::Divide
+                | BinaryOperator::Modulo,
+            right,
+        } => {
+            is_numeric_operand::<B, DB>(left, table_id, database, depth + 1)
+                && is_numeric_operand::<B, DB>(right, table_id, database, depth + 1)
+        }
+        _ => column_scalar_of::<B, DB>(operand, table_id, database).is_some_and(|kind| {
+            matches!(
+                kind.family(),
+                Some(ScalarFamily::Int | ScalarFamily::Float | ScalarFamily::Decimal)
+            )
+        }),
     }
 }
 
