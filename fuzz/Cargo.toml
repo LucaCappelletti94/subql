@@ -111,3 +111,10 @@ path = "fuzz_targets/fuzz_snapshot_restore_roundtrip.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "fuzz_predicate_verdict_sqlite"
+path = "fuzz_targets/fuzz_predicate_verdict_sqlite.rs"
+test = false
+doc = false
+bench = false
