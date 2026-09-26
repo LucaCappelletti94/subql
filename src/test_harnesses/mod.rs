@@ -23,6 +23,7 @@
 
 pub(crate) mod aggregate_consistency;
 pub(crate) mod harness_functions;
+pub mod predicate_grammar;
 pub(crate) mod snapshot_restore;
 
 pub use aggregate_consistency::harness_aggregate_consistency;
@@ -30,6 +31,8 @@ pub use harness_functions::{
     fuzz_catalog, harness_canonicalize, harness_codec_decode, harness_deserialize_shard,
     harness_parse_sql, harness_vm_eval, harness_wal_json_postparse,
 };
+#[cfg(feature = "pg-sqlite-emu")]
+pub use predicate_grammar::harness_predicate_verdict_sqlite;
 #[cfg(feature = "pg-sqlite-emu")]
 pub use snapshot_restore::harness_sqlite_pgoutput_e2e;
 pub use snapshot_restore::{harness_pgoutput, harness_snapshot_restore_roundtrip};
@@ -281,6 +284,15 @@ mod regression_tests {
         replay_crashes(
             "fuzz_snapshot_restore_roundtrip",
             harness_snapshot_restore_roundtrip,
+        );
+    }
+
+    #[cfg(feature = "pg-sqlite-emu")]
+    #[test]
+    fn regression_fuzz_predicate_verdict_sqlite() {
+        replay_crashes(
+            "fuzz_predicate_verdict_sqlite",
+            super::harness_predicate_verdict_sqlite,
         );
     }
 
