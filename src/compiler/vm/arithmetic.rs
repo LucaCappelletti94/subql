@@ -110,6 +110,12 @@ pub(crate) fn arithmetic_add<B: Backend>(
     Ok(match (a, b) {
         (Value::Int(x), Value::Int(y)) => return B::integer_binary(ArithmeticOp::Add, x, y),
         (Value::Float(x), Value::Float(y)) => Value::Float(x + y),
+        (Value::Int(x), Value::Float(y)) => {
+            B::int_as_float(&x).map_or(Value::Null, |x| Value::Float(x + y))
+        }
+        (Value::Float(x), Value::Int(y)) => {
+            B::int_as_float(&y).map_or(Value::Null, |y| Value::Float(x + y))
+        }
         (Value::Decimal(x), Value::Decimal(y)) => Value::Decimal(x + y),
         _ => Value::Null,
     })
@@ -126,6 +132,12 @@ pub(crate) fn arithmetic_subtract<B: Backend>(
     Ok(match (a, b) {
         (Value::Int(x), Value::Int(y)) => return B::integer_binary(ArithmeticOp::Subtract, x, y),
         (Value::Float(x), Value::Float(y)) => Value::Float(x - y),
+        (Value::Int(x), Value::Float(y)) => {
+            B::int_as_float(&x).map_or(Value::Null, |x| Value::Float(x - y))
+        }
+        (Value::Float(x), Value::Int(y)) => {
+            B::int_as_float(&y).map_or(Value::Null, |y| Value::Float(x - y))
+        }
         (Value::Decimal(x), Value::Decimal(y)) => Value::Decimal(x - y),
         _ => Value::Null,
     })
@@ -142,6 +154,12 @@ pub(crate) fn arithmetic_multiply<B: Backend>(
     Ok(match (a, b) {
         (Value::Int(x), Value::Int(y)) => return B::integer_binary(ArithmeticOp::Multiply, x, y),
         (Value::Float(x), Value::Float(y)) => Value::Float(x * y),
+        (Value::Int(x), Value::Float(y)) => {
+            B::int_as_float(&x).map_or(Value::Null, |x| Value::Float(x * y))
+        }
+        (Value::Float(x), Value::Int(y)) => {
+            B::int_as_float(&y).map_or(Value::Null, |y| Value::Float(x * y))
+        }
         (Value::Decimal(x), Value::Decimal(y)) => Value::Decimal(x * y),
         _ => Value::Null,
     })
@@ -190,6 +208,18 @@ pub(crate) fn arithmetic_divide<B: Backend>(
             }
             Value::Float(x / y)
         }
+        (Value::Int(x), Value::Float(y)) => {
+            if let Some(null) = zero_divisor::<B, _>(&y, ArithmeticOp::Divide)? {
+                return Ok(null);
+            }
+            B::int_as_float(&x).map_or(Value::Null, |x| Value::Float(x / y))
+        }
+        (Value::Float(x), Value::Int(y)) => {
+            if let Some(null) = zero_divisor::<B, _>(&y, ArithmeticOp::Divide)? {
+                return Ok(null);
+            }
+            B::int_as_float(&y).map_or(Value::Null, |y| Value::Float(x / y))
+        }
         (Value::Decimal(x), Value::Decimal(y)) => {
             if let Some(null) = zero_divisor::<B, _>(&y, ArithmeticOp::Divide)? {
                 return Ok(null);
@@ -218,6 +248,14 @@ pub(crate) fn arithmetic_modulo<B: Backend>(
                 return Ok(null);
             }
             return B::integer_binary(ArithmeticOp::Modulo, x, y);
+        }
+        // Only SQLite's promotion of an overflowed integer reaches here, and
+        // SQLite truncates both operands back to integers, which is undefined
+        // past the integer range, so the overflow it continues is reported.
+        (Value::Float(_), _) | (_, Value::Float(_)) => {
+            return Err(EvaluationRefusal::IntegerOverflow {
+                operation: ArithmeticOp::Modulo,
+            })
         }
         _ => Value::Null,
     })
