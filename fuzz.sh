@@ -15,6 +15,7 @@ TARGETS=(
     fuzz_snapshot_restore_roundtrip
     fuzz_predicate_verdict_sqlite
     fuzz_engine_model_sqlite
+    fuzz_decoder_roundtrip
 )
 
 # libFuzzer runtime knobs (passed after `--` to cargo-fuzz):

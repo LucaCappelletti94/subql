@@ -125,3 +125,10 @@ path = "fuzz_targets/fuzz_engine_model_sqlite.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "fuzz_decoder_roundtrip"
+path = "fuzz_targets/fuzz_decoder_roundtrip.rs"
+test = false
+doc = false
+bench = false
