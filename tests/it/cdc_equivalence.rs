@@ -21,8 +21,8 @@ use sql_traits::structs::ParserDB;
 use sqlparser::dialect::PostgreSqlDialect;
 use subql::backend::{CdcEvent, RowKind, Value};
 use subql::{
-    CdcSource, ColumnId, EventKind, PgStreamingCdcSource, PgStreamingConfig, PollingPgCdcConfig,
-    PollingPgCdcSource, TableId,
+    CdcSource, ColumnId, EventKind, PgCommit, PgStreamingCdcSource, PgStreamingConfig,
+    PollingPgCdcConfig, PollingPgCdcSource, SourceItem, TableId,
 };
 
 const DDL: &str = "CREATE TABLE orders (id INT PRIMARY KEY, price FLOAT);";
@@ -137,22 +137,25 @@ fn canonicalize<E: CdcEvent<Backend = subql::backend::Postgres>>(
 /// `pg_streaming_e2e::next_item_delivers_an_insert_without_waiting_for_a_tick`.
 const DRAIN_HANG_GUARD: Duration = Duration::from_secs(30);
 
-async fn drain_n<S>(source: &mut S, n: usize) -> Vec<S::Event>
+/// The events and commits of the next `transactions` transactions.
+async fn drain_n<S>(source: &mut S, transactions: usize) -> (Vec<S::Event>, Vec<PgCommit>)
 where
-    S: CdcSource,
+    S: CdcSource<Commit = PgCommit>,
 {
-    let mut out = Vec::with_capacity(n);
-    while out.len() < n {
-        let item = tokio::time::timeout(DRAIN_HANG_GUARD, source.next_item())
+    let mut events = Vec::new();
+    let mut commits = Vec::with_capacity(transactions);
+    while commits.len() < transactions {
+        match tokio::time::timeout(DRAIN_HANG_GUARD, source.next_item())
             .await
             .expect("next_item timeout draining")
             .expect("next_item err")
-            .expect("source closed before drain target reached");
-        if let Some(ev) = item.into_event() {
-            out.push(ev);
+            .expect("source closed before drain target reached")
+        {
+            SourceItem::Event(event) => events.push(event),
+            SourceItem::Commit(commit) => commits.push(commit),
         }
     }
-    out
+    (events, commits)
 }
 
 #[test]
@@ -215,13 +218,18 @@ fn push_and_poll_observe_identical_event_streams() {
                 .unwrap_or_else(|e| panic!("delete id={id}: {e}"));
         }
 
-        let (push_events, poll_events) = tokio::join!(
+        // Every statement autocommits, so each is one transaction.
+        let ((push_events, push_commits), (poll_events, poll_commits)) = tokio::join!(
             drain_n(&mut push_source, N_TOTAL),
             drain_n(&mut poll_source, N_TOTAL)
         );
 
         assert_eq!(push_events.len(), N_TOTAL);
         assert_eq!(poll_events.len(), N_TOTAL);
+        assert_eq!(
+            push_commits, poll_commits,
+            "both transports name the same commits and the same ends"
+        );
 
         let canon_catalog =
             ParserDB::parse::<PostgreSqlDialect>(DDL).expect("parse DDL for canonicalize");

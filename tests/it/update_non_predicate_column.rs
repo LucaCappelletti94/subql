@@ -226,7 +226,10 @@ mod real_source {
             .expect("poll succeeds")
             .and_then(SourceItem::into_event)
             .expect("expected an event on the queue");
-        let _ = source.poll_next_item(); // commit
+        assert!(
+            matches!(source.poll_next_item(), Ok(Some(SourceItem::Commit(_)))),
+            "the row's commit follows it"
+        );
         ev
     }
 
