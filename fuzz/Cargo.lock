@@ -346,10 +346,15 @@ name = "diesel"
 version = "2.3.12"
 source = "git+https://github.com/LucaCappelletti94/diesel?branch=future#705e43404056739897f3a123be6332adf2b13d7a"
 dependencies = [
+ "bigdecimal",
  "bitflags",
+ "chrono",
  "diesel_derives",
  "downcast-rs",
  "libsqlite3-sys",
+ "num-bigint",
+ "num-integer",
+ "num-traits",
  "serde_json",
  "sqlite-wasm-rs",
  "time",
