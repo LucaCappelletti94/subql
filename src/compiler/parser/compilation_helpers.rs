@@ -1068,6 +1068,12 @@ where
     };
     for operand in [node.expr, node.pattern] {
         refuse_condition_operand(operand)?;
+        if !is_text_operand::<B, DB>(operand, table_id, database) {
+            return Err(RegisterError::UnsupportedSql(format!(
+                "{} is served over a text column, a string or NULL",
+                node.keyword
+            )));
+        }
     }
     for operand in [node.expr, node.pattern] {
         compile_expr_recursive::<B, DB>(
@@ -1086,6 +1092,25 @@ where
         out.push(Instruction::Not);
     }
     Ok(())
+}
+
+/// Whether a pattern match reads `operand` as text on every engine: a text
+/// column, a string, a bound parameter or `NULL`. MySQL and SQLite match a
+/// number or a boolean by its text rendering and PostgreSQL refuses it, a
+/// rendering subql does not reproduce.
+fn is_text_operand<B: Backend, DB: DatabaseLike>(
+    operand: &Expr,
+    table_id: TableId,
+    database: &DB,
+) -> bool {
+    match value_column(operand) {
+        Expr::Value(ValueWithSpan {
+            value: SqlValue::SingleQuotedString(_) | SqlValue::Null | SqlValue::Placeholder(_),
+            ..
+        }) => true,
+        _ => column_scalar_of::<B, DB>(operand, table_id, database)
+            .is_some_and(|kind| kind.family() == Some(ScalarFamily::String)),
+    }
 }
 
 /// The families a served `COALESCE` may answer in: the ones whose literal
