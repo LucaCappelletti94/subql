@@ -70,6 +70,8 @@ All notable changes to subql are recorded here. The format follows [Keep a Chang
 ### Fixed
 
 - `IS [NOT] NULL` over a condition, as in `WHERE (a > 0) IS NOT NULL`, asks whether the condition is unknown, as every engine does. It was compiled to a null test of a value, so every dispatch on the subscription's table failed with a VM type error and took every other subscription on that table with it.
+- A keyed re-read that a change with no key, such as a truncate, moves to a whole re-read is written to the store under its new tier. It was taken out of the reads file and never written back, so the next restart silently lost the subscription.
+- An in-process aggregate that stops mid-dispatch, on an update without its old image, a group cap or a sum out of range, is written to the store as the whole re-read it became. The store kept naming the stopped aggregate, so a restart brought back the tier the subscriber had been told was gone.
 - A keyed re-read asks about both keys of an update that moved a row's primary key. It asked only about the new one, so the row stayed in the subscriber's answer under its old key forever.
 - SQLite's `AVG` over an integer column divides the exact integer sum, as SQLite does, while no real value is among the rows. It divided a running double, so `2^53`, `1` and `-2^53` averaged `0` where SQLite answers `1/3`.
 - A filter comparing a float column with an integer bound, as in `price > 0` or `price < 1`, delivers a row whose value lies between two integers. The candidate index filed every range as integers, where `> 0` starts at `1`, so `price = 0.0025` was never considered. Only an integer column is filed by range now.

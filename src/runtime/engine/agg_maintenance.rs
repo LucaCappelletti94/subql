@@ -70,6 +70,7 @@ where
             SubscriptionScope::Durable => None,
             SubscriptionScope::Session(session) => Some(session),
         };
+        let table_id = self.subscription_to_table.get(&subscription_id).copied();
         let _ = self.unregister_subscription_internal(subscription_id);
         let reread = RereadRegistration {
             consumer: registration.consumer,
@@ -78,6 +79,12 @@ where
             database_reads_per_consumer: registration.database_reads_per_consumer,
         };
         let registered = self.capture_whole(subscription_id, plan, &reread);
+        // The reads file first, as `snapshot_table` orders them, so a failed
+        // shard write leaves the new tier named rather than the answer lost.
+        self.persist_reads_after_transition();
+        if let Some(table_id) = table_id {
+            self.persist_table_after_removal(table_id);
+        }
         let transition = crate::MaintenanceTransition {
             subscription_id,
             from: crate::TierKind::InProcess,
