@@ -2625,7 +2625,7 @@ dependencies = [
  "libc",
  "percent-encoding",
  "pin-project-lite",
- "socket2 0.6.5",
+ "socket2 0.5.10",
  "tokio",
  "tower-service",
  "tracing",
@@ -3855,7 +3855,7 @@ dependencies = [
 [[package]]
 name = "pg2sqlite"
 version = "0.1.0"
-source = "git+https://github.com/LucaCappelletti94/pg2sqlite?branch=main#b1684d615557aa38648f99ad3c681b84af16ae62"
+source = "git+https://github.com/LucaCappelletti94/pg2sqlite?branch=main#8d05c614b3a1ad2faad586d41830249e8af5139e"
 dependencies = [
  "sql-traits",
  "sqlparser",
@@ -4307,7 +4307,7 @@ dependencies = [
  "quinn-udp",
  "rustc-hash 2.1.3",
  "rustls",
- "socket2 0.6.5",
+ "socket2 0.5.10",
  "thiserror 2.0.20",
  "tokio",
  "tracing",
@@ -4345,7 +4345,7 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
- "socket2 0.6.5",
+ "socket2 0.5.10",
  "tracing",
  "windows-sys 0.61.2",
 ]
@@ -5210,7 +5210,7 @@ dependencies = [
 [[package]]
 name = "sql-traits"
 version = "0.1.0"
-source = "git+https://github.com/earth-metabolome-initiative/sql-traits?branch=main#2f5140fcfda8cba52ce1aea1662375133bafe299"
+source = "git+https://github.com/earth-metabolome-initiative/sql-traits?branch=main#8ab50b2a42485282ca25cd9db22c5fb7b910161a"
 dependencies = [
  "geometric-traits",
  "serde",
@@ -5261,7 +5261,7 @@ dependencies = [
 [[package]]
 name = "sqlparser"
 version = "0.63.0"
-source = "git+https://github.com/apache/datafusion-sqlparser-rs?branch=main#935288339bb2243999583b4fbaa8cbb84b93db37"
+source = "git+https://github.com/apache/datafusion-sqlparser-rs?branch=main#37df75e6566293117739d82a937eef25132c32bf"
 dependencies = [
  "log",
  "recursive",
@@ -5291,7 +5291,7 @@ dependencies = [
 [[package]]
 name = "sqlparser_derive"
 version = "0.6.0"
-source = "git+https://github.com/apache/datafusion-sqlparser-rs?branch=main#935288339bb2243999583b4fbaa8cbb84b93db37"
+source = "git+https://github.com/apache/datafusion-sqlparser-rs?branch=main#37df75e6566293117739d82a937eef25132c32bf"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -5532,7 +5532,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
