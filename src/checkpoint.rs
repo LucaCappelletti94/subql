@@ -99,7 +99,8 @@ impl PgLsn {
     }
 }
 
-/// Where a Postgres row change falls in commit order.
+/// Where a Postgres row change, or the commit that ends its transaction,
+/// falls in commit order.
 ///
 /// Ordered by the commit position of the change's transaction, the start of
 /// its commit record, and then by the change's ordinal within that
@@ -108,7 +109,8 @@ impl PgLsn {
 /// older transaction commits after a newer one.
 ///
 /// The ordinal counts a transaction's row events from 1 in message order.
-/// Ordinal 0 is the position of a read, see [`Self::before_commit`].
+/// Ordinal 0 is the position of a read, see [`Self::before_commit`], and
+/// `u64::MAX` is the position of the commit itself, see [`Self::at_commit`].
 ///
 /// # Examples
 ///
@@ -124,6 +126,10 @@ impl PgLsn {
 /// // A read at 1400 reflects T2 and not T1.
 /// let read = PgCommitPosition::before_commit(PgLsn(1400));
 /// assert!(t2_row < read && read < t1_first);
+///
+/// // T1's commit follows its rows, and a transaction committing later follows it.
+/// let t1_commit = PgCommitPosition::at_commit(PgLsn(1500));
+/// assert!(t1_second < t1_commit && t1_commit < PgCommitPosition::before_commit(PgLsn(1501)));
 /// ```
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct PgCommitPosition {
@@ -167,13 +173,21 @@ impl PgCommitPosition {
         Self::new(lsn, 0)
     }
 
+    /// The commit of the transaction whose commit record starts at
+    /// `commit_lsn`, after every row of it and before every later transaction.
+    #[must_use]
+    pub const fn at_commit(commit_lsn: PgLsn) -> Self {
+        Self::new(commit_lsn, u64::MAX)
+    }
+
     /// Start of the commit record of the change's transaction.
     #[must_use]
     pub const fn commit_lsn(self) -> PgLsn {
         self.commit_lsn
     }
 
-    /// The change's place in its transaction, from 1, or 0 for a read.
+    /// The change's place in its transaction, from 1, or 0 for a read and
+    /// `u64::MAX` for the commit.
     #[must_use]
     pub const fn ordinal(self) -> u64 {
         self.ordinal

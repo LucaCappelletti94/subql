@@ -24,13 +24,13 @@ pub use runtime::SubscriptionEngine;
 pub use sqlite_cdc::{SqliteCdcError, SqliteCdcSource};
 pub use sqlite_cdc::{SqliteChangesetEvent, SqliteChangesetParser};
 pub use types::*;
-#[cfg(feature = "std")]
-pub use wal::CdcSource;
 pub use wal::{
     parse_maxwell, parse_wal2json_v1, ChangeEvent, ChangeV1, MaxwellEvent, MaxwellMessage,
-    MessageV2, PgChangeEvent, TransactionOrderError, Wal2JsonV2Event, Wal2JsonV2Reader,
+    MessageV2, PgChangeEvent, PgCommit, TransactionOrderError, Wal2JsonV2Event, Wal2JsonV2Reader,
     WalParseError, WalParser,
 };
+#[cfg(feature = "std")]
+pub use wal::{CdcSource, SourceItem, SourceItemOf};
 #[cfg(feature = "pg-streaming")]
 pub use wal::{
     ClusterIdentity, PgStreamingCdcSource, PgStreamingConfig, PgStreamingError, TimelineSwitch,

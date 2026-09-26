@@ -16,7 +16,7 @@
 #![allow(clippy::unwrap_used)]
 
 use subql::backend::{CdcEvent, RowKind, Value};
-use subql::{catalog_helpers, EventKind, PgChangeEvent, PgSqliteEmuSource};
+use subql::{catalog_helpers, EventKind, PgChangeEvent, PgSqliteEmuSource, SourceItem};
 
 const SINGLE_PK_PG_DDL: &str =
     "CREATE TABLE orders (id INT PRIMARY KEY, price FLOAT, status TEXT);";
@@ -26,10 +26,16 @@ const COMPOSITE_PK_PG_DDL: &str = "CREATE TABLE items (\
     PRIMARY KEY (region_id, item_id));";
 
 fn drain_one(source: &mut PgSqliteEmuSource) -> PgChangeEvent {
-    source
-        .poll_next_event()
+    let ev = source
+        .poll_next_item()
         .expect("poll succeeds")
-        .expect("expected an event on the queue")
+        .and_then(SourceItem::into_event)
+        .expect("expected an event on the queue");
+    assert!(
+        matches!(source.poll_next_item(), Ok(Some(SourceItem::Commit(_)))),
+        "the row's commit follows it"
+    );
+    ev
 }
 
 #[test]
@@ -154,7 +160,7 @@ fn single_pk_insert_update_delete_round_trip() {
     );
 
     assert!(
-        source.poll_next_event().unwrap().is_none(),
+        source.poll_next_item().unwrap().is_none(),
         "queue is empty after DELETE",
     );
 }
@@ -324,7 +330,7 @@ fn composite_pk_insert_update_delete_round_trip() {
     );
 
     assert!(
-        source.poll_next_event().unwrap().is_none(),
+        source.poll_next_item().unwrap().is_none(),
         "queue is empty after DELETE",
     );
 }
@@ -353,10 +359,15 @@ fn a_quoted_column_survives_the_update_fallback() {
         )
         .unwrap();
     let insert = source
-        .poll_next_event()
+        .poll_next_item()
         .expect("the INSERT drains without touching the fallback")
+        .and_then(SourceItem::into_event)
         .expect("an insert event");
     assert_eq!(insert.kind(), EventKind::Insert);
+    assert!(matches!(
+        source.poll_next_item(),
+        Ok(Some(SourceItem::Commit(_)))
+    ));
 
     // Touch only `note`, so the quoted column arrives as `(None, None)` and the
     // emulator has to go and read it.
@@ -396,10 +407,15 @@ fn the_update_fallback_preserves_storage_classes() {
         .execute_sql("INSERT INTO blobs (id, raw, maybe, note) VALUES (1, X'0102', NULL, 'keep')")
         .unwrap();
     let insert = source
-        .poll_next_event()
+        .poll_next_item()
         .expect("the INSERT drains without touching the fallback")
+        .and_then(SourceItem::into_event)
         .expect("an insert event");
     assert_eq!(insert.kind(), EventKind::Insert);
+    assert!(matches!(
+        source.poll_next_item(),
+        Ok(Some(SourceItem::Commit(_)))
+    ));
 
     source
         .execute_sql("UPDATE blobs SET note = 'changed' WHERE id = 1")

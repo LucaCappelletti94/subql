@@ -31,7 +31,7 @@ use proptest::prelude::*;
 use sqlparser::dialect::PostgreSqlDialect;
 use subql::backend::CdcEvent;
 use subql::{
-    DefaultIds, EventKind, PgChangeEvent, PgSqliteEmuSource, SubscriptionEngine,
+    DefaultIds, EventKind, PgChangeEvent, PgSqliteEmuSource, SourceItem, SubscriptionEngine,
     SubscriptionRequest,
 };
 
@@ -231,9 +231,14 @@ proptest! {
             };
 
             let event = source
-                .poll_next_event()
+                .poll_next_item()
                 .unwrap()
+                .and_then(SourceItem::into_event)
                 .expect("op should produce a drained event");
+            prop_assert!(
+                matches!(source.poll_next_item().unwrap(), Some(SourceItem::Commit(_))),
+                "each op is one transaction, so its commit follows its row",
+            );
             let notifs = engine.consumers(&event).unwrap();
 
             let mut actual_inserted: Vec<u64> = notifs.inserted().to_vec();
@@ -272,7 +277,7 @@ proptest! {
         // The interleaved drain above should have exhausted the queue
         // exactly, so any trailing event is a bookkeeping bug.
         prop_assert!(
-            source.poll_next_event().unwrap().is_none(),
+            source.poll_next_item().unwrap().is_none(),
             "emulator queue should be empty after all ops drained",
         );
     }

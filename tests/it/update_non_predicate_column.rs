@@ -220,10 +220,17 @@ mod real_source {
     );";
 
     fn drain_one(source: &mut PgSqliteEmuSource) -> PgChangeEvent {
-        source
-            .poll_next_event()
+        use subql::SourceItem;
+        let ev = source
+            .poll_next_item()
             .expect("poll succeeds")
-            .expect("expected an event on the queue")
+            .and_then(SourceItem::into_event)
+            .expect("expected an event on the queue");
+        assert!(
+            matches!(source.poll_next_item(), Ok(Some(SourceItem::Commit(_)))),
+            "the row's commit follows it"
+        );
+        ev
     }
 
     #[test]

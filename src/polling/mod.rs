@@ -37,8 +37,8 @@
 //!
 //! Polling reads through `pg_logical_slot_peek_binary_changes`, which does
 //! not consume, so the slot's `confirmed_flush_lsn` moves only when
-//! [`crate::CdcSource::ack`] says a transaction is applied. That is the same
-//! contract the push source answers.
+//! [`crate::CdcSource::ack`] reaches a transaction's [`crate::PgCommit`].
+//! That is the same contract the push source answers.
 //!
 //! [`CdcSource`]: crate::CdcSource
 
@@ -52,7 +52,7 @@ use pg_walstream::error::ReplicationError;
 use pg_walstream::PgReplicationConnection;
 use sql_traits::prelude::DatabaseLike;
 
-use crate::wal::{PgChangeEvent, TransactionOrderError};
+use crate::wal::{PgChangeEvent, PgCommit, PgSourceItem, TransactionOrderError};
 use crate::PgCommitPosition;
 
 pub(crate) mod helpers;
@@ -149,7 +149,7 @@ pub enum PollingPgCdcError {
 /// the retained WAL and the cost of a poll.
 pub struct PollingPgCdcSource {
     config: PollingPgCdcConfig,
-    event_rx: tokio::sync::mpsc::Receiver<Result<PgChangeEvent, PollingPgCdcError>>,
+    event_rx: tokio::sync::mpsc::Receiver<Result<PgSourceItem, PollingPgCdcError>>,
     /// Positions the consumer acknowledged, carried to the loop, which
     /// advances the slot on its next iteration.
     ack_tx: std::sync::mpsc::Sender<PgCommitPosition>,
@@ -334,13 +334,14 @@ impl Drop for PollingPgCdcSource {
 
 impl crate::CdcSource for PollingPgCdcSource {
     type Event = PgChangeEvent;
+    type Commit = PgCommit;
     type Error = PollingPgCdcError;
 
     #[allow(clippy::manual_async_fn)]
-    fn next_event(
+    fn next_item(
         &mut self,
-    ) -> impl core::future::Future<Output = Result<Option<Self::Event>, Self::Error>> + Send {
-        crate::wal::shared_helpers::recv_source_event(&mut self.event_rx)
+    ) -> impl core::future::Future<Output = Result<Option<PgSourceItem>, Self::Error>> + Send {
+        crate::wal::shared_helpers::recv_source_item(&mut self.event_rx)
     }
 
     // The body is sync, a channel send, but the trait requires

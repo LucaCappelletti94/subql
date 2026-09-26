@@ -133,16 +133,18 @@ impl<DB: DatabaseLike> SqliteCdcSource<DB> {
 
 impl<DB: DatabaseLike> crate::CdcSource for SqliteCdcSource<DB> {
     type Event = SqliteChangesetEvent;
+    type Commit = core::convert::Infallible;
     type Error = SqliteCdcError;
 
-    fn next_event(
+    fn next_item(
         &mut self,
-    ) -> impl core::future::Future<Output = Result<Option<Self::Event>, Self::Error>> + Send {
-        // `poll_next_event` never blocks. It touches the in-process
-        // session state and, on drain, the in-memory changeset buffer.
-        // Wrapping the sync body in `core::future::ready` avoids the
-        // extra state machine an `async` block would spin up.
-        core::future::ready(self.poll_next_event())
+    ) -> impl core::future::Future<Output = Result<Option<crate::SourceItemOf<Self>>, Self::Error>> + Send
+    {
+        // `poll_next_event` never blocks, so no state machine is needed.
+        core::future::ready(
+            self.poll_next_event()
+                .map(|event| event.map(crate::SourceItem::Event)),
+        )
     }
 
     fn ack(
@@ -327,9 +329,10 @@ mod tests {
             .execute(source.connection())
             .expect("insert");
 
-        let ev = <SqliteCdcSource<ParserDB> as crate::CdcSource>::next_event(&mut source);
-        let event = block_on(ev)
-            .expect("next_event succeeds")
+        let item = <SqliteCdcSource<ParserDB> as crate::CdcSource>::next_item(&mut source);
+        let event = block_on(item)
+            .expect("next_item succeeds")
+            .and_then(crate::SourceItem::into_event)
             .expect("one event pending");
         assert_eq!(event.kind(), crate::EventKind::Insert);
         assert_eq!(

@@ -610,11 +610,16 @@ mod streamed_tests {
                 .await
                 .expect("the replication connection opens");
             sql_query(dml).execute(&mut writer).expect("the DML lands");
-            tokio::time::timeout(STREAM_HANG_GUARD, source.next_event())
-                .await
-                .expect("the server streams the event")
-                .expect("the stream does not error")
-                .expect("the source is still open")
+            loop {
+                let item = tokio::time::timeout(STREAM_HANG_GUARD, source.next_item())
+                    .await
+                    .expect("the server streams the event")
+                    .expect("the stream does not error")
+                    .expect("the source is still open");
+                if let Some(ev) = item.into_event() {
+                    break ev;
+                }
+            }
         });
         (setup, event)
     }
@@ -622,7 +627,7 @@ mod streamed_tests {
     ///
     /// A hang guard, not a latency budget. That delivery rides the wire rather
     /// than a tick is asserted in
-    /// `pg_streaming_e2e::next_event_delivers_an_insert_without_waiting_for_a_tick`
+    /// `pg_streaming_e2e::next_item_delivers_an_insert_without_waiting_for_a_tick`
     /// and nowhere else. Here the deadline exists only so a stalled slot
     /// fails instead of hanging the run. Thirty seconds is what the rest of
     /// the container suite uses for the same purpose, at
@@ -829,11 +834,16 @@ mod streamed_tests {
             sql_query("UPDATE t SET wide = 2 WHERE id = 1")
                 .execute(&mut writer)
                 .expect("the update lands");
-            tokio::time::timeout(STREAM_HANG_GUARD, source.next_event())
-                .await
-                .expect("the server streams the event")
-                .expect("the stream does not error")
-                .expect("the source is still open")
+            loop {
+                let item = tokio::time::timeout(STREAM_HANG_GUARD, source.next_item())
+                    .await
+                    .expect("the server streams the event")
+                    .expect("the stream does not error")
+                    .expect("the source is still open");
+                if let Some(ev) = item.into_event() {
+                    break ev;
+                }
+            }
         });
 
         let database = ParserDB::parse::<PostgreSqlDialect>(DDL).expect("the DDL parses");

@@ -12,7 +12,7 @@ use core::time::Duration;
 
 use pg_walstream::{parse_lsn, Lsn, PgOutputDecoder, PgReplicationConnection};
 
-use crate::wal::{PgChangeEvent, PgOutputOrder, ReleaseQueue};
+use crate::wal::{PgChangeEvent, PgOutputOrder, PgSourceItem, ReleaseQueue, SourceItem};
 use crate::PgCommitPosition;
 
 use super::helpers::{hex_decode, render_lsn, sql_string_literal};
@@ -38,7 +38,7 @@ pub(super) fn polling_loop(
     slot_name: String,
     publication_name: String,
     poll_interval: Duration,
-    event_tx: tokio::sync::mpsc::Sender<Result<PgChangeEvent, PollingPgCdcError>>,
+    event_tx: tokio::sync::mpsc::Sender<Result<PgSourceItem, PollingPgCdcError>>,
     ack_rx: std::sync::mpsc::Receiver<PgCommitPosition>,
     polls_issued: Arc<AtomicU64>,
     events_received: Arc<AtomicU64>,
@@ -56,8 +56,7 @@ pub(super) fn polling_loop(
     let mut releases = ReleaseQueue::new();
     // A peek re-reads every unacknowledged transaction at the same positions.
     let mut last_delivered: Option<PgCommitPosition> = None;
-    // Whether the open transaction delivered a row on this peek.
-    let mut delivered = false;
+    let unseen = |last: Option<PgCommitPosition>, position| last.is_none_or(|last| position > last);
     let slot = sql_string_literal(&slot_name);
     let publication = sql_string_literal(&publication_name);
 
@@ -167,24 +166,30 @@ pub(super) fn polling_loop(
                 reason = "the buffer is reused for every message"
             )]
             for ev in rows.drain(..) {
-                if last_delivered.is_some_and(|last| ev.position() <= last) {
+                if !unseen(last_delivered, ev.position()) {
                     continue;
                 }
                 last_delivered = Some(ev.position());
-                delivered = true;
                 events_received.fetch_add(1, Ordering::Relaxed);
                 total_drained_events.fetch_add(1, Ordering::Relaxed);
                 if !drain_counted {
                     drain_counted = true;
                     non_empty_drains.fetch_add(1, Ordering::Relaxed);
                 }
-                if event_tx.blocking_send(Ok(ev)).is_err() {
+                if event_tx.blocking_send(Ok(SourceItem::Event(ev))).is_err() {
                     return;
                 }
             }
-            if let Some(committed) = committed {
-                if core::mem::take(&mut delivered) {
-                    releases.committed(committed);
+            if let Some(commit) =
+                committed.filter(|commit| unseen(last_delivered, commit.position()))
+            {
+                last_delivered = Some(commit.position());
+                releases.committed(commit);
+                if event_tx
+                    .blocking_send(Ok(SourceItem::Commit(commit)))
+                    .is_err()
+                {
+                    return;
                 }
             }
         }

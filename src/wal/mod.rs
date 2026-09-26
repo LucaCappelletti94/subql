@@ -20,11 +20,11 @@ mod transaction_order;
 mod wal2json;
 pub(crate) mod wire_event;
 
-pub use change_event::PgChangeEvent;
 #[cfg(any(feature = "pg-streaming", feature = "pg-sqlite-emu"))]
 pub(crate) use change_event::PgOutputOrder;
 #[cfg(feature = "pg-streaming")]
 pub(crate) use change_event::ReleaseQueue;
+pub use change_event::{PgChangeEvent, PgCommit};
 pub use maxwell::parse_messages as parse_maxwell;
 pub use maxwell::MaxwellEvent;
 pub use maxwell_cdc::Message as MaxwellMessage;
@@ -34,10 +34,13 @@ pub use pg_streaming::{
 };
 pub use pg_walstream::ChangeEvent;
 pub(crate) use shared_helpers::{changed_columns_by_name, resolve_table};
-#[cfg(feature = "std")]
-pub use streaming::CdcSource;
 #[cfg(feature = "pg-streaming")]
 pub(crate) use streaming::ExitFlagGuard;
+#[cfg(feature = "std")]
+pub use streaming::{CdcSource, SourceItem, SourceItemOf};
+/// What a Postgres source yields, a row change or the commit ending its transaction.
+#[cfg(any(feature = "pg-streaming", feature = "pg-sqlite-emu"))]
+pub(crate) type PgSourceItem = SourceItem<PgChangeEvent, PgCommit>;
 pub use transaction_order::TransactionOrderError;
 pub use wal2json::{parse_wal2json_v1, Wal2JsonV2Event, Wal2JsonV2Reader};
 pub use wal2json_events::{ChangeV1, MessageV2};
