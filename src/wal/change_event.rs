@@ -81,7 +81,7 @@ const fn dml_kind(event: &ChangeEvent) -> Option<EventKind> {
         EventType::Insert { .. } => Some(EventKind::Insert),
         EventType::Update { .. } => Some(EventKind::Update),
         EventType::Delete { .. } => Some(EventKind::Delete),
-        EventType::Truncate(_) => Some(EventKind::Truncate),
+        EventType::Truncate { .. } => Some(EventKind::Truncate),
         _ => None,
     }
 }
@@ -183,11 +183,19 @@ impl PgOutputOrder {
                     PgCommitPosition::new(commit, ordinal),
                 )]);
             }
-            EventType::Truncate(names) => {
-                for name in names {
+            EventType::Truncate {
+                tables,
+                cascade,
+                restart_identity,
+            } => {
+                for table in tables {
                     let (commit, ordinal) = self.order.next_row()?;
                     let single = ChangeEvent {
-                        event_type: EventType::Truncate(vec![Arc::clone(name)]),
+                        event_type: EventType::Truncate {
+                            tables: vec![Arc::clone(table)],
+                            cascade: *cascade,
+                            restart_identity: *restart_identity,
+                        },
                         lsn: change.lsn,
                         metadata: change.metadata.clone(),
                     };
@@ -247,8 +255,8 @@ fn event_table_id<DB: DatabaseLike>(event: &ChangeEvent, db: &DB) -> Option<Tabl
         | EventType::Delete { schema, table, .. } => {
             resolve_table::<crate::backend::Postgres, DB>(schema, table, db).ok()
         }
-        EventType::Truncate(names) => {
-            let full = names.first()?.as_ref();
+        EventType::Truncate { tables, .. } => {
+            let full = tables.first()?.as_ref();
             let (schema, table) = full.rsplit_once('.').unwrap_or(("", full));
             resolve_table::<crate::backend::Postgres, DB>(schema, table, db).ok()
         }
@@ -559,6 +567,7 @@ mod tests {
         use super::super::{CommittedTransaction, PgChangeEvent, PgOutputOrder};
         use crate::wal::TransactionOrderError;
         use crate::{PgCommitPosition, PgLsn};
+        use alloc::sync::Arc;
         use bytes::Bytes;
         use pg_walstream::{ChangeEvent, ColumnValue, Lsn, RowData};
 
@@ -662,6 +671,8 @@ mod tests {
                 begin(1500),
                 ChangeEvent::truncate(
                     vec!["public.orders".into(), "public.items".into()],
+                    true,
+                    false,
                     Lsn::new(1000),
                 ),
                 insert(1100),
@@ -671,14 +682,21 @@ mod tests {
             let tables: Vec<_> = rows
                 .iter()
                 .map(|row| match &row.change().event_type {
-                    pg_walstream::EventType::Truncate(names) => names.clone(),
+                    pg_walstream::EventType::Truncate {
+                        tables,
+                        cascade,
+                        restart_identity,
+                    } => (tables.clone(), *cascade, *restart_identity),
                     other => panic!("expected a truncate, got {other:?}"),
                 })
                 .take(2)
                 .collect();
+            let orders: Arc<str> = "public.orders".into();
+            let items: Arc<str> = "public.items".into();
             assert_eq!(
                 tables,
-                vec![vec!["public.orders".into()], vec!["public.items".into()]]
+                vec![(vec![orders], true, false), (vec![items], true, false)],
+                "each table keeps the statement's CASCADE and RESTART IDENTITY"
             );
             let ordinals: Vec<u64> = rows.iter().map(|row| row.position().ordinal()).collect();
             assert_eq!(ordinals, vec![1, 2, 3]);
