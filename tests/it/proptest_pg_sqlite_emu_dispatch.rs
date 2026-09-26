@@ -31,7 +31,8 @@ use proptest::prelude::*;
 use sqlparser::dialect::PostgreSqlDialect;
 use subql::backend::CdcEvent;
 use subql::{
-    ChangeEvent, DefaultIds, EventKind, PgSqliteEmuSource, SubscriptionEngine, SubscriptionRequest,
+    DefaultIds, EventKind, PgChangeEvent, PgSqliteEmuSource, SubscriptionEngine,
+    SubscriptionRequest,
 };
 
 const PG_DDL: &str = "CREATE TABLE orders (id INT PRIMARY KEY, amount INT, status TEXT);";
@@ -140,8 +141,8 @@ fn oracle(subs: &[Subscription], old_row: Option<&Row>, new_row: Option<&Row>) -
 
 fn build_engine(
     source: &PgSqliteEmuSource,
-) -> SubscriptionEngine<ChangeEvent, DefaultIds, sql_traits::structs::ParserDB> {
-    let mut engine = SubscriptionEngine::<ChangeEvent, DefaultIds, _>::new(
+) -> SubscriptionEngine<PgChangeEvent, DefaultIds, sql_traits::structs::ParserDB> {
+    let mut engine = SubscriptionEngine::<PgChangeEvent, DefaultIds, _>::new(
         source.pg_catalog().clone(),
         PostgreSqlDialect {},
     );
