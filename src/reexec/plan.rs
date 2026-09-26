@@ -874,13 +874,14 @@ fn key_projection_positions<B: Backend, DB: DatabaseLike>(
     database: &DB,
 ) -> Option<Vec<usize>> {
     let select = crate::compiler::sql_shape::select_of(statement)?;
-    // A wildcard returns the table's columns in the table's own order, so a
-    // key column's ordinal is its position.
-    if select
-        .projection
-        .iter()
-        .any(|item| matches!(item, SelectItem::Wildcard(_)))
-    {
+    // A wildcard, or one qualified by the table read, returns the table's
+    // columns in the table's own order, so a key column's ordinal is its position.
+    if select.projection.iter().any(|item| {
+        matches!(item, SelectItem::Wildcard(_))
+            || crate::compiler::sql_shape::wildcard_of_read_table::<B, DB>(
+                item, select, table, database,
+            )
+    }) {
         return (select.projection.len() == 1).then(|| {
             key_columns
                 .iter()
@@ -890,15 +891,18 @@ fn key_projection_positions<B: Backend, DB: DatabaseLike>(
     }
     let mut named: Vec<Option<(&Ident, bool)>> = Vec::with_capacity(select.projection.len());
     for item in &select.projection {
-        named.push(match item {
-            SelectItem::UnnamedExpr(Expr::Identifier(ident)) => {
-                Some((ident, ident.quote_style.is_some()))
-            }
-            SelectItem::UnnamedExpr(Expr::CompoundIdentifier(parts)) => {
+        // An alias renames the column it follows, so the column is read from
+        // the expression and never from the alias.
+        let (SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. }) = item else {
+            named.push(None);
+            continue;
+        };
+        named.push(match expr {
+            Expr::Identifier(ident) => Some((ident, ident.quote_style.is_some())),
+            Expr::CompoundIdentifier(parts) => {
                 parts.last().map(|last| (last, last.quote_style.is_some()))
             }
-            // An expression, an alias, or a qualified wildcard delivers a
-            // value, not the key column itself.
+            // A computed value delivers a value, not the key column itself.
             _ => None,
         });
     }
@@ -1305,6 +1309,27 @@ mod key_projection_tests {
                 &db
             ),
             Some(vec![0]),
+        );
+    }
+
+    #[test]
+    fn a_wildcard_of_the_read_table_carries_the_key_at_its_ordinal() {
+        let db = ParserDB::parse::<sqlparser::dialect::PostgreSqlDialect>(
+            "CREATE TABLE t (a INT, id INT PRIMARY KEY);",
+        )
+        .expect("DDL parses");
+        let table = crate::catalog_helpers::table_id::<Postgres, _>(&db, "t").expect("t exists");
+        let pg = |sql: &str| statement(&sqlparser::dialect::PostgreSqlDialect {}, sql);
+        for sql in ["SELECT t.* FROM t", "SELECT x.* FROM t x"] {
+            assert_eq!(
+                key_projection_positions::<Postgres, _>(&pg(sql), table, &[1], &db),
+                Some(vec![1]),
+                "{sql}",
+            );
+        }
+        assert_eq!(
+            key_projection_positions::<Postgres, _>(&pg("SELECT m.* FROM t"), table, &[1], &db),
+            None,
         );
     }
 }

@@ -81,6 +81,46 @@ pub struct TablePartitionSnapshot<I: IdTypes, B: Backend> {
     pub predicates: Arc<PredicateStore<I, B>>,
 }
 
+impl<I: IdTypes, B: Backend> TablePartitionSnapshot<I, B> {
+    /// Candidate predicates for one row image, with no false negatives.
+    ///
+    /// An UPDATE has two images, so it selects through
+    /// [`HybridIndexes::select_update_candidates`] instead.
+    #[must_use]
+    pub fn select_candidates(
+        &self,
+        arity: usize,
+        mut read_col: impl FnMut(ColumnId) -> ColumnProbe,
+    ) -> RoaringBitmap {
+        let mut candidates = self.indexes.fallback.clone();
+        for col_id in (0..=ColumnId::MAX).take(arity) {
+            let probe = read_col(col_id);
+            if let Some(indexable) = probe.value.as_ref() {
+                if let Some(bitmap) = self.indexes.query_equality(col_id, indexable) {
+                    candidates |= bitmap;
+                }
+                self.indexes
+                    .query_range_into(col_id, indexable, &mut candidates);
+            }
+            let null_kind = match probe.presence {
+                CellPresence::Null => super::indexes::NullKind::IsNull,
+                CellPresence::Present => super::indexes::NullKind::IsNotNull,
+                // An absent cell cannot prune, so every predicate reading it stays a candidate.
+                CellPresence::Missing | CellPresence::Undecodable => {
+                    if let Some(deps) = self.indexes.dependency.get(&col_id) {
+                        candidates |= deps;
+                    }
+                    continue;
+                }
+            };
+            if let Some(bitmap) = self.indexes.null_checks.get(&(col_id, null_kind)) {
+                candidates |= bitmap;
+            }
+        }
+        candidates
+    }
+}
+
 /// What removing a binding removed: the consumer it belonged to, and whether
 /// its predicate went with it.
 pub struct BindingRemoval<I: IdTypes> {
@@ -170,84 +210,15 @@ impl<I: IdTypes, B: Backend> TablePartition<I, B> {
             .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     }
 
-    /// Select candidate predicates for one row image, as INSERT and DELETE
-    /// dispatch do.
-    ///
-    /// The `read_col` closure yields the current column value as an
-    /// [`IndexableCell`] (or `None` for `Null` / `Missing`), together
-    /// with the null flag. Callers derived from a
-    /// [`crate::backend::CdcEvent`] compose this closure by iterating
-    /// column ids and dispatching on their pre-cached
-    /// [`crate::backend::ScalarKind`]. Returns the union of all index
-    /// lookups plus the fallback set (predicates that can't be indexed).
-    ///
-    /// Guaranteed no false negatives: every predicate that could match
-    /// the row is in the returned bitmap.
-    ///
-    /// An UPDATE is dispatched against two row images, so probing one of them
-    /// cannot select its candidates: a predicate the new image fails may be one
-    /// the old image matched. Use
-    /// [`select_update_candidates`](Self::select_update_candidates).
+    /// Candidate predicates for one row image, as
+    /// [`TablePartitionSnapshot::select_candidates`] selects them.
     #[must_use]
     pub fn select_candidates(
         &self,
         arity: usize,
-        mut read_col: impl FnMut(ColumnId) -> ColumnProbe,
+        read_col: impl FnMut(ColumnId) -> ColumnProbe,
     ) -> RoaringBitmap {
-        let snapshot = self.load_snapshot();
-
-        let mut candidates = RoaringBitmap::new();
-
-        // Always include fallback (unindexable predicates).
-        candidates |= &snapshot.indexes.fallback;
-
-        for col_idx in 0..arity {
-            #[allow(clippy::cast_possible_truncation)]
-            let col_id = col_idx as ColumnId;
-            let probe = read_col(col_id);
-
-            if let Some(indexable) = probe.value.as_ref() {
-                if let Some(bitmap) = snapshot.indexes.query_equality(col_id, indexable) {
-                    candidates |= bitmap;
-                }
-                snapshot
-                    .indexes
-                    .query_range_into(col_id, indexable, &mut candidates);
-            }
-
-            match probe.presence {
-                CellPresence::Null => {
-                    if let Some(bitmap) = snapshot
-                        .indexes
-                        .null_checks
-                        .get(&(col_id, super::indexes::NullKind::IsNull))
-                    {
-                        candidates |= bitmap;
-                    }
-                }
-                CellPresence::Present => {
-                    if let Some(bitmap) = snapshot
-                        .indexes
-                        .null_checks
-                        .get(&(col_id, super::indexes::NullKind::IsNotNull))
-                    {
-                        candidates |= bitmap;
-                    }
-                }
-                // A cell the event does not carry cannot be indexed, so
-                // pruning on it would drop a predicate the comparator
-                // would have judged, exactly as for a cell that failed to
-                // decode. Every predicate reading the column stays a
-                // candidate and the evaluation decides.
-                CellPresence::Missing | CellPresence::Undecodable => {
-                    if let Some(deps) = snapshot.indexes.dependency.get(&col_id) {
-                        candidates |= deps;
-                    }
-                }
-            }
-        }
-
-        candidates
+        self.load_snapshot().select_candidates(arity, read_col)
     }
 
     /// Select candidate row predicates for an UPDATE.

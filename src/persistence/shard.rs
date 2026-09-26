@@ -30,20 +30,11 @@ use sql_traits::{
     structs::{AlgorithmId, SchemaFingerprint},
 };
 
-/// Shard format version. v14: a stored `LIKE` carries no case flag,
-/// because the case rule rides its comparison descriptor. v13: a stored
-/// integer column type carries the width its declaration fixes. v12: a stored `/` carries the rule its
-/// quotient
-/// is computed by, including the declared increment where the engine's
-/// rule wants one. v11: a stored arithmetic instruction carries the
-/// width its float result is held at. v10: a stored column kind carries the
-/// refinements
-/// its declaration fixes, so a `real` column reloads as float4 rather than
-/// as float8. v9: a stored comparison carries the text rule resolved for its
-/// operation, so no evaluation consults a collation. v8: a stored bytecode
-/// program carries the comparison facts of every column it loads. v7: full
-/// fingerprint envelope replaced the legacy `u64` field.
-const SHARD_VERSION: u16 = 14;
+/// Shard format version, written into every shard header.
+///
+/// Loading refuses a shard carrying any other version, so a change to what a
+/// stored field means bumps it.
+const SHARD_VERSION: u16 = 15;
 
 /// Hard cap for decompressed shard payload size (defense in depth).
 ///
@@ -643,7 +634,7 @@ mod tests {
 
     /// Every envelope field roundtrips through the on-wire header.
     #[test]
-    fn test_v14_envelope_roundtrip() {
+    fn test_v15_envelope_roundtrip() {
         let catalog = make_catalog();
         let tid = fixture_table_id(&catalog);
         let payload = shard_payload_with_consumers(vec![1, 2, 3], 42);
@@ -651,7 +642,7 @@ mod tests {
         let bytes = serialize_shard(tid, &payload, &catalog).unwrap();
         let (header, _) = deserialize_shard::<DefaultIds, _>(&bytes, &catalog).unwrap();
 
-        assert_eq!(header.version, 14);
+        assert_eq!(header.version, 15);
         assert_eq!(header.fingerprint.algorithm_id, ALGORITHM_ID_SHA2_256);
         assert_eq!(header.fingerprint.canonicalization_version, 1);
         assert_eq!(header.fingerprint.profile_id, 1);
@@ -665,8 +656,12 @@ mod tests {
     /// Loading a shard whose header carries an older version must fail with
     /// `VersionMismatch`: no legacy decode path is supported. v13 is the
     /// version whose stored `LIKE` carries its own case flag, so decoding
-    /// one under v14's shape would read a pattern's case handling off the
-    /// wrong field entirely.
+    /// one under a later shape would read a pattern's case handling off the
+    /// wrong field entirely. v14 reads a bare boolean column as `= true`,
+    /// which fails every dispatch under `AND`, `OR` and `NOT`, and a program
+    /// kept from it would also absorb a fresh registration of the same filter.
+    /// Its `LIKE` also carries no escape field, so its bytes would decode
+    /// against a different shape.
     #[test]
     fn test_older_versions_rejected() {
         let catalog = make_catalog();
@@ -674,7 +669,7 @@ mod tests {
         let payload = empty_shard_payload(1);
         let bytes = serialize_shard(tid, &payload, &catalog).unwrap();
 
-        for stored in [6_u16, 7, 8, 9, 10, 11, 12, 13] {
+        for stored in [6_u16, 7, 8, 9, 10, 11, 12, 13, 14] {
             let tampered = tamper_shard_header(&bytes, |hdr| {
                 hdr.version = stored;
             });
@@ -683,10 +678,10 @@ mod tests {
             assert!(
                 matches!(
                     &result,
-                    Err(StorageError::VersionMismatch { expected: 14, got })
+                    Err(StorageError::VersionMismatch { expected: 15, got })
                         if *got == stored
                 ),
-                "expected VersionMismatch{{expected: 14, got: {stored}}}, got {result:?}"
+                "expected VersionMismatch{{expected: 15, got: {stored}}}, got {result:?}"
             );
         }
     }

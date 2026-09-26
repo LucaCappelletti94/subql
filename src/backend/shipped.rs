@@ -162,6 +162,13 @@ impl<V: postgres_jsonb_canonical::PgVersion + 'static> Backend for Postgres<V> {
     const DIVISION: super::scalar_value::DivisionRule =
         super::scalar_value::DivisionRule::IntegersTruncate;
 
+    /// Measured: `<=>` is `operator does not exist`.
+    const NULL_SAFE_EQUALITY: super::scalar_value::NullSafeEquality =
+        super::scalar_value::NullSafeEquality::DistinctFrom;
+
+    /// Measured: `(NULL = 1) IS UNKNOWN` is true.
+    const READS_IS_UNKNOWN: bool = true;
+
     /// The quotient's scale is the engine's, resolved at registration.
     fn decimal_quotient(
         dividend: bigdecimal::BigDecimal,
@@ -184,13 +191,20 @@ impl<V: postgres_jsonb_canonical::PgVersion + 'static> Backend for Postgres<V> {
 
     type Custom = NoCustomScalars<Self>;
 
-    /// Measured: a backslash escapes, and a pattern ending with one is
-    /// refused once the matcher reaches it with input still to read.
-    const LIKE_ESCAPE: Option<crate::compiler::vm::refusal::LikeEscape> =
-        Some(crate::compiler::vm::refusal::LikeEscape {
-            character: '\\',
-            dangling: crate::compiler::vm::refusal::DanglingEscape::Fails,
-        });
+    /// Measured: a backslash escapes.
+    const LIKE_DEFAULT_ESCAPE: Option<char> = Some('\\');
+
+    /// Measured: refused once the matcher reaches it with input still to read.
+    const LIKE_DANGLING_ESCAPE: crate::compiler::vm::refusal::DanglingEscape =
+        crate::compiler::vm::refusal::DanglingEscape::Fails;
+
+    /// Measured: one character escapes, and `ESCAPE ''` is no escape.
+    fn like_escape_clause(written: &str) -> Result<Option<char>, &'static str> {
+        if written.is_empty() {
+            return Ok(None);
+        }
+        one_escape_character(written)
+    }
 
     /// PostgreSQL reads a delimited column name exactly as written, which
     /// is what makes `"Owner"` and `owner` two columns.
@@ -471,13 +485,25 @@ impl<C: MySqlTableNameCase> Backend for MySql<C> {
 
     type Custom = NoCustomScalars<Self>;
 
-    /// Measured: a backslash escapes, and a pattern ending with one
-    /// answers 0 whether or not input remains, so it never raises.
-    const LIKE_ESCAPE: Option<crate::compiler::vm::refusal::LikeEscape> =
-        Some(crate::compiler::vm::refusal::LikeEscape {
-            character: '\\',
-            dangling: crate::compiler::vm::refusal::DanglingEscape::NoMatch,
-        });
+    /// Measured: a backslash escapes.
+    const LIKE_DEFAULT_ESCAPE: Option<char> = Some('\\');
+
+    /// Measured: 0 whether or not input remains, so it never raises.
+    const LIKE_DANGLING_ESCAPE: crate::compiler::vm::refusal::DanglingEscape =
+        crate::compiler::vm::refusal::DanglingEscape::NoMatch;
+
+    /// Measured on 8.0.46: one ASCII character escapes, and a character
+    /// outside ASCII is `ERROR 1210 Incorrect arguments to ESCAPE`. What
+    /// `ESCAPE ''` means turns on the session's `NO_BACKSLASH_ESCAPES`.
+    fn like_escape_clause(written: &str) -> Result<Option<char>, &'static str> {
+        if written.is_empty() {
+            return Err("MySQL reads `ESCAPE ''` by the session's NO_BACKSLASH_ESCAPES");
+        }
+        if !written.is_ascii() {
+            return Err("MySQL rejects an escape character outside ASCII");
+        }
+        one_escape_character(written)
+    }
 
     /// MySQL compares a column name case-insensitively whether or not it
     /// was written in backticks.
@@ -545,6 +571,13 @@ impl<C: MySqlTableNameCase> Backend for MySql<C> {
     /// division `DIV`, which is a different operator.
     const DIVISION: super::scalar_value::DivisionRule =
         super::scalar_value::DivisionRule::QuotientsAreDecimalInWords;
+
+    /// Measured: `IS DISTINCT FROM` is `ERROR 1064`, a syntax error.
+    const NULL_SAFE_EQUALITY: super::scalar_value::NullSafeEquality =
+        super::scalar_value::NullSafeEquality::Spaceship;
+
+    /// Measured: `(NULL = 1) IS UNKNOWN` is `1`.
+    const READS_IS_UNKNOWN: bool = true;
 
     /// The quotient's scale is the engine's, resolved at registration.
     fn decimal_quotient(
@@ -790,6 +823,14 @@ impl Backend for SQLite {
     const DIVISION: super::scalar_value::DivisionRule =
         super::scalar_value::DivisionRule::IntegersTruncate;
 
+    /// Measured: `<=>` is a syntax error.
+    const NULL_SAFE_EQUALITY: super::scalar_value::NullSafeEquality =
+        super::scalar_value::NullSafeEquality::DistinctFrom;
+
+    /// Measured on 3.51: `x IS UNKNOWN` fails with `no such column: UNKNOWN`,
+    /// since the word is read as a name.
+    const READS_IS_UNKNOWN: bool = false;
+
     /// SQLite decodes no decimal cell, so this states the rule it declares rather than a second one.
     fn decimal_quotient(
         dividend: bigdecimal::BigDecimal,
@@ -841,8 +882,18 @@ impl Backend for SQLite {
     }
 
     /// SQLite gives `LIKE` no default escape: a backslash in a pattern
-    /// matches a backslash, so no pattern can end with one dangling.
-    const LIKE_ESCAPE: Option<crate::compiler::vm::refusal::LikeEscape> = None;
+    /// matches a backslash.
+    const LIKE_DEFAULT_ESCAPE: Option<char> = None;
+
+    /// Measured: a clause's escape ending the pattern answers 0.
+    const LIKE_DANGLING_ESCAPE: crate::compiler::vm::refusal::DanglingEscape =
+        crate::compiler::vm::refusal::DanglingEscape::NoMatch;
+
+    /// Measured: one character escapes, and anything else is `ESCAPE
+    /// expression must be a single character`.
+    fn like_escape_clause(written: &str) -> Result<Option<char>, &'static str> {
+        one_escape_character(written)
+    }
 
     /// SQLite compares a column name case-insensitively, quoted or not.
     const COLUMN_NAME_CASE: sql_traits::structs::IdentifierCase =
@@ -1018,4 +1069,13 @@ impl Backend for SQLite {
     // Named because associated type defaults are unstable; MySQL and SQLite JSON
     // semantics never route through the PostgreSQL crate.
     type JsonbVersion = postgres_jsonb_canonical::Pg18;
+}
+
+/// The one character `written` spells, as every engine reads an escape.
+fn one_escape_character(written: &str) -> Result<Option<char>, &'static str> {
+    let mut characters = written.chars();
+    match (characters.next(), characters.next()) {
+        (Some(character), None) => Ok(Some(character)),
+        _ => Err("an escape clause names exactly one character"),
+    }
 }

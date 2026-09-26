@@ -484,7 +484,8 @@ where
                 );
                 true
             }
-            crate::compiler::sql_shape::QueryProjection::Rows => false,
+            crate::compiler::sql_shape::QueryProjection::Rows
+            | crate::compiler::sql_shape::QueryProjection::Columns { .. } => false,
         };
         if opened {
             self.aggregate_registrations.insert(

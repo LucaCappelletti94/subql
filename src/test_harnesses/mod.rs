@@ -88,6 +88,10 @@ mod tests {
             Instruction::JumpIfFalse(_) => 22,
             Instruction::JumpIfTrue(_) => 23,
             Instruction::TermTruth(_) => 24,
+            Instruction::NotDistinct(_) => 25,
+            Instruction::IsTruth { .. } => 26,
+            Instruction::Truth => 27,
+            Instruction::Coalesce(_) => 28,
         }
     }
 
@@ -150,7 +154,7 @@ mod tests {
 
         assert_eq!(
             seen.len(),
-            24,
+            28,
             "expected all Instruction variants, saw {seen:?}"
         );
     }

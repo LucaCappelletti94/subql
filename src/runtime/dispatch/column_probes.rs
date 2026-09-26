@@ -17,13 +17,13 @@ pub(super) fn probe_column_for_index<E: CdcEvent, DB: DatabaseLike>(
     arity: usize,
     db: &DB,
 ) -> ColumnProbe {
-    if col as usize >= arity {
+    if usize::from(col) >= arity {
         return ColumnProbe::missing();
     }
-    match event.value_at(db, row, col) {
+    match event.cell_at(db, row, col).as_deref() {
         Ok(Value::Missing) => ColumnProbe::missing(),
         Ok(Value::Null) => ColumnProbe::null(),
-        Ok(v) => ColumnProbe::present(IndexableCell::from_value::<E::Backend>(&v)),
+        Ok(v) => ColumnProbe::present(IndexableCell::from_value::<E::Backend>(v)),
         Err(_) => ColumnProbe::undecodable(),
     }
 }
@@ -45,8 +45,8 @@ pub(super) fn probe_column_for_agg<E: CdcEvent, DB: DatabaseLike>(
     if usize::from(col) >= arity {
         return Ok(AggCellRead::Missing);
     }
-    let value = event.value_at(db, row, col)?;
-    Ok(match &value {
+    let value = event.cell_at(db, row, col)?;
+    Ok(match &*value {
         Value::Missing => AggCellRead::Missing,
         Value::Null => AggCellRead::Null,
         Value::Int(i) => (i as &dyn Any)

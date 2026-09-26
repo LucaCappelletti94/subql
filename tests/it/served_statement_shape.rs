@@ -161,6 +161,125 @@ fn distinct_is_refused() {
     refused_naming("SELECT DISTINCT id, status, amount FROM t", "DISTINCT");
 }
 
+/// `COUNT` is refused in the words every aggregate uses, and alone keeps
+/// telling the caller that `*` is accepted.
+#[test]
+fn count_is_refused_in_the_aggregates_shared_words() {
+    for (sql, words) in [
+        (
+            "SELECT COUNT(*) FILTER (WHERE amount > 1) FROM t",
+            "COUNT(...) FILTER (WHERE ...) not supported",
+        ),
+        (
+            "SELECT SUM(amount) FILTER (WHERE amount > 1) FROM t",
+            "SUM(...) FILTER (WHERE ...) not supported",
+        ),
+        (
+            "SELECT COUNT(amount + 1) FROM t",
+            "COUNT argument must be * or a plain column name, not an expression",
+        ),
+        (
+            "SELECT SUM(amount + 1) FROM t",
+            "SUM argument must be a plain column name, not an expression",
+        ),
+    ] {
+        refused_naming(sql, words);
+    }
+}
+
+/// A column that declares no collation compares under the database
+/// default, which the catalog cannot name, and the refusal says so rather
+/// than claiming the column declares one.
+#[test]
+fn an_undeclared_collation_is_named_as_the_default() {
+    let message = refusal("SELECT * FROM t WHERE status ILIKE 'a%'");
+    assert!(
+        message.contains("the database default collation or one the catalog cannot name"),
+        "{message}"
+    );
+    assert!(!message.contains("declares"), "{message}");
+}
+
+/// `q.*` is `*` when `q` names the one table the statement reads: its
+/// alias when it has one, its name otherwise. Served in process, and
+/// notified exactly as `*` is.
+#[test]
+fn a_wildcard_qualified_by_the_table_is_served_as_the_wildcard() {
+    for sql in [
+        "SELECT t.* FROM t WHERE amount > 3",
+        "SELECT public.t.* FROM t WHERE amount > 3",
+        "SELECT x.* FROM t x WHERE amount > 3",
+        "SELECT X.* FROM t AS x WHERE amount > 3",
+    ] {
+        let mut engine = engine();
+        let registered = engine
+            .register(SubscriptionRequest::new(1u64, sql))
+            .unwrap_or_else(|error| panic!("{sql} should register, got {error:?}"));
+        assert!(
+            matches!(registered.tier, Tier::InProcess(_)),
+            "{sql} should be served in process, got {:?}",
+            registered.not_served_because
+        );
+        engine
+            .register(SubscriptionRequest::new(
+                2u64,
+                "SELECT * FROM t WHERE amount > 3",
+            ))
+            .unwrap();
+        let table = subql::catalog_helpers::table_id::<Postgres, _>(
+            &ParserDB::parse::<PostgreSqlDialect>(DDL).unwrap(),
+            "t",
+        )
+        .unwrap();
+        let row = |amount: i64| vec![Value::Int(1), Value::String("a".into()), Value::Int(amount)];
+        let inserted = engine.consumers(&TestEvent::insert(table, row(5))).unwrap();
+        assert_eq!(
+            inserted.inserted(),
+            [1, 2],
+            "{sql} insert is notified as `*` is"
+        );
+        let updated = engine
+            .consumers(&TestEvent::update(table, row(5), row(6)))
+            .unwrap();
+        assert_eq!(
+            updated.updated(),
+            [1, 2],
+            "{sql} update is notified as `*` is"
+        );
+        let deleted = engine.consumers(&TestEvent::delete(table, row(6))).unwrap();
+        assert_eq!(
+            deleted.deleted(),
+            [1, 2],
+            "{sql} delete is notified as `*` is"
+        );
+    }
+    // An alias hides the table's name, and another table is not read at all.
+    refused_naming("SELECT t.* FROM t x WHERE amount > 3", "Qualified wildcard");
+    refused_naming("SELECT m.* FROM t WHERE amount > 3", "Qualified wildcard");
+    refused_naming(
+        "SELECT nope.* FROM t WHERE amount > 3",
+        "Qualified wildcard",
+    );
+
+    // Unaliased, the written name qualifies even where the search path cannot
+    // resolve it to the table.
+    let db = ParserDB::parse::<PostgreSqlDialect>(
+        "CREATE SCHEMA s; CREATE TABLE s.u (id INT PRIMARY KEY, amount INT);",
+    )
+    .unwrap();
+    let registered = Engine::new(db, PostgreSqlDialect {})
+        .register(SubscriptionRequest::new(
+            1u64,
+            "SELECT u.* FROM s.u WHERE amount > 3",
+        ))
+        .unwrap();
+    assert!(
+        matches!(registered.tier, Tier::InProcess(_)),
+        "{:?}",
+        registered.not_served_because
+    );
+}
+
 /// A bound on how many rows come back is a question about the other rows, and
 /// a change event carries one row.
 #[test]
@@ -223,6 +342,105 @@ fn a_clause_the_subscription_cannot_honour_is_refused() {
         "WINDOW",
     );
     refused_naming("SELECT * INTO other FROM t", "INTO");
+}
+
+/// `IN` and `BETWEEN` type their literals by the column the tested side reads,
+/// through arithmetic as `=` does, so `amount + 1 IN (5, 6)` is served and
+/// answers as the engine does. A tested side reading no column, or a condition
+/// where a value is read, is routed rather than refused as a bad literal.
+#[test]
+fn an_expression_tested_by_in_or_between_is_served_or_routed() {
+    let selects = |predicate: &str, amount: i64| {
+        let mut engine = engine();
+        let table = subql::catalog_helpers::table_id::<Postgres, _>(
+            &ParserDB::parse::<PostgreSqlDialect>(DDL).unwrap(),
+            "t",
+        )
+        .unwrap();
+        let registered = engine
+            .register(SubscriptionRequest::new(
+                1u64,
+                format!("SELECT * FROM t WHERE {predicate}"),
+            ))
+            .unwrap_or_else(|error| panic!("{predicate} registers, got {error:?}"));
+        assert!(
+            matches!(registered.tier, Tier::InProcess(_)),
+            "{predicate}: {:?}",
+            registered.not_served_because
+        );
+        let row = vec![Value::Int(1), Value::String("a".into()), Value::Int(amount)];
+        !engine
+            .consumers(&TestEvent::insert(table, row))
+            .unwrap()
+            .inserted()
+            .is_empty()
+    };
+    assert!(selects("amount + 1 IN (5, 6)", 4));
+    assert!(!selects("amount + 1 IN (5, 6)", 7));
+    assert!(selects("amount * 2 BETWEEN 7 AND 9", 4));
+    assert!(!selects("amount * 2 BETWEEN 7 AND 9", 5));
+    assert!(selects("amount + 1 NOT IN (5, 6)", 7));
+    for predicate in [
+        "1 + 1 IN (2, 3)",
+        "1 + 1 BETWEEN 1 AND 3",
+        "(amount = 1) IN (true)",
+        "(amount = 1) BETWEEN false AND true",
+        "amount BETWEEN (amount = 1) AND 3",
+        "(status = 'a') LIKE 't%'",
+    ] {
+        let _ = refusal(&format!("SELECT * FROM t WHERE {predicate}"));
+    }
+}
+
+/// `IN` asks the question `=` asks of each item, so a column whose collation
+/// `=` leaves to the database leaves `IN` there too, however it is wrapped.
+/// It used to compare bytes: under a case-insensitive collation
+/// `folded IN ('a')` missed a stored `'A'` that the database selects.
+#[test]
+fn in_is_classified_as_equality_is() {
+    const COLLATED: &str = "CREATE COLLATION ci (provider = icu, \
+                            locale = 'und-u-ks-level2', deterministic = false); \
+                            CREATE TABLE t (id INT PRIMARY KEY, label TEXT, \
+                            strict TEXT COLLATE \"C\", folded TEXT COLLATE \"ci\")";
+    let served = |predicate: &str| {
+        let database = ParserDB::parse::<PostgreSqlDialect>(COLLATED).unwrap();
+        let mut engine: Engine = SubscriptionEngine::new(database, PostgreSqlDialect {});
+        engine
+            .register(SubscriptionRequest::new(
+                1u64,
+                format!("SELECT * FROM t WHERE {predicate}"),
+            ))
+            .unwrap_or_else(|error| panic!("{predicate} registers, got {error:?}"))
+            .not_served_because
+            .is_none()
+    };
+    for column in ["label", "strict", "folded"] {
+        let equality = served(&format!("{column} = 'a'"));
+        for membership in [
+            format!("{column} IN ('a', 'b')"),
+            format!("{column} NOT IN ('a', 'b')"),
+            format!("({column}) IN ('a', 'b')"),
+            format!("COALESCE({column}, 'x') IN ('a', 'b')"),
+            // Parentheses hide nothing from `=` either.
+            format!("({column}) = 'a'"),
+            format!("({column}) IS NOT DISTINCT FROM 'a'"),
+        ] {
+            assert_eq!(served(&membership), equality, "{membership}");
+        }
+        let ordering = served(&format!("{column} < 'b'"));
+        for ordered in [
+            format!("({column}) < 'b'"),
+            format!("({column}) BETWEEN 'a' AND 'b'"),
+        ] {
+            assert_eq!(served(&ordered), ordering, "{ordered}");
+        }
+        let pattern = served(&format!("{column} LIKE 'a%'"));
+        assert_eq!(
+            served(&format!("({column}) LIKE 'a%'")),
+            pattern,
+            "({column}) LIKE"
+        );
+    }
 }
 
 /// The served shape itself, so the refusals above are not a blanket one. The

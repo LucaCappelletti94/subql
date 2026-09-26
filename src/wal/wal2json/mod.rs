@@ -105,6 +105,25 @@ mod tests {
         );
     }
 
+    /// Each row image keeps its own decoded cells, whichever is read first.
+    #[test]
+    fn a_resolved_update_keeps_old_and_new_cells_apart() {
+        let db = orders();
+        let ev = one_v2(
+            br#"{"action":"U","schema":"public","table":"orders",
+                 "columns":[{"name":"id","type":"integer","value":7},
+                            {"name":"amount","type":"integer","value":250}],
+                 "identity":[{"name":"id","type":"integer","value":7},
+                             {"name":"amount","type":"integer","value":100}]}"#,
+        );
+        for first in [RowKind::Old, RowKind::New] {
+            let resolved = crate::backend::ResolvedEvent::new(&ev, &db);
+            let _ = resolved.value_at(&db, first, 2);
+            assert_eq!(resolved.value_at(&db, RowKind::Old, 2), Ok(Value::Int(100)));
+            assert_eq!(resolved.value_at(&db, RowKind::New, 2), Ok(Value::Int(250)));
+        }
+    }
+
     #[test]
     fn v2_boundary_messages_drop() {
         assert_eq!(

@@ -135,10 +135,10 @@ fn json_at(json: &serde_json::Value, path: &[String]) -> RowCell<'static> {
 }
 
 pub fn render_text<B: Backend>(value: &Value<B>) -> Option<String> {
-    render_sql_text(&row_cell(value))
+    render_sql_text(row_cell(value))
 }
 
-fn render_sql_text(cell: &RowCell<'_>) -> Option<String> {
+fn render_sql_text(cell: RowCell<'_>) -> Option<String> {
     match cell {
         RowCell::Absent | RowCell::Null | RowCell::Undecodable => None,
         RowCell::Text(value)
@@ -146,8 +146,8 @@ fn render_sql_text(cell: &RowCell<'_>) -> Option<String> {
         | RowCell::Integer(value)
         | RowCell::Decimal(value)
         | RowCell::Date(value)
-        | RowCell::Time(value) => Some(value.to_string()),
-        RowCell::Bool(flag) => Some(if *flag { "true" } else { "false" }.to_string()),
+        | RowCell::Time(value) => Some(value.into_owned()),
+        RowCell::Bool(flag) => Some(if flag { "true" } else { "false" }.to_string()),
         RowCell::Timestamp(value) => Some(timestamp_sql_text(value.as_ref())),
         RowCell::TimestampTz(value) => timestamptz_sql_text(value.as_ref()),
         RowCell::Bytea(bytes) => Some(bytea_sql_text(bytes.as_ref())),

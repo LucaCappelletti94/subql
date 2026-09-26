@@ -450,6 +450,91 @@ fn an_explicit_projection_still_delivers_the_primary_key() {
     );
 }
 
+/// A key column renamed by its alias is still the key, read where it sits.
+/// The column is what is written before the alias, so swapped names put the
+/// key where `id` is read and not where `id` is spelt. A computed value
+/// carrying the key's name is not the key.
+#[test]
+fn a_key_column_under_an_alias_is_still_the_key() {
+    for (sql, columns) in [
+        (
+            "SELECT status, id AS order_id FROM orders WHERE lower(status) = 'paid'",
+            ["status", "order_id"],
+        ),
+        (
+            "SELECT id AS status, status AS id FROM orders WHERE lower(status) = 'paid'",
+            ["status", "id"],
+        ),
+    ] {
+        let (mut engine, table) = setup(&[(1, "paid")]);
+        match engine
+            .register(
+                SubscriptionRequest::<DefaultIds, SQLite>::new(9u64, sql),
+                (),
+            )
+            .expect("a filter outside the language is captured")
+        {
+            Registered {
+                tier: Tier::KeyedRows { .. },
+                ..
+            } => {}
+            other => panic!("{sql}: expected a keyed capture, got {other:?}"),
+        }
+        let event = TestEvent::<SQLite>::update(table, row(1, "paid"), row(1, "paid"))
+            .with_pk_columns([0u16]);
+        engine.apply_leaving_reads_queued(&event).expect("apply");
+        let notifications = engine.resolve_collect().expect("dispatch");
+        assert_eq!(notifications.row_deltas.len(), 1, "{sql}");
+        let delta = &notifications.row_deltas[0];
+        assert_eq!(delta.key, vec![Value::Int(1)], "{sql}");
+        assert_eq!(delta.columns.as_ref(), columns.map(String::from), "{sql}");
+    }
+
+    let (mut engine, _table) = setup(&[(1, "paid")]);
+    let computed = "SELECT id + 0 AS id, status FROM orders WHERE lower(status) = 'paid'";
+    let registered = engine
+        .register(
+            SubscriptionRequest::<DefaultIds, SQLite>::new(9u64, computed),
+            (),
+        )
+        .expect("a filter outside the language is captured");
+    assert!(
+        !matches!(registered.tier, Tier::KeyedRows { .. }),
+        "{computed} carries no key column, got {registered:?}"
+    );
+}
+
+/// A condition used as a value, compared or computed with, is SQL each
+/// engine answers and the in-process language does not, so it is routed to a
+/// read with a reason rather than failing registration.
+#[test]
+fn a_condition_used_as_a_value_is_routed_to_a_read() {
+    for sql in [
+        "SELECT * FROM orders WHERE (status = 'paid') = true",
+        "SELECT * FROM orders WHERE true = (status = 'paid')",
+        "SELECT * FROM orders WHERE (status = 'paid') IS NOT DISTINCT FROM true",
+        "SELECT * FROM orders WHERE (id > 1) <> (status = 'paid')",
+    ] {
+        let (mut engine, _table) = setup(&[(1, "paid")]);
+        let registered = engine
+            .register(
+                SubscriptionRequest::<DefaultIds, SQLite>::new(9u64, sql),
+                (),
+            )
+            .unwrap_or_else(|error| panic!("{sql} is routed, not refused: {error:?}"));
+        assert!(
+            !matches!(registered.tier, Tier::InProcess(_)),
+            "{sql}: {:?}",
+            registered.tier
+        );
+        let reason = registered
+            .not_served_because
+            .map(|reason| reason.to_string())
+            .expect("a read tier says why");
+        assert!(reason.contains("condition"), "{sql}: {reason}");
+    }
+}
+
 /// A filter that reads a second table cannot be served by asking about the
 /// changed rows of the first.
 ///
@@ -895,5 +980,60 @@ fn a_batch_spanning_several_pages_answers_every_key_once() {
         keys,
         (0..6).collect::<Vec<i64>>(),
         "every key answered exactly once, none twice and none missing"
+    );
+}
+
+/// A subset of columns under a filter the engine evaluates is served in
+/// process, where it used to be this tier. So an UPDATE of an unprojected
+/// column neither notifies nor sends the database anything, where this tier
+/// read the row back and delivered it unchanged.
+#[test]
+fn a_column_subset_under_an_evaluable_filter_reads_nothing() {
+    const WIDE: &str = "CREATE TABLE orders (id INTEGER PRIMARY KEY, status TEXT, note TEXT)";
+    let mut conn = SqliteConnection::establish(":memory:").unwrap();
+    diesel::sql_query(WIDE).execute(&mut conn).expect("create");
+    diesel::sql_query("INSERT INTO orders VALUES (1, 'paid', 'b')")
+        .execute(&mut conn)
+        .expect("seed");
+    let catalog = ParserDB::parse::<SQLiteDialect>(WIDE).expect("catalog");
+    let table = subql::catalog_helpers::table_id::<subql::backend::Postgres, _>(&catalog, "orders")
+        .expect("orders");
+    let inner = SubscriptionEngine::<TestEvent<SQLite>, DefaultIds, ParserDB>::new(
+        catalog,
+        SQLiteDialect {},
+    );
+    let mut engine: CountingEngine = AutoResolvingEngine::new(inner, SyncMode(Counting::new(conn)));
+    let registered = engine
+        .register(
+            SubscriptionRequest::<DefaultIds, SQLite>::new(
+                1u64,
+                "SELECT id, status FROM orders WHERE status = 'paid'",
+            ),
+            (),
+        )
+        .expect("registers");
+    assert!(
+        matches!(registered.tier, Tier::InProcess(_)),
+        "{:?}",
+        registered.tier
+    );
+    let cells = |note: &str| {
+        vec![
+            Value::Int(1),
+            Value::String("paid".into()),
+            Value::String(note.into()),
+        ]
+    };
+    let applied = engine
+        .apply_leaving_reads_queued(
+            &TestEvent::<SQLite>::update(table, cells("a"), cells("b")).with_pk_columns([0u16]),
+        )
+        .expect("apply");
+    assert!(applied.engine.updated().is_empty());
+    let resolved = engine.resolve_collect().expect("resolve");
+    assert!(resolved.row_deltas.is_empty() && resolved.rows_updates.is_empty());
+    assert!(
+        engine.connector().take().is_empty(),
+        "the database is not asked"
     );
 }

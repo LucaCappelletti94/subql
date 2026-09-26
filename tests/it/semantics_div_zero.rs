@@ -275,3 +275,98 @@ fn modulo_has_no_overflow_case() {
     assert_eq!(sqlite.evaluation_failures(), []);
     assert_eq!(sqlite.inserted(), &[1]);
 }
+
+/// An update refused on both row images reports the refusal met first, the
+/// old image's, as PostgreSQL raises the first error it reaches.
+#[test]
+fn an_aggregate_refused_on_both_images_reports_the_first_refusal() {
+    let db = ParserDB::parse::<PostgreSqlDialect>(DDL).expect("DDL parses");
+    let table = catalog_helpers::table_id::<Postgres, _>(&db, "t").expect("t is in the catalog");
+    let mut engine: SubscriptionEngine<TestEvent<Postgres>, DefaultIds, ParserDB> =
+        SubscriptionEngine::new(db, PostgreSqlDialect {});
+    let subscription = engine
+        .register(SubscriptionRequest::new(
+            1u64,
+            "SELECT COUNT(*) FROM t WHERE qty * 4611686018427387904 > 0 AND 100 / (qty - 1) > 0",
+        ))
+        .expect("the aggregate registers")
+        .subscription_id;
+    subql::Install::install(
+        &mut engine,
+        subscription,
+        subql::AggregateSeedInstall {
+            rows: vec![vec![Value::Int(0)]],
+            read_at: None,
+        },
+    )
+    .expect("the count seeds");
+
+    // The old image overflows the product, the new one divides by zero.
+    let output = engine
+        .aggregate_updates(&TestEvent::update(table, row(2, 1.0), row(1, 1.0)))
+        .expect("dispatch succeeds");
+
+    assert_eq!(
+        output.evaluation_failures,
+        vec![(
+            subscription,
+            EvaluationRefusal::IntegerOverflow {
+                operation: ArithmeticOp::Multiply,
+            }
+        )]
+    );
+}
+
+/// `dispatch` reports a refused aggregate beside the refused rows, with its
+/// consumer, rather than answering the event with nothing at all.
+#[test]
+fn dispatch_reports_a_refused_aggregate() {
+    let db = ParserDB::parse::<PostgreSqlDialect>(DDL).expect("DDL parses");
+    let table = catalog_helpers::table_id::<Postgres, _>(&db, "t").expect("t is in the catalog");
+    let mut engine: SubscriptionEngine<TestEvent<Postgres>, DefaultIds, ParserDB> =
+        SubscriptionEngine::new(db, PostgreSqlDialect {});
+    let subscription = engine
+        .register(SubscriptionRequest::new(
+            7u64,
+            "SELECT COUNT(*) FROM t WHERE 100 / qty > 0",
+        ))
+        .expect("the aggregate registers")
+        .subscription_id;
+    subql::Install::install(
+        &mut engine,
+        subscription,
+        subql::AggregateSeedInstall {
+            rows: vec![vec![Value::Int(0)]],
+            read_at: None,
+        },
+    )
+    .expect("the count seeds");
+
+    let output = engine
+        .dispatch(&TestEvent::insert(table, row(0, 1.0)))
+        .expect("dispatch succeeds");
+
+    assert_eq!(
+        output
+            .notifications()
+            .evaluation_failures()
+            .iter()
+            .map(|failure| (
+                failure.subscription_id,
+                failure.consumer_id,
+                failure.refusal
+            ))
+            .collect::<Vec<_>>(),
+        vec![(
+            subscription,
+            7,
+            EvaluationRefusal::DivisionByZero {
+                operation: ArithmeticOp::Divide,
+            }
+        )]
+    );
+    assert!(
+        output.aggregate_updates().is_empty(),
+        "the refused row is not folded"
+    );
+}

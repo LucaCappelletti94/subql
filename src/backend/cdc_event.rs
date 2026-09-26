@@ -5,7 +5,8 @@ use crate::backend::{
     Backend, Checkpoint, ColumnId, CustomScalars, DatabaseLike, EventKind, RowKind, ScalarKindOf,
     TableId, Value,
 };
-use alloc::vec::Vec;
+use alloc::{borrow::Cow, boxed::Box, vec::Vec};
+use core::cell::OnceCell;
 
 /// What a row image says about one cell.
 ///
@@ -155,6 +156,25 @@ pub trait CdcEvent {
         col: ColumnId,
     ) -> Result<Value<Self::Backend>, crate::ValueError>;
 
+    /// Whether [`cell_at`](Self::cell_at) lends every present cell from values
+    /// the event already holds decoded, so caching them would only add work.
+    #[doc(hidden)]
+    const LENDS_CELLS: bool = false;
+
+    /// One cell, lent when the event holds it decoded and owned otherwise.
+    ///
+    /// A borrowed answer must stay borrowed on every later call for the same
+    /// cell, which is what lets the VM refer back to it.
+    #[doc(hidden)]
+    fn cell_at<DB: DatabaseLike>(
+        &self,
+        db: &DB,
+        row: RowKind,
+        col: ColumnId,
+    ) -> Result<Cow<'_, Value<Self::Backend>>, crate::ValueError> {
+        self.value_at(db, row, col).map(Cow::Owned)
+    }
+
     /// What the row image says about one cell.
     ///
     /// The distinction [`CellPresence::Missing`] draws is the load-bearing
@@ -204,12 +224,22 @@ pub trait CdcEvent {
     }
 }
 
+type DecodedCell<B> = OnceCell<Result<Value<B>, crate::ValueError>>;
+
+/// One row image's cells, allocated at the first read of any of them.
+type DecodedImage<B> = OnceCell<Box<[DecodedCell<B>]>>;
+
 /// One event paired with its resolved catalog table.
+///
+/// Every cell is decoded at most once per row image, however many
+/// predicates read it.
 pub struct ResolvedEvent<'a, E: CdcEvent> {
     event: &'a E,
     table_id: TableId,
-    pk_columns: core::cell::OnceCell<Vec<ColumnId>>,
-    changed_columns: core::cell::OnceCell<Vec<ColumnId>>,
+    pk_columns: OnceCell<Vec<ColumnId>>,
+    changed_columns: OnceCell<Vec<ColumnId>>,
+    /// Indexed by [`RowKind`] as `Old`, `New`, `Pk`, then by column.
+    cells: [DecodedImage<E::Backend>; 3],
 }
 
 impl<'a, E: CdcEvent> ResolvedEvent<'a, E> {
@@ -217,9 +247,31 @@ impl<'a, E: CdcEvent> ResolvedEvent<'a, E> {
         Self {
             event,
             table_id: event.table_id(database),
-            pk_columns: core::cell::OnceCell::new(),
-            changed_columns: core::cell::OnceCell::new(),
+            pk_columns: OnceCell::new(),
+            changed_columns: OnceCell::new(),
+            cells: [OnceCell::new(), OnceCell::new(), OnceCell::new()],
         }
+    }
+
+    /// The cache slot for one cell, or `None` for a column past the table's arity.
+    fn cell_slot<DB: DatabaseLike>(
+        &self,
+        database: &DB,
+        row: RowKind,
+        col: ColumnId,
+    ) -> Option<&DecodedCell<E::Backend>> {
+        let image = match row {
+            RowKind::Old => 0,
+            RowKind::New => 1,
+            RowKind::Pk => 2,
+        };
+        self.cells[image]
+            .get_or_init(|| {
+                let arity =
+                    crate::catalog_helpers::table_arity(database, self.table_id).unwrap_or(0);
+                (0..arity).map(|_| OnceCell::new()).collect()
+            })
+            .get(usize::from(col))
     }
 
     pub(crate) const fn table_id(&self) -> TableId {
@@ -285,7 +337,26 @@ impl<E: CdcEvent> CdcEvent for ResolvedEvent<'_, E> {
         row: RowKind,
         col: ColumnId,
     ) -> Result<Value<Self::Backend>, crate::ValueError> {
-        self.event.value_at_resolved(db, self.table_id, row, col)
+        self.cell_at(db, row, col).map(Cow::into_owned)
+    }
+
+    fn cell_at<DB: DatabaseLike>(
+        &self,
+        db: &DB,
+        row: RowKind,
+        col: ColumnId,
+    ) -> Result<Cow<'_, Value<Self::Backend>>, crate::ValueError> {
+        if E::LENDS_CELLS {
+            return self.event.cell_at(db, row, col);
+        }
+        let decode = || self.event.value_at_resolved(db, self.table_id, row, col);
+        let Some(slot) = self.cell_slot(db, row, col) else {
+            return decode().map(Cow::Owned);
+        };
+        match slot.get_or_init(decode) {
+            Ok(value) => Ok(Cow::Borrowed(value)),
+            Err(error) => Err(error.clone()),
+        }
     }
 
     fn value_at_known_pk<DB: DatabaseLike>(

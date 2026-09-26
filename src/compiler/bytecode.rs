@@ -136,6 +136,10 @@ pub struct DanglingComparisonRef(pub u16);
 /// Parameterised on the observed [`Backend`] so that `PushLiteral` and
 /// `In` carry backend-typed payloads. Every other variant
 /// is backend-agnostic but shares the type parameter for uniform storage.
+///
+/// Variants are only ever appended. A persisted program is postcard, which
+/// tags a variant with its declaration index, so a variant inserted before
+/// another would decode every stored program under the wrong instructions.
 #[derive(Serialize, Deserialize)]
 #[serde(bound = "")]
 pub enum Instruction<B: Backend> {
@@ -295,8 +299,8 @@ pub enum Instruction<B: Backend> {
     },
 
     /// `LIKE` pattern matching against a text scalar. `%` matches zero or
-    /// more characters, `_` matches exactly one character. No ESCAPE clause
-    /// support.
+    /// more characters, `_` matches exactly one character, and the escape
+    /// character makes the one after it literal.
     ///
     /// Non-string operands yield `Tri::Unknown`. `Missing` / `Null` operands
     /// yield `Tri::Unknown`.
@@ -313,6 +317,11 @@ pub enum Instruction<B: Backend> {
         /// its `ILIKE` folds ASCII under `C`, while SQLite's `LIKE` folds
         /// ASCII and has no `ILIKE` at all.
         comparison: ComparisonRef,
+        /// The escape character, from the written `ESCAPE` clause or the
+        /// engine's default. Resolved at registration only, so `None` means the
+        /// pattern has no escape character at all, never the engine's default.
+        /// A program built by hand spells PostgreSQL's backslash as `Some`.
+        escape: Option<char>,
     },
 
     // Control Flow (short-circuit evaluation)
@@ -350,6 +359,55 @@ pub enum Instruction<B: Backend> {
     /// [`Vm::eval_with_terms`]: crate::compiler::Vm::eval_with_terms
     /// [`VmError::MissingTermTruth`]: crate::compiler::VmError::MissingTermTruth
     TermTruth(u16),
+
+    // Null-safe comparison (pop 2 values, push Tri)
+    /// Not distinct: `a IS NOT DISTINCT FROM b`, MySQL's `a <=> b`.
+    ///
+    /// [`Equal`](Self::Equal) that reads `Null` as a value: two `Null`s are
+    /// `Tri::True` and a `Null` against a present value is `Tri::False`. A
+    /// `Missing` operand is still `Tri::Unknown`, since the row may hold
+    /// anything there. Carries the facts `Equal` would, so the two agree on
+    /// every pair of present values.
+    ///
+    /// Stack: `[..., a, b] -> [..., Tri]`.
+    NotDistinct(ComparisonRef),
+
+    // Truth test (pop 1 Tri, push Tri)
+    /// `c IS [NOT] TRUE`, `IS [NOT] FALSE` and `IS [NOT] UNKNOWN`: whether
+    /// the condition's value is `value`, negated for `IS NOT`.
+    ///
+    /// Two-valued on a present answer, so an unknown condition is `False`
+    /// under `IS TRUE`. An unknown condition that read a cell the source did
+    /// not carry stays `Tri::Unknown`, since that cell may hold anything.
+    ///
+    /// Stack: `[..., tri] -> [..., Tri]`.
+    IsTruth {
+        /// The value the condition is tested for.
+        value: crate::compiler::Tri,
+        /// Whether `NOT` was written, which flips a present answer.
+        negated: bool,
+    },
+
+    // Truth of a value (pop 1 value, push Tri)
+    /// A boolean value read where a condition is read, as `flag` is in
+    /// `WHERE n = 3 AND flag`: its truth under the backend's
+    /// [`ScalarTruth`](crate::backend::ScalarTruth), `Tri::Unknown` for
+    /// `Null` or `Missing`.
+    ///
+    /// Not `= true`: SQLite keeps a boolean column as the integer stored in
+    /// it and reads any nonzero one as true here, where `= true` compares it
+    /// with `1`.
+    ///
+    /// Stack: `[..., value] -> [..., Tri]`.
+    Truth,
+
+    // COALESCE (pop n values, push value)
+    /// `COALESCE(a, b, ...)` over the last `n` values: the first that is not
+    /// `Null`, else `Null`. A `Missing` value ahead of it is the answer, since
+    /// the row may hold anything there.
+    ///
+    /// Stack: `[..., a, b, ...] -> [..., value]`.
+    Coalesce(u16),
 }
 
 /// A compiled bytecode program.
@@ -519,12 +577,20 @@ impl<B: Backend> Clone for Instruction<B> {
                 lower: *lower,
                 upper: *upper,
             },
-            Self::Like { comparison } => Self::Like {
+            Self::Like { comparison, escape } => Self::Like {
                 comparison: *comparison,
+                escape: *escape,
             },
             Self::JumpIfFalse(offset) => Self::JumpIfFalse(*offset),
             Self::JumpIfTrue(offset) => Self::JumpIfTrue(*offset),
             Self::TermTruth(slot) => Self::TermTruth(*slot),
+            Self::NotDistinct(r) => Self::NotDistinct(*r),
+            Self::IsTruth { value, negated } => Self::IsTruth {
+                value: *value,
+                negated: *negated,
+            },
+            Self::Truth => Self::Truth,
+            Self::Coalesce(count) => Self::Coalesce(*count),
         }
     }
 }
@@ -568,13 +634,22 @@ impl<B: Backend> core::fmt::Debug for Instruction<B> {
                 .field("lower", lower)
                 .field("upper", upper)
                 .finish(),
-            Self::Like { comparison } => f
+            Self::Like { comparison, escape } => f
                 .debug_struct("Like")
                 .field("comparison", comparison)
+                .field("escape", escape)
                 .finish(),
             Self::JumpIfFalse(offset) => f.debug_tuple("JumpIfFalse").field(offset).finish(),
             Self::JumpIfTrue(offset) => f.debug_tuple("JumpIfTrue").field(offset).finish(),
             Self::TermTruth(slot) => f.debug_tuple("TermTruth").field(slot).finish(),
+            Self::NotDistinct(r) => f.debug_tuple("NotDistinct").field(r).finish(),
+            Self::IsTruth { value, negated } => f
+                .debug_struct("IsTruth")
+                .field("value", value)
+                .field("negated", negated)
+                .finish(),
+            Self::Truth => f.write_str("Truth"),
+            Self::Coalesce(count) => f.debug_tuple("Coalesce").field(count).finish(),
         }
     }
 }
@@ -590,12 +665,23 @@ impl<B: Backend> PartialEq for Instruction<B> {
             | (Self::LessThanOrEqual(a), Self::LessThanOrEqual(b))
             | (Self::GreaterThan(a), Self::GreaterThan(b))
             | (Self::GreaterThanOrEqual(a), Self::GreaterThanOrEqual(b))
-            | (Self::Like { comparison: a }, Self::Like { comparison: b }) => a == b,
+            | (Self::NotDistinct(a), Self::NotDistinct(b)) => a == b,
+            (
+                Self::Like {
+                    comparison: a,
+                    escape: ae,
+                },
+                Self::Like {
+                    comparison: b,
+                    escape: be,
+                },
+            ) => a == b && ae == be,
             (Self::IsNull, Self::IsNull)
             | (Self::IsNotNull, Self::IsNotNull)
             | (Self::And, Self::And)
             | (Self::Or, Self::Or)
-            | (Self::Not, Self::Not) => true,
+            | (Self::Not, Self::Not)
+            | (Self::Truth, Self::Truth) => true,
             (Self::Add(a), Self::Add(b))
             | (Self::Subtract(a), Self::Subtract(b))
             | (Self::Multiply(a), Self::Multiply(b))
@@ -626,7 +712,19 @@ impl<B: Backend> PartialEq for Instruction<B> {
             ) => a == b && ar == br,
             (Self::JumpIfFalse(a), Self::JumpIfFalse(b))
             | (Self::JumpIfTrue(a), Self::JumpIfTrue(b)) => a == b,
-            (Self::TermTruth(a), Self::TermTruth(b)) => a == b,
+            (Self::TermTruth(a), Self::TermTruth(b)) | (Self::Coalesce(a), Self::Coalesce(b)) => {
+                a == b
+            }
+            (
+                Self::IsTruth {
+                    value: av,
+                    negated: an,
+                },
+                Self::IsTruth {
+                    value: bv,
+                    negated: bn,
+                },
+            ) => av == bv && an == bn,
             _ => false,
         }
     }
@@ -666,6 +764,66 @@ impl<B: Backend> PartialEq for BytecodeProgram<B> {
 mod tests {
     use super::*;
     use crate::backend::Postgres;
+
+    /// The tag each variant is persisted under, which a stored program is
+    /// read back by and which therefore never moves.
+    #[test]
+    fn every_instruction_keeps_its_persisted_tag() {
+        let r = ComparisonRef::NONE;
+        let tagged: [(Instruction<Postgres>, u8); 29] = [
+            (Instruction::PushLiteral(Value::Null), 0),
+            (Instruction::LoadColumn(0), 1),
+            (Instruction::Equal(r), 2),
+            (Instruction::NotEqual(r), 3),
+            (Instruction::LessThan(r), 4),
+            (Instruction::LessThanOrEqual(r), 5),
+            (Instruction::GreaterThan(r), 6),
+            (Instruction::GreaterThanOrEqual(r), 7),
+            (Instruction::IsNull, 8),
+            (Instruction::IsNotNull, 9),
+            (Instruction::And, 10),
+            (Instruction::Or, 11),
+            (Instruction::Not, 12),
+            (Instruction::Add(None), 13),
+            (Instruction::Subtract(None), 14),
+            (Instruction::Multiply(None), 15),
+            (Instruction::Divide(None, Quotient::FromTheOperands), 16),
+            (Instruction::Modulo(None), 17),
+            (Instruction::Negate(None), 18),
+            (
+                Instruction::In {
+                    literals: Vec::new(),
+                    comparison: r,
+                },
+                19,
+            ),
+            (Instruction::Between { lower: r, upper: r }, 20),
+            (
+                Instruction::Like {
+                    comparison: r,
+                    escape: None,
+                },
+                21,
+            ),
+            (Instruction::JumpIfFalse(1), 22),
+            (Instruction::JumpIfTrue(1), 23),
+            (Instruction::TermTruth(0), 24),
+            (Instruction::NotDistinct(r), 25),
+            (
+                Instruction::IsTruth {
+                    value: crate::compiler::Tri::Unknown,
+                    negated: false,
+                },
+                26,
+            ),
+            (Instruction::Truth, 27),
+            (Instruction::Coalesce(2), 28),
+        ];
+        for (instruction, tag) in tagged {
+            let bytes = postcard::to_allocvec(&instruction).expect("an instruction serializes");
+            assert_eq!(bytes.first(), Some(&tag), "{instruction:?}");
+        }
+    }
 
     #[test]
     fn test_extract_dependencies() {

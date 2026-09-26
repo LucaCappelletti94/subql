@@ -598,6 +598,23 @@ impl<I: IdTypes, B: Backend> PredicateStore<I, B> {
             .and_then(|held| held.by_ordinal.get(&ordinal))
     }
 
+    /// The ids [`subscriptions_of`](Self::subscriptions_of) holds, in order.
+    ///
+    /// A tree iterator heap-allocates its stack, so the one-id set, which
+    /// dedup makes the usual case, is read through `first` instead.
+    pub fn subscription_ids_of(
+        &self,
+        id: PredicateId,
+        ordinal: ConsumerOrdinal,
+    ) -> impl Iterator<Item = SubscriptionId> + '_ {
+        let set = self.subscriptions_of(id, ordinal);
+        let one = set
+            .filter(|set| set.size() == 1)
+            .and_then(|set| set.first());
+        let many = set.filter(|set| set.size() > 1).map(|set| set.iter());
+        one.into_iter().chain(many.into_iter().flatten()).copied()
+    }
+
     /// Every predicate that has a holder, with the ordinals holding it.
     pub fn held_predicates(&self) -> impl Iterator<Item = (PredicateId, &RoaringBitmap)> {
         self.bound

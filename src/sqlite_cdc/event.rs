@@ -85,4 +85,18 @@ impl CdcEvent for SqliteChangesetEvent {
     ) -> Result<Value<Self::Backend>, crate::ValueError> {
         Ok(self.row_view(row, col).cloned().unwrap_or(Value::Missing))
     }
+
+    const LENDS_CELLS: bool = true;
+
+    fn cell_at<DB: DatabaseLike>(
+        &self,
+        _db: &DB,
+        row: RowKind,
+        col: ColumnId,
+    ) -> Result<alloc::borrow::Cow<'_, Value<Self::Backend>>, crate::ValueError> {
+        Ok(self.row_view(row, col).map_or(
+            alloc::borrow::Cow::Owned(Value::Missing),
+            alloc::borrow::Cow::Borrowed,
+        ))
+    }
 }

@@ -1,6 +1,7 @@
 //! Column-reference helpers used by the parser and prefilter.
 
 use crate::{backend::Backend, catalog_helpers, ColumnId, TableId};
+use alloc::vec::Vec;
 use sql_traits::prelude::DatabaseLike;
 use sqlparser::ast::Expr;
 
@@ -30,4 +31,68 @@ pub fn resolve_column_ref<B: Backend, DB: DatabaseLike>(
         &ident.value,
         ident.quote_style.is_some(),
     )
+}
+
+/// The expression `expr` reads as a value: itself with its parentheses
+/// removed, or a `COALESCE`'s first column argument.
+///
+/// Registration serves a `COALESCE` only when its column arguments share one
+/// declared type and collation, so the first one's facts are the call's.
+/// Parentheses change nothing a comparison reads, so they must not hide a
+/// column's collation from one. Purely syntactic: whether the call is served
+/// is the compiler's question.
+#[must_use]
+pub fn value_column(expr: &Expr) -> &Expr {
+    let mut bare = expr;
+    while let Expr::Nested(inner) = bare {
+        bare = inner;
+    }
+    coalesce_arguments(bare)
+        .and_then(|arguments| {
+            arguments.into_iter().find(|argument| {
+                matches!(argument, Expr::Identifier(_) | Expr::CompoundIdentifier(_))
+            })
+        })
+        .unwrap_or(bare)
+}
+
+/// The arguments of `expr` when it is a plain `COALESCE(...)` call, parentheses
+/// aside, and `None` for anything else, including a call carrying a clause.
+#[must_use]
+pub fn coalesce_arguments(expr: &Expr) -> Option<Vec<&Expr>> {
+    use sqlparser::ast::{FunctionArg, FunctionArgExpr, FunctionArguments};
+    let mut bare = expr;
+    while let Expr::Nested(inner) = bare {
+        bare = inner;
+    }
+    let Expr::Function(function) = bare else {
+        return None;
+    };
+    let [name] = function.name.0.as_slice() else {
+        return None;
+    };
+    if !name
+        .as_ident()
+        .is_some_and(|ident| ident.value.eq_ignore_ascii_case("coalesce"))
+        || function.filter.is_some()
+        || function.over.is_some()
+        || function.null_treatment.is_some()
+        || !function.within_group.is_empty()
+        || !matches!(function.parameters, FunctionArguments::None)
+    {
+        return None;
+    }
+    let FunctionArguments::List(list) = &function.args else {
+        return None;
+    };
+    if list.duplicate_treatment.is_some() || !list.clauses.is_empty() {
+        return None;
+    }
+    list.args
+        .iter()
+        .map(|argument| match argument {
+            FunctionArg::Unnamed(FunctionArgExpr::Expr(argument)) => Some(argument),
+            _ => None,
+        })
+        .collect()
 }

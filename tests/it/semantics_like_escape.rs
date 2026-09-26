@@ -17,8 +17,7 @@
 
 use sql_traits::structs::ParserDB;
 use sqlparser::dialect::{MySqlDialect, PostgreSqlDialect};
-use subql::backend::{Backend, MySql, Postgres, SQLite, Value};
-use subql::compiler::vm::refusal::DanglingEscape;
+use subql::backend::{MySql, Postgres, SQLite, Value};
 use subql::testing::TestEvent;
 use subql::{
     catalog_helpers, DefaultIds, EvaluationRefusal, SubscriptionEngine, SubscriptionRequest,
@@ -226,39 +225,20 @@ fn a_pattern_ending_with_the_escape_fails_the_subscription() {
 
 /// MySQL never raises for a dangling escape: measured, it answers 0
 /// whether or not input remains, so its rule is no-match rather than
-/// PostgreSQL's refusal. The constants are asserted because they are the
-/// per-backend rule the walk consults.
+/// PostgreSQL's refusal. `like_escape_clause` pins that rule for every
+/// engine through a written escape.
 ///
-/// The end-to-end half is a different answer from PostgreSQL's, and it is
-/// not the escape rule that decides it. MySQL's own literal rules make a
+/// This test's answer differs from PostgreSQL's, and it is not the escape
+/// rule that decides it. MySQL's own literal rules make a
 /// backslash escape the closing quote, so the pattern is written `'a\\'`
 /// there, and rendering that back out yields SQL MySQL itself rejects,
 /// which the server confirms with error 1064. subql's canonicalizer sees
 /// exactly that and declines to serve a predicate whose spelling does not
-/// read back as itself, so the subscription becomes a database read. That
-/// is the honest answer, not a wrong one, and it means no in-process
-/// dangling escape arises under MySQL at all.
+/// read back as itself, so a written backslash escape stays a database
+/// read. An `ESCAPE` clause naming another character does reach the matcher
+/// in process and answers no-match, as `like_escape_clause` pins.
 #[test]
 fn mysql_pattern_ending_with_the_escape_is_a_no_match() {
-    assert_eq!(
-        <MySql as Backend>::LIKE_ESCAPE
-            .expect("MySQL has a default escape")
-            .dangling,
-        DanglingEscape::NoMatch,
-        "measured as 0 on 8.4.11, not an error"
-    );
-    assert_eq!(
-        <Postgres as Backend>::LIKE_ESCAPE
-            .expect("PostgreSQL has a default escape")
-            .dangling,
-        DanglingEscape::Fails,
-        "and PostgreSQL raises, which is why the rule is per backend"
-    );
-    assert!(
-        <SQLite as Backend>::LIKE_ESCAPE.is_none(),
-        "SQLite has no default escape, so it can have no dangling one"
-    );
-
     let db = ParserDB::parse::<MySqlDialect>(MYSQL_DDL).expect("DDL parses");
     let mut engine: SubscriptionEngine<TestEvent<MySql>, DefaultIds, ParserDB> =
         SubscriptionEngine::new(db, MySqlDialect {});

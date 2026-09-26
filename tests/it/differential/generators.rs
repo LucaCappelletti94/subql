@@ -781,6 +781,10 @@ pub fn predicate_forms(engine: Engine) -> Vec<String> {
         // C4: a backslash in a pattern, and an explicit escape.
         r"unbounded_bytes LIKE 'a\%b'".to_string(),
         r"unbounded_bytes LIKE 'a!%b' ESCAPE '!'".to_string(),
+        // E5: a written escape over a wildcard it makes literal, and over
+        // itself.
+        r"unbounded_bytes LIKE '%!_%' ESCAPE '!'".to_string(),
+        r"unbounded_bytes NOT LIKE 'a%%' ESCAPE '%'".to_string(),
         // C5: a padded column, whose trailing spaces a pattern reads.
         "padded_bytes LIKE 'ab'".to_string(),
         "padded_bytes = 'ab'".to_string(),
@@ -792,7 +796,37 @@ pub fn predicate_forms(engine: Engine) -> Vec<String> {
         "unbounded_named < 'AB'".to_string(),
         "unbounded_default < 'AB'".to_string(),
     ];
+    // E3: null-safe equality, in the one spelling each engine accepts,
+    // over two columns, a literal and a collated text column.
+    if engine == Engine::MySql {
+        forms.push("narrow <=> wide".to_string());
+        forms.push("NOT (narrow <=> 3)".to_string());
+        forms.push("unbounded_nocase <=> 'AB'".to_string());
+    } else {
+        forms.push("narrow IS NOT DISTINCT FROM wide".to_string());
+        forms.push("narrow IS DISTINCT FROM 3".to_string());
+        forms.push("unbounded_nocase IS NOT DISTINCT FROM 'AB'".to_string());
+    }
+    // E4: truth tests, with `IS UNKNOWN` where the engine has it.
+    forms.push("(narrow = wide) IS NOT TRUE".to_string());
+    forms.push("flag IS FALSE".to_string());
+    forms.push("narrow > 0 AND flag".to_string());
+    // E6: `COALESCE` over a column and a literal of its family.
+    forms.push("COALESCE(narrow, 0) > 3".to_string());
+    forms.push("COALESCE(unbounded_bytes, 'ab') = 'ab'".to_string());
+    // An arithmetic side tested by `IN` and `BETWEEN`.
+    forms.push("narrow + 1 IN (2, 4)".to_string());
+    forms.push("narrow * 2 BETWEEN 3 AND 8".to_string());
+    if engine != Engine::Sqlite {
+        forms.push("(unbounded_nocase = 'AB') IS UNKNOWN".to_string());
+    }
+    if engine != Engine::MySql {
+        // E5: a backslash as the written escape, which MySQL spells with
+        // its own literal escaping.
+        forms.push(r"unbounded_bytes LIKE 'a\%' ESCAPE '\'".to_string());
+    }
     if engine == Engine::Postgres {
+        forms.push(r"unbounded_bytes ILIKE 'A!%' ESCAPE '!'".to_string());
         // C3: `jsonb` ordering, and D5: a case-insensitive pattern, both
         // of which only this engine has.
         forms.push("binary_document = '{}'".to_string());
@@ -802,6 +836,39 @@ pub fn predicate_forms(engine: Engine) -> Vec<String> {
     }
     if engine == Engine::MySql {
         forms.push("exact / 3 > 0.333333333".to_string());
+    }
+    forms
+}
+
+/// The forms `engine` serves in process on at least some rows, each of which
+/// the sweep must actually compare. A form added for a construct subql serves
+/// belongs here, or the sweep can route it on every row and still pass.
+#[must_use]
+pub fn served_forms(engine: Engine) -> Vec<&'static str> {
+    let mut forms = vec![
+        r"unbounded_bytes LIKE 'a!%b' ESCAPE '!'",
+        r"unbounded_bytes LIKE '%!_%' ESCAPE '!'",
+        r"unbounded_bytes NOT LIKE 'a%%' ESCAPE '%'",
+        "(narrow = wide) IS NOT TRUE",
+        "flag IS FALSE",
+        "narrow > 0 AND flag",
+        "COALESCE(narrow, 0) > 3",
+        "COALESCE(unbounded_bytes, 'ab') = 'ab'",
+        "narrow + 1 IN (2, 4)",
+        "narrow * 2 BETWEEN 3 AND 8",
+    ];
+    if engine != Engine::MySql {
+        forms.extend([
+            r"unbounded_bytes LIKE 'a\%' ESCAPE '\'",
+            "narrow IS NOT DISTINCT FROM wide",
+            "narrow IS DISTINCT FROM 3",
+        ]);
+    }
+    if engine == Engine::MySql {
+        forms.extend(["narrow <=> wide", "NOT (narrow <=> 3)"]);
+    }
+    if engine == Engine::Postgres {
+        forms.push(r"unbounded_bytes ILIKE 'A!%' ESCAPE '!'");
     }
     forms
 }

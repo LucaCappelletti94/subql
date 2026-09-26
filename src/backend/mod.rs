@@ -61,9 +61,9 @@ pub use scalar_value::{
     Carried, ColumnCollation, ColumnComparison, ColumnComparisonOf, ComparisonContext,
     CustomScalars, DeclaredType, DivisionPrecisionIncrement, DivisionRule, FloatOrder,
     FloatSumOverflow, FloatWidth, GroupKeyEncoder, IntWidth, MeanRule, MySqlCollationPadding,
-    NamedColumnCollation, NoCustom, NoCustomScalars, NumericWidening, ScalarFamily, ScalarKind,
-    ScalarKindOf, SumRule, TextCase, TextOperation, TextResolution, TextRule, TextWidth,
-    TrailingSpaces, Value, ValueKind, ValueKindOf, VarianceSeed,
+    NamedColumnCollation, NoCustom, NoCustomScalars, NullSafeEquality, NumericWidening,
+    ScalarFamily, ScalarKind, ScalarKindOf, SumRule, TextCase, TextOperation, TextResolution,
+    TextRule, TextWidth, TrailingSpaces, Value, ValueKind, ValueKindOf, VarianceSeed,
 };
 pub use scalars_and_backend::{
     Backend, JsonDocument, ScalarCore, ScalarKey, ScalarText, ScalarTruth, SqliteJson,

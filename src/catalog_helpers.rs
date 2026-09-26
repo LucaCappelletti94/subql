@@ -479,13 +479,6 @@ pub(crate) fn classify_scalar_kind<B: crate::backend::Backend>(
     <B::Custom as crate::backend::CustomScalars>::classify(declared_type).map(ScalarKind::Custom)
 }
 
-/// The builtin kind a column declares, or `None` when it declares none.
-///
-/// For callers whose question is genuinely about builtins: whether a column
-/// can be aggregated, which wire type it emits, how a seed row decodes. A
-/// column of a custom type answers `None`, which is the honest answer to
-/// "which builtin is this", and each caller refuses it in its own terms.
-/// Use [`column_scalar_kind`] where a custom column has to be served.
 /// How a fold over `spec`'s column answers on this backend.
 ///
 /// Resolved once at registration, because it follows the column's declared
@@ -551,14 +544,23 @@ pub fn total_rule<B: crate::backend::Backend, DB: DatabaseLike>(
     }
 }
 
+/// The builtin kind a column declares, or `None` when it declares none.
+///
+/// For callers whose question is genuinely about builtins: whether a column
+/// can be aggregated, which wire type it emits, how a seed row decodes. A
+/// column of a custom type answers `None`, which is the honest answer to
+/// "which builtin is this", and each caller refuses it in its own terms.
+/// Use [`column_scalar_kind`] where a custom column has to be served.
 #[must_use]
 pub fn column_scalar_family<DB: DatabaseLike>(
     database: &DB,
     table_id: TableId,
     column_id: ColumnId,
 ) -> Option<crate::backend::ScalarFamily> {
-    let table = database.table_by_id(table_id as usize)?;
-    let column = table.column_by_id(column_id as usize, database).ok()??;
+    let table = database.table_by_id(usize::try_from(table_id).ok()?)?;
+    let column = table
+        .column_by_id(usize::from(column_id), database)
+        .ok()??;
     scalar_family(&column.data_type(database))
 }
 

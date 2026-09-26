@@ -406,7 +406,7 @@ pub fn term_columns(terms: &[CompiledTerm]) -> Vec<Vec<ColumnId>> {
 
 /// A changed row's link value, in the form the subscriber lookup is keyed by.
 ///
-/// Ten of [`Value`]'s fifteen variants. `Float`, `Json` and `Jsonb` are absent
+/// Eleven of [`Value`]'s sixteen variants. `Float`, `Json` and `Jsonb` are absent
 /// because their equality is not reflexive, and `Missing` and `Null` are absent
 /// because they are not values (see [`TermLookup`]).
 pub enum TermKey<B: Backend> {

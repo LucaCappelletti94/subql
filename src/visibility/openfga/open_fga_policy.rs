@@ -355,24 +355,38 @@ where
         &self,
         request: BatchCheckRequest,
     ) -> Result<BTreeMap<String, bool>, OpenFgaError> {
+        let response = self
+            .with_transport_retry(|mut client| {
+                let request = request.clone();
+                async move { client.batch_check(request).await }
+            })
+            .await?;
+        let mut out = BTreeMap::new();
+        for (correlation, result) in response.result {
+            // An error on one question is not an answer to it, so it is left
+            // out and reported as unanswered rather than read as a refusal.
+            let Some(CheckResult::Allowed(allowed)) = result.check_result else {
+                continue;
+            };
+            out.insert(correlation, allowed);
+        }
+        Ok(out)
+    }
+
+    /// One call to the store through `call`, retried while its failure is the
+    /// transport's and at most as often as configured.
+    async fn with_transport_retry<R, F, Fut>(&self, mut call: F) -> Result<R, OpenFgaError>
+    where
+        F: FnMut(OpenFgaServiceClient<T>) -> Fut,
+        Fut: core::future::Future<
+            Output = Result<openfga_client::tonic::Response<R>, openfga_client::tonic::Status>,
+        >,
+    {
         let mut attempts = 0;
         loop {
             attempts += 1;
-            let mut client = self.client.clone();
-            match client.batch_check(request.clone()).await {
-                Ok(response) => {
-                    let mut out = BTreeMap::new();
-                    for (correlation, result) in response.into_inner().result {
-                        // An error on one question is not an answer to it, so
-                        // it is left out and reported as unanswered rather than
-                        // read as a refusal.
-                        let Some(CheckResult::Allowed(allowed)) = result.check_result else {
-                            continue;
-                        };
-                        out.insert(correlation, allowed);
-                    }
-                    return Ok(out);
-                }
+            match call(self.client.clone()).await {
+                Ok(response) => return Ok(response.into_inner()),
                 Err(status) if OpenFgaError::is_transport(status.code()) => {
                     if attempts > self.connect_retries {
                         return Err(OpenFgaError::Transport {
@@ -916,28 +930,9 @@ where
     ///
     /// Unfiltered because `Read` accepts a non-empty user or a non-empty
     /// object id and nothing else, so a `(type, relation)` region cannot be
-    /// asked for. Authoritative for the same reason
-    /// [`read_slice`](Self::read_slice) is: this read precedes a write built
-    /// from it.
+    /// asked for.
     async fn read_every_tuple(&self) -> Result<Vec<TupleKey>, OpenFgaError> {
-        let mut out = Vec::new();
-        let mut continuation_token = String::new();
-        loop {
-            let request = ReadRequest {
-                store_id: self.store_id.clone(),
-                tuple_key: None,
-                page_size: None,
-                continuation_token: continuation_token.clone(),
-                // Discriminant extraction: the generated field is a bare `i32`.
-                consistency: ConsistencyPreference::HigherConsistency as i32,
-            };
-            let response = self.read_page(&request).await?;
-            out.extend(response.tuples.into_iter().filter_map(|tuple| tuple.key));
-            if response.continuation_token.is_empty() {
-                return Ok(out);
-            }
-            continuation_token = response.continuation_token;
-        }
+        self.read_all(None).await
     }
 
     /// Every tuple the store holds in `slice`, read page by page.
@@ -962,53 +957,40 @@ where
                 object: alloc::format!("{object_type}:"),
             },
         };
+        self.read_all(Some(filter)).await
+    }
+
+    /// Every tuple `filter` selects, or the whole store for `None`, read page
+    /// by page.
+    ///
+    /// Authoritative regardless of the configured read preference, since
+    /// every caller builds a write from what it reads.
+    async fn read_all(
+        &self,
+        filter: Option<ReadRequestTupleKey>,
+    ) -> Result<Vec<TupleKey>, OpenFgaError> {
         let mut out = Vec::new();
         let mut continuation_token = String::new();
         loop {
             let request = ReadRequest {
                 store_id: self.store_id.clone(),
-                tuple_key: Some(filter.clone()),
+                tuple_key: filter.clone(),
                 page_size: None,
-                continuation_token: continuation_token.clone(),
+                continuation_token: core::mem::take(&mut continuation_token),
                 // Discriminant extraction: the generated field is a bare `i32`.
-                // Authoritative regardless of the configured read preference,
-                // since this read precedes a write built from it.
                 consistency: ConsistencyPreference::HigherConsistency as i32,
             };
-            let response = self.read_page(&request).await?;
+            let response = self
+                .with_transport_retry(|mut client| {
+                    let request = request.clone();
+                    async move { client.read(request).await }
+                })
+                .await?;
             out.extend(response.tuples.into_iter().filter_map(|tuple| tuple.key));
             if response.continuation_token.is_empty() {
                 return Ok(out);
             }
             continuation_token = response.continuation_token;
-        }
-    }
-
-    /// One page of a read, retrying a transport failure as far as configured.
-    async fn read_page(
-        &self,
-        request: &ReadRequest,
-    ) -> Result<openfga_client::client::ReadResponse, OpenFgaError> {
-        let mut attempts = 0;
-        loop {
-            attempts += 1;
-            let mut client = self.client.clone();
-            match client.read(request.clone()).await {
-                Ok(response) => return Ok(response.into_inner()),
-                Err(status) if OpenFgaError::is_transport(status.code()) => {
-                    if attempts > self.connect_retries {
-                        return Err(OpenFgaError::Transport {
-                            attempts,
-                            message: status.message().to_string(),
-                        });
-                    }
-                }
-                Err(status) => {
-                    return Err(OpenFgaError::Rejected {
-                        message: status.message().to_string(),
-                    })
-                }
-            }
         }
     }
 
@@ -1112,27 +1094,12 @@ where
             deletes,
             authorization_model_id: self.authorization_model_id.clone(),
         };
-        let mut attempts = 0;
-        loop {
-            attempts += 1;
-            let mut client = self.client.clone();
-            match client.write(request.clone()).await {
-                Ok(_) => return Ok(()),
-                Err(status) if OpenFgaError::is_transport(status.code()) => {
-                    if attempts > self.connect_retries {
-                        return Err(OpenFgaError::Transport {
-                            attempts,
-                            message: status.message().to_string(),
-                        });
-                    }
-                }
-                Err(status) => {
-                    return Err(OpenFgaError::Rejected {
-                        message: status.message().to_string(),
-                    })
-                }
-            }
-        }
+        self.with_transport_retry(|mut client| {
+            let request = request.clone();
+            async move { client.write(request).await }
+        })
+        .await?;
+        Ok(())
     }
 }
 

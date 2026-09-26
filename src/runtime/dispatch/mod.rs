@@ -71,17 +71,6 @@ enum Matched<'a> {
     Narrowed(RoaringBitmap),
 }
 
-impl Matched<'_> {
-    /// The subscribers matched, or [`None`] when none did.
-    const fn bitmap(&self) -> Option<&RoaringBitmap> {
-        match self {
-            Self::Every(all) => Some(all),
-            Self::Nobody => None,
-            Self::Narrowed(some) => Some(some),
-        }
-    }
-}
-
 /// One predicate's verdict for one row version.
 ///
 /// Both halves at once, because a predicate carrying a membership term can
@@ -114,6 +103,34 @@ impl Matched<'_> {
             Self::Nobody => Self::Nobody,
             Self::Narrowed(some) => Self::Narrowed(some - refused),
         }
+    }
+}
+
+impl Matched<'_> {
+    /// The subscribers matched, or [`None`] when none did.
+    const fn bitmap(&self) -> Option<&RoaringBitmap> {
+        match self {
+            Self::Every(all) => Some(all),
+            Self::Nobody => None,
+            Self::Narrowed(some) => Some(some),
+        }
+    }
+}
+
+/// The union of every consumer set one dispatch matched.
+///
+/// `|=` into an array container allocates a new one per call, so ordinals
+/// are inserted one by one, which grows the container in place.
+#[derive(Default)]
+struct OrdinalUnion(RoaringBitmap);
+
+impl OrdinalUnion {
+    fn add(&mut self, set: &RoaringBitmap) {
+        self.0.extend(set);
+    }
+
+    fn finish(self) -> RoaringBitmap {
+        self.0
     }
 }
 
@@ -531,18 +548,74 @@ where
     C: crate::Checkpoint,
 {
     let snapshot = partition.load_snapshot();
-    let mut ordinals = RoaringBitmap::new();
+    let mut ordinals = OrdinalUnion::default();
     for (pred_id, consumers) in snapshot.predicates.held_predicates() {
         let Some(pred) = snapshot.predicates.get_predicate(pred_id) else {
             continue;
         };
-        if matches!(pred.projection, QueryProjection::Rows) {
-            ordinals |= consumers;
-            collect_stamps_for_predicate(&snapshot.predicates, pred_id, consumers, stamps);
+        if pred.projection.delivers_rows() {
+            ordinals.add(consumers);
+            extend_subscriptions(&snapshot.predicates, pred_id, consumers, stamps);
         }
     }
-    let deleted = resolve_ordinals(ordinals, consumer_dict);
+    let deleted = resolve_ordinals(ordinals.finish(), consumer_dict);
     ConsumerNotifications::from_parts(Vec::new(), deleted, Vec::new())
+}
+
+/// What an event did to the columns a subset projects.
+#[derive(Clone, Copy)]
+enum ProjectedChange {
+    /// The old image does not carry this projected column, and the subset
+    /// does not carry the key to apply the change by instead.
+    OldLacks(crate::ColumnId),
+    /// Every projected cell is carried and equal in both images.
+    Unchanged,
+    /// A projected cell differs, or an image does not carry one.
+    Changed,
+}
+
+/// What `event` did to the columns `projection` names, `None` unless it
+/// names a subset. An image without a new row compares nothing, and so
+/// reads only whether the old one lacks a column, which only a subset
+/// without the key cannot answer.
+fn projected_change<E: CdcEvent, DB: DatabaseLike>(
+    projection: &QueryProjection,
+    event: &E,
+    db: &DB,
+) -> Result<Option<ProjectedChange>, DispatchError> {
+    let QueryProjection::Columns {
+        columns,
+        carries_key,
+    } = projection
+    else {
+        return Ok(None);
+    };
+    let cell = |row, column| {
+        event
+            .cell_at(db, row, column)
+            .map_err(|error| dispatch_vm_error(VmError::Value(error)))
+    };
+    let mut change = ProjectedChange::Unchanged;
+    for &column in columns {
+        let old = cell(RowKind::Old, column)?;
+        if old.is_missing() {
+            // A keyed consumer applies the change by key, which every old
+            // image carries, so only a bag needs the old values.
+            return Ok(Some(if *carries_key {
+                ProjectedChange::Changed
+            } else {
+                ProjectedChange::OldLacks(column)
+            }));
+        }
+        if matches!(change, ProjectedChange::Unchanged) && event.kind() == EventKind::Update {
+            let new = cell(RowKind::New, column)?;
+            // `Missing` equals no carried value, so an absent new cell is a change.
+            if *new != *old {
+                change = ProjectedChange::Changed;
+            }
+        }
+    }
+    Ok(Some(change))
 }
 
 /// Resolve a `RoaringBitmap` of consumer ordinals into a `Vec` of consumer IDs.
@@ -717,23 +790,24 @@ fn collect_bound_subscriptions<I: IdTypes, B: Backend, T: Copy>(
 ) {
     for ord_u32 in consumers {
         let ord = ConsumerOrdinal::new(ord_u32);
-        if let Some(sub_ids) = predicates.subscriptions_of(pred_id, ord) {
-            out.extend(sub_ids.iter().map(|sub_id| (ord, *sub_id, payload)));
-        }
+        out.extend(
+            predicates
+                .subscription_ids_of(pred_id, ord)
+                .map(|sub_id| (ord, sub_id, payload)),
+        );
     }
 }
 
-fn collect_stamps_for_predicate<I: IdTypes, B: Backend>(
+/// Extend `out` with every subscription through which one of `consumers`
+/// holds `pred_id`.
+fn extend_subscriptions<I: IdTypes, B: Backend>(
     predicates: &PredicateStore<I, B>,
     pred_id: PredicateId,
     consumers: &RoaringBitmap,
-    out: &mut Vec<SubscriptionId>,
+    out: &mut impl Extend<SubscriptionId>,
 ) {
     for ord_u32 in consumers {
-        let ord = ConsumerOrdinal::new(ord_u32);
-        if let Some(sub_ids) = predicates.subscriptions_of(pred_id, ord) {
-            out.extend(sub_ids.iter().copied());
-        }
+        out.extend(predicates.subscription_ids_of(pred_id, ConsumerOrdinal::new(ord_u32)));
     }
 }
 
@@ -761,12 +835,12 @@ where
     E: CdcEvent,
     DB: DatabaseLike,
 {
-    let candidates = partition.select_update_candidates();
     let snapshot = partition.load_snapshot();
+    let candidates = snapshot.indexes.select_update_candidates();
 
-    let mut inserted_ordinals = RoaringBitmap::new();
-    let mut deleted_ordinals = RoaringBitmap::new();
-    let mut updated_ordinals = RoaringBitmap::new();
+    let mut inserted_ordinals = OrdinalUnion::default();
+    let mut deleted_ordinals = OrdinalUnion::default();
+    let mut updated_ordinals = OrdinalUnion::default();
 
     for pred_id_u32 in &candidates {
         let Some(pred_id) = super::ids::PredicateId::try_from_u32(pred_id_u32) else {
@@ -778,7 +852,7 @@ where
         };
 
         // Only row subscriptions participate in consumers().
-        if !matches!(pred.projection, QueryProjection::Rows) {
+        if !pred.projection.delivers_rows() {
             continue;
         }
 
@@ -847,21 +921,38 @@ where
 
         let new_served = new_matched.matched.without(&refused_here);
         let old_served = old_matched.matched.without(&refused_here);
+        let subset = projected_change(&pred.projection, event, db)?;
         split_transition(&new_served, &old_served, |slot, set| {
-            collect_stamps_for_predicate(&snapshot.predicates, pred_id, set, stamps);
-            let target = match slot {
-                Slot::Inserted => &mut inserted_ordinals,
-                Slot::Deleted => &mut deleted_ordinals,
-                Slot::Updated => &mut updated_ordinals,
-            };
-            *target |= set;
+            // A consumer removes a row of a subset by its old projected
+            // values, and one whose projected values did not move holds
+            // nothing that changed.
+            match (slot, subset) {
+                (Slot::Deleted | Slot::Updated, Some(ProjectedChange::OldLacks(column))) => {
+                    collect_bound_subscriptions(
+                        &snapshot.predicates,
+                        pred_id,
+                        set,
+                        column,
+                        &mut reports.unanswered,
+                    );
+                    return;
+                }
+                (Slot::Updated, Some(ProjectedChange::Unchanged)) => return,
+                _ => {}
+            }
+            extend_subscriptions(&snapshot.predicates, pred_id, set, stamps);
+            match slot {
+                Slot::Inserted => inserted_ordinals.add(set),
+                Slot::Deleted => deleted_ordinals.add(set),
+                Slot::Updated => updated_ordinals.add(set),
+            }
         });
     }
 
     Ok(ConsumerNotifications::from_parts(
-        resolve_ordinals(inserted_ordinals, consumer_dict),
-        resolve_ordinals(deleted_ordinals, consumer_dict),
-        resolve_ordinals(updated_ordinals, consumer_dict),
+        resolve_ordinals(inserted_ordinals.finish(), consumer_dict),
+        resolve_ordinals(deleted_ordinals.finish(), consumer_dict),
+        resolve_ordinals(updated_ordinals.finish(), consumer_dict),
     ))
 }
 
@@ -883,11 +974,12 @@ where
     DB: DatabaseLike,
 {
     let (stamps, reports) = accumulators;
-    let candidates = partition.select_candidates(arity, |col| {
+    let snapshot = partition.load_snapshot();
+    let candidates = snapshot.select_candidates(arity, |col| {
         probe_column_for_index(event, row, col, arity, db)
     });
-    let snapshot = partition.load_snapshot();
-    let mut matching_ordinals = RoaringBitmap::new();
+    let mut matching_ordinals = OrdinalUnion::default();
+    let mut unanswered = Vec::new();
 
     for_each_matching_predicate(
         &candidates,
@@ -895,15 +987,34 @@ where
         &mut EvalContext { event, row, vm, db },
         reports,
         |pred, consumers| {
-            if matches!(pred.projection, QueryProjection::Rows) {
-                matching_ordinals |= consumers;
-                collect_stamps_for_predicate(&snapshot.predicates, pred.id, consumers, stamps);
+            if !pred.projection.delivers_rows() {
+                return Ok(());
             }
+            // A deleted row of a subset is removed by its old projected values.
+            if row == RowKind::Old {
+                if let Some(ProjectedChange::OldLacks(column)) =
+                    projected_change(&pred.projection, event, db)?
+                {
+                    unanswered.push((pred.id, consumers.clone(), column));
+                    return Ok(());
+                }
+            }
+            matching_ordinals.add(consumers);
+            extend_subscriptions(&snapshot.predicates, pred.id, consumers, stamps);
             Ok(())
         },
     )?;
+    for (pred_id, consumers, column) in &unanswered {
+        collect_bound_subscriptions(
+            &snapshot.predicates,
+            *pred_id,
+            consumers,
+            *column,
+            &mut reports.unanswered,
+        );
+    }
 
-    Ok(matching_ordinals)
+    Ok(matching_ordinals.finish())
 }
 
 fn for_each_matching_predicate<I, E, F, DB>(
@@ -989,25 +1100,20 @@ fn delta_spec_and_groups(
             };
             Some((spec, groups))
         }
-        QueryProjection::Rows => None,
+        QueryProjection::Rows | QueryProjection::Columns { .. } => None,
     }
 }
 
-/// Weighted-row pairs for aggregate delta computation.
+/// The row images an aggregate folds for an event of `kind`, each with its weight.
 ///
-/// Delta normalization per event kind:
-/// * `Insert`   -> `[(+1, RowKind::New)]`
-/// * `Delete`   -> `[(-1, RowKind::Old)]`
-/// * `Update`   -> `[(-1, RowKind::Old), (+1, RowKind::New)]`
-/// * `Truncate` -> nothing, because emptying a table is not a row change.
-///   [`SubscriptionEngine::aggregate_updates`](crate::SubscriptionEngine::aggregate_updates)
-///   answers it from the held totals before reaching here.
-fn weighted_rows_for_agg<E: CdcEvent>(event: &E) -> Vec<(i64, RowKind)> {
-    match event.kind() {
-        EventKind::Insert => vec![(1, RowKind::New)],
-        EventKind::Delete => vec![(-1, RowKind::Old)],
-        EventKind::Update => vec![(-1, RowKind::Old), (1, RowKind::New)],
-        EventKind::Truncate => Vec::new(),
+/// A truncate folds nothing here, since `SubscriptionEngine::aggregate_updates`
+/// answers it from the held totals first.
+const fn weighted_rows_for_agg(kind: EventKind) -> &'static [(i64, RowKind)] {
+    match kind {
+        EventKind::Insert => &[(1, RowKind::New)],
+        EventKind::Delete => &[(-1, RowKind::Old)],
+        EventKind::Update => &[(-1, RowKind::Old), (1, RowKind::New)],
+        EventKind::Truncate => &[],
     }
 }
 
@@ -1021,56 +1127,33 @@ pub(crate) struct AggregateDelta<B: crate::backend::Backend> {
     pub rows: i64,
 }
 
-/// The refused subscriptions of one event, with their deltas removed.
+/// The subscriptions one event reported, each with its first report in
+/// evaluation order, and with their deltas removed.
 ///
-/// A refused subscription contributes no delta, even when one row version
+/// A reported subscription contributes no delta, even when one row version
 /// was served: an update's fold needs both versions, and folding half of it
 /// would move the total by a row the filter never judged. The caller
 /// applies the stop after folding, so the removal happens here.
-fn refused_subscriptions<B: crate::backend::Backend>(
-    refusals: Vec<(ConsumerOrdinal, SubscriptionId, EvaluationRefusal)>,
+fn reported_subscriptions<B: crate::backend::Backend, T>(
+    reports: Vec<(ConsumerOrdinal, SubscriptionId, T)>,
     deltas: &mut Vec<AggregateDelta<B>>,
-) -> Vec<(SubscriptionId, EvaluationRefusal)> {
-    let mut refused: Vec<(SubscriptionId, EvaluationRefusal)> = refusals
+) -> Vec<(SubscriptionId, T)> {
+    let mut reported: Vec<(SubscriptionId, T)> = reports
         .into_iter()
-        .map(|(_, subscription, failure)| (subscription, failure))
+        .map(|(_, subscription, report)| (subscription, report))
         .collect();
-    refused.sort_unstable_by_key(|(subscription, _)| *subscription);
-    refused.dedup_by_key(|(subscription, _)| *subscription);
-    if !refused.is_empty() {
+    // Stable, so the report met first survives the dedup, as the engine
+    // raises the first error it reaches.
+    reported.sort_by_key(|(subscription, _)| *subscription);
+    reported.dedup_by_key(|(subscription, _)| *subscription);
+    if !reported.is_empty() {
         deltas.retain(|delta| {
-            refused
+            reported
                 .binary_search_by_key(&delta.subscription, |(subscription, _)| *subscription)
                 .is_err()
         });
     }
-    refused
-}
-
-/// Drop every delta belonging to a subscription whose filter could not
-/// read a cell, and report those subscriptions with the column.
-///
-/// Mirrors [`refused_subscriptions`]: an aggregate's delta is only sound
-/// when both sides of the transition were decidable, so a subscription
-/// that could not answer one of them contributes nothing at all.
-fn unanswered_subscriptions<B: crate::backend::Backend>(
-    unanswered: Vec<(ConsumerOrdinal, SubscriptionId, crate::ColumnId)>,
-    deltas: &mut Vec<AggregateDelta<B>>,
-) -> Vec<(SubscriptionId, crate::ColumnId)> {
-    let mut absent: Vec<(SubscriptionId, crate::ColumnId)> = unanswered
-        .into_iter()
-        .map(|(_, subscription, column)| (subscription, column))
-        .collect();
-    absent.sort_unstable();
-    absent.dedup_by_key(|(subscription, _)| *subscription);
-    if !absent.is_empty() {
-        deltas.retain(|delta| {
-            absent
-                .binary_search_by_key(&delta.subscription, |(subscription, _)| *subscription)
-                .is_err()
-        });
-    }
-    absent
+    reported
 }
 
 pub(crate) struct AggregateComputation<B: crate::backend::Backend> {
@@ -1115,10 +1198,7 @@ fn accumulate_aggregate_deltas<I, B>(
 {
     for ordinal in consumers {
         let ordinal = ConsumerOrdinal::new(ordinal);
-        let Some(subscriptions) = state.store.subscriptions_of(predicate, ordinal) else {
-            continue;
-        };
-        for &subscription in subscriptions {
+        for subscription in state.store.subscription_ids_of(predicate, ordinal) {
             if state.missing_old.contains(&subscription) {
                 continue;
             }
@@ -1175,31 +1255,9 @@ where
         let Some(consumers) = store.consumers_of(pred_id) else {
             continue;
         };
-        for ord_u32 in consumers {
-            let ord = ConsumerOrdinal::new(ord_u32);
-            if let Some(subscriptions) = store.subscriptions_of(pred_id, ord) {
-                missing.extend(subscriptions.iter().copied());
-            }
-        }
+        extend_subscriptions(store, pred_id, consumers, &mut missing);
     }
     missing
-}
-
-fn extend_bound_subscriptions<I, B>(
-    consumers: &RoaringBitmap,
-    predicate: PredicateId,
-    store: &PredicateStore<I, B>,
-    subscriptions: &mut HashSet<SubscriptionId>,
-) where
-    I: IdTypes,
-    B: crate::backend::Backend,
-{
-    for ordinal in consumers {
-        let ordinal = ConsumerOrdinal::new(ordinal);
-        if let Some(bound) = store.subscriptions_of(predicate, ordinal) {
-            subscriptions.extend(bound.iter().copied());
-        }
-    }
 }
 
 enum AggregateGroup<B: crate::backend::Backend> {
@@ -1245,21 +1303,22 @@ where
     E: CdcEvent,
     DB: DatabaseLike,
 {
-    let weighted_rows = weighted_rows_for_agg(event);
     let mut net: AggregateNet<E::Backend> = HashMap::new();
     let snapshot = partition.load_snapshot();
 
     let kind = event.kind();
     let candidates = if kind == EventKind::Update {
-        event.with_changed_columns(db, |changed| partition.select_agg_candidates(kind, changed))
+        event.with_changed_columns(db, |changed| {
+            snapshot.indexes.select_agg_candidates(kind, changed)
+        })
     } else {
-        partition.select_agg_candidates(kind, &[])
+        snapshot.indexes.select_agg_candidates(kind, &[])
     };
     let missing_old = subscriptions_missing_old(event, &candidates, &snapshot.predicates, db);
     let mut group_key_failed = HashSet::new();
     let mut reports = DispatchReports::default();
 
-    for (weight, row) in weighted_rows {
+    for &(weight, row) in weighted_rows_for_agg(kind) {
         for_each_matching_predicate(
             &candidates,
             &snapshot.predicates,
@@ -1289,10 +1348,10 @@ where
                         AggregateGroup::Ungrouped => None,
                         AggregateGroup::Group(group) => Some(group),
                         AggregateGroup::Unencodable => {
-                            extend_bound_subscriptions(
-                                consumers,
-                                pred.id,
+                            extend_subscriptions(
                                 &snapshot.predicates,
+                                pred.id,
+                                consumers,
                                 &mut group_key_failed,
                             );
                             return Ok(());
@@ -1334,11 +1393,11 @@ where
     missing_old.sort_unstable();
     let mut group_key_failed: Vec<_> = group_key_failed.into_iter().collect();
     group_key_failed.sort_unstable();
-    let evaluation_refused = refused_subscriptions(reports.refusals, &mut deltas);
+    let evaluation_refused = reported_subscriptions(reports.refusals, &mut deltas);
     // The same treatment as a refusal, for the same reason: a delta the
     // event could only compute for one side of the transition is worse
     // than no delta, because the error never washes out.
-    let unanswered_filter = unanswered_subscriptions(reports.unanswered, &mut deltas);
+    let unanswered_filter = reported_subscriptions(reports.unanswered, &mut deltas);
 
     Ok(AggregateComputation {
         deltas,
@@ -1364,7 +1423,9 @@ mod transition_tests {
     /// Every non-empty set the split emits, as `(slot, ordinals)`.
     fn split(new: &Matched<'_>, old: &Matched<'_>) -> Vec<(Slot, Vec<u32>)> {
         let mut out = Vec::new();
-        split_transition(new, old, |slot, set| out.push((slot, set.iter().collect())));
+        split_transition(new, old, |slot, set| {
+            out.push((slot, set.iter().collect()));
+        });
         out
     }
 

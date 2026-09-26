@@ -395,3 +395,112 @@ fn a_batch_that_cannot_be_written_survives_best_effort() {
     );
     assert_eq!(engine.subscription_count(), 2, "and both stay registered");
 }
+
+/// A null-safe equality comes back from its shard answering as it did, a
+/// `NULL` status selected and a present one not.
+#[test]
+fn a_null_safe_equality_comes_back_answering_as_it_did() {
+    let store = TempStore::new();
+    let mut engine = store.open(catalog());
+    engine
+        .register(SubscriptionRequest::new(
+            1u64,
+            "SELECT * FROM orders WHERE status IS NOT DISTINCT FROM NULL",
+        ))
+        .expect("the filter registers");
+    engine.snapshot_table(table("orders")).expect("snapshot");
+    drop(engine);
+
+    let mut restored = store.open(catalog());
+    assert_eq!(restored.subscription_count(), 1);
+    let row = |status: subql::backend::Value<Postgres>| {
+        TestEvent::insert(
+            table("orders"),
+            vec![
+                subql::backend::Value::Int(1),
+                subql::backend::Value::Float(1.0),
+                status,
+            ],
+        )
+    };
+    let unset = restored
+        .consumers(&row(subql::backend::Value::Null))
+        .expect("dispatch");
+    assert_eq!(unset.inserted(), [1u64]);
+    let paid = restored
+        .consumers(&row(subql::backend::Value::String("paid".into())))
+        .expect("dispatch");
+    assert!(paid.inserted().is_empty());
+}
+
+/// A written `LIKE` escape comes back from its shard with the pattern it
+/// escapes, a literal `%` selected and any other character not.
+#[test]
+fn a_written_like_escape_comes_back_answering_as_it_did() {
+    let store = TempStore::new();
+    let mut engine = store.open(catalog());
+    engine
+        .register(SubscriptionRequest::new(
+            1u64,
+            "SELECT * FROM orders WHERE status LIKE 'p!%' ESCAPE '!'",
+        ))
+        .expect("the filter registers");
+    engine.snapshot_table(table("orders")).expect("snapshot");
+    drop(engine);
+
+    let mut restored = store.open(catalog());
+    assert_eq!(restored.subscription_count(), 1);
+    let row = |status: &str| {
+        TestEvent::insert(
+            table("orders"),
+            vec![
+                subql::backend::Value::Int(1),
+                subql::backend::Value::Float(1.0),
+                subql::backend::Value::String(status.into()),
+            ],
+        )
+    };
+    assert_eq!(
+        restored.consumers(&row("p%")).expect("dispatch").inserted(),
+        [1u64]
+    );
+    assert!(restored
+        .consumers(&row("px"))
+        .expect("dispatch")
+        .inserted()
+        .is_empty());
+}
+
+/// A column subset comes back from its shard still naming its columns, so an
+/// update of an unprojected column is still not reported.
+#[test]
+fn a_column_subset_comes_back_answering_as_it_did() {
+    let store = TempStore::new();
+    let mut engine = store.open(catalog());
+    engine
+        .register(SubscriptionRequest::new(
+            1u64,
+            "SELECT id, status FROM orders WHERE status = 'paid'",
+        ))
+        .expect("the filter registers");
+    engine.snapshot_table(table("orders")).expect("snapshot");
+    drop(engine);
+
+    let mut restored = store.open(catalog());
+    assert_eq!(restored.subscription_count(), 1);
+    let row = |price: f64| {
+        vec![
+            subql::backend::Value::Int(1),
+            subql::backend::Value::Float(price),
+            subql::backend::Value::String("paid".into()),
+        ]
+    };
+    let repriced = restored
+        .consumers(&TestEvent::update(table("orders"), row(1.0), row(2.0)))
+        .expect("dispatch");
+    assert!(repriced.updated().is_empty(), "the price is not projected");
+    let inserted = restored
+        .consumers(&TestEvent::insert(table("orders"), row(1.0)))
+        .expect("dispatch");
+    assert_eq!(inserted.inserted(), [1u64]);
+}

@@ -3,7 +3,7 @@
 //! Implements truth tables from SQL standard for NULL propagation.
 
 /// SQL tri-state value
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum Tri {
     True,
     False,

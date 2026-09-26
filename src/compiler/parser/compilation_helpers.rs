@@ -1,16 +1,18 @@
 //! Expression compilation helpers split out of the parser.
 
 use super::{Compiling, MAX_TERMS_PER_FILTER};
-use crate::backend::{Backend, ScalarFamily, Value, ValueKindOf};
+use crate::backend::{Backend, NullSafeEquality, ScalarFamily, Value, ValueKindOf};
 use crate::compiler::bytecode::{ComparisonRef, FloatResult};
-use crate::compiler::literals::{resolve_column_ref, SqlLiteralParse};
-use crate::compiler::{canonicalize, sql_shape, BytecodeProgram, Instruction};
+use crate::compiler::literals::{
+    coalesce_arguments, resolve_column_ref, value_column, SqlLiteralParse,
+};
+use crate::compiler::{canonicalize, sql_shape, BytecodeProgram, Instruction, Tri};
 use crate::term::{term_columns, CompiledTerm};
 use crate::{RegisterError, TableId};
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use sql_traits::prelude::DatabaseLike;
-use sqlparser::ast::{BinaryOperator, Expr, UnaryOperator, Value as SqlValue};
+use sqlparser::ast::{BinaryOperator, Expr, UnaryOperator, Value as SqlValue, ValueWithSpan};
 use sqlparser_canonicalize::Canonicalizer;
 
 /// If `expr` is a bare column reference, return what a value of that column
@@ -25,7 +27,7 @@ fn column_scalar_of<B: Backend, DB: DatabaseLike>(
     table_id: TableId,
     database: &DB,
 ) -> Option<ValueKindOf<B>> {
-    let col = resolve_column_ref::<B, DB>(expr, table_id, database)?;
+    let col = resolve_column_ref::<B, DB>(value_column(expr), table_id, database)?;
     crate::catalog_helpers::column_scalar_kind::<B, DB>(database, table_id, col)
         .map(|kind| kind.value_kind())
 }
@@ -63,6 +65,25 @@ fn nested_column_scalar_of<B: Backend, DB: DatabaseLike>(
         }
         _ => None,
     }
+}
+
+/// The kind the literals beside `tested` are read at: the kind of the column it
+/// reads, through the arithmetic around it, as `=` reads it.
+///
+/// A side reading no column has no kind every engine agrees on, so it is
+/// routed to the engine rather than read as text and refused as a bad literal.
+fn tested_side_kind<B: Backend, DB: DatabaseLike>(
+    tested: &Expr,
+    table_id: TableId,
+    database: &DB,
+    depth: usize,
+    keyword: &str,
+) -> Result<ValueKindOf<B>, RegisterError> {
+    nested_column_scalar_of::<B, DB>(tested, table_id, database, depth).ok_or_else(|| {
+        RegisterError::UnsupportedSql(format!(
+            "{keyword} is served over a tested side reading a column of the table"
+        ))
+    })
 }
 
 /// The kind a binary operation answers, given the kind its operands carry.
@@ -113,6 +134,9 @@ const fn instruction_is_tri_typed<B: Backend>(instr: &Instruction<B>) -> bool {
             | Instruction::JumpIfFalse(_)
             | Instruction::JumpIfTrue(_)
             | Instruction::TermTruth(_)
+            | Instruction::NotDistinct(_)
+            | Instruction::IsTruth { .. }
+            | Instruction::Truth
     )
 }
 
@@ -142,6 +166,65 @@ where
             "empty WHERE clause after compilation".to_string(),
         )),
     }
+}
+
+/// Whether `expr`, parentheses aside, names a boolean column of the table.
+fn is_boolean_column<B: Backend, DB: DatabaseLike>(
+    expr: &Expr,
+    table_id: TableId,
+    database: &DB,
+) -> bool {
+    let mut bare = value_column(expr);
+    while let Expr::Nested(inner) = bare {
+        bare = inner;
+    }
+    resolve_column_ref::<B, DB>(bare, table_id, database).is_some_and(|column| {
+        crate::catalog_helpers::column_scalar_family(database, table_id, column)
+            == Some(ScalarFamily::Bool)
+    })
+}
+
+/// Turn the value `expr` just compiled to into a condition, where one is read.
+///
+/// A boolean column reads as its own truth, which is how each engine reads
+/// one there. `= true` is not that on SQLite, whose boolean column keeps the
+/// stored integer and compares it with `1`. A boolean literal keeps the
+/// `= true` comparison, and any other value is routed, since MySQL and SQLite
+/// read a nonzero number as true where the comparison never matches.
+fn ensure_condition<B, DB>(
+    expr: &Expr,
+    table_id: TableId,
+    database: &DB,
+    out: &mut Compiling<B>,
+) -> Result<(), RegisterError>
+where
+    B: Backend + SqlLiteralParse,
+    DB: DatabaseLike,
+{
+    if out.out.last().is_some_and(instruction_is_tri_typed) {
+        return Ok(());
+    }
+    if is_boolean_column::<B, DB>(expr, table_id, database) {
+        out.push(Instruction::Truth);
+        return Ok(());
+    }
+    let mut bare = expr;
+    while let Expr::Nested(inner) = bare {
+        bare = inner;
+    }
+    if !matches!(
+        bare,
+        Expr::Value(ValueWithSpan {
+            value: SqlValue::Boolean(_),
+            ..
+        })
+    ) {
+        return Err(RegisterError::UnsupportedSql(
+            "a value that is not boolean, read as a condition".to_string(),
+        ));
+    }
+    let comparison = ComparisonRef::new(out.intern_comparison(expr, table_id, database), None);
+    wrap_bare_value_as_tri::<B>(&mut out.out, comparison)
 }
 
 /// Compile a SQL expression into bytecode, plus the membership terms it names.
@@ -174,8 +257,7 @@ where
         0,
         ScalarFamily::String.into(),
     )?;
-    let bare = ComparisonRef::new(compiling.intern_comparison(expr, table_id, database), None);
-    wrap_bare_value_as_tri::<B>(&mut compiling.out, bare)?;
+    ensure_condition::<B, DB>(expr, table_id, database, &mut compiling)?;
     let terms = canonicalize_term_slots(&mut compiling, canonicalizer)?;
     let columns = term_columns(&terms);
     Ok((
@@ -249,7 +331,7 @@ fn float_result_width<B: Backend, DB: DatabaseLike>(
     database: &DB,
     depth: usize,
 ) -> FloatResult {
-    if let Some(column) = resolve_column_ref::<B, DB>(expr, table_id, database) {
+    if let Some(column) = resolve_column_ref::<B, DB>(value_column(expr), table_id, database) {
         return crate::catalog_helpers::column_comparison::<B, DB>(database, table_id, column)
             .and_then(|facts| facts.kind.declared_type())
             .and_then(crate::backend::DeclaredType::float_width);
@@ -318,6 +400,7 @@ where
                         depth + 1,
                         ScalarFamily::String.into(),
                     )?;
+                    ensure_condition::<B, DB>(left, table_id, database, out)?;
 
                     let jump_idx = out.len();
                     out.push(Instruction::JumpIfFalse(0)); // offset backfilled once rhs length is known (line 213)
@@ -331,6 +414,7 @@ where
                         depth + 1,
                         ScalarFamily::String.into(),
                     )?;
+                    ensure_condition::<B, DB>(right, table_id, database, out)?;
                     out.push(Instruction::And);
 
                     let rhs_len = out.len() - rhs_start;
@@ -345,6 +429,7 @@ where
                         depth + 1,
                         ScalarFamily::String.into(),
                     )?;
+                    ensure_condition::<B, DB>(left, table_id, database, out)?;
 
                     let jump_idx = out.len();
                     out.push(Instruction::JumpIfTrue(0)); // offset backfilled once rhs length is known (line 240)
@@ -358,16 +443,29 @@ where
                         depth + 1,
                         ScalarFamily::String.into(),
                     )?;
+                    ensure_condition::<B, DB>(right, table_id, database, out)?;
                     out.push(Instruction::Or);
 
                     let rhs_len = out.len() - rhs_start;
                     out[jump_idx] = Instruction::JumpIfTrue(rhs_len + 1);
                 }
+                BinaryOperator::Spaceship => compile_null_safe_equality::<B, DB>(
+                    (left, right),
+                    NullSafeEquality::Spaceship,
+                    false,
+                    table_id,
+                    database,
+                    out,
+                    depth,
+                )?,
                 _ => {
                     // A name resolving to no column falls to the generic arms, whose refusal names it.
                     if caller_term::<B, DB>(expr, table_id, database, out)? {
                         return Ok(());
                     }
+                    refuse_condition_operand(left)?;
+                    refuse_condition_operand(right)?;
+                    refuse_literal_foreign_to_coalesce::<B, DB>(left, right, table_id, database)?;
 
                     // Non-short-circuit operators: compile both sides,
                     // then emit the op. Target-typed literal inference
@@ -536,15 +634,14 @@ where
             list,
             negated,
         } => {
-            // Derive target from the tested expression if it's a column
-            // reference; fall back to String otherwise (best-effort).
-            let list_target = column_scalar_of::<B, DB>(expr, table_id, database)
-                .unwrap_or_else(|| ScalarFamily::String.into());
+            refuse_condition_operand(expr)?;
+            let list_target = tested_side_kind::<B, DB>(expr, table_id, database, depth, "IN")?;
 
             compile_expr_recursive::<B, DB>(expr, table_id, database, out, depth + 1, list_target)?;
 
             let mut literals: Vec<Value<B>> = Vec::with_capacity(list.len());
             for item in list {
+                refuse_literal_foreign_to_coalesce::<B, DB>(expr, item, table_id, database)?;
                 if let Expr::Value(val) = item {
                     literals.push(B::parse_literal(&val.value, list_target)?);
                 } else {
@@ -557,10 +654,21 @@ where
                 }
             }
 
-            let tested = out.intern_comparison(expr, table_id, database);
+            // Each item asks the question `=` asks, so the collation `=` would
+            // refuse is refused here, and the rule it would resolve is used.
+            let comparison = match list.first() {
+                Some(item) => out.comparison_for(
+                    expr,
+                    item,
+                    table_id,
+                    database,
+                    crate::backend::TextOperation::Equality,
+                )?,
+                None => ComparisonRef::new(out.intern_comparison(expr, table_id, database), None),
+            };
             out.push(Instruction::In {
                 literals,
-                comparison: ComparisonRef::new(tested, None),
+                comparison,
             });
 
             if *negated {
@@ -637,8 +745,14 @@ where
             high,
             negated,
         } => {
-            let range_target = column_scalar_of::<B, DB>(expr, table_id, database)
-                .unwrap_or_else(|| ScalarFamily::String.into());
+            for operand in [expr, low, high] {
+                refuse_condition_operand(operand)?;
+            }
+            let range_target =
+                tested_side_kind::<B, DB>(expr, table_id, database, depth, "BETWEEN")?;
+            for bound in [low, high] {
+                refuse_literal_foreign_to_coalesce::<B, DB>(expr, bound, table_id, database)?;
+            }
 
             // Stack order: value, lower, upper.
             compile_expr_recursive::<B, DB>(
@@ -746,7 +860,10 @@ where
             )?;
 
             match op {
-                UnaryOperator::Not => out.push(Instruction::Not),
+                UnaryOperator::Not => {
+                    ensure_condition::<B, DB>(inner, table_id, database, out)?;
+                    out.push(Instruction::Not);
+                }
                 UnaryOperator::Plus => {
                     // Unary + is no-op.
                 }
@@ -775,7 +892,7 @@ where
                 expr,
                 pattern,
                 negated: *negated,
-                escaped: escape_char.is_some(),
+                escape: escape_char.as_deref(),
                 keyword: "LIKE",
                 operation: crate::backend::TextOperation::Pattern,
             },
@@ -796,7 +913,7 @@ where
                 expr,
                 pattern,
                 negated: *negated,
-                escaped: escape_char.is_some(),
+                escape: escape_char.as_deref(),
                 keyword: "ILIKE",
                 operation: crate::backend::TextOperation::CaseInsensitivePattern,
             },
@@ -805,6 +922,39 @@ where
             out,
             depth,
         )?,
+
+        Expr::IsTrue(condition)
+        | Expr::IsNotTrue(condition)
+        | Expr::IsFalse(condition)
+        | Expr::IsNotFalse(condition)
+        | Expr::IsUnknown(condition)
+        | Expr::IsNotUnknown(condition) => {
+            let (value, negated) = match expr {
+                Expr::IsTrue(_) => (Tri::True, false),
+                Expr::IsNotTrue(_) => (Tri::True, true),
+                Expr::IsFalse(_) => (Tri::False, false),
+                Expr::IsNotFalse(_) => (Tri::False, true),
+                Expr::IsUnknown(_) => (Tri::Unknown, false),
+                _ => (Tri::Unknown, true),
+            };
+            compile_truth_test::<B, DB>(condition, value, negated, table_id, database, out, depth)?;
+        }
+
+        Expr::IsNotDistinctFrom(left, right) | Expr::IsDistinctFrom(left, right) => {
+            compile_null_safe_equality::<B, DB>(
+                (left, right),
+                NullSafeEquality::DistinctFrom,
+                matches!(expr, Expr::IsDistinctFrom(..)),
+                table_id,
+                database,
+                out,
+                depth,
+            )?;
+        }
+
+        Expr::Function(_) if coalesce_arguments(expr).is_some() => {
+            compile_coalesce::<B, DB>(expr, table_id, database, out, depth)?;
+        }
 
         // Nested Expressions (parentheses)
         Expr::Nested(inner) => {
@@ -878,7 +1028,8 @@ struct PatternMatch<'sql> {
     expr: &'sql Expr,
     pattern: &'sql Expr,
     negated: bool,
-    escaped: bool,
+    /// The written `ESCAPE` clause, if any.
+    escape: Option<&'sql Expr>,
     /// The keyword to name in a refusal, `LIKE` or `ILIKE`.
     keyword: &'static str,
     operation: crate::backend::TextOperation,
@@ -897,11 +1048,26 @@ where
     B: Backend + SqlLiteralParse,
     DB: DatabaseLike,
 {
-    if node.escaped {
-        return Err(RegisterError::UnsupportedSql(format!(
-            "{} ESCAPE not yet supported",
-            node.keyword
-        )));
+    // The written clause replaces the engine's default escape.
+    let escape = match node.escape {
+        None => B::LIKE_DEFAULT_ESCAPE,
+        Some(written) => match written {
+            Expr::Value(ValueWithSpan {
+                value: SqlValue::SingleQuotedString(character),
+                ..
+            }) => B::like_escape_clause(character).map_err(|reason| {
+                RegisterError::UnsupportedSql(format!("{} ESCAPE: {reason}", node.keyword))
+            })?,
+            _ => {
+                return Err(RegisterError::UnsupportedSql(format!(
+                    "{} ESCAPE is served with a quoted character only",
+                    node.keyword
+                )))
+            }
+        },
+    };
+    for operand in [node.expr, node.pattern] {
+        refuse_condition_operand(operand)?;
     }
     for operand in [node.expr, node.pattern] {
         compile_expr_recursive::<B, DB>(
@@ -915,8 +1081,322 @@ where
     }
     let comparison =
         out.comparison_for(node.expr, node.pattern, table_id, database, node.operation)?;
-    out.push(Instruction::Like { comparison });
+    out.push(Instruction::Like { comparison, escape });
     if node.negated {
+        out.push(Instruction::Not);
+    }
+    Ok(())
+}
+
+/// The families a served `COALESCE` may answer in: the ones whose literal
+/// every engine reads alike.
+const COALESCE_FAMILIES: [ScalarFamily; 5] = [
+    ScalarFamily::Int,
+    ScalarFamily::Float,
+    ScalarFamily::Decimal,
+    ScalarFamily::String,
+    ScalarFamily::Bool,
+];
+
+/// Whether `literal` is written in `family`'s own form, the one every engine
+/// types alike: a number for the numeric families, and an integer one for
+/// `Int`, since a fraction makes the engines pick a decimal type.
+fn native_literal(literal: &SqlValue, family: ScalarFamily) -> bool {
+    match (literal, family) {
+        (SqlValue::Null, _)
+        | (SqlValue::Number(..), ScalarFamily::Float | ScalarFamily::Decimal)
+        | (SqlValue::SingleQuotedString(_), ScalarFamily::String)
+        | (SqlValue::Boolean(_), ScalarFamily::Bool) => true,
+        (SqlValue::Number(digits, _), ScalarFamily::Int) => !digits.contains(['.', 'e', 'E']),
+        _ => false,
+    }
+}
+
+/// The refusal for a `COALESCE` the engines type differently.
+fn coalesce_refusal(reason: &str) -> RegisterError {
+    RegisterError::UnsupportedSql(format!(
+        "COALESCE is served over column arguments of one declared type and collation and \
+         literals written in that type's own form, and {reason}"
+    ))
+}
+
+/// Compile a `COALESCE` whose arguments every engine types alike.
+///
+/// Its column arguments share one declared type and collation in a family
+/// whose literals every engine reads alike, and each literal is written in
+/// that family's form. Measured, the engines disagree past that:
+/// `COALESCE(1, 2.5) / 2` is `0.5` on PostgreSQL and MySQL and `0` on SQLite,
+/// and `COALESCE(1, 'a')` is an error on PostgreSQL only.
+fn compile_coalesce<B, DB>(
+    expr: &Expr,
+    table_id: TableId,
+    database: &DB,
+    out: &mut Compiling<B>,
+    depth: usize,
+) -> Result<(), RegisterError>
+where
+    B: Backend + SqlLiteralParse,
+    DB: DatabaseLike,
+{
+    let arguments = coalesce_arguments(expr).unwrap_or_default();
+    if arguments.len() < 2 {
+        return Err(coalesce_refusal(
+            "a call of one argument is an error on SQLite",
+        ));
+    }
+    let mut facts = None;
+    for argument in &arguments {
+        match argument {
+            Expr::Value(_) => {}
+            Expr::Identifier(_) | Expr::CompoundIdentifier(_) => {
+                let column = resolve_column_ref::<B, DB>(argument, table_id, database)
+                    .ok_or_else(|| coalesce_refusal("an argument names no column of the table"))?;
+                let declared =
+                    crate::catalog_helpers::column_comparison::<B, DB>(database, table_id, column);
+                match (&facts, declared) {
+                    (_, None) => return Err(coalesce_refusal("an argument has no known type")),
+                    (None, Some(declared)) => facts = Some((column, declared)),
+                    (Some((_, first)), Some(declared)) if *first == declared => {}
+                    (Some(_), Some(_)) => {
+                        return Err(coalesce_refusal(
+                            "its columns differ in declared type or collation",
+                        ))
+                    }
+                }
+            }
+            _ => {
+                return Err(coalesce_refusal(
+                    "an argument is neither a column nor a literal",
+                ))
+            }
+        }
+    }
+    let Some((column, _)) = facts else {
+        return Err(coalesce_refusal("no argument is a column"));
+    };
+    let family = crate::catalog_helpers::column_scalar_family(database, table_id, column)
+        .filter(|family| COALESCE_FAMILIES.contains(family))
+        .ok_or_else(|| coalesce_refusal("its type is one whose literals the engines read apart"))?;
+    for argument in &arguments {
+        if let Expr::Value(literal) = argument {
+            if !native_literal(&literal.value, family) {
+                return Err(coalesce_refusal(
+                    "a literal is written in another type's form",
+                ));
+            }
+        }
+    }
+    let target =
+        column_scalar_of::<B, DB>(expr, table_id, database).unwrap_or_else(|| family.into());
+    for argument in &arguments {
+        compile_expr_recursive::<B, DB>(argument, table_id, database, out, depth + 1, target)?;
+    }
+    let count = u16::try_from(arguments.len())
+        .map_err(|_| coalesce_refusal("it has more arguments than a program counts"))?;
+    out.push(Instruction::Coalesce(count));
+    Ok(())
+}
+
+/// Refuse a literal beside a `COALESCE` written in another family's form.
+///
+/// SQLite gives an expression no affinity, so it compares a quoted literal
+/// with a `COALESCE` over integers as text and answers false, where PostgreSQL
+/// and MySQL convert it: measured, `COALESCE(NULL, 1) = '1'`.
+fn refuse_literal_foreign_to_coalesce<B: Backend, DB: DatabaseLike>(
+    left: &Expr,
+    right: &Expr,
+    table_id: TableId,
+    database: &DB,
+) -> Result<(), RegisterError> {
+    for (coalesced, other) in [(left, right), (right, left)] {
+        if coalesce_arguments(coalesced).is_none() {
+            continue;
+        }
+        let Expr::Value(literal) = other else {
+            continue;
+        };
+        let family = resolve_column_ref::<B, DB>(value_column(coalesced), table_id, database)
+            .and_then(|column| {
+                crate::catalog_helpers::column_scalar_family(database, table_id, column)
+            });
+        if !family.is_some_and(|family| native_literal(&literal.value, family)) {
+            return Err(coalesce_refusal(
+                "a literal compared with it is written in another type's form",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Refuse a condition where a value is read, as in `(a = b) = true`.
+///
+/// Every engine answers it, and the language compares and computes with
+/// values only, so it is routed to a read rather than typed against the
+/// sibling column and refused as a bad literal.
+fn refuse_condition_operand(operand: &Expr) -> Result<(), RegisterError> {
+    let mut bare = operand;
+    while let Expr::Nested(inner) = bare {
+        bare = inner;
+    }
+    let condition = match bare {
+        Expr::BinaryOp { op, .. } => matches!(
+            op,
+            BinaryOperator::Eq
+                | BinaryOperator::NotEq
+                | BinaryOperator::Lt
+                | BinaryOperator::LtEq
+                | BinaryOperator::Gt
+                | BinaryOperator::GtEq
+                | BinaryOperator::And
+                | BinaryOperator::Or
+                | BinaryOperator::Spaceship
+        ),
+        Expr::UnaryOp { op, .. } => matches!(op, UnaryOperator::Not),
+        _ => matches!(
+            bare,
+            Expr::IsNull(_)
+                | Expr::IsNotNull(_)
+                | Expr::IsTrue(_)
+                | Expr::IsNotTrue(_)
+                | Expr::IsFalse(_)
+                | Expr::IsNotFalse(_)
+                | Expr::IsUnknown(_)
+                | Expr::IsNotUnknown(_)
+                | Expr::IsDistinctFrom(..)
+                | Expr::IsNotDistinctFrom(..)
+                | Expr::Like { .. }
+                | Expr::ILike { .. }
+                | Expr::InList { .. }
+                | Expr::InSubquery { .. }
+                | Expr::Between { .. }
+                | Expr::Exists { .. }
+        ),
+    };
+    if condition {
+        return Err(RegisterError::UnsupportedSql(
+            "a condition compared or computed with as a value is not supported in process, \
+             which compares and computes with values only"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// Refuse a membership subquery or a caller comparison as the operand of a
+/// truth test or a null-safe equality.
+///
+/// Either can negate what it wraps, as `IS NOT TRUE` and `IS DISTINCT FROM
+/// true` do, which is the subtraction `NOT` over a term is refused for, and a
+/// term answers per subscriber rather than as one value.
+fn refuse_term_operand(operand: &Expr) -> Result<(), RegisterError> {
+    if sql_shape::contains_membership_subquery(operand)
+        || sql_shape::contains_caller_comparison(operand)
+    {
+        return Err(RegisterError::UnsupportedSql(
+            "A membership subquery or a comparison to the caller under a truth test (IS TRUE, \
+             IS FALSE, IS UNKNOWN) or a null-safe equality is not supported. SubQL serves the \
+             relationship itself, and these can negate it. Run this as a regular SQL query in \
+             your database."
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// Compile a truth test of `condition` for `value`, negated for `IS NOT`.
+///
+/// The operand is a condition or a boolean column, the one kind every engine
+/// reads alike: PostgreSQL raises on a number where MySQL and SQLite read
+/// its truth, so any other operand is left to the engine.
+fn compile_truth_test<B, DB>(
+    condition: &Expr,
+    value: Tri,
+    negated: bool,
+    table_id: TableId,
+    database: &DB,
+    out: &mut Compiling<B>,
+    depth: usize,
+) -> Result<(), RegisterError>
+where
+    B: Backend + SqlLiteralParse,
+    DB: DatabaseLike,
+{
+    refuse_term_operand(condition)?;
+    if value == Tri::Unknown && !B::READS_IS_UNKNOWN {
+        return Err(RegisterError::UnsupportedSql(
+            "`IS [NOT] UNKNOWN` is not a truth test on this engine, which reads `UNKNOWN` as a \
+             name"
+                .to_string(),
+        ));
+    }
+    compile_expr_recursive::<B, DB>(
+        condition,
+        table_id,
+        database,
+        out,
+        depth + 1,
+        ScalarFamily::Bool.into(),
+    )?;
+    if !out.out.last().is_some_and(instruction_is_tri_typed)
+        && !is_boolean_column::<B, DB>(condition, table_id, database)
+    {
+        return Err(RegisterError::UnsupportedSql(
+            "a truth test is served over a condition or a boolean column, and the engines \
+             disagree about any other operand"
+                .to_string(),
+        ));
+    }
+    ensure_condition::<B, DB>(condition, table_id, database, out)?;
+    out.push(Instruction::IsTruth { value, negated });
+    Ok(())
+}
+
+/// Compile a null-safe equality written in `spelling`, negated for
+/// `IS DISTINCT FROM`.
+///
+/// A spelling the engine rejects is not served, so the engine's own error
+/// is what the caller meets. The comparison facts are the ones `=` resolves,
+/// so both refuse the same operand pairs.
+fn compile_null_safe_equality<B, DB>(
+    (left, right): (&Expr, &Expr),
+    spelling: NullSafeEquality,
+    negated: bool,
+    table_id: TableId,
+    database: &DB,
+    out: &mut Compiling<B>,
+    depth: usize,
+) -> Result<(), RegisterError>
+where
+    B: Backend + SqlLiteralParse,
+    DB: DatabaseLike,
+{
+    if spelling != B::NULL_SAFE_EQUALITY {
+        return Err(RegisterError::UnsupportedSql(format!(
+            "`{}` is not this engine's null-safe equality, which it spells `{}`",
+            spelling.spelling(),
+            B::NULL_SAFE_EQUALITY.spelling()
+        )));
+    }
+    refuse_term_operand(left)?;
+    refuse_term_operand(right)?;
+    refuse_condition_operand(left)?;
+    refuse_condition_operand(right)?;
+    refuse_literal_foreign_to_coalesce::<B, DB>(left, right, table_id, database)?;
+    let target = nested_column_scalar_of::<B, DB>(left, table_id, database, depth)
+        .or_else(|| nested_column_scalar_of::<B, DB>(right, table_id, database, depth))
+        .unwrap_or_else(|| ScalarFamily::String.into());
+    for operand in [left, right] {
+        compile_expr_recursive::<B, DB>(operand, table_id, database, out, depth + 1, target)?;
+    }
+    let comparison = out.comparison_for(
+        left,
+        right,
+        table_id,
+        database,
+        crate::backend::TextOperation::Equality,
+    )?;
+    out.push(Instruction::NotDistinct(comparison));
+    if negated {
         out.push(Instruction::Not);
     }
     Ok(())

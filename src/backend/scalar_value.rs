@@ -724,6 +724,31 @@ pub enum NumericWidening {
     Exact,
 }
 
+/// How an engine spells the equality that holds between two `NULL`s.
+///
+/// Measured 2026-09-24: PostgreSQL 16 and SQLite 3.51 accept
+/// `IS [NOT] DISTINCT FROM` and reject `<=>`, and MySQL 8.0.46 accepts `<=>`
+/// and rejects `IS DISTINCT FROM` with `ERROR 1064`. Both spellings ask one
+/// question, so a spelling the engine rejects is left to the engine to reject.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum NullSafeEquality {
+    /// `a IS [NOT] DISTINCT FROM b`, the standard's spelling.
+    DistinctFrom,
+    /// `a <=> b`, true exactly where `a IS NOT DISTINCT FROM b` is.
+    Spaceship,
+}
+
+impl NullSafeEquality {
+    /// The spelling as it is written, for a refusal to name.
+    #[must_use]
+    pub const fn spelling(self) -> &'static str {
+        match self {
+            Self::DistinctFrom => "IS [NOT] DISTINCT FROM",
+            Self::Spaceship => "<=>",
+        }
+    }
+}
+
 /// What `/` answers, which is an engine's choice and not one rule.
 ///
 /// Measured 2026-09-05 on PostgreSQL 16.15, MySQL 8.4.11 and SQLite
