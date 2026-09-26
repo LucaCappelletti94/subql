@@ -404,6 +404,9 @@ mod float_range_bounds;
 
 mod null_test_of_condition;
 
+#[cfg(all(feature = "diesel-typed-sqlite", feature = "executor-diesel"))]
+mod sync_cursors;
+
 mod column_subset;
 
 mod semantics_float_width;

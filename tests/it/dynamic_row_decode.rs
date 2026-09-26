@@ -219,27 +219,6 @@ fn a_result_inside_the_budget_reports_no_more() {
     assert!(!page.value.more);
 }
 
-/// The cursor path is what keyless results need, and a connector that holds no
-/// cursors says so rather than pretending.
-#[test]
-fn a_connector_without_cursors_refuses_them_by_name() {
-    use subql::reexec::{Connector, CursorError, CursorId, DieselConnector};
-
-    let connector: DieselConnector<SqliteConnection, subql::backend::Postgres> =
-        DieselConnector::new(conn());
-    assert!(matches!(
-        connector.open_cursor(
-            &subql::reexec::ReadQuery::without_binds("SELECT DISTINCT label FROM readings"),
-            &(),
-        ),
-        Err(CursorError::Unsupported)
-    ));
-    assert!(matches!(
-        connector.close_cursor(CursorId(1)),
-        Err(CursorError::Unsupported)
-    ));
-}
-
 /// A seed read declares one column kind per component, so a result of another
 /// width is refused rather than zipped short. A silently truncated seed would
 /// hand an aggregate a count without its sum.

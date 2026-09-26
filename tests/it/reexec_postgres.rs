@@ -663,3 +663,83 @@ fn each_read_runs_read_only_at_repeatable_read() {
         "refused for being read-only rather than for any other reason, got {refused}"
     );
 }
+
+/// The sync connector's cursor streams one snapshot: every row once across
+/// pages under the byte budget, the last page says so, and a row committed
+/// after the cursor opened is not in it. Closing ends the transaction, so
+/// the connector reads again afterwards, and a closed cursor is unknown.
+#[test]
+#[ignore = "requires Docker; run with --ignored"]
+fn a_sync_cursor_pages_one_snapshot_of_a_keyless_result() {
+    use subql::reexec::{CursorError, ReadQuery};
+
+    common::assert_docker_available();
+    let db = common::pg_database();
+    let slot = db.slot(SLOT);
+    let mut conn_setup = db.connect();
+    let seed: Vec<(i64, f64)> = (1..=40_u32)
+        .map(|id| (i64::from(id), f64::from(id)))
+        .collect();
+    common::pg::setup_orders(&mut conn_setup, &seed, &slot);
+
+    let connector = PgDieselConnector::new(db.connect());
+    let cursor = connector
+        .open_cursor(
+            &ReadQuery::owned(
+                "SELECT DISTINCT id, status FROM orders WHERE id > $1 ORDER BY id".to_string(),
+                vec![Value::Int(0)],
+            ),
+            &(),
+        )
+        .expect("open cursor");
+    sql_query("INSERT INTO orders (id, price, quantity, status) VALUES (999, 1.0, 1, 'late')")
+        .execute(&mut conn_setup)
+        .expect("concurrent insert");
+
+    let mut ids = Vec::new();
+    let mut pages = 0;
+    let mut first_fence = None;
+    loop {
+        let page = connector.fetch_cursor(cursor, 96).expect("fetch page");
+        pages += 1;
+        let fence = page
+            .fence
+            .clone()
+            .expect("a cursor's pages carry its fence");
+        assert_eq!(
+            *first_fence.get_or_insert_with(|| fence.clone()),
+            fence,
+            "every page reports the one snapshot's fence"
+        );
+        assert_eq!(page.value.columns, vec!["id", "status"]);
+        for row in &page.value.rows {
+            let Value::Int(id) = row[0] else {
+                panic!("id decodes as an integer, got {:?}", row[0]);
+            };
+            ids.push(id);
+        }
+        if !page.value.more {
+            break;
+        }
+        assert!(pages < 100, "the cursor finishes");
+    }
+    assert!(pages > 1, "a 96-byte budget splits forty rows");
+    assert_eq!(ids, (1..=40).collect::<Vec<i64>>());
+    connector.close_cursor(cursor).expect("close");
+    assert!(matches!(
+        connector.fetch_cursor(cursor, 96),
+        Err(CursorError::Unknown(id)) if id == cursor
+    ));
+    let (value, _) = connector
+        .execute_scalar(
+            &ReadQuery::without_binds("SELECT COUNT(*) AS v FROM orders"),
+            ScalarFamily::Int,
+            &(),
+        )
+        .expect("a read after the cursor closed");
+    assert_eq!(
+        value,
+        Value::Int(41),
+        "the closed cursor's snapshot is gone"
+    );
+}

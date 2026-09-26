@@ -3,13 +3,14 @@
 
 use super::diesel_backend::boxed_postgres_read_query;
 use super::diesel_connector::{load_page_postgres, load_scalar, load_scalar_row};
-use super::pg_diesel_connector::{read_fence, read_in_snapshot};
+use super::pg_diesel_connector::{
+    fetch_page_from, read_fence, read_in_snapshot, PgCursorState, CURSOR_BATCH,
+};
 use super::{
-    drain_cursor_buffer, run_setup_statements, Connector, CursorError, CursorId, ReadQuery,
-    RowPage, ScalarRowError, SessionSetup, Snapshot, PG_READ_SNAPSHOT,
+    run_setup_statements, Connector, CursorError, CursorId, ReadQuery, RowPage, ScalarRowError,
+    SessionSetup, Snapshot, PG_READ_SNAPSHOT,
 };
 use crate::backend::{ScalarFamily, Value};
-use alloc::string::String;
 use diesel::{QueryResult, RunQueryDsl};
 use thiserror::Error;
 
@@ -50,22 +51,11 @@ pub struct PgR2D2DieselConnector<S = ()> {
     _setup: core::marker::PhantomData<fn() -> S>,
 }
 
-/// One open cursor: the connection it pins, the fence of the snapshot its
-/// pages report, and rows already fetched but not yet delivered.
-///
-/// The leftover buffer is what keeps the byte budget exact. `FETCH` cannot be
-/// undone, so a batch that overshoots the budget would otherwise have to be
-/// returned whole or thrown away; carrying the remainder into the next page
-/// does neither.
+/// One open cursor: the connection it pins and its paging state.
 #[cfg(feature = "executor-diesel-postgres-r2d2")]
 struct PgCursor {
     conn: r2d2::PooledConnection<diesel::r2d2::ConnectionManager<diesel::PgConnection>>,
-    /// The cursor's `DECLARE`d name, which the per-page `FETCH` and the
-    /// closing `CLOSE` are built from.
-    name: String,
-    fence: Option<crate::PgSnapshotFence>,
-    columns: alloc::vec::Vec<String>,
-    leftover: alloc::collections::VecDeque<alloc::vec::Vec<Value<crate::backend::Postgres>>>,
+    state: PgCursorState,
 }
 
 /// Diesel's transaction manager for `PgConnection`.
@@ -275,10 +265,7 @@ impl<S: SessionSetup> Connector for PgR2D2DieselConnector<S> {
             id,
             alloc::sync::Arc::new(parking_lot::Mutex::new(PgCursor {
                 conn,
-                name,
-                fence,
-                columns: alloc::vec::Vec::new(),
-                leftover: alloc::collections::VecDeque::new(),
+                state: PgCursorState::new(name, fence),
             })),
         );
         Ok(id)
@@ -289,11 +276,6 @@ impl<S: SessionSetup> Connector for PgR2D2DieselConnector<S> {
         cursor: CursorId,
         max_bytes: usize,
     ) -> Result<Snapshot<RowPage<Self::Backend>, Self::Checkpoint>, CursorError<Self::Error>> {
-        /// Rows per `FETCH`. Overshoot is carried into the next page rather
-        /// than discarded, so this trades round trips against buffered rows
-        /// and never against correctness.
-        const BATCH: usize = 64;
-
         let entry = self
             .cursors
             .lock()
@@ -307,7 +289,8 @@ impl<S: SessionSetup> Connector for PgR2D2DieselConnector<S> {
             return Err(CursorError::Busy(cursor));
         };
 
-        let outcome = fetch_page_from(&mut guard, max_bytes, BATCH);
+        let PgCursor { conn, state } = &mut *guard;
+        let outcome = fetch_page_from(conn, state, max_bytes, CURSOR_BATCH);
         drop(guard);
         match outcome {
             Ok(page) => Ok(page),
@@ -331,7 +314,7 @@ impl<S: SessionSetup> Connector for PgR2D2DieselConnector<S> {
         let held = &mut *entry.lock();
         // `CLOSE` is a cursor command with no typed DSL spelling, so raw SQL
         // is required. The name is the connector's own, never a caller's.
-        let closed = diesel::sql_query(alloc::format!("CLOSE {}", held.name))
+        let closed = diesel::sql_query(alloc::format!("CLOSE {}", held.state.name))
             .execute(&mut *held.conn)
             .and_then(|_| PgTxn::commit_transaction(&mut *held.conn));
         match closed {
@@ -340,59 +323,6 @@ impl<S: SessionSetup> Connector for PgR2D2DieselConnector<S> {
                 let _ = PgTxn::rollback_transaction(&mut *held.conn);
                 Err(CursorError::Connector(PgR2D2Error::Diesel(e)))
             }
-        }
-    }
-}
-
-/// Fill one page from an open cursor, buffering whatever a `FETCH` overshot.
-///
-/// The sync twin of `PgAsyncDieselConnector::fetch_from`, split out for the
-/// same reason: the caller decides what a failure means for the cursor's
-/// registration, and that decision does not belong inside the read loop.
-#[cfg(feature = "executor-diesel-postgres-r2d2")]
-fn fetch_page_from(
-    held: &mut PgCursor,
-    max_bytes: usize,
-    batch: usize,
-) -> QueryResult<Snapshot<RowPage<crate::backend::Postgres>, crate::PgCommitPosition>> {
-    let mut rows: alloc::vec::Vec<alloc::vec::Vec<Value<crate::backend::Postgres>>> =
-        alloc::vec::Vec::new();
-    let mut spent = 0_usize;
-    loop {
-        if drain_cursor_buffer(&mut held.leftover, &mut rows, &mut spent, max_bytes) {
-            return Ok(Snapshot {
-                value: RowPage {
-                    columns: held.columns.clone(),
-                    rows,
-                    more: true,
-                },
-                fence: held.fence.clone(),
-            });
-        }
-        // `FETCH FORWARD` is a cursor command with no typed DSL equivalent.
-        let page = load_page_postgres(
-            &mut held.conn,
-            &ReadQuery::without_binds(&alloc::format!("FETCH FORWARD {batch} FROM {}", held.name)),
-            usize::MAX,
-        )?;
-        if held.columns.is_empty() {
-            held.columns = page.columns;
-        }
-        // An empty batch is the cursor's own end-of-result signal, so the loop
-        // exits on what the database said rather than on a short-batch guess. A
-        // guess costs a round trip when right and a hang when wrong, which is a
-        // bad trade for a loop.
-        let fetched = page.rows.len();
-        held.leftover.extend(page.rows);
-        if fetched == 0 {
-            return Ok(Snapshot {
-                value: RowPage {
-                    columns: held.columns.clone(),
-                    rows,
-                    more: false,
-                },
-                fence: held.fence.clone(),
-            });
         }
     }
 }
