@@ -69,6 +69,7 @@ All notable changes to subql are recorded here. The format follows [Keep a Chang
 ### Fixed
 
 - `IS [NOT] NULL` over a condition, as in `WHERE (a > 0) IS NOT NULL`, asks whether the condition is unknown, as every engine does. It was compiled to a null test of a value, so every dispatch on the subscription's table failed with a VM type error and took every other subscription on that table with it.
+- SQLite's `AVG` over an integer column divides the exact integer sum, as SQLite does, while no real value is among the rows. It divided a running double, so `2^53`, `1` and `-2^53` averaged `0` where SQLite answers `1/3`.
 - A filter comparing a float column with an integer bound, as in `price > 0` or `price < 1`, delivers a row whose value lies between two integers. The candidate index filed every range as integers, where `> 0` starts at `1`, so `price = 0.0025` was never considered. Only an integer column is filed by range now.
 - Two strings compared with no column between them, as in `'a' = 'A'`, are routed to a database read on MySQL, and ordered ones on PostgreSQL, where they compare under a database default the catalog does not name. They were compared by bytes. On SQLite they compare as SQLite does, and `'a' LIKE 'A'` now folds ASCII case there.
 - `x NOT BETWEEN low AND high` with a `NULL` bound selects a row the other bound already excludes, as every engine does. `b NOT BETWEEN 1 AND NULL` with `b = 0` was withheld, because a `NULL` bound made the whole test unknown where only its own side is.

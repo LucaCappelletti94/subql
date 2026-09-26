@@ -1097,6 +1097,18 @@ impl AggAccumulator {
             (Total::Double(total, _) | Total::Single(total, _), _) => Some(
                 crate::NumericValue::Double(total.value() / self.contributions as f64),
             ),
+            // SQLite divides its exact integer sum once while no real value
+            // is among the rows, where a running double loses what cancels.
+            (
+                Total::Integer {
+                    value,
+                    reals: FloatParts::EMPTY,
+                    ..
+                },
+                crate::backend::MeanRule::Double,
+            ) => Some(crate::NumericValue::Double(
+                crate::backend::widen_i64_to_f64(*value) / self.contributions as f64,
+            )),
             (_, crate::backend::MeanRule::Double) => Some(double()),
             (Total::Integer { value, .. }, crate::backend::MeanRule::Exact) => Some(
                 crate::NumericValue::Decimal(self.quotient(&bigdecimal::BigDecimal::from(*value))),

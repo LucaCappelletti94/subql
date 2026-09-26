@@ -292,6 +292,21 @@ fn sqlite_avg_is_a_double() {
     );
 }
 
+/// SQLite sums an integer column exactly and divides once, so the mean does
+/// not carry the rounding of a running double. `2^53`, `1` and `-2^53` sum
+/// to `1`, where a double running total loses the `1` and answers `0`.
+#[test]
+fn sqlite_avg_divides_the_exact_integer_sum() {
+    let mut folding = sqlite("big");
+    folding.fold(BIG, Value::Int(1 << 53));
+    folding.fold(BIG, Value::Int(1));
+    assert_eq!(
+        folding.fold(BIG, Value::Int(-(1 << 53))),
+        Some(AggValue::Avg(Some(NumericValue::Double(1.0 / 3.0)))),
+        "the integer sum is 1, over three rows"
+    );
+}
+
 /// A mean over a `real` column is the double quotient of a double sum,
 /// even though the sum of the same column is single precision.
 ///
