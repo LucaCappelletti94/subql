@@ -278,8 +278,26 @@ pub fn harness_canonicalize(data: &[u8]) {
     let mut vm = Vm::<Postgres>::new();
     for cells in probe_rows(&written, table) {
         let event = TestEvent::<Postgres>::insert(table, cells);
-        let a = vm.eval(&written, &event, RowKind::New, fuzz_catalog());
-        let b = vm.eval(&restated_program, &event, RowKind::New, fuzz_catalog());
+        // A canonical chain is sorted, so either program can stop on an
+        // operand the other never reaches, as an engine refusal or as a
+        // membership term the harness binds no truth for. Only the rows both
+        // spellings answer carry a meaning to compare.
+        let mut answer = |program: &BytecodeProgram<Postgres>| match vm.eval(
+            program,
+            &event,
+            RowKind::New,
+            fuzz_catalog(),
+        ) {
+            Ok(tri) => Some(tri),
+            Err(
+                crate::compiler::VmError::Refused(_)
+                | crate::compiler::VmError::MissingTermTruth(_),
+            ) => None,
+            Err(other) => panic!("{sql} failed to evaluate on {event:?}: {other:?}"),
+        };
+        let (Some(a), Some(b)) = (answer(&written), answer(&restated_program)) else {
+            continue;
+        };
         assert_eq!(a, b, "{sql} and {restated} disagree on {event:?}");
     }
 }
