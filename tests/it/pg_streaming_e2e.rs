@@ -1019,18 +1019,24 @@ fn raw_history_switches(content: &str) -> Vec<TimelineSwitch> {
         .collect()
 }
 
-fn docker_ok(args: &[&str]) -> String {
+fn docker(args: &[&str]) -> Result<String, String> {
     let out = std::process::Command::new("docker")
         .args(args)
         .output()
         .unwrap_or_else(|e| panic!("docker {}: {e}", args.join(" ")));
-    assert!(
-        out.status.success(),
-        "docker {}: {}",
-        args.join(" "),
-        String::from_utf8_lossy(&out.stderr)
-    );
-    String::from_utf8_lossy(&out.stdout).trim().to_string()
+    if out.status.success() {
+        Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+    } else {
+        Err(format!(
+            "docker {}: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&out.stderr)
+        ))
+    }
+}
+
+fn docker_ok(args: &[&str]) -> String {
+    docker(args).unwrap_or_else(|err| panic!("{err}"))
 }
 
 fn wait_until(what: &str, mut probe: impl FnMut() -> bool) {
@@ -1053,7 +1059,7 @@ struct PitrCluster {
 
 impl PitrCluster {
     /// Clone the shared server with `pg_basebackup`, recover to the backup's consistency point and promote to timeline 2.
-    fn promoted(name: &str, source_container: &str) -> Self {
+    fn promoted(name: &str, source_container: &str, source: &mut PgConnection) -> Self {
         let mut clone = Self {
             container: format!("subql-pitr-{name}"),
             volume: format!("subql-pitr-{name}-vol"),
@@ -1061,11 +1067,21 @@ impl PitrCluster {
         };
         let image = common::pg_image_ref();
         docker_ok(&["volume", "create", &clone.volume]);
+        // Reserved before the backup starts, so the shared server cannot recycle
+        // WAL the backup has yet to stream. Function calls the DSL cannot express.
+        let slot = format!("subql_pitr_{name}");
+        sql_query(format!(
+            "SELECT pg_create_physical_replication_slot('{slot}', true)"
+        ))
+        .execute(source)
+        .expect("reserve WAL for the backup");
         // Postgres refuses an immediate target without a restore_command, and consistency never consults it.
-        let seed = r#"pg_basebackup -h 127.0.0.1 -U subql_test -D /dst -X stream \
+        let seed = format!(
+            r#"pg_basebackup -h 127.0.0.1 -U subql_test -D /dst -X stream -S {slot} \
                && printf "recovery_target = 'immediate'\nrestore_command = 'false'\n" >> /dst/postgresql.auto.conf \
-               && touch /dst/recovery.signal"#;
-        docker_ok(&[
+               && touch /dst/recovery.signal"#
+        );
+        let seeded = docker(&[
             "run",
             "--rm",
             "--network",
@@ -1077,8 +1093,15 @@ impl PitrCluster {
             &image,
             "sh",
             "-c",
-            seed,
+            &seed,
         ]);
+        // The walsender can still hold the slot for a moment after the backup exits.
+        wait_until("the backup slot is dropped", || {
+            sql_query(format!("SELECT pg_drop_replication_slot('{slot}')"))
+                .execute(source)
+                .is_ok()
+        });
+        seeded.unwrap_or_else(|err| panic!("{err}"));
         let data = format!("{}:/var/lib/postgresql/data", clone.volume);
         let mut run = vec![
             "run",
@@ -1203,7 +1226,7 @@ fn cluster_identity_of_a_promoted_point_in_time_clone() {
     let publication = "subql_pg_streaming_pitr_pub";
     common::create_publication(&mut setup, publication, "orders");
 
-    let clone = PitrCluster::promoted(db.name(), db.container());
+    let clone = PitrCluster::promoted(db.name(), db.container(), &mut setup);
     let mut on_clone =
         diesel::PgConnection::establish(&clone.url(db.name())).expect("connect to clone");
     let slot = db.slot("subql_pg_streaming_pitr");
