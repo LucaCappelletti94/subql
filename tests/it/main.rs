@@ -387,6 +387,8 @@ mod like_escape_clause;
 
 mod coalesce;
 
+mod between_null_bound;
+
 mod column_subset;
 
 mod semantics_float_width;

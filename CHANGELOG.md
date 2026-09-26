@@ -62,6 +62,7 @@ All notable changes to subql are recorded here. The format follows [Keep a Chang
 
 ### Fixed
 
+- `x NOT BETWEEN low AND high` with a `NULL` bound selects a row the other bound already excludes, as every engine does. `b NOT BETWEEN 1 AND NULL` with `b = 0` was withheld, because a `NULL` bound made the whole test unknown where only its own side is.
 - `IN` over a text column reads the column's collation as `=` does. It compared bytes, so `folded IN ('a')` over a case-insensitive collation was served in process and missed a stored `'A'` the database selects, where `folded = 'a'` is left to the database. It is now left there too.
 - Parentheses no longer hide a column's collation from a comparison. `(label) < 'b'` over a column whose ordering the build cannot reproduce was served in byte order, where `label < 'b'` is left to the database.
 - A boolean column read as a condition beside `AND` or `OR`, or under `NOT`, as in `WHERE n = 3 AND flag`, no longer fails every dispatch with a VM type error. It reads as the column's own truth wherever a condition is read, which on SQLite is any nonzero stored integer, so `WHERE flag` over a stored `5` now selects the row as SQLite does, where it was compared with `true` and missed. Any other bare value read as a condition, as in `WHERE n` or `WHERE COALESCE(n, 0)`, is routed to a read, where it was compared with `true` and missed every row MySQL and SQLite select for a nonzero number.
