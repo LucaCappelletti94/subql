@@ -15,6 +15,8 @@
 //! [`OracleVerdict`] keeps them apart and the comparison refuses to treat
 //! a refusal as unknown.
 
+#[cfg(feature = "pg-sqlite-emu")]
+pub mod generated;
 pub mod generators;
 pub mod layers;
 pub mod oracle;
