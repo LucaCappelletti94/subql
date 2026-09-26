@@ -166,7 +166,7 @@ mod schema_dml_fixtures {
     use subql::emit::WireTable;
     use subql::patchset::{CustomTypePgAdapter, SqliteAdapter};
     use subql::testing::TestEvent;
-    use subql::{ChangeEvent, DefaultIds, SubscriptionEngine};
+    use subql::{DefaultIds, PgChangeEvent, SubscriptionEngine};
     use uuid::Uuid;
 
     const PG_CREATE_MOOD: &str = "CREATE TYPE mood AS ENUM ('happy', 'sad', 'neutral')";
@@ -541,7 +541,7 @@ mod schema_dml_fixtures {
         // inbound API, which reconstructs the ops from the raw bytes.
         sql_query("TRUNCATE orders").execute(pg).unwrap();
 
-        let pg_engine: SubscriptionEngine<ChangeEvent, DefaultIds, ParserDB> =
+        let pg_engine: SubscriptionEngine<PgChangeEvent, DefaultIds, ParserDB> =
             SubscriptionEngine::new(subql_catalog(), PostgreSqlDialect {});
         let pg_adapter = CustomTypePgAdapter::new(pg_engine.database())
             .expect("the catalog indexes")

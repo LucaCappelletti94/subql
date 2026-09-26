@@ -33,7 +33,7 @@ use std::collections::BTreeMap;
 use proptest::prelude::*;
 use sql_traits::structs::ParserDB;
 use subql::backend::{CdcEvent, RowKind, Value};
-use subql::{ChangeEvent, ColumnId, EventKind, PgSqliteEmuSource};
+use subql::{ColumnId, EventKind, PgChangeEvent, PgSqliteEmuSource};
 
 const PG_DDL: &str = "CREATE TABLE orders (id INT PRIMARY KEY, price FLOAT, status TEXT);";
 
@@ -102,7 +102,7 @@ fn diff(old: &Row, new: &Row) -> Vec<ColumnId> {
     changed
 }
 fn assert_row_matches(
-    event: &ChangeEvent,
+    event: &PgChangeEvent,
     db: &ParserDB,
     side: RowKind,
     expected: &Row,

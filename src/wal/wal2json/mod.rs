@@ -6,26 +6,29 @@
 //! decoding each cell against the catalog on demand. This replaces the former
 //! bespoke `Wal2JsonV{1,2}Parser` and `Wal2JsonV{1,2}Event`.
 //!
-//! v2 carries the stream LSN (with `include-lsn=true`) and surfaces it as a
-//! [`PgLsn`](crate::PgLsn) checkpoint. v1 batches a transaction and has no
-//! per-change LSN, so it uses [`NoCheckpoint`](crate::NoCheckpoint).
+//! v2 is read through [`Wal2JsonV2Reader`], which follows the transaction
+//! boundaries to place each row at its [`PgCommitPosition`](crate::PgCommitPosition)
+//! (with `include-lsn=true`). v1 batches a transaction and has no per-change
+//! position, so it uses [`NoCheckpoint`](crate::NoCheckpoint).
 
 mod decode_helpers;
 mod parse_helpers;
 mod v1;
 mod v2;
 
-pub use parse_helpers::{parse_wal2json_v1, parse_wal2json_v2};
+pub use parse_helpers::parse_wal2json_v1;
+pub use v2::{Wal2JsonV2Event, Wal2JsonV2Reader};
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_wal2json_v1, parse_wal2json_v2};
+    use super::{parse_wal2json_v1, Wal2JsonV2Event, Wal2JsonV2Reader};
     use crate::backend::{CdcEvent, RowKind, Value};
     use crate::types::EventKind;
-    use crate::PgLsn;
+    use crate::wal::{TransactionOrderError, WalParseError};
+    use crate::{PgCommitPosition, PgLsn};
+    use alloc::vec::Vec;
     use sql_traits::structs::ParserDB;
     use sqlparser::dialect::PostgreSqlDialect;
-    use wal2json_events::MessageV2;
 
     fn orders() -> ParserDB {
         ParserDB::parse::<PostgreSqlDialect>(
@@ -34,10 +37,28 @@ mod tests {
         .expect("parse DDL")
     }
 
-    fn one_v2(bytes: &[u8]) -> MessageV2 {
-        let mut msgs = parse_wal2json_v2(bytes).expect("parse succeeds");
-        assert_eq!(msgs.len(), 1);
-        msgs.remove(0)
+    /// The row `bytes` carries, read as the first row of a transaction
+    /// committing at `0/16B2300`.
+    fn one_v2(bytes: &[u8]) -> Wal2JsonV2Event {
+        let mut reader = Wal2JsonV2Reader::new();
+        let begin = reader.parse(br#"{"action":"B","lsn":"0/16B2300"}"#);
+        assert!(begin.expect("begin parses").is_none());
+        reader
+            .parse(bytes)
+            .expect("parse succeeds")
+            .expect("a row action carries an event")
+    }
+
+    /// Checkpoints of the row events `lines` carry, in order.
+    fn checkpoints(lines: &[&[u8]]) -> Result<Vec<Option<PgCommitPosition>>, WalParseError> {
+        let mut reader = Wal2JsonV2Reader::new();
+        let mut out = Vec::new();
+        for line in lines {
+            if let Some(event) = reader.parse(line)? {
+                out.push(event.checkpoint());
+            }
+        }
+        Ok(out)
     }
 
     #[test]
@@ -51,8 +72,11 @@ mod tests {
         );
         assert_eq!(ev.kind(), EventKind::Insert);
         assert_eq!(ev.pk_columns(&db), alloc::vec![0u16]);
-        assert_eq!(ev.checkpoint(), PgLsn::parse("0/16B2270"));
-        assert!(ev.checkpoint().is_some());
+        assert_eq!(
+            ev.checkpoint(),
+            Some(PgCommitPosition::new(PgLsn(0x16B_2300), 1)),
+            "the checkpoint is the commit position the begin named, not the row's own lsn"
+        );
         assert_eq!(
             ev.value_at(&db, RowKind::New, 2).expect("amount present"),
             Value::Int(250)
@@ -124,16 +148,76 @@ mod tests {
         }
     }
 
+    /// T2, a row at 1200 committing at 1300, arrives before T1, rows at 1000
+    /// and 1100 committing at 1500.
     #[test]
-    fn v2_boundary_messages_drop() {
+    fn v2_rows_order_by_commit_then_place_in_transaction() {
+        let placed = checkpoints(&[
+            br#"{"action":"B","lsn":"0/514"}"#,
+            br#"{"action":"I","schema":"public","table":"orders","lsn":"0/4B0","columns":[]}"#,
+            br#"{"action":"C","lsn":"0/514"}"#,
+            br#"{"action":"B","lsn":"0/5DC"}"#,
+            br#"{"action":"M","transactional":true,"prefix":"p","content":"c"}"#,
+            br#"{"action":"I","schema":"public","table":"orders","lsn":"0/3E8","columns":[]}"#,
+            br#"{"action":"T","schema":"public","table":"orders","lsn":"0/44C"}"#,
+            br#"{"action":"C","lsn":"0/5DC"}"#,
+        ]);
         assert_eq!(
-            parse_wal2json_v2(br#"{"action":"B"}"#).expect("begin parses"),
-            []
+            placed.expect("frames in place"),
+            vec![
+                Some(PgCommitPosition::new(PgLsn(1300), 1)),
+                Some(PgCommitPosition::new(PgLsn(1500), 1)),
+                Some(PgCommitPosition::new(PgLsn(1500), 2)),
+            ]
         );
-        assert_eq!(
-            parse_wal2json_v2(br#"{"action":"C"}"#).expect("commit parses"),
-            []
-        );
+    }
+
+    /// Without `include-lsn` the begin names no commit, so the rows carry no
+    /// position rather than a made-up one.
+    #[test]
+    fn v2_without_commit_positions_carries_none() {
+        let placed = checkpoints(&[
+            br#"{"action":"B"}"#,
+            br#"{"action":"I","schema":"public","table":"orders","columns":[]}"#,
+            br#"{"action":"C"}"#,
+        ]);
+        assert_eq!(placed.expect("frames in place"), vec![None]);
+    }
+
+    #[test]
+    fn v2_boundaries_out_of_place_are_refused() {
+        let row: &[u8] = br#"{"action":"I","schema":"public","table":"orders","columns":[]}"#;
+        assert!(matches!(
+            checkpoints(&[row]),
+            Err(WalParseError::TransactionOrder(
+                TransactionOrderError::RowOutsideTransaction
+            ))
+        ));
+        assert!(matches!(
+            checkpoints(&[br#"{"action":"C"}"#]),
+            Err(WalParseError::TransactionOrder(
+                TransactionOrderError::CommitOutsideTransaction
+            ))
+        ));
+        assert!(matches!(
+            checkpoints(&[br#"{"action":"B"}"#, br#"{"action":"B"}"#]),
+            Err(WalParseError::TransactionOrder(
+                TransactionOrderError::NestedBegin
+            ))
+        ));
+        assert!(matches!(
+            checkpoints(&[
+                br#"{"action":"B","lsn":"0/5DC"}"#,
+                br#"{"action":"C","lsn":"0/640"}"#
+            ]),
+            Err(WalParseError::TransactionOrder(
+                TransactionOrderError::CommitMismatch { .. }
+            ))
+        ));
+        assert!(matches!(
+            checkpoints(&[br#"{"action":"B","lsn":"not-an-lsn"}"#]),
+            Err(WalParseError::MalformedPayload(_))
+        ));
     }
 
     #[test]

@@ -25,8 +25,8 @@ use diesel_async::{AsyncConnection, RunQueryDsl as _};
 /// [`AsyncPgConnection`](diesel_async::AsyncPgConnection). Each
 /// `execute_scalar` reads `pg_current_wal_lsn()`, opens a `READ ONLY
 /// REPEATABLE READ` transaction for the user's SQL, and returns the
-/// [`Value<Postgres>`](crate::backend::Postgres) with the parsed
-/// [`PgLsn`](crate::PgLsn). Pure Rust: `diesel-async` speaks the PG wire
+/// [`Value<Postgres>`](crate::backend::Postgres) with the read's
+/// [`PgCommitPosition`](crate::PgCommitPosition). Pure Rust: `diesel-async` speaks the PG wire
 /// protocol through `tokio-postgres`, no libpq.
 ///
 /// # Errors
@@ -114,7 +114,7 @@ struct PgAsyncCursor {
         diesel_async::AsyncPgConnection,
     >,
     name: alloc::string::String,
-    checkpoint: Option<crate::PgLsn>,
+    checkpoint: Option<crate::PgCommitPosition>,
     columns: alloc::vec::Vec<alloc::string::String>,
     leftover: alloc::collections::VecDeque<alloc::vec::Vec<Value<crate::backend::Postgres>>>,
 }
@@ -189,7 +189,8 @@ impl<S> PgAsyncDieselConnector<S> {
         held: &mut PgAsyncCursor,
         max_bytes: usize,
         batch: usize,
-    ) -> diesel::QueryResult<Snapshot<RowPage<crate::backend::Postgres>, crate::PgLsn>> {
+    ) -> diesel::QueryResult<Snapshot<RowPage<crate::backend::Postgres>, crate::PgCommitPosition>>
+    {
         let mut rows: alloc::vec::Vec<alloc::vec::Vec<Value<crate::backend::Postgres>>> =
             alloc::vec::Vec::new();
         let mut spent = 0_usize;
@@ -244,11 +245,11 @@ impl<S> PgAsyncDieselConnector<S> {
 #[cfg(feature = "executor-diesel-async-postgres")]
 async fn read_current_lsn_async(
     conn: &mut diesel_async::AsyncPgConnection,
-) -> diesel::QueryResult<Option<crate::PgLsn>> {
+) -> diesel::QueryResult<Option<crate::PgCommitPosition>> {
     let row: PgLsnRow = sql_query("SELECT pg_current_wal_lsn()::text AS lsn")
         .get_result(conn)
         .await?;
-    Ok(crate::PgLsn::parse(&row.lsn))
+    Ok(crate::PgLsn::parse(&row.lsn).map(crate::PgCommitPosition::before_commit))
 }
 
 /// Put the open transaction on the read snapshot, then run `setup`.
@@ -269,7 +270,7 @@ async fn begin_read_snapshot(
 impl<S: SessionSetup + Send + Sync> AsyncConnector for PgAsyncDieselConnector<S> {
     type AuthContext = S;
     type Error = DieselAsyncError;
-    type Checkpoint = crate::PgLsn;
+    type Checkpoint = crate::PgCommitPosition;
     type Backend = crate::backend::Postgres;
 
     fn execute_scalar(
@@ -291,7 +292,7 @@ impl<S: SessionSetup + Send + Sync> AsyncConnector for PgAsyncDieselConnector<S>
             let lsn = read_current_lsn_async(conn)
                 .await
                 .map_err(DieselAsyncError::Diesel)?;
-            conn.transaction::<(Value<Self::Backend>, Option<crate::PgLsn>), diesel::result::Error, _>(
+            conn.transaction::<(Value<Self::Backend>, Option<crate::PgCommitPosition>), diesel::result::Error, _>(
                 async move |c| {
                     begin_read_snapshot(c, auth.setup_statements()).await?;
                     let value = load_scalar_postgres_async(c, &query, kind).await?;
@@ -322,7 +323,7 @@ impl<S: SessionSetup + Send + Sync> AsyncConnector for PgAsyncDieselConnector<S>
             let lsn = read_current_lsn_async(conn)
                 .await
                 .map_err(DieselAsyncError::Diesel)?;
-            conn.transaction::<Snapshot<RowPage<Self::Backend>, crate::PgLsn>, diesel::result::Error, _>(
+            conn.transaction::<Snapshot<RowPage<Self::Backend>, crate::PgCommitPosition>, diesel::result::Error, _>(
                 async move |c| {
                     begin_read_snapshot(c, auth.setup_statements()).await?;
                     let value = load_page_postgres_async(c, &query, max_bytes).await?;
@@ -544,7 +545,7 @@ impl<S: SessionSetup + Send + Sync> AsyncConnector for PgAsyncDieselConnector<S>
             let lsn = read_current_lsn_async(conn)
                 .await
                 .map_err(|e| ScalarRowError::Connector(DieselAsyncError::Diesel(e)))?;
-            conn.transaction::<(Vec<Value<Self::Backend>>, Option<crate::PgLsn>), diesel::result::Error, _>(
+            conn.transaction::<(Vec<Value<Self::Backend>>, Option<crate::PgCommitPosition>), diesel::result::Error, _>(
                 async move |c| {
                     begin_read_snapshot(c, auth.setup_statements()).await?;
                     let values = load_scalar_row_postgres_async(c, &query, &kinds).await?;

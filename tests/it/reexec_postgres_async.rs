@@ -36,9 +36,8 @@ use subql::reexec::{
     SnapshotResult,
 };
 use subql::{
-    parse_wal2json_v2, AggregateResultValue, AggregateValueChange, DefaultIds,
-    MaintenanceStopReason, MessageV2, Registered, SubscriptionEngine, SubscriptionRequest, Tier,
-    TierKind,
+    AggregateResultValue, AggregateValueChange, DefaultIds, MaintenanceStopReason, Registered,
+    SubscriptionEngine, SubscriptionRequest, Tier, TierKind, Wal2JsonV2Event,
 };
 
 mod grouped_schema {
@@ -86,7 +85,7 @@ fn poll_once<F: core::future::Future>(fut: &mut core::pin::Pin<Box<F>>) -> bool 
 const SLOT: &str = "subql_test_async";
 
 type Engine =
-    AutoResolvingEngine<MessageV2, DefaultIds, ParserDB, AsyncMode<PgAsyncDieselConnector>>;
+    AutoResolvingEngine<Wal2JsonV2Event, DefaultIds, ParserDB, AsyncMode<PgAsyncDieselConnector>>;
 
 /// Build a `bb8` pool over `AsyncPgConnection` for the database at `url`.
 async fn pg_async_pool(url: &str) -> Pool<AsyncPgConnection> {
@@ -97,14 +96,15 @@ async fn pg_async_pool(url: &str) -> Pool<AsyncPgConnection> {
         .expect("build async pg pool")
 }
 
-fn build_engine(catalog: ParserDB, pool: Pool<AsyncPgConnection>) -> Engine {
-    let inner =
-        SubscriptionEngine::<MessageV2, DefaultIds, ParserDB>::new(catalog, PostgreSqlDialect {});
-    AutoResolvingEngine::new(inner, AsyncMode::new(PgAsyncDieselConnector::new(pool)))
-}
+/// An UPDATE carrying no row image, so no key a keyed read could use.
+const KEYLESS_UPDATE: &str = r#"{"action":"U","schema":"public","table":"orders"}"#;
 
-fn parse_message(msg: &str) -> Vec<MessageV2> {
-    parse_wal2json_v2(msg.as_bytes()).expect("wal2json parse")
+fn build_engine(catalog: ParserDB, pool: Pool<AsyncPgConnection>) -> Engine {
+    let inner = SubscriptionEngine::<Wal2JsonV2Event, DefaultIds, ParserDB>::new(
+        catalog,
+        PostgreSqlDialect {},
+    );
+    AutoResolvingEngine::new(inner, AsyncMode::new(PgAsyncDieselConnector::new(pool)))
 }
 
 /// Headline test: engine-supported and captured subscriptions coexist. An
@@ -169,10 +169,7 @@ fn engine_and_captured_paths_coexist_through_pg_async_connector() {
             "expected at least one wal2json message after INSERT+DELETE"
         );
 
-        let mut events: Vec<MessageV2> = Vec::new();
-        for msg in &msgs {
-            events.extend(parse_message(msg));
-        }
+        let events = common::read_wal2json_v2(&msgs);
         assert_eq!(
             events.len(),
             2,
@@ -212,7 +209,7 @@ fn engine_and_captured_paths_coexist_through_pg_async_connector() {
     });
 }
 
-/// `PgAsyncDieselConnector` snapshot reads value plus a non-zero `PgLsn`
+/// `PgAsyncDieselConnector` snapshot reads value plus a non-zero commit position
 /// inside one transaction, mirroring the sync snapshot test.
 #[test]
 #[ignore = "requires Docker; run with --ignored"]
@@ -244,7 +241,7 @@ fn snapshot_reads_value_and_lsn_from_pg_async() {
 
         let lsn = checkpoint.expect("PgAsyncDieselConnector must report a checkpoint");
         assert!(
-            lsn > subql::PgLsn(0),
+            lsn.commit_lsn() > subql::PgLsn(0),
             "pg_current_wal_lsn() should be non-zero on a live server, got {lsn:?}"
         );
     });
@@ -276,7 +273,7 @@ fn execute_scalar_row_decodes_integer_aggregate_seed_async() {
         ParserDB::parse::<PostgreSqlDialect>("CREATE TABLE nums (id INT PRIMARY KEY, amount INT);")
             .expect("parse nums DDL");
     let mut engine =
-        SubscriptionEngine::<MessageV2, DefaultIds, ParserDB>::new(db, PostgreSqlDialect {});
+        SubscriptionEngine::<Wal2JsonV2Event, DefaultIds, ParserDB>::new(db, PostgreSqlDialect {});
     let bundle = engine
         .register(SubscriptionRequest::<DefaultIds, Postgres>::new(
             1u64,
@@ -668,7 +665,7 @@ fn the_keyed_tier_delivers_row_deltas_through_the_async_engine() {
             .execute(&mut conn_dml)
             .expect("update");
         let msgs = common::drain_slot(&mut conn_setup, &slot);
-        let events: Vec<MessageV2> = msgs.iter().flat_map(|m| parse_message(m)).collect();
+        let events = common::read_wal2json_v2(&msgs);
         assert!(!events.is_empty(), "the slot must carry both updates");
 
         let mut deltas = Vec::new();
@@ -778,7 +775,7 @@ fn the_whole_reread_tier_delivers_pages_through_the_async_engine() {
             .execute(&mut conn_dml)
             .expect("insert");
         let msgs = common::drain_slot(&mut conn_setup, &slot);
-        let events: Vec<MessageV2> = msgs.iter().flat_map(|m| parse_message(m)).collect();
+        let events = common::read_wal2json_v2(&msgs);
         assert!(!events.is_empty(), "the slot must carry the insert");
 
         let mut pages = Vec::new();
@@ -870,7 +867,7 @@ fn the_async_batch_path_delivers_row_deltas_and_transitions_a_keyless_change() {
             .execute(&mut conn_dml)
             .expect("update");
         let msgs = common::drain_slot(&mut conn_setup, &slot);
-        let events: Vec<MessageV2> = msgs.iter().flat_map(|m| parse_message(m)).collect();
+        let events = common::read_wal2json_v2(&msgs);
         assert!(events.len() >= 3, "the slot must carry all three updates");
 
         for event in &events {
@@ -913,7 +910,7 @@ fn the_async_batch_path_delivers_row_deltas_and_transitions_a_keyless_change() {
 
         // A change carrying no readable key changes the same subscription to a
         // complete row read, which this connector resolves immediately.
-        let keyless = parse_message(r#"{"action":"U","schema":"public","table":"orders"}"#);
+        let keyless = common::read_wal2json_v2(&common::in_transaction(KEYLESS_UPDATE));
         assert_eq!(keyless.len(), 1, "the probe must parse as one message");
         let output = engine
             .apply_leaving_reads_queued(&keyless[0])
@@ -1102,7 +1099,10 @@ fn every_read_reports_a_position_taken_before_its_snapshot() {
         "the scalar read's snapshot holds one row"
     );
     assert!(
-        position.expect("a PG connector reports a position") < after_commit,
+        position
+            .expect("a PG connector reports a position")
+            .commit_lsn()
+            < after_commit,
         "the scalar read's position must sit behind the commit at {after_commit:?}"
     );
 
@@ -1122,7 +1122,10 @@ fn every_read_reports_a_position_taken_before_its_snapshot() {
         "the page's snapshot holds two rows"
     );
     assert!(
-        page.checkpoint.expect("a PG connector reports a position") < after_commit,
+        page.checkpoint
+            .expect("a PG connector reports a position")
+            .commit_lsn()
+            < after_commit,
         "the page read's position must sit behind the commit at {after_commit:?}"
     );
 
@@ -1147,7 +1150,10 @@ fn every_read_reports_a_position_taken_before_its_snapshot() {
         "the seed read's snapshot holds three rows"
     );
     assert!(
-        position.expect("a PG connector reports a position") < after_commit,
+        position
+            .expect("a PG connector reports a position")
+            .commit_lsn()
+            < after_commit,
         "the seed read's position must sit behind the commit at {after_commit:?}"
     );
 }
@@ -1220,10 +1226,7 @@ fn grouped_min_snapshots_and_rereads_one_group_async() {
         })
         .await
         .expect("slot reader joins");
-        let events: Vec<_> = messages
-            .iter()
-            .flat_map(|message| parse_message(message))
-            .collect();
+        let events = common::read_wal2json_v2(&messages);
         let settled = engine
             .apply(&events[0])
             .expect("apply")

@@ -95,6 +95,11 @@ mod tests {
     use sql_traits::structs::ParserDB;
     use sqlparser::dialect::PostgreSqlDialect;
 
+    /// `change` as the first row of a transaction committing at `0x10`.
+    fn positioned(change: ChangeEvent) -> crate::PgChangeEvent {
+        crate::PgChangeEvent::new(change, crate::PgCommitPosition::new(crate::PgLsn(0x10), 1))
+    }
+
     fn catalog() -> (ParserDB, TableId) {
         let db = ParserDB::parse::<PostgreSqlDialect>(
             "CREATE TABLE docs (id INT PRIMARY KEY, owner INT);",
@@ -342,7 +347,7 @@ mod tests {
     #[test]
     fn real_change_event_composes_with_event_row() {
         let (db, docs) = catalog();
-        let event = ChangeEvent {
+        let event = positioned(ChangeEvent {
             event_type: EventType::Insert {
                 schema: "public".into(),
                 table: "docs".into(),
@@ -354,7 +359,7 @@ mod tests {
             },
             lsn: Lsn::new(0x10),
             metadata: None,
-        };
+        });
         let row = EventRow::current(&event, &db).expect("insert on a known table builds");
         assert_eq!(row.table_id(), docs);
         assert_eq!(owner_of(&row), Some(7));
@@ -440,7 +445,7 @@ mod tests {
     #[test]
     fn no_view_for_a_table_the_catalog_does_not_know() {
         let (db, _docs) = catalog();
-        let stranger = ChangeEvent {
+        let stranger = positioned(ChangeEvent {
             event_type: EventType::Insert {
                 schema: "public".into(),
                 table: "not_in_the_catalog".into(),
@@ -449,7 +454,7 @@ mod tests {
             },
             lsn: Lsn::new(1),
             metadata: None,
-        };
+        });
         assert_eq!(
             stranger.table_id(&db),
             TableId::MAX,
@@ -539,7 +544,7 @@ mod tests {
     #[test]
     fn a_corrupt_cell_surfaces_as_an_error_not_an_absence() {
         let (db, _docs) = catalog();
-        let event = ChangeEvent {
+        let event = positioned(ChangeEvent {
             event_type: EventType::Insert {
                 schema: "public".into(),
                 table: "docs".into(),
@@ -551,7 +556,7 @@ mod tests {
             },
             lsn: Lsn::new(1),
             metadata: None,
-        };
+        });
         let row = EventRow::current(&event, &db).expect("insert on a known table builds");
 
         assert_eq!(row.value_at(0), Ok(Value::Int(4)), "the good column reads");

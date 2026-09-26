@@ -67,7 +67,7 @@ impl<'a, E: CdcEvent, DB: DatabaseLike> EventRow<'a, E, DB> {
     /// contract even when it builds.
     ///
     /// Reads [`CdcEvent::kind`](crate::backend::CdcEvent::kind), so the event must be a row or truncate
-    /// event. Sources reduce a raw stream with `into_engine_events`
+    /// event. Sources reduce a raw stream to row events
     /// before anything reaches the engine, and the same applies here.
     #[must_use]
     pub fn new(event: &'a E, db: &'a DB, row: RowKind) -> Option<Self> {

@@ -53,8 +53,8 @@ use sql_traits::structs::ParserDB;
 use sqlparser::dialect::PostgreSqlDialect;
 use subql::backend::CdcEvent;
 use subql::{
-    CdcSource, EventKind, PgLsn, PgStreamingCdcSource, PgStreamingConfig, PollingPgCdcConfig,
-    PollingPgCdcSource,
+    CdcSource, EventKind, PgCommitPosition, PgStreamingCdcSource, PgStreamingConfig,
+    PollingPgCdcConfig, PollingPgCdcSource,
 };
 
 const DDL: &str = "CREATE TABLE orders (id INT PRIMARY KEY, price FLOAT);";
@@ -163,7 +163,7 @@ async fn collect_latencies(
 
 /// Spawn a task that drains `source.next_event()` and forwards
 /// `(id, observed_at)` tuples to the channel. Generic over any
-/// `CdcSource<Checkpoint = PgLsn>` so the same loop drives both
+/// `CdcSource<Checkpoint = PgCommitPosition>` so the same loop drives both
 /// push and polling.
 fn spawn_receiver<S>(
     mut source: S,
@@ -173,7 +173,8 @@ fn spawn_receiver<S>(
 )
 where
     S: CdcSource + Send + 'static,
-    S::Event: subql::backend::CdcEvent<Backend = subql::backend::Postgres, Checkpoint = PgLsn>,
+    S::Event:
+        subql::backend::CdcEvent<Backend = subql::backend::Postgres, Checkpoint = PgCommitPosition>,
 {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<(i64, Instant)>();
     let schema = ParserDB::parse::<PostgreSqlDialect>(DDL).expect("parse DDL");

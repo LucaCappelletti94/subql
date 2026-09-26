@@ -200,9 +200,10 @@ pub fn drop_slot(conn: &mut PgConnection, name: &str) {
 }
 
 /// Drain every queued WAL change from the named slot as wal2json v2 JSON
-/// strings, in commit order. The options match what `parse_wal2json_v2`
-/// expects: `format-version=2`, `include-pk=true`, and `include-lsn=true` so
-/// each change carries the LSN that `MessageV2` surfaces as its checkpoint.
+/// strings, in commit order. The options match what
+/// [`subql::Wal2JsonV2Reader`] expects: `format-version=2` with its
+/// transaction boundaries, `include-pk=true`, and `include-lsn=true` so each
+/// begin names the commit position the reader places its rows at.
 pub fn drain_slot(conn: &mut PgConnection, name: &str) -> Vec<String> {
     #[derive(diesel::QueryableByName)]
     struct Row {
@@ -221,6 +222,28 @@ pub fn drain_slot(conn: &mut PgConnection, name: &str) -> Vec<String> {
     .load(conn)
     .expect("pg_logical_slot_get_changes");
     rows.into_iter().map(|r| r.data).collect()
+}
+
+/// The row events a drained wal2json v2 stream carries, placed in commit order.
+pub fn read_wal2json_v2(messages: &[String]) -> Vec<subql::Wal2JsonV2Event> {
+    let mut reader = subql::Wal2JsonV2Reader::new();
+    messages
+        .iter()
+        .filter_map(|message| reader.parse(message.as_bytes()).expect("wal2json parse"))
+        .collect()
+}
+
+/// `row` framed as the only row of a wal2json v2 transaction.
+#[cfg(any(
+    feature = "executor-diesel-async-postgres",
+    feature = "executor-diesel-postgres-r2d2"
+))]
+pub fn in_transaction(row: &str) -> Vec<String> {
+    vec![
+        r#"{"action":"B"}"#.into(),
+        row.into(),
+        r#"{"action":"C"}"#.into(),
+    ]
 }
 
 /// Create a Postgres `PUBLICATION` over a single table. Required before

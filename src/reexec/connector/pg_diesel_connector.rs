@@ -25,7 +25,7 @@ use diesel::{sql_query, Connection, RunQueryDsl};
 ///
 /// Each read takes the WAL position first, then opens a `READ ONLY REPEATABLE
 /// READ` transaction for the user's SQL, and returns the resulting
-/// [`Value<crate::backend::Postgres>`] with the parsed [`crate::PgLsn`].
+/// [`Value<crate::backend::Postgres>`] at [`crate::PgCommitPosition::before_commit`] of it.
 ///
 /// The order is the whole point. `pg_current_wal_lsn()` is not bound to the
 /// transaction snapshot: inside one repeatable-read transaction it advances
@@ -96,9 +96,9 @@ pub struct PgLsnRow {
 #[cfg(feature = "executor-diesel-postgres")]
 pub(super) fn read_current_lsn(
     conn: &mut diesel::PgConnection,
-) -> diesel::QueryResult<Option<crate::PgLsn>> {
+) -> diesel::QueryResult<Option<crate::PgCommitPosition>> {
     let row: PgLsnRow = sql_query("SELECT pg_current_wal_lsn()::text AS lsn").get_result(conn)?;
-    Ok(crate::PgLsn::parse(&row.lsn))
+    Ok(crate::PgLsn::parse(&row.lsn).map(crate::PgCommitPosition::before_commit))
 }
 
 /// Take the WAL position, then run `body` inside the read snapshot with
@@ -114,7 +114,7 @@ pub(super) fn read_at_lsn<T>(
     conn: &mut diesel::PgConnection,
     setup: &[String],
     body: impl FnOnce(&mut diesel::PgConnection) -> diesel::QueryResult<T>,
-) -> diesel::QueryResult<(T, Option<crate::PgLsn>)> {
+) -> diesel::QueryResult<(T, Option<crate::PgCommitPosition>)> {
     let lsn = read_current_lsn(conn)?;
     let value = conn.transaction(|conn| {
         sql_query(PG_READ_SNAPSHOT).execute(conn)?;
@@ -128,7 +128,7 @@ pub(super) fn read_at_lsn<T>(
 impl<S: SessionSetup> Connector for PgDieselConnector<S> {
     type AuthContext = S;
     type Error = diesel::result::Error;
-    type Checkpoint = crate::PgLsn;
+    type Checkpoint = crate::PgCommitPosition;
     type Backend = crate::backend::Postgres;
 
     fn execute_scalar(

@@ -286,7 +286,7 @@ pub fn harness_pgoutput(data: &[u8]) {
 /// Drives an arbitrary DML stream through [`crate::PgSqliteEmuSource`],
 /// which internally re-encodes each session changeset as pgoutput wire
 /// bytes, decodes them with `pg_walstream`'s `PgOutputDecoder`, and
-/// dispatches every emitted [`crate::ChangeEvent`] through a
+/// dispatches every emitted [`crate::PgChangeEvent`] through a
 /// populated [`SubscriptionEngine`]. Exercises the whole pipeline
 /// (catalog plus pg2sqlite plus session extension plus changeset->
 /// pgoutput encode plus pgoutput decode plus VM dispatch) on every
@@ -367,7 +367,7 @@ pub fn harness_sqlite_pgoutput_e2e(data: &[u8]) {
 #[cfg(feature = "pg-sqlite-emu")]
 struct E2eFixture {
     source: crate::PgSqliteEmuSource,
-    engine: SubscriptionEngine<crate::ChangeEvent, DefaultIds, ParserDB>,
+    engine: SubscriptionEngine<crate::PgChangeEvent, DefaultIds, ParserDB>,
     table_id: crate::TableId,
 }
 
@@ -395,7 +395,7 @@ impl E2eFixture {
         let table_id = catalog_helpers::table_id::<Postgres, _>(source.pg_catalog(), "orders")
             .expect("fuzz fixture orders table must resolve");
 
-        let mut engine: SubscriptionEngine<crate::ChangeEvent, DefaultIds, ParserDB> =
+        let mut engine: SubscriptionEngine<crate::PgChangeEvent, DefaultIds, ParserDB> =
             SubscriptionEngine::new(source.pg_catalog().clone(), PostgreSqlDialect {});
         for (consumer_id, sql) in Self::SUBSCRIPTIONS {
             engine
@@ -436,7 +436,10 @@ impl E2eFixture {
     fn drain_and_dispatch<F>(&mut self, sink: &mut F)
     where
         F: FnMut(
-            &Result<crate::ConsumerNotifications<DefaultIds, crate::PgLsn>, crate::DispatchError>,
+            &Result<
+                crate::ConsumerNotifications<DefaultIds, crate::PgCommitPosition>,
+                crate::DispatchError,
+            >,
         ),
     {
         loop {

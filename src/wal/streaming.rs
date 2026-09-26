@@ -51,8 +51,8 @@ pub trait CdcSource: Send {
     /// The typed CDC event this source surfaces.
     ///
     /// Position (checkpoint) is expressed through the event's own
-    /// [`CdcEvent::Checkpoint`]. Postgres sources typically pick a
-    /// concrete Backend = Postgres event with `Checkpoint = PgLsn`.
+    /// [`CdcEvent::Checkpoint`]. The Postgres sources yield
+    /// [`crate::PgChangeEvent`], whose checkpoint is a [`crate::PgCommitPosition`].
     type Event: CdcEvent + Send + Sync;
 
     /// Source-specific error returned by the futures below.

@@ -31,7 +31,7 @@ use sqlite_diff_rs::{
 };
 use sqlparser::dialect::PostgreSqlDialect;
 use subql::patchset::PgAdapter;
-use subql::{ChangeEvent, DefaultIds, SubscriptionEngine};
+use subql::{DefaultIds, PgChangeEvent, SubscriptionEngine};
 use uuid::Uuid;
 
 const DDL: &str = "CREATE TABLE things (id UUID PRIMARY KEY, tag TEXT);";
@@ -55,7 +55,7 @@ fn apply_patchset_uuid_roundtrip_blob_and_text_clients() {
     sql_query(PG_DDL).execute(&mut conn).expect("create table");
 
     let catalog = ParserDB::parse::<PostgreSqlDialect>(DDL).expect("parse subql DDL");
-    let engine: SubscriptionEngine<ChangeEvent, DefaultIds, ParserDB> =
+    let engine: SubscriptionEngine<PgChangeEvent, DefaultIds, ParserDB> =
         SubscriptionEngine::new(catalog, PostgreSqlDialect {});
 
     let things = SimpleTable::new("things", &["id", "tag"], &[0]);

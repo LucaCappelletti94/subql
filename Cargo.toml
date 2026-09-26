@@ -168,7 +168,7 @@ arbitrary = { version = "1", features = ["derive"], optional = true }
 # `--no-default-features` build stays `no_std + alloc` with no `tokio`. The
 # `std` feature below propagates `pg_walstream/std`, and `pg-streaming` opts
 # into `pg_walstream/rustls-tls` for the pure-Rust replication client.
-pg_walstream = { version = "0.8", default-features = false }
+pg_walstream = { version = "0.9", default-features = false }
 
 # Optional diesel-backed Connector for the auto-resolving re-execution
 # engine. Off by default - the lib's no_std + alloc / wasm32 surface stays
@@ -194,7 +194,7 @@ r2d2 = { version = "0.8", optional = true }
 diesel-async = { version = "0.9", optional = true, default-features = false }
 
 # SQLite patchsets and digest conversion for both CDC wire formats.
-sqlite-diff-rs = { version = "0.14", default-features = false, features = ["wal2json", "maxwell"] }
+sqlite-diff-rs = { version = "0.15", default-features = false, features = ["wal2json", "maxwell"] }
 # PostgreSQL wal2json parser and model.
 wal2json-events = { version = "0.1.0", default-features = false }
 # MySQL Maxwell parser and model. Direct, like `wal2json-events` and for the

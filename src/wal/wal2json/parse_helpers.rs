@@ -1,6 +1,6 @@
 use alloc::string::ToString;
 use alloc::vec::Vec;
-use wal2json_events::{Action, ChangeV1, MessageV2};
+use wal2json_events::{Action, ChangeV1};
 
 use crate::types::EventKind;
 use crate::wal::WalParseError;
@@ -24,27 +24,6 @@ pub(super) const fn v1_row_kind(change: &ChangeV1) -> Option<EventKind> {
         // Not a row change.
         ChangeV1::Message { .. } => None,
     }
-}
-
-/// Parse one wal2json v2 line into the row events subql dispatches.
-///
-/// Returns an empty vector for a transaction boundary (`B`, `C`, `M`) and a
-/// single [`MessageV2`] for a row action (`I`, `U`, `D`, `T`).
-///
-/// # Errors
-///
-/// [`WalParseError::InvalidUtf8`] for non-UTF-8 input and
-/// [`WalParseError::JsonError`] for malformed JSON.
-pub fn parse_wal2json_v2(bytes: &[u8]) -> Result<Vec<MessageV2>, WalParseError> {
-    let text =
-        core::str::from_utf8(bytes).map_err(|e| WalParseError::InvalidUtf8(e.to_string()))?;
-    let msg =
-        wal2json_events::parse_v2(text).map_err(|e| WalParseError::JsonError(e.to_string()))?;
-    Ok(if v2_row_kind(msg.action()).is_some() {
-        alloc::vec![msg]
-    } else {
-        Vec::new()
-    })
 }
 
 /// Parse a wal2json v1 transaction into one [`ChangeV1`] per row change.

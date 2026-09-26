@@ -49,10 +49,11 @@ use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use core::time::Duration;
 
 use pg_walstream::error::ReplicationError;
-use pg_walstream::{ChangeEvent, PgReplicationConnection};
+use pg_walstream::PgReplicationConnection;
 use sql_traits::prelude::DatabaseLike;
 
-use crate::PgLsn;
+use crate::wal::{PgChangeEvent, TransactionOrderError};
+use crate::PgCommitPosition;
 
 pub(crate) mod helpers;
 pub(crate) mod inner_polling_loop;
@@ -135,6 +136,10 @@ pub enum PollingPgCdcError {
     /// produce events.
     #[error("polling source shut down")]
     SourceClosed,
+    /// The decoded changes' transaction frames were out of place, so their
+    /// rows could not be placed in commit order.
+    #[error("decoded changes out of order: {0}")]
+    TransactionOrder(#[from] TransactionOrderError),
 }
 
 /// Polling-based Postgres CDC source.
@@ -144,10 +149,10 @@ pub enum PollingPgCdcError {
 /// the retained WAL and the cost of a poll.
 pub struct PollingPgCdcSource {
     config: PollingPgCdcConfig,
-    event_rx: tokio::sync::mpsc::Receiver<Result<ChangeEvent, PollingPgCdcError>>,
+    event_rx: tokio::sync::mpsc::Receiver<Result<PgChangeEvent, PollingPgCdcError>>,
     /// Positions the consumer acknowledged, carried to the loop, which
     /// advances the slot on its next iteration.
-    ack_tx: std::sync::mpsc::Sender<u64>,
+    ack_tx: std::sync::mpsc::Sender<PgCommitPosition>,
     polls_issued: Arc<AtomicU64>,
     events_received: Arc<AtomicU64>,
     empty_polls_observed: Arc<AtomicU64>,
@@ -169,8 +174,8 @@ impl PollingPgCdcSource {
     /// exists, and spawn the inner task that drains the slot at the
     /// configured cadence.
     /// `catalog` is retained for API stability and is currently unused.
-    /// The source yields raw `ChangeEvent`s that the engine resolves
-    /// against its own catalog at dispatch time.
+    /// The engine resolves the events against its own catalog at dispatch
+    /// time.
     #[allow(clippy::needless_pass_by_value)]
     pub async fn connect<DB: DatabaseLike + 'static>(
         config: PollingPgCdcConfig,
@@ -328,7 +333,7 @@ impl Drop for PollingPgCdcSource {
 }
 
 impl crate::CdcSource for PollingPgCdcSource {
-    type Event = ChangeEvent;
+    type Event = PgChangeEvent;
     type Error = PollingPgCdcError;
 
     #[allow(clippy::manual_async_fn)]
@@ -344,9 +349,9 @@ impl crate::CdcSource for PollingPgCdcSource {
     #[allow(clippy::manual_async_fn, clippy::unused_async)]
     fn ack(
         &mut self,
-        upto: PgLsn,
+        upto: PgCommitPosition,
     ) -> impl core::future::Future<Output = Result<(), Self::Error>> + Send {
-        let send_result = self.ack_tx.send(upto.0);
+        let send_result = self.ack_tx.send(upto);
         async move {
             send_result.map_err(|_| PollingPgCdcError::SourceClosed)?;
             Ok(())

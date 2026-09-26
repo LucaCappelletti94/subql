@@ -253,11 +253,16 @@ pub use mysql::{maxwell_collect, mysql_database, start_maxwell};
     feature = "executor-diesel-async-mysql",
 ))]
 pub use parked_reads::{park_a_mysql_read, park_a_read, PARK};
+#[cfg(any(
+    feature = "executor-diesel-async-postgres",
+    feature = "executor-diesel-postgres-r2d2"
+))]
+pub use pg::in_transaction;
 #[cfg(feature = "pg-streaming")]
 pub use pg::PgDatabase;
 #[cfg(any(feature = "pg-streaming", feature = "pgoutput-emit"))]
 pub use pg::{create_pgoutput_slot, create_publication};
-pub use pg::{create_slot, drain_slot, drop_slot, pg_database};
+pub use pg::{create_slot, drain_slot, drop_slot, pg_database, read_wal2json_v2};
 
 /// Mapped gRPC port of this run's shared OpenFGA. Blocking: call it from
 /// `spawn_blocking` inside an async test.

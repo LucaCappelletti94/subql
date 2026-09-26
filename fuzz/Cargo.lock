@@ -858,7 +858,7 @@ checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
 [[package]]
 name = "pg2sqlite"
 version = "0.1.0"
-source = "git+https://github.com/LucaCappelletti94/pg2sqlite?branch=main#787815b7cb578e1407b524e7f43c73be91bd6b5b"
+source = "git+https://github.com/LucaCappelletti94/pg2sqlite?branch=main#8d05c614b3a1ad2faad586d41830249e8af5139e"
 dependencies = [
  "sql-traits",
  "sqlparser",
@@ -868,9 +868,9 @@ dependencies = [
 
 [[package]]
 name = "pg_walstream"
-version = "0.8.1"
+version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4cb204bf29c07ccaedb26f3c6c87fd02fc7cb99021bf7b40f339ddb3aae7fcc2"
+checksum = "f6bdc4f0d36c6f314ce9468ff12ca0d3e814ac4ba51c46758c57d9e470ceefa2"
 dependencies = [
  "bytes",
  "chrono",
@@ -1224,7 +1224,7 @@ dependencies = [
 [[package]]
 name = "sql-traits"
 version = "0.1.0"
-source = "git+https://github.com/earth-metabolome-initiative/sql-traits?branch=main#7e068a8c14ed9ec7eed0112427121d4e89799be8"
+source = "git+https://github.com/earth-metabolome-initiative/sql-traits?branch=main#8ab50b2a42485282ca25cd9db22c5fb7b910161a"
 dependencies = [
  "geometric-traits",
  "serde",
@@ -1245,9 +1245,9 @@ dependencies = [
 
 [[package]]
 name = "sqlite-diff-rs"
-version = "0.14.0"
+version = "0.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "26dd4527d7fe7a00a76907a4512c2fdefaa3b5dc20a5c7801d8ff614eae9dc4a"
+checksum = "6a3feca792d8f7372e3a79a16703d53648ffd8b2d3ccfe5398ebd2cbdb1eb7b4"
 dependencies = [
  "hashbrown 0.17.1",
  "indexmap",
@@ -1273,7 +1273,7 @@ dependencies = [
 [[package]]
 name = "sqlparser"
 version = "0.63.0"
-source = "git+https://github.com/apache/datafusion-sqlparser-rs?branch=main#3255202ab074697bdd84b141f43301bbe814711e"
+source = "git+https://github.com/apache/datafusion-sqlparser-rs?branch=main#37df75e6566293117739d82a937eef25132c32bf"
 dependencies = [
  "log",
  "recursive",
@@ -1283,8 +1283,8 @@ dependencies = [
 
 [[package]]
 name = "sqlparser-canonicalize"
-version = "0.1.0"
-source = "git+https://github.com/LucaCappelletti94/sqlparser-canonicalize?branch=main#bec4fd1fc464c5ada922c341cd63754420b9f2b0"
+version = "0.2.1"
+source = "git+https://github.com/LucaCappelletti94/sqlparser-canonicalize?branch=main#12ff22066305050314923d204054833ced5f7f56"
 dependencies = [
  "seahash",
  "sqlparser",
@@ -1303,7 +1303,7 @@ dependencies = [
 [[package]]
 name = "sqlparser_derive"
 version = "0.6.0"
-source = "git+https://github.com/apache/datafusion-sqlparser-rs?branch=main#3255202ab074697bdd84b141f43301bbe814711e"
+source = "git+https://github.com/apache/datafusion-sqlparser-rs?branch=main#37df75e6566293117739d82a937eef25132c32bf"
 dependencies = [
  "proc-macro2",
  "quote",
