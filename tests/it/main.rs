@@ -400,6 +400,8 @@ mod pattern_operands;
 
 mod arithmetic_operands;
 
+mod float_range_bounds;
+
 mod column_subset;
 
 mod semantics_float_width;
