@@ -17,7 +17,7 @@ use crate::backend::{DivisionPrecisionIncrement, FloatWidth, Postgres, RowKind, 
 use crate::compiler::bytecode::{
     BytecodeProgram, ComparisonRef, FloatResult, Instruction, Quotient,
 };
-use crate::compiler::canonicalize::{hash_sql, normalize_sql};
+use crate::compiler::canonicalize::normalize_sql;
 use crate::compiler::parser::parse_and_compile;
 use crate::compiler::vm::Vm;
 use crate::persistence::codec;
@@ -111,7 +111,7 @@ fn arb_quotient(u: &mut Unstructured<'_>) -> arbitrary::Result<Quotient> {
 
 /// Generate an [`Instruction<Postgres>`] from fuzzer-controlled bytes.
 pub fn arb_instruction(u: &mut Unstructured<'_>) -> arbitrary::Result<Instruction<Postgres>> {
-    match u.int_in_range(0u8..=27)? {
+    match u.int_in_range(0u8..=28)? {
         0 => Ok(Instruction::PushLiteral(arb_value(u)?)),
         1 => Ok(Instruction::LoadColumn(u.int_in_range(0u16..=63)?)),
         2 => Ok(Instruction::Equal(arb_comparison_ref(u)?)),
@@ -156,18 +156,23 @@ pub fn arb_instruction(u: &mut Unstructured<'_>) -> arbitrary::Result<Instructio
         // Jump instructions with bounded offsets (0..=31 to stay within any reasonable program)
         22 => Ok(Instruction::JumpIfFalse(u.int_in_range(0usize..=31)?)),
         23 => Ok(Instruction::JumpIfTrue(u.int_in_range(0usize..=31)?)),
-        24 => Ok(Instruction::NotDistinct(arb_comparison_ref(u)?)),
-        25 => Ok(Instruction::IsTruth {
-            value: match u.int_in_range(0u8..=2)? {
-                0 => crate::compiler::Tri::True,
-                1 => crate::compiler::Tri::False,
-                _ => crate::compiler::Tri::Unknown,
-            },
+        24 => Ok(Instruction::TermTruth(u.int_in_range(0u16..=3)?)),
+        25 => Ok(Instruction::NotDistinct(arb_comparison_ref(u)?)),
+        26 => Ok(Instruction::IsTruth {
+            value: arb_tri(u)?,
             negated: u.arbitrary()?,
         }),
-        26 => Ok(Instruction::Truth),
+        27 => Ok(Instruction::Truth),
         _ => Ok(Instruction::Coalesce(u.int_in_range(0u16..=4)?)),
     }
+}
+
+fn arb_tri(u: &mut Unstructured<'_>) -> arbitrary::Result<crate::compiler::Tri> {
+    Ok(match u.int_in_range(0u8..=2)? {
+        0 => crate::compiler::Tri::True,
+        1 => crate::compiler::Tri::False,
+        _ => crate::compiler::Tri::Unknown,
+    })
 }
 
 /// Parse SQL using PostgreSqlDialect, the dialect subql's CDC pipeline
@@ -190,7 +195,9 @@ pub fn harness_parse_sql(data: &[u8]) {
     let _ = parse_and_compile::<Postgres, _>(sql, &pg, fuzz_catalog());
 }
 
-/// Generate random bytecode + row and evaluate with the VM.
+/// Generate random bytecode, a row and membership term truths, and evaluate
+/// with the VM. Up to three truths against slots up to 3 reaches both a
+/// supplied term and a missing one.
 pub fn harness_vm_eval(data: &[u8]) {
     let mut u = Unstructured::new(data);
 
@@ -218,11 +225,22 @@ pub fn harness_vm_eval(data: &[u8]) {
         Err(_) => return,
     };
 
+    let Ok(n_truths) = u.int_in_range(0usize..=3) else {
+        return;
+    };
+    let truths: Vec<crate::compiler::Tri> = match (0..n_truths)
+        .map(|_| arb_tri(&mut u))
+        .collect::<arbitrary::Result<_>>()
+    {
+        Ok(v) => v,
+        Err(_) => return,
+    };
+
     let program = BytecodeProgram::new(instructions);
     let event = TestEvent::<Postgres>::insert(0, cells);
 
     let mut vm = Vm::<Postgres>::new();
-    let _ = vm.eval(&program, &event, RowKind::New, fuzz_catalog());
+    let _ = vm.eval_with_terms(&program, &event, RowKind::New, fuzz_catalog(), &truths);
 }
 
 /// Feed raw bytes to shard deserialization.
@@ -230,18 +248,92 @@ pub fn harness_deserialize_shard(data: &[u8]) {
     let _ = deserialize_shard::<DefaultIds, _>(data, fuzz_catalog());
 }
 
-/// Normalize and hash SQL, asserting determinism. PostgreSqlDialect only.
-/// See `harness_parse_sql` for the rationale.
+/// Two spellings with one canonical form share one compiled program, so a
+/// filter on `orders` and its canonical form must compile to programs that
+/// answer every row alike. The input is the filter alone, so every input that
+/// parses reaches the compiler. PostgreSqlDialect only, see `harness_parse_sql`
+/// for the rationale.
 pub fn harness_canonicalize(data: &[u8]) {
-    let Ok(sql) = core::str::from_utf8(data) else {
+    let Ok(filter) = core::str::from_utf8(data) else {
         return;
     };
-    let dialect = &PostgreSqlDialect {} as &dyn sqlparser::dialect::Dialect;
-    if let Ok(normalized) = normalize_sql(sql, dialect) {
-        let h1 = hash_sql(&normalized);
-        let h2 = hash_sql(&normalized);
-        assert_eq!(h1, h2, "hash_sql is not deterministic");
+    let sql = format!("SELECT * FROM orders WHERE {filter}");
+    let dialect = PostgreSqlDialect {};
+    let Ok(canonical) = normalize_sql(&sql, &dialect) else {
+        return;
+    };
+    let Ok((table, written)) = parse_and_compile::<Postgres, _>(&sql, &dialect, fuzz_catalog())
+    else {
+        return;
+    };
+    let restated = format!("SELECT * FROM orders WHERE {canonical}");
+    let (restated_table, restated_program) =
+        parse_and_compile::<Postgres, _>(&restated, &dialect, fuzz_catalog())
+            .unwrap_or_else(|e| panic!("{restated} does not compile: {e}"));
+    assert_eq!(
+        table, restated_table,
+        "{sql} and {restated} read different tables"
+    );
+
+    let mut vm = Vm::<Postgres>::new();
+    for cells in probe_rows(&written, table) {
+        let event = TestEvent::<Postgres>::insert(table, cells);
+        let a = vm.eval(&written, &event, RowKind::New, fuzz_catalog());
+        let b = vm.eval(&restated_program, &event, RowKind::New, fuzz_catalog());
+        assert_eq!(a, b, "{sql} and {restated} disagree on {event:?}");
     }
+}
+
+/// Rows of `orders` built from the literals `program` compares against, one
+/// either side of each integer and each string as written, plus a row of
+/// NULLs. Every integer column takes the value, offset by its position in
+/// half the rows so columns compared with each other both match and differ.
+fn probe_rows(
+    program: &BytecodeProgram<Postgres>,
+    table: crate::TableId,
+) -> Vec<Vec<Value<Postgres>>> {
+    let mut ints = vec![0i64];
+    let mut strings = vec![String::new()];
+    for instruction in &program.instructions {
+        let literals: &[Value<Postgres>] = match instruction {
+            Instruction::PushLiteral(value) => core::slice::from_ref(value),
+            Instruction::In { literals, .. } => literals,
+            _ => &[],
+        };
+        for literal in literals {
+            match literal {
+                Value::Int(n) => ints.extend([n.saturating_sub(1), *n, n.saturating_add(1)]),
+                Value::String(text) => strings.push(text.clone()),
+                _ => {}
+            }
+        }
+    }
+    ints.sort_unstable();
+    ints.dedup();
+    ints.truncate(12);
+    strings.sort_unstable();
+    strings.dedup();
+    strings.truncate(4);
+
+    let columns = crate::catalog_helpers::table_arity(fuzz_catalog(), table).unwrap_or(19);
+    let mut rows = vec![vec![Value::Null; columns]];
+    for (i, n) in ints.iter().enumerate() {
+        for text in &strings {
+            let spread = i % 2 == 1;
+            rows.push(
+                (0..columns)
+                    .map(|column| match column {
+                        2 => Value::String(text.as_str().into()),
+                        _ if spread => {
+                            Value::Int(n.saturating_add(i64::try_from(column).unwrap_or(0)))
+                        }
+                        _ => Value::Int(*n),
+                    })
+                    .collect(),
+            );
+        }
+    }
+    rows
 }
 
 /// Try decoding raw bytes as different types.

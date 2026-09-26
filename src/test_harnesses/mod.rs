@@ -61,38 +61,23 @@ mod tests {
         }
     }
 
+    /// The persisted tag, which is the variant's declaration index.
     fn instruction_kind(instr: &Instruction<Postgres>) -> u8 {
-        match instr {
-            Instruction::PushLiteral(_) => 0,
-            Instruction::LoadColumn(_) => 1,
-            Instruction::Equal(_) => 2,
-            Instruction::NotEqual(_) => 3,
-            Instruction::LessThan(_) => 4,
-            Instruction::LessThanOrEqual(_) => 5,
-            Instruction::GreaterThan(_) => 6,
-            Instruction::GreaterThanOrEqual(_) => 7,
-            Instruction::IsNull => 8,
-            Instruction::IsNotNull => 9,
-            Instruction::And => 10,
-            Instruction::Or => 11,
-            Instruction::Not => 12,
-            Instruction::Add(_) => 13,
-            Instruction::Subtract(_) => 14,
-            Instruction::Multiply(_) => 15,
-            Instruction::Divide(..) => 16,
-            Instruction::Modulo(_) => 17,
-            Instruction::Negate(_) => 18,
-            Instruction::In { .. } => 19,
-            Instruction::Between { .. } => 20,
-            Instruction::Like { .. } => 21,
-            Instruction::JumpIfFalse(_) => 22,
-            Instruction::JumpIfTrue(_) => 23,
-            Instruction::TermTruth(_) => 24,
-            Instruction::NotDistinct(_) => 25,
-            Instruction::IsTruth { .. } => 26,
-            Instruction::Truth => 27,
-            Instruction::Coalesce(_) => 28,
-        }
+        let bytes = postcard::to_allocvec(instr).expect("an instruction serializes");
+        bytes[0]
+    }
+
+    /// How many variants `Instruction` declares, read off postcard. Every
+    /// variant decodes from its tag followed by zeros, and the first tag past
+    /// the last variant does not.
+    fn instruction_variants() -> usize {
+        (0u8..=u8::MAX)
+            .take_while(|tag| {
+                let mut bytes = [0u8; 32];
+                bytes[0] = *tag;
+                postcard::from_bytes::<Instruction<Postgres>>(&bytes).is_ok()
+            })
+            .count()
     }
 
     #[test]
@@ -152,11 +137,10 @@ mod tests {
             }
         }
 
-        assert_eq!(
-            seen.len(),
-            28,
-            "expected all Instruction variants, saw {seen:?}"
-        );
+        let every: BTreeSet<u8> = (0..instruction_variants())
+            .map(|tag| u8::try_from(tag).expect("fewer than 256 variants"))
+            .collect();
+        assert_eq!(seen, every, "arb_instruction misses a variant");
     }
 
     #[test]
@@ -168,7 +152,7 @@ mod tests {
         harness_vm_eval(&vec![0xEE; 4096]);
 
         harness_deserialize_shard(&[0x00, 0x01, 0x02, 0x03]);
-        harness_canonicalize(b"SELECT * FROM orders WHERE status = 'open'");
+        harness_canonicalize(b"status = 'open' AND amount > 5");
 
         let encoded_vec = codec::encode(&vec![1_u8, 2, 3, 4]).unwrap();
         harness_codec_decode(&encoded_vec);
