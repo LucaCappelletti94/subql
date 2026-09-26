@@ -299,8 +299,8 @@ pub enum Instruction<B: Backend> {
     },
 
     /// `LIKE` pattern matching against a text scalar. `%` matches zero or
-    /// more characters, `_` matches exactly one character. No ESCAPE clause
-    /// support.
+    /// more characters, `_` matches exactly one character, and the escape
+    /// character makes the one after it literal.
     ///
     /// Non-string operands yield `Tri::Unknown`. `Missing` / `Null` operands
     /// yield `Tri::Unknown`.
@@ -368,9 +368,6 @@ pub enum Instruction<B: Backend> {
     /// `Missing` operand is still `Tri::Unknown`, since the row may hold
     /// anything there. Carries the facts `Equal` would, so the two agree on
     /// every pair of present values.
-    ///
-    /// Last among the variants so every program persisted before it keeps
-    /// its encoding.
     ///
     /// Stack: `[..., a, b] -> [..., Tri]`.
     NotDistinct(ComparisonRef),

@@ -188,8 +188,9 @@ fn is_boolean_column<B: Backend, DB: DatabaseLike>(
 ///
 /// A boolean column reads as its own truth, which is how each engine reads
 /// one there. `= true` is not that on SQLite, whose boolean column keeps the
-/// stored integer and compares it with `1`. Any other bare value keeps the
-/// `= true` comparison.
+/// stored integer and compares it with `1`. A boolean literal keeps the
+/// `= true` comparison, and any other value is routed, since MySQL and SQLite
+/// read a nonzero number as true where the comparison never matches.
 fn ensure_condition<B, DB>(
     expr: &Expr,
     table_id: TableId,
@@ -206,6 +207,21 @@ where
     if is_boolean_column::<B, DB>(expr, table_id, database) {
         out.push(Instruction::Truth);
         return Ok(());
+    }
+    let mut bare = expr;
+    while let Expr::Nested(inner) = bare {
+        bare = inner;
+    }
+    if !matches!(
+        bare,
+        Expr::Value(ValueWithSpan {
+            value: SqlValue::Boolean(_),
+            ..
+        })
+    ) {
+        return Err(RegisterError::UnsupportedSql(
+            "a value that is not boolean, read as a condition".to_string(),
+        ));
     }
     let comparison = ComparisonRef::new(out.intern_comparison(expr, table_id, database), None);
     wrap_bare_value_as_tri::<B>(&mut out.out, comparison)

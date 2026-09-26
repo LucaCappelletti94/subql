@@ -131,7 +131,13 @@ fn sqlite_reads_a_stored_nonzero_boolean_as_true() {
 /// the engine: PostgreSQL raises and the others read a number's truth.
 #[test]
 fn a_non_boolean_operand_is_left_to_the_engine() {
-    for predicate in ["n IS TRUE", "(n + 1) IS NOT FALSE"] {
+    for predicate in [
+        "n IS TRUE",
+        "(n + 1) IS NOT FALSE",
+        "n AND flag",
+        "COALESCE(n, 0)",
+        "NOT (n + 1)",
+    ] {
         assert!(
             not_served::<Postgres, _>(PostgreSqlDialect {}, predicate).is_some(),
             "PostgreSQL routes {predicate}"
