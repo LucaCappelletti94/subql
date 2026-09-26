@@ -217,7 +217,7 @@ impl<B: Backend> Compiling<B> {
             self.intern_comparison(right, table_id, database),
         );
         let Some(column) = text_column else {
-            return Ok(reference);
+            return Self::string_pair_rule(left, right, operation, reference);
         };
 
         let context = crate::backend::ComparisonContext {
@@ -264,6 +264,50 @@ impl<B: Backend> Compiling<B> {
             }
         };
         Ok(reference.with_text(Some(rule)))
+    }
+
+    /// Two strings with no column between them compare under the database
+    /// default collation, which is what a column declaring none reads, so
+    /// the backend answers them as it answers such a column.
+    fn string_pair_rule(
+        left: &Expr,
+        right: &Expr,
+        operation: crate::backend::TextOperation,
+        reference: ComparisonRef,
+    ) -> Result<ComparisonRef, RegisterError> {
+        let is_string = |side: &Expr| {
+            matches!(
+                crate::compiler::literals::value_column(side),
+                Expr::Value(sqlparser::ast::ValueWithSpan {
+                    value: sqlparser::ast::Value::SingleQuotedString(_),
+                    ..
+                })
+            )
+        };
+        if !(is_string(left) && is_string(right)) {
+            return Ok(reference);
+        }
+        let default_text = crate::backend::ColumnComparisonOf::<B> {
+            kind: crate::backend::ScalarKind::Builtin(crate::backend::DeclaredType::Text(
+                crate::backend::TextWidth::Varying,
+            )),
+            declared_type: alloc::string::String::from("text"),
+            collation: crate::backend::ColumnCollation::DatabaseDefault,
+        };
+        let context = crate::backend::ComparisonContext {
+            left: Some(&default_text),
+            right: None,
+            text: None,
+        };
+        match B::text_rule(&context, operation) {
+            crate::backend::TextResolution::Rule(rule) => Ok(reference.with_text(Some(rule))),
+            crate::backend::TextResolution::NeedsRead
+            | crate::backend::TextResolution::Refused { .. } => Err(RegisterError::UnsupportedSql(
+                "two strings compare under the database default collation, which the catalog \
+                 does not name"
+                    .into(),
+            )),
+        }
     }
 }
 
