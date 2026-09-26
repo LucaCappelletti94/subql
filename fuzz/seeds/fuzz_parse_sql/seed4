@@ -1,0 +1,1 @@
+SELECT * FROM orders WHERE amount BETWEEN 1 AND 9

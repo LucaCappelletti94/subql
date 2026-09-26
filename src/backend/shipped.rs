@@ -297,6 +297,10 @@ impl<V: postgres_jsonb_canonical::PgVersion + 'static> Backend for Postgres<V> {
         crate::backend::cross_kind_numeric_ordering(left, right)
     }
 
+    fn int_as_float(value: &i64) -> Option<f64> {
+        Some(super::scalar_value::widen_i64_to_f64(*value))
+    }
+
     /// PostgreSQL's own float rule: NaN equals NaN. IEEE, which is what
     /// `PartialOrd` on `f64` implements, says a NaN equals nothing, so
     /// `WHERE value = value` skipped the row the server returns.
@@ -630,6 +634,10 @@ impl<C: MySqlTableNameCase> Backend for MySql<C> {
         crate::backend::cross_kind_numeric_ordering(left, right)
     }
 
+    fn int_as_float(value: &i64) -> Option<f64> {
+        Some(super::scalar_value::widen_i64_to_f64(*value))
+    }
+
     /// Measured on 8.4.11: only the binary collations are reproducible.
     /// The server default folds case and accents, and a case-sensitive UCA
     /// collation is not byte-exact either, since `utf8mb4_0900_as_cs`
@@ -912,6 +920,10 @@ impl Backend for SQLite {
         right: &Value<Self>,
     ) -> Result<Option<core::cmp::Ordering>, crate::EvaluationRefusal> {
         crate::backend::cross_kind_numeric_ordering(left, right)
+    }
+
+    fn int_as_float(value: &i64) -> Option<f64> {
+        Some(super::scalar_value::widen_i64_to_f64(*value))
     }
 
     /// SQLite's three built-in collations are all exactly reproducible:

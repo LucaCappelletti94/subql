@@ -1,0 +1,1 @@
+SELECT o.* FROM orders AS o WHERE o.id = 1

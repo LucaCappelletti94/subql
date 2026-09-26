@@ -387,6 +387,14 @@ mod like_escape_clause;
 
 mod coalesce;
 
+mod between_null_bound;
+
+mod operand_kinds;
+
+mod literal_text_comparison;
+
+mod float_range_bounds;
+
 mod column_subset;
 
 mod semantics_float_width;
