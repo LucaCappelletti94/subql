@@ -407,6 +407,9 @@ mod null_test_of_condition;
 #[cfg(all(feature = "diesel-typed-sqlite", feature = "executor-diesel"))]
 mod sync_cursors;
 
+#[cfg(all(feature = "diesel-typed-sqlite", feature = "executor-diesel"))]
+mod keyed_reads_key_change;
+
 mod column_subset;
 
 mod semantics_float_width;
