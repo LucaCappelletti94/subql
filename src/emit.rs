@@ -41,7 +41,7 @@ use sql_traits::prelude::{DatabaseLike, TableLike};
 use sqlite_diff_rs::maxwell::{ConversionError as MaxwellConversionError, Maxwell};
 #[cfg(feature = "pgoutput-emit")]
 use sqlite_diff_rs::pg_walstream::{
-    ChangeEvent as PgChangeEvent, ConversionError as PgConversionError, PgWalstream,
+    ChangeEvent, ConversionError as PgConversionError, PgWalstream,
 };
 use sqlite_diff_rs::wal2json::{ConversionError, Wal2Json};
 use sqlite_diff_rs::{
@@ -429,7 +429,7 @@ pub fn pgoutput_adapter() -> TypeMap<PgWalstream, String, Vec<u8>> {
 #[cfg(feature = "pgoutput-emit")]
 pub fn pgoutput_patchset_builder<DB: DatabaseLike>(
     database: &DB,
-    events: &[PgChangeEvent],
+    events: &[ChangeEvent],
 ) -> Result<PatchSet<WireTable, String, Vec<u8>>, PgConversionError> {
     fold_events(
         database,
@@ -446,7 +446,7 @@ pub fn pgoutput_patchset_builder<DB: DatabaseLike>(
 #[cfg(feature = "pgoutput-emit")]
 pub fn pgoutput_patchset<DB: DatabaseLike>(
     database: &DB,
-    events: &[PgChangeEvent],
+    events: &[ChangeEvent],
 ) -> Result<Vec<u8>, PgConversionError> {
     Ok(pgoutput_patchset_builder(database, events)?.build())
 }
@@ -466,7 +466,7 @@ pub fn pgoutput_patchset<DB: DatabaseLike>(
 #[cfg(feature = "pgoutput-emit")]
 pub fn pgoutput_changeset_builder<DB: DatabaseLike>(
     database: &DB,
-    events: &[PgChangeEvent],
+    events: &[ChangeEvent],
 ) -> Result<ChangeSet<WireTable, String, Vec<u8>>, PgConversionError> {
     fold_events(
         database,
@@ -483,7 +483,7 @@ pub fn pgoutput_changeset_builder<DB: DatabaseLike>(
 #[cfg(feature = "pgoutput-emit")]
 pub fn pgoutput_changeset<DB: DatabaseLike>(
     database: &DB,
-    events: &[PgChangeEvent],
+    events: &[ChangeEvent],
 ) -> Result<Vec<u8>, PgConversionError> {
     Ok(pgoutput_changeset_builder(database, events)?.build())
 }
@@ -1057,7 +1057,7 @@ mod tests {
         .unwrap();
 
         // CDC path: the same uuid as pgoutput text.
-        let ev = PgChangeEvent {
+        let ev = ChangeEvent {
             event_type: EventType::Insert {
                 schema: "public".into(),
                 table: "orders".into(),
@@ -1120,7 +1120,7 @@ mod tests {
         )
         .unwrap();
 
-        let ev = PgChangeEvent {
+        let ev = ChangeEvent {
             event_type: EventType::Insert {
                 schema: "public".into(),
                 table: "orders".into(),
@@ -1244,7 +1244,7 @@ mod tests {
              CREATE TABLE b.items (id INT PRIMARY KEY, right_num INT);",
         )
         .unwrap();
-        let ev = PgChangeEvent {
+        let ev = ChangeEvent {
             event_type: EventType::Insert {
                 schema: "a".into(),
                 table: "items".into(),

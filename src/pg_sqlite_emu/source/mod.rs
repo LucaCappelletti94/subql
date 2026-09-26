@@ -5,7 +5,7 @@
 //! surrounding orchestration: PG DDL translation via [`pg2sqlite`],
 //! session lifecycle, per-table [`RelationSchema`] cache, the
 //! unchanged-column row lookup, and the `PgOutputDecoder` feedback loop
-//! that turns the encoded frames back into typed [`crate::ChangeEvent`]s.
+//! that turns the encoded frames back into [`crate::PgChangeEvent`]s.
 
 use alloc::collections::VecDeque;
 use alloc::string::{String, ToString};
@@ -16,7 +16,7 @@ use diesel::{sql_query, RunQueryDsl, SqliteConnection};
 use diesel_sqlite_session::{Session, SqliteSessionExt};
 use hashbrown::{HashMap, HashSet};
 use pg2sqlite::{options::Pg2SqliteOptions, pg2sqlite::Pg2Sqlite};
-use pg_walstream::{encode_message, ChangeEvent, Lsn, PgOutputDecoder};
+use pg_walstream::{encode_message, Lsn, PgOutputDecoder};
 use sql_traits::prelude::{DatabaseLike, TableLike};
 use sql_traits::structs::ParserDB;
 use sqlite_diff_rs::pg_walstream_reverse::{
@@ -25,7 +25,7 @@ use sqlite_diff_rs::pg_walstream_reverse::{
 use sqlite_diff_rs::{ChangesetOp, ParsedDiffSet, TableSchema};
 
 use super::error::PgSqliteEmuError;
-use crate::wal::into_engine_events;
+use crate::wal::{PgChangeEvent, PgOutputOrder};
 use crate::TableId;
 
 mod row_lookup;
@@ -44,7 +44,7 @@ const PROTOCOL_VERSION: u8 = 1;
 /// # Examples
 ///
 /// Build a source, drive one INSERT through the wrapped connection,
-/// and inspect the typed [`ChangeEvent`] the source materialises
+/// and inspect the [`PgChangeEvent`] the source materialises
 /// from SQLite's session changeset. Full engine-dispatch pipeline
 /// lives in the [module docs](super#quickstart).
 ///
@@ -75,11 +75,12 @@ pub struct PgSqliteEmuSource {
     connection: SqliteConnection,
     pg_catalog: ParserDB,
     decoder: PgOutputDecoder,
-    pending: VecDeque<ChangeEvent>,
+    order: PgOutputOrder,
+    pending: VecDeque<PgChangeEvent>,
     announced: HashSet<Oid>,
     tables: HashMap<String, TableMeta>,
-    /// Monotonic WAL position stamped on each data frame, since
-    /// `pgoutput` data messages carry no body LSN.
+    /// WAL position of the last frame, which the next transaction's
+    /// positions follow.
     next_lsn: u64,
 }
 
@@ -164,6 +165,7 @@ impl PgSqliteEmuSource {
             session,
             pg_catalog,
             decoder: PgOutputDecoder::with_protocol_version(u32::from(PROTOCOL_VERSION)),
+            order: PgOutputOrder::new(),
             pending: VecDeque::new(),
             announced: HashSet::new(),
             tables,
@@ -193,7 +195,7 @@ impl PgSqliteEmuSource {
     ///
     /// Shortest usable pipeline: open, run one DML, drain one event.
     /// The typed row image round-trips through the pgoutput wire and
-    /// back into a `ChangeEvent` before the assertion sees it.
+    /// back into a `PgChangeEvent` before the assertion sees it.
     ///
     /// ```
     /// use subql::backend::{CdcEvent, RowKind, Value};
@@ -282,7 +284,7 @@ impl PgSqliteEmuSource {
     /// assert!(source.drain()?.is_empty(), "queue is now flushed");
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
-    pub fn drain(&mut self) -> Result<Vec<ChangeEvent>, PgSqliteEmuError> {
+    pub fn drain(&mut self) -> Result<Vec<PgChangeEvent>, PgSqliteEmuError> {
         let mut out = Vec::new();
         while let Some(ev) = self.poll_next_event()? {
             out.push(ev);
@@ -314,7 +316,7 @@ impl PgSqliteEmuSource {
     /// assert!(source.poll_next_event()?.is_none());
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
-    pub fn poll_next_event(&mut self) -> Result<Option<ChangeEvent>, PgSqliteEmuError> {
+    pub fn poll_next_event(&mut self) -> Result<Option<PgChangeEvent>, PgSqliteEmuError> {
         if self.pending.is_empty() && !self.session.is_empty() {
             self.drain_session()?;
             // SQLite sessions accumulate: `.changeset()` snapshots
@@ -374,8 +376,7 @@ impl PgSqliteEmuSource {
             relation_ids: alloc::vec![meta.oid],
             flags: 0,
         };
-        self.push_frame(&msg)?;
-        Ok(())
+        self.push_transaction(&[msg])
     }
 
     /// Mutable access to the underlying [`SqliteConnection`].
@@ -406,6 +407,7 @@ impl PgSqliteEmuSource {
                 "session emitted patchset instead of changeset".into(),
             ));
         };
+        let mut messages = Vec::new();
         for op in diffset.iter() {
             let name = op.table().name().clone();
             let meta = self
@@ -422,12 +424,13 @@ impl PgSqliteEmuSource {
                 relation_name: meta.sqlite_table.as_str(),
                 columns: cols.as_slice(),
             };
-            let msg = op_to_message(&op, &schema, fallback.as_deref()).map_err(|e| {
-                PgSqliteEmuError::UnknownTable(alloc::format!("op_to_message: {e}"))
-            })?;
-            self.push_frame(&msg)?;
+            messages.push(
+                op_to_message(&op, &schema, fallback.as_deref()).map_err(|e| {
+                    PgSqliteEmuError::UnknownTable(alloc::format!("op_to_message: {e}"))
+                })?,
+            );
         }
-        Ok(())
+        self.push_transaction(&messages)
     }
 
     /// Emit the `Relation` frame for a table the first time it appears
@@ -452,13 +455,42 @@ impl PgSqliteEmuSource {
         let _ = self.decoder.decode_message(buf, Lsn::new(0));
     }
 
+    /// Frame `messages` as one transaction and queue the rows it carries.
+    fn push_transaction(
+        &mut self,
+        messages: &[LogicalReplicationMessage],
+    ) -> Result<(), PgSqliteEmuError> {
+        let rows = u64::try_from(messages.len()).expect("a message count fits in u64");
+        // Laid out as a server writes them, the rows' records and then the commit record.
+        let commit_lsn = self.next_lsn + rows + 2;
+        let pushed = self
+            .push_frame(&LogicalReplicationMessage::Begin {
+                final_lsn: commit_lsn,
+                timestamp: 0,
+                xid: 0,
+            })
+            .and_then(|()| messages.iter().try_for_each(|msg| self.push_frame(msg)))
+            .and_then(|()| {
+                self.push_frame(&LogicalReplicationMessage::Commit {
+                    flags: 0,
+                    commit_lsn,
+                    end_lsn: commit_lsn + 1,
+                    timestamp: 0,
+                })
+            });
+        if pushed.is_err() {
+            // A failed frame leaves the transaction open, and the next drain begins afresh.
+            self.order = PgOutputOrder::new();
+        }
+        pushed
+    }
+
     fn push_frame(&mut self, msg: &LogicalReplicationMessage) -> Result<(), PgSqliteEmuError> {
         let mut buf = BytesMut::new();
         encode_message(msg, PROTOCOL_VERSION, &mut buf);
-        // Fresh position per frame, else all events collapse to `Lsn(0)`.
         self.next_lsn += 1;
         if let Some(decoded) = self.decoder.decode_message(buf, Lsn::new(self.next_lsn))? {
-            self.pending.extend(into_engine_events(decoded));
+            self.order.apply(decoded, &mut self.pending)?;
         }
         Ok(())
     }
@@ -540,7 +572,7 @@ impl TableMeta {
 }
 
 impl crate::CdcSource for PgSqliteEmuSource {
-    type Event = ChangeEvent;
+    type Event = PgChangeEvent;
     type Error = PgSqliteEmuError;
 
     fn next_event(
@@ -775,28 +807,31 @@ mod tests {
         assert_eq!(ev.table_id(src.pg_catalog()), table_id);
     }
 
+    /// Every drain is one transaction, and its rows order after every row of
+    /// the drains before it and among themselves in their order.
     #[test]
-    fn events_carry_strictly_increasing_nonzero_lsns() {
+    fn events_carry_strictly_increasing_commit_positions() {
         let mut src = build_source();
-        for id in 1..=3 {
+        let insert = |src: &mut PgSqliteEmuSource, id: u32| {
             sql_query(alloc::format!(
                 "INSERT INTO orders (id, amount, status) VALUES ({id}, {id}0, 'paid')"
             ))
             .execute(src.connection())
             .unwrap();
-        }
-        let events = src.drain().unwrap();
-        assert_eq!(events.len(), 3);
+        };
+        insert(&mut src, 1);
+        insert(&mut src, 2);
+        let mut events = src.drain().unwrap();
+        insert(&mut src, 3);
+        events.extend(src.drain().unwrap());
 
-        let checkpoints: Vec<crate::PgLsn> = events
+        let checkpoints: Vec<crate::PgCommitPosition> = events
             .iter()
-            .map(|e| e.checkpoint().expect("emulator event carries an LSN"))
+            .map(|e| e.checkpoint().expect("emulator event carries a position"))
             .collect();
-        assert!(
-            checkpoints[0] > crate::PgLsn(0),
-            "first checkpoint must start above zero, got {:?}",
-            checkpoints[0]
-        );
+        let ordinals: Vec<u64> = checkpoints.iter().map(|c| c.ordinal()).collect();
+        assert_eq!(ordinals, [1, 2, 1], "ordinals count from 1 in each drain");
+        assert_eq!(checkpoints[0].commit_lsn(), checkpoints[1].commit_lsn());
         assert!(
             checkpoints.windows(2).all(|w| w[1] > w[0]),
             "checkpoints must be strictly increasing, got {checkpoints:?}"

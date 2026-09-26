@@ -176,8 +176,8 @@ mod engine_setup {
     use std::collections::BTreeSet;
     use subql::backend::{MySql, Postgres};
     use subql::{
-        parse_maxwell, parse_wal2json_v2, DefaultIds, MaxwellEvent, MessageV2, SubscriptionEngine,
-        SubscriptionRequest,
+        parse_maxwell, DefaultIds, MaxwellEvent, SubscriptionEngine, SubscriptionRequest,
+        Wal2JsonV2Event, Wal2JsonV2Reader,
     };
 
     const SUBSCRIPTIONS: &[(u64, &str)] = &[
@@ -190,7 +190,9 @@ mod engine_setup {
         (4, "SELECT * FROM readings WHERE sensor_id = 1"),
     ];
 
-    fn setup_pg_engine(catalog: ParserDB) -> SubscriptionEngine<MessageV2, DefaultIds, ParserDB> {
+    fn setup_pg_engine(
+        catalog: ParserDB,
+    ) -> SubscriptionEngine<Wal2JsonV2Event, DefaultIds, ParserDB> {
         let mut engine = SubscriptionEngine::new(catalog, PostgreSqlDialect {});
         for (consumer_id, sql) in SUBSCRIPTIONS {
             engine
@@ -222,7 +224,7 @@ mod engine_setup {
 
     fn dispatch_events<E>(
         engine: &mut SubscriptionEngine<E, DefaultIds, ParserDB>,
-        parse: impl Fn(&[u8]) -> Result<Vec<E>, subql::WalParseError>,
+        mut parse: impl FnMut(&[u8]) -> Result<Vec<E>, subql::WalParseError>,
         messages: &[String],
     ) -> Vec<BTreeSet<u64>>
     where
@@ -300,7 +302,12 @@ mod engine_setup {
         let mut mx_engine = setup_mysql_engine(super::iot_catalog_mysql());
 
         // Dispatch and collect results
-        let pg_results = dispatch_events(&mut pg_engine, parse_wal2json_v2, &pg_messages);
+        let mut reader = Wal2JsonV2Reader::new();
+        let pg_results = dispatch_events(
+            &mut pg_engine,
+            |bytes| reader.parse(bytes).map(|event| event.into_iter().collect()),
+            &pg_messages,
+        );
         let mx_results = dispatch_events(
             &mut mx_engine,
             |bytes| {

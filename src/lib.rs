@@ -27,8 +27,9 @@ pub use types::*;
 #[cfg(feature = "std")]
 pub use wal::CdcSource;
 pub use wal::{
-    parse_maxwell, parse_wal2json_v1, parse_wal2json_v2, ChangeEvent, ChangeV1, MaxwellEvent,
-    MaxwellMessage, MessageV2, WalParseError, WalParser,
+    parse_maxwell, parse_wal2json_v1, ChangeEvent, ChangeV1, MaxwellEvent, MaxwellMessage,
+    MessageV2, PgChangeEvent, TransactionOrderError, Wal2JsonV2Event, Wal2JsonV2Reader,
+    WalParseError, WalParser,
 };
 #[cfg(feature = "pg-streaming")]
 pub use wal::{
@@ -38,7 +39,9 @@ pub use wal::{
 // Re-export the sql-traits types subql consumers most often need to spell out
 // at call sites: trait bounds for generic code, the canonical schema
 // fingerprint and its envelope error, and the parser-backed default DB impl.
-pub use checkpoint::{Checkpoint, MysqlBinlogPos, NoCheckpoint, OpaqueCheckpoint, PgLsn};
+pub use checkpoint::{
+    Checkpoint, MysqlBinlogPos, NoCheckpoint, OpaqueCheckpoint, PgCommitPosition, PgLsn,
+};
 #[cfg(feature = "std")]
 pub use clock::StdClock;
 pub use clock::{Clock, ClockHandle, ManualClock};

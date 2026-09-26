@@ -22,7 +22,10 @@ use diesel::{sql_query, Connection, RunQueryDsl};
 use sql_traits::structs::ParserDB;
 use sqlparser::dialect::PostgreSqlDialect;
 use subql::backend::CdcEvent;
-use subql::{CdcSource, EventKind, PgLsn, PgStreamingCdcSource, PgStreamingConfig, TimelineSwitch};
+use subql::{
+    CdcSource, EventKind, PgCommitPosition, PgLsn, PgStreamingCdcSource, PgStreamingConfig,
+    TimelineSwitch,
+};
 
 const DDL: &str = "CREATE TABLE orders (id INT PRIMARY KEY, price FLOAT);";
 const PG_DDL: &str = "CREATE TABLE orders (id INT PRIMARY KEY, price DOUBLE PRECISION)";
@@ -166,11 +169,9 @@ fn next_event_delivers_an_insert_without_waiting_for_a_tick() {
     common::drop_slot(&mut setup, &slot);
 }
 
-/// Explicit `ack(upto)` advances the slot's
-/// `confirmed_flush_lsn` on the server. Without acking, the slot
-/// retains all WAL since slot creation. Acking releases it. The
-/// load-bearing claim: an `ack` issued by the caller produces a
-/// visible server-side state change within a short window.
+/// Explicit `ack(upto)` advances the slot's `confirmed_flush_lsn` on the
+/// server past the whole transaction `upto` ends. Without acking, the slot
+/// retains all WAL since slot creation.
 #[test]
 #[ignore = "requires Docker; run with --ignored"]
 fn ack_advances_confirmed_flush_lsn() {
@@ -204,7 +205,7 @@ fn ack_advances_confirmed_flush_lsn() {
                 .unwrap_or_else(|e| panic!("insert id={id}: {e}"));
         }
 
-        let mut last_lsn = PgLsn(0);
+        let mut last = None;
         for _ in 0..3 {
             let ev = tokio::time::timeout(ARRIVAL, source.next_event())
                 .await
@@ -212,21 +213,19 @@ fn ack_advances_confirmed_flush_lsn() {
                 .expect("next_event err")
                 .expect("source closed");
             assert_eq!(ev.kind(), EventKind::Insert);
-            last_lsn = ev.checkpoint().expect("XLogData carries an LSN");
+            last = ev.checkpoint();
         }
-        assert!(
-            last_lsn.0 > 0,
-            "events must carry a non-zero LSN; got {last_lsn:?}"
-        );
+        let last = last.expect("a streamed event carries a checkpoint");
+        let last_lsn = last.commit_lsn();
 
-        source.ack(last_lsn).await.expect("ack");
+        source.ack(last).await.expect("ack");
 
         // Loop is a liveness check; a no-op ack would never advance the LSN.
         let deadline = Instant::now() + ARRIVAL;
         let mut advanced = None;
         while Instant::now() < deadline {
             if let Some(observed) = confirmed_flush_lsn(&mut probe, &slot_inner) {
-                if observed >= last_lsn {
+                if observed > last_lsn {
                     advanced = Some(observed);
                     break;
                 }
@@ -236,7 +235,7 @@ fn ack_advances_confirmed_flush_lsn() {
 
         let observed = advanced.unwrap_or_else(|| {
             panic!(
-                "confirmed_flush_lsn never reached {last_lsn:?}: \
+                "confirmed_flush_lsn never passed {last_lsn:?}: \
                  ack() must surface a StandbyStatusUpdate to the server"
             )
         });
@@ -245,6 +244,246 @@ fn ack_advances_confirmed_flush_lsn() {
         let obs_hi = u32::try_from(observed.0 >> 32).expect("high 32 bits fit u32");
         let obs_lo = u32::try_from(observed.0 & 0xFFFF_FFFF).expect("low 32 bits fit u32");
         println!("ack({lsn_hi}/{lsn_lo}) -> confirmed_flush_lsn {obs_hi}/{obs_lo}");
+    });
+
+    common::drop_slot(&mut setup, &slot);
+}
+
+/// Three events in arrival order, from an older transaction committing after
+/// a newer one, the shape every concurrent writer produces.
+fn interleaved_checkpoints(rows_in_the_older_transaction: usize) -> Vec<PgCommitPosition> {
+    common::assert_docker_available();
+    let db = common::pg_database();
+    let mut setup = db.connect();
+    let mut older = db.connect();
+    let mut newer = db.connect();
+    sql_query(PG_DDL).execute(&mut setup).expect("create table");
+    let slot = db.slot("subql_pg_streaming_commit_order");
+    let publication = "subql_pg_streaming_commit_order_pub";
+    common::create_publication(&mut setup, publication, "orders");
+    common::create_pgoutput_slot(&mut setup, &slot);
+    let catalog = ParserDB::parse::<PostgreSqlDialect>(DDL).expect("parse DDL");
+    let config = PgStreamingConfig::new(db.url(), &slot, publication);
+
+    let checkpoints = current_thread_rt().block_on(async move {
+        let mut source = PgStreamingCdcSource::connect(config, catalog)
+            .await
+            .expect("connect");
+        // The older transaction writes first and stays open.
+        sql_query("BEGIN").execute(&mut older).expect("begin");
+        for id in 0..rows_in_the_older_transaction {
+            sql_query(format!("INSERT INTO orders VALUES ({}, 1.0)", 100 + id))
+                .execute(&mut older)
+                .expect("older insert");
+        }
+        // A newer transaction commits while it is open.
+        sql_query("INSERT INTO orders VALUES (1, 2.0)")
+            .execute(&mut newer)
+            .expect("newer insert");
+        sql_query("COMMIT")
+            .execute(&mut older)
+            .expect("commit the older");
+
+        let mut checkpoints = Vec::new();
+        for _ in 0..=rows_in_the_older_transaction {
+            let event = next(&mut source).await;
+            checkpoints.push(
+                event
+                    .checkpoint()
+                    .expect("a streamed event carries a checkpoint"),
+            );
+        }
+        checkpoints
+    });
+    common::drop_slot(&mut setup, &slot);
+    checkpoints
+}
+
+/// The next event, which must arrive.
+async fn next(source: &mut PgStreamingCdcSource) -> subql::PgChangeEvent {
+    tokio::time::timeout(ARRIVAL, source.next_event())
+        .await
+        .expect("the event arrives")
+        .expect("next_event must not error")
+        .expect("source must not have shut down")
+}
+
+/// A transaction that commits later orders later, whatever order its rows were written in.
+#[test]
+#[ignore = "requires Docker; run with --ignored"]
+fn checkpoints_follow_commit_order_across_interleaved_transactions() {
+    let checkpoints = interleaved_checkpoints(1);
+    assert!(
+        checkpoints[0] < checkpoints[1],
+        "the newer transaction committed first, so its event must order first: {checkpoints:?}"
+    );
+}
+
+/// Every delivered event orders strictly after the one before it, including the rows inside one
+/// transaction, so a consumer resuming from any checkpoint it holds misses nothing after it.
+#[test]
+#[ignore = "requires Docker; run with --ignored"]
+fn checkpoints_strictly_increase_through_a_multi_row_transaction() {
+    let checkpoints = interleaved_checkpoints(2);
+    assert!(
+        checkpoints.windows(2).all(|pair| pair[0] < pair[1]),
+        "checkpoints must strictly increase in delivery order: {checkpoints:?}"
+    );
+}
+
+/// Connect, waiting out the walsender of a source just dropped, which holds
+/// the slot until it notices.
+async fn connect_when_free(config: &PgStreamingConfig) -> PgStreamingCdcSource {
+    let deadline = Instant::now() + ARRIVAL;
+    loop {
+        let catalog = ParserDB::parse::<PostgreSqlDialect>(DDL).expect("parse DDL");
+        match PgStreamingCdcSource::connect(config.clone(), catalog).await {
+            Ok(source) => return source,
+            Err(err) if err.to_string().contains("is active") && Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            Err(err) => panic!("connect: {err}"),
+        }
+    }
+}
+
+/// Wait until the source has reported an acknowledgement at least `past`
+/// far, then return the slot's `confirmed_flush_lsn` as the server holds it.
+async fn flushed_after_ack(
+    source: &PgStreamingCdcSource,
+    past: impl Fn(PgLsn) -> bool,
+    probe: &mut diesel::PgConnection,
+    slot: &str,
+) -> PgLsn {
+    let deadline = Instant::now() + ARRIVAL;
+    while !source.acknowledged_position().is_some_and(&past) {
+        assert!(
+            Instant::now() < deadline,
+            "the acknowledgement never reached the server"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    loop {
+        let flushed = confirmed_flush_lsn(probe, slot).expect("the slot exists");
+        if past(flushed) {
+            return flushed;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the slot never took the acknowledgement"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// Acknowledging part of a transaction leaves the slot before it, so a fresh
+/// source receives the whole transaction again, and acknowledging its last row
+/// releases it, so a fresh source never sees it.
+#[test]
+#[ignore = "requires Docker; run with --ignored"]
+fn acknowledging_part_of_a_transaction_never_releases_it() {
+    common::assert_docker_available();
+    let db = common::pg_database();
+    let mut setup = db.connect();
+    let mut dml = db.connect();
+    let mut probe = db.connect();
+    sql_query(PG_DDL).execute(&mut setup).expect("create table");
+    let slot = db.slot("subql_pg_streaming_partial_ack");
+    let publication = "subql_pg_streaming_partial_ack_pub";
+    common::create_publication(&mut setup, publication, "orders");
+    common::create_pgoutput_slot(&mut setup, &slot);
+    let config = PgStreamingConfig::new(db.url(), &slot, publication);
+    let slot_inner = slot.clone();
+
+    current_thread_rt().block_on(async move {
+        let mut source = connect_when_free(&config).await;
+        sql_query("BEGIN").execute(&mut dml).expect("begin");
+        sql_query("INSERT INTO orders VALUES (1, 1.0), (2, 2.0)")
+            .execute(&mut dml)
+            .expect("insert");
+        sql_query("COMMIT").execute(&mut dml).expect("commit");
+        let first = next(&mut source).await.checkpoint().unwrap();
+        let second = next(&mut source).await.checkpoint().unwrap();
+
+        source.ack(first).await.expect("ack the first row");
+        let flushed = flushed_after_ack(&source, |_| true, &mut probe, &slot_inner).await;
+        assert!(
+            flushed < first.commit_lsn(),
+            "the slot passed a transaction the consumer holds half of: {flushed:?} against {first:?}"
+        );
+        drop(source);
+        let mut source = connect_when_free(&config).await;
+        let again = [
+            next(&mut source).await.checkpoint(),
+            next(&mut source).await.checkpoint(),
+        ];
+        assert_eq!(
+            again,
+            [Some(first), Some(second)],
+            "the half-acknowledged transaction must come back whole"
+        );
+
+        source.ack(second).await.expect("ack the last row");
+        flushed_after_ack(&source, |lsn| lsn > second.commit_lsn(), &mut probe, &slot_inner).await;
+        drop(source);
+        let mut source = connect_when_free(&config).await;
+        sql_query("INSERT INTO orders VALUES (3, 3.0)")
+            .execute(&mut dml)
+            .expect("insert");
+        let after = next(&mut source).await.checkpoint().unwrap();
+        assert!(
+            after.commit_lsn() > second.commit_lsn(),
+            "the acknowledged transaction must not come back, got {after:?}"
+        );
+    });
+
+    common::drop_slot(&mut setup, &slot);
+}
+
+/// Resuming from a checkpoint in the middle of a transaction delivers exactly
+/// the events after it, none skipped and none repeated.
+#[test]
+#[ignore = "requires Docker; run with --ignored"]
+fn resuming_from_a_checkpoint_delivers_exactly_the_events_after_it() {
+    common::assert_docker_available();
+    let db = common::pg_database();
+    let mut setup = db.connect();
+    let mut dml = db.connect();
+    sql_query(PG_DDL).execute(&mut setup).expect("create table");
+    let slot = db.slot("subql_pg_streaming_resume");
+    let publication = "subql_pg_streaming_resume_pub";
+    common::create_publication(&mut setup, publication, "orders");
+    common::create_pgoutput_slot(&mut setup, &slot);
+    let config = PgStreamingConfig::new(db.url(), &slot, publication);
+
+    current_thread_rt().block_on(async move {
+        let mut source = connect_when_free(&config).await;
+        sql_query("INSERT INTO orders VALUES (1, 1.0), (2, 2.0), (3, 3.0)")
+            .execute(&mut dml)
+            .expect("insert");
+        let mut delivered = Vec::new();
+        for _ in 0..3 {
+            delivered.push(next(&mut source).await.checkpoint().unwrap());
+        }
+        drop(source);
+
+        let mut source = connect_when_free(&config.start(Some(delivered[0]))).await;
+        sql_query("INSERT INTO orders VALUES (4, 4.0)")
+            .execute(&mut dml)
+            .expect("insert");
+        let mut resumed = Vec::new();
+        for _ in 0..3 {
+            resumed.push(next(&mut source).await.checkpoint().unwrap());
+        }
+        assert_eq!(
+            &resumed[..2],
+            &delivered[1..],
+            "the rest of the transaction, once each"
+        );
+        assert!(
+            resumed[2].commit_lsn() > delivered[2].commit_lsn(),
+            "then the next transaction, got {resumed:?}"
+        );
     });
 
     common::drop_slot(&mut setup, &slot);

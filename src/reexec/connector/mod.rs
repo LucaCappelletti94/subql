@@ -374,8 +374,9 @@ pub trait Connector {
     /// opens, never after: behind the snapshot re-delivers changes the
     /// snapshot already holds, which keyed application absorbs, while ahead
     /// of it silently drops a transaction the snapshot never saw. PG-aware
-    /// connectors choose [`crate::PgLsn`] and read `pg_current_wal_lsn()`,
-    /// which is not snapshot-bound, before opening the read's transaction.
+    /// connectors read `pg_current_wal_lsn()`, which is not snapshot-bound,
+    /// before opening the read's transaction and report
+    /// [`crate::PgCommitPosition::before_commit`] of it.
     /// Backends with no native position (in-memory SQLite, MySQL absent of
     /// binlog tracking) choose [`crate::NoCheckpoint`] and return `None`.
     type Checkpoint: Checkpoint;

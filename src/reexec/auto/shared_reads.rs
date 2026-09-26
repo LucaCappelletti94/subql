@@ -10,7 +10,7 @@ use super::{
 /// Carry a connector's read position into the event-checkpoint domain.
 ///
 /// Identity when the two domains are the same type, which is every shipped
-/// pairing (`PgLsn` reads with `PgLsn` events, and so on). `None` when one
+/// pairing (`PgCommitPosition` reads with `PgCommitPosition` events, and so on). `None` when one
 /// side has no position domain (`NoCheckpoint`): a Maxwell-fed MySQL engine
 /// reads binlog positions its events cannot spell, and a positionless seed
 /// is what the install layer already handles. Two DIFFERENT real position

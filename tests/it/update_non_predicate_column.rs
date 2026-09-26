@@ -208,7 +208,7 @@ mod real_source {
     use sqlparser::dialect::PostgreSqlDialect;
     use subql::backend::CdcEvent;
     use subql::{
-        ChangeEvent, DefaultIds, EventKind, PgSqliteEmuSource, SubscriptionEngine,
+        DefaultIds, EventKind, PgChangeEvent, PgSqliteEmuSource, SubscriptionEngine,
         SubscriptionRequest,
     };
 
@@ -219,7 +219,7 @@ mod real_source {
         status TEXT
     );";
 
-    fn drain_one(source: &mut PgSqliteEmuSource) -> ChangeEvent {
+    fn drain_one(source: &mut PgSqliteEmuSource) -> PgChangeEvent {
         source
             .poll_next_event()
             .expect("poll succeeds")
@@ -229,7 +229,7 @@ mod real_source {
     #[test]
     fn status_only_update_reaches_the_subscription() {
         let mut source = PgSqliteEmuSource::open_in_memory(PG_DDL).expect("build source");
-        let mut engine = SubscriptionEngine::<ChangeEvent, DefaultIds, _>::new(
+        let mut engine = SubscriptionEngine::<PgChangeEvent, DefaultIds, _>::new(
             source.pg_catalog().clone(),
             PostgreSqlDialect {},
         );

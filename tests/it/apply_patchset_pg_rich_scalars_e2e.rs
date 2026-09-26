@@ -14,7 +14,7 @@ use sql_traits::structs::ParserDB;
 use sqlite_diff_rs::{DiffOps, Insert, PatchSet, SimpleTable};
 use sqlparser::dialect::PostgreSqlDialect;
 use subql::patchset::PgAdapter;
-use subql::{ChangeEvent, DefaultIds, SubscriptionEngine};
+use subql::{DefaultIds, PgChangeEvent, SubscriptionEngine};
 
 const DDL: &str = "CREATE TABLE rich (id INT PRIMARY KEY, amount NUMERIC(12,3), \
                    at TIMESTAMP, at_tz TIMESTAMPTZ, on_day DATE, at_time TIME, \
@@ -61,7 +61,7 @@ fn apply_patchset_binds_every_rich_scalar_natively() {
         .expect("set the session zone");
 
     let catalog = ParserDB::parse::<PostgreSqlDialect>(DDL).expect("parse subql DDL");
-    let engine: SubscriptionEngine<ChangeEvent, DefaultIds, ParserDB> =
+    let engine: SubscriptionEngine<PgChangeEvent, DefaultIds, ParserDB> =
         SubscriptionEngine::new(catalog, PostgreSqlDialect {});
 
     let rich = SimpleTable::new("rich", &COLUMNS, &[0]);

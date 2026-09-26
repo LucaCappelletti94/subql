@@ -3,7 +3,7 @@
 //! Exercises the pool-backed PG connector: a captured `MIN(price)`
 //! subscription is registered, snapshot bootstraps via the pool, then a
 //! DELETE-of-the-extreme drives a re-execution that round-trips through
-//! the pool. Asserts the snapshot carries a real `PgLsn` and that the
+//! the pool. Asserts the snapshot carries a real commit position and that the
 //! ScalarUpdate emitted by re-execution carries the originating event's
 //! LSN.
 //!
@@ -31,9 +31,8 @@ use subql::reexec::{
     AutoResolvingEngine, Connector, PgR2D2DieselConnector, SessionSetup, SnapshotResult, SyncMode,
 };
 use subql::{
-    parse_wal2json_v2, AggregateResultValue, AggregateValueChange, DefaultIds,
-    MaintenanceStopReason, MessageV2, Registered, SubscriptionEngine, SubscriptionRequest, Tier,
-    TierKind,
+    AggregateResultValue, AggregateValueChange, DefaultIds, MaintenanceStopReason, Registered,
+    SubscriptionEngine, SubscriptionRequest, Tier, TierKind, Wal2JsonV2Event,
 };
 
 mod grouped_schema {
@@ -98,17 +97,18 @@ fn build_pool(url: &str) -> r2d2::Pool<ConnectionManager<PgConnection>> {
         .expect("build r2d2 pool")
 }
 
+/// An UPDATE carrying no row image, so no key a keyed read could use.
+const KEYLESS_UPDATE: &str = r#"{"action":"U","schema":"public","table":"orders"}"#;
+
 fn build_engine(
     catalog: ParserDB,
     pool: r2d2::Pool<ConnectionManager<PgConnection>>,
-) -> AutoResolvingEngine<MessageV2, DefaultIds, ParserDB, SyncMode<PgR2D2DieselConnector>> {
-    let inner =
-        SubscriptionEngine::<MessageV2, DefaultIds, ParserDB>::new(catalog, PostgreSqlDialect {});
+) -> AutoResolvingEngine<Wal2JsonV2Event, DefaultIds, ParserDB, SyncMode<PgR2D2DieselConnector>> {
+    let inner = SubscriptionEngine::<Wal2JsonV2Event, DefaultIds, ParserDB>::new(
+        catalog,
+        PostgreSqlDialect {},
+    );
     AutoResolvingEngine::new(inner, SyncMode(PgR2D2DieselConnector::new(pool)))
-}
-
-fn parse_message(msg: &str) -> Vec<MessageV2> {
-    parse_wal2json_v2(msg.as_bytes()).expect("wal2json parse")
 }
 
 /// Snapshot through the pool returns the right value + an LSN tied to
@@ -142,7 +142,7 @@ fn r2d2_pool_drives_snapshot_and_reexec() {
     assert_eq!(value, Value::Float(5.0));
     let snapshot_lsn = snapshot_lsn.expect("PgR2D2DieselConnector must report a checkpoint");
     assert!(
-        snapshot_lsn > subql::PgLsn(0),
+        snapshot_lsn.commit_lsn() > subql::PgLsn(0),
         "pg_current_wal_lsn() must be non-zero on a live server"
     );
 
@@ -153,10 +153,7 @@ fn r2d2_pool_drives_snapshot_and_reexec() {
         .expect("delete id=1");
 
     let msgs = common::drain_slot(&mut conn_setup, &slot);
-    let mut events: Vec<MessageV2> = Vec::new();
-    for msg in &msgs {
-        events.extend(parse_message(msg));
-    }
+    let events = common::read_wal2json_v2(&msgs);
     assert_eq!(events.len(), 1, "expected one DELETE event");
     let settled = engine
         .apply(&events[0])
@@ -302,10 +299,7 @@ fn a_captured_query_delivers_its_rows_again_when_the_table_changes() {
         .execute(&mut conn_dml)
         .expect("insert");
     let msgs = common::drain_slot(&mut conn_setup, &slot);
-    let mut events: Vec<MessageV2> = Vec::new();
-    for msg in &msgs {
-        events.extend(parse_message(msg));
-    }
+    let events = common::read_wal2json_v2(&msgs);
     assert_eq!(events.len(), 1, "expected one INSERT event");
 
     let mut delivered: Vec<i64> = Vec::new();
@@ -482,10 +476,8 @@ fn a_joined_capture_is_triggered_by_either_table() {
         sql_query(dml).execute(&mut conn_dml).expect(label);
         let msgs = common::drain_slot(&mut conn_setup, &slot);
         let mut delivered = 0;
-        for msg in &msgs {
-            for event in parse_message(msg) {
-                engine.apply_leaving_reads_queued(&event).expect("apply");
-            }
+        for event in common::read_wal2json_v2(&msgs) {
+            engine.apply_leaving_reads_queued(&event).expect("apply");
         }
         let notifications = engine.resolve_collect().expect("dispatch");
         delivered += notifications.rows_updates.len();
@@ -603,7 +595,10 @@ fn every_read_reports_a_position_taken_before_its_snapshot() {
         "the scalar read's snapshot holds one row"
     );
     assert!(
-        position.expect("a PG connector reports a position") < after_commit,
+        position
+            .expect("a PG connector reports a position")
+            .commit_lsn()
+            < after_commit,
         "the scalar read's position must sit behind the commit at {after_commit:?}"
     );
 
@@ -619,7 +614,10 @@ fn every_read_reports_a_position_taken_before_its_snapshot() {
         "the page's snapshot holds two rows"
     );
     assert!(
-        page.checkpoint.expect("a PG connector reports a position") < after_commit,
+        page.checkpoint
+            .expect("a PG connector reports a position")
+            .commit_lsn()
+            < after_commit,
         "the page read's position must sit behind the commit at {after_commit:?}"
     );
 
@@ -640,7 +638,10 @@ fn every_read_reports_a_position_taken_before_its_snapshot() {
         "the seed read's snapshot holds three rows"
     );
     assert!(
-        position.expect("a PG connector reports a position") < after_commit,
+        position
+            .expect("a PG connector reports a position")
+            .commit_lsn()
+            < after_commit,
         "the seed read's position must sit behind the commit at {after_commit:?}"
     );
 }
@@ -1036,7 +1037,7 @@ fn a_keyless_change_transitions_and_runs_the_sync_replacement_read() {
         other => panic!("expected a keyed capture, got {other:?}"),
     };
 
-    let events = parse_message(r#"{"action":"U","schema":"public","table":"orders"}"#);
+    let events = common::read_wal2json_v2(&common::in_transaction(KEYLESS_UPDATE));
     let notifications = engine
         .apply_leaving_reads_queued(&events[0])
         .expect("keyless change transitions");
@@ -1139,10 +1140,7 @@ fn grouped_min_snapshots_and_rereads_one_group_sync() {
     diesel::delete(grouped_schema::orders::table.find(1))
         .execute(&mut conn)
         .expect("delete current minimum");
-    let events: Vec<_> = common::drain_slot(&mut conn, &slot)
-        .iter()
-        .flat_map(|message| parse_message(message))
-        .collect();
+    let events = common::read_wal2json_v2(&common::drain_slot(&mut conn, &slot));
     let settled = engine.apply(&events[0]).expect("apply").resolve_collect();
     let output = settled.reads.expect("group re-read");
     assert_eq!(engine.pending_read_count(), 0, "no pending reads");

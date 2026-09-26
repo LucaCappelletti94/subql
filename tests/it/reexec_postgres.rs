@@ -33,8 +33,7 @@ use subql::reexec::{
     AutoResolvingEngine, Connector, PgDieselConnector, SessionSetup, SnapshotResult, SyncMode,
 };
 use subql::{
-    parse_wal2json_v2, DefaultIds, MessageV2, Registered, SubscriptionEngine, SubscriptionRequest,
-    Tier,
+    DefaultIds, Registered, SubscriptionEngine, SubscriptionRequest, Tier, Wal2JsonV2Event,
 };
 
 const SLOT: &str = "subql_test";
@@ -42,17 +41,12 @@ const SLOT: &str = "subql_test";
 fn build_engine(
     catalog: ParserDB,
     conn_exec: PgConnection,
-) -> AutoResolvingEngine<MessageV2, DefaultIds, ParserDB, SyncMode<PgDieselConnector>> {
-    let inner =
-        SubscriptionEngine::<MessageV2, DefaultIds, ParserDB>::new(catalog, PostgreSqlDialect {});
+) -> AutoResolvingEngine<Wal2JsonV2Event, DefaultIds, ParserDB, SyncMode<PgDieselConnector>> {
+    let inner = SubscriptionEngine::<Wal2JsonV2Event, DefaultIds, ParserDB>::new(
+        catalog,
+        PostgreSqlDialect {},
+    );
     AutoResolvingEngine::new(inner, SyncMode(PgDieselConnector::new(conn_exec)))
-}
-
-/// Parse one wal2json v2 message into zero or more [`MessageV2`]s.
-/// The parser emits 0 events for relation-only messages (begin/commit/
-/// relation), which the test must tolerate.
-fn parse_message(msg: &str) -> Vec<MessageV2> {
-    parse_wal2json_v2(msg.as_bytes()).expect("wal2json parse")
 }
 
 /// Harness health check: container starts, three PG connections, catalog
@@ -199,10 +193,7 @@ fn engine_and_captured_paths_coexist_through_pg_connector() {
         "expected at least one wal2json message after INSERT+DELETE"
     );
 
-    let mut events: Vec<MessageV2> = Vec::new();
-    for msg in &msgs {
-        events.extend(parse_message(msg));
-    }
+    let events = common::read_wal2json_v2(&msgs);
     assert_eq!(
         events.len(),
         2,
@@ -293,10 +284,7 @@ fn update_displacing_extreme_resolves_via_pg_connector() {
         .expect("update id=1 price=20.0");
 
     let msgs = common::drain_slot(&mut conn_setup, &slot);
-    let mut events: Vec<MessageV2> = Vec::new();
-    for msg in &msgs {
-        events.extend(parse_message(msg));
-    }
+    let events = common::read_wal2json_v2(&msgs);
     assert_eq!(events.len(), 1, "expected exactly one UPDATE event");
 
     let settled = engine
@@ -310,11 +298,11 @@ fn update_displacing_extreme_resolves_via_pg_connector() {
     assert_eq!(engine.pending_read_count(), 0, "no pending reads");
 }
 
-/// Test 3 - PgDieselConnector::snapshot returns a real PgLsn.
+/// Test 3 - PgDieselConnector::snapshot returns a real commit position.
 ///
 /// Seeds the table with `(1, 5.0), (2, 9.0)`, registers `MIN(price)`, then
 /// calls `engine.snapshot(qid)` BEFORE any CDC events. The result should be
-/// `SnapshotResult::Scalar(Value::Float(5.0), Some(PgLsn(_)))` where the
+/// `SnapshotResult::Scalar(Value::Float(5.0), Some(position))` where the
 /// LSN is non-zero (PG always has a position). Subsequent dispatches then
 /// see 5.0 as the current MIN without any further connector calls because
 /// `snapshot` already installed the value.
@@ -346,7 +334,7 @@ fn snapshot_reads_value_and_lsn_from_pg() {
 
     let lsn = checkpoint.expect("PgDieselConnector must report a checkpoint");
     assert!(
-        lsn > subql::PgLsn(0),
+        lsn.commit_lsn() > subql::PgLsn(0),
         "pg_current_wal_lsn() should be non-zero on a live server, got {lsn:?}"
     );
 }
@@ -377,7 +365,7 @@ fn execute_scalar_row_decodes_integer_aggregate_seed() {
         ParserDB::parse::<PostgreSqlDialect>("CREATE TABLE nums (id INT PRIMARY KEY, amount INT);")
             .expect("parse nums DDL");
     let mut engine =
-        SubscriptionEngine::<MessageV2, DefaultIds, ParserDB>::new(db, PostgreSqlDialect {});
+        SubscriptionEngine::<Wal2JsonV2Event, DefaultIds, ParserDB>::new(db, PostgreSqlDialect {});
     let bundle = engine
         .register(SubscriptionRequest::<DefaultIds, Postgres>::new(
             1u64,
@@ -514,7 +502,10 @@ fn every_read_reports_a_position_taken_before_its_snapshot() {
         "the scalar read's snapshot holds one row"
     );
     assert!(
-        position.expect("a PG connector reports a position") < after_commit,
+        position
+            .expect("a PG connector reports a position")
+            .commit_lsn()
+            < after_commit,
         "the scalar read's position must sit behind the commit at {after_commit:?}"
     );
 
@@ -531,7 +522,10 @@ fn every_read_reports_a_position_taken_before_its_snapshot() {
         "the page's snapshot holds two rows"
     );
     assert!(
-        page.checkpoint.expect("a PG connector reports a position") < after_commit,
+        page.checkpoint
+            .expect("a PG connector reports a position")
+            .commit_lsn()
+            < after_commit,
         "the page read's position must sit behind the commit at {after_commit:?}"
     );
 
@@ -553,7 +547,10 @@ fn every_read_reports_a_position_taken_before_its_snapshot() {
         "the seed read's snapshot holds three rows"
     );
     assert!(
-        position.expect("a PG connector reports a position") < after_commit,
+        position
+            .expect("a PG connector reports a position")
+            .commit_lsn()
+            < after_commit,
         "the seed read's position must sit behind the commit at {after_commit:?}"
     );
 }

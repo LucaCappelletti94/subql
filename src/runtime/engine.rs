@@ -338,9 +338,10 @@ where
     ///
     /// Stored as an [`crate::OpaqueCheckpoint`] so the engine does not
     /// have to carry a struct-level checkpoint type parameter. The
-    /// materializer serialises its concrete checkpoint type (`PgLsn`,
-    /// `MysqlBinlogPos`, ...) to bytes before installing, deserialises
-    /// on read. The map's cleanup is hooked into
+    /// materializer installs its concrete checkpoint through
+    /// [`crate::Checkpoint::to_opaque`], whose bytes sort as the checkpoint
+    /// does, and reads it back through [`crate::Checkpoint::from_opaque`].
+    /// The map's cleanup is hooked into
     /// [`unregister_session`](Self::unregister_session) and the
     /// per-subscription unregister paths so cursors never outlive their
     /// owning subscription.
@@ -3766,7 +3767,11 @@ where
     // oplog watermark to decide catchup vs full re-sync.
 
     /// Advance the resume cursor for `(session_id, sub_id)` to
-    /// `checkpoint`.
+    /// `checkpoint`, compared as bytes.
+    ///
+    /// Build `checkpoint` with [`crate::Checkpoint::to_opaque`]. The bytes
+    /// of a serde encoding with variable-width integers do not sort in value
+    /// order, so an ordered pair encoded that way can read as a rewind.
     ///
     /// Returns `Ok(None)` when no cursor was previously stored for the
     /// pair (i.e. this is the first advance), and `Ok(Some(previous))`

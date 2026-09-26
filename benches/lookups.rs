@@ -11,7 +11,7 @@ use sqlparser::dialect::PostgreSqlDialect;
 use std::fmt::Write as _;
 use std::hint::black_box;
 use subql::backend::CdcEvent;
-use subql::wal::{parse_wal2json_v1, parse_wal2json_v2, ChangeV1, MessageV2};
+use subql::wal::{parse_wal2json_v1, ChangeV1, Wal2JsonV2Event, Wal2JsonV2Reader};
 use subql::{catalog_helpers, DefaultIds, SubscriptionEngine, SubscriptionRequest};
 
 const WIDTH: usize = 40;
@@ -27,7 +27,7 @@ fn wide_catalog() -> ParserDB {
 }
 
 /// A wal2json v2 UPDATE carrying both full images, with `changed` cells moved.
-fn v2_update(changed: usize) -> MessageV2 {
+fn v2_update(changed: usize) -> Wal2JsonV2Event {
     let cells = |shift: i64| {
         (0..WIDTH)
             .map(|column| {
@@ -46,8 +46,14 @@ fn v2_update(changed: usize) -> MessageV2 {
         cells(1000),
         cells(0)
     );
-    let mut parsed = parse_wal2json_v2(json.as_bytes()).expect("bench JSON parses");
-    parsed.remove(0)
+    let mut reader = Wal2JsonV2Reader::new();
+    reader
+        .parse(br#"{"action":"B"}"#)
+        .expect("bench begin parses");
+    reader
+        .parse(json.as_bytes())
+        .expect("bench JSON parses")
+        .expect("an update is a row event")
 }
 
 /// The v1 spelling of [`v2_update`].
@@ -116,7 +122,7 @@ fn wire_dispatch_benchmark(c: &mut Criterion) {
     let mut group = c.benchmark_group("wire_dispatch");
     for predicates in [1usize, 16] {
         let db = wide_catalog();
-        let mut engine: SubscriptionEngine<MessageV2, DefaultIds, ParserDB> =
+        let mut engine: SubscriptionEngine<Wal2JsonV2Event, DefaultIds, ParserDB> =
             SubscriptionEngine::new(db, PostgreSqlDialect {});
         for subscription in 0..predicates {
             engine

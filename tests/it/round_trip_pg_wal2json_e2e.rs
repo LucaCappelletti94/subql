@@ -20,17 +20,16 @@ use crate::common;
 
 use diesel::PgConnection;
 use subql::emit::wal2json_patchset_builder;
-use subql::{parse_wal2json_v2, MessageV2};
+use subql::{MessageV2, Wal2JsonV2Event};
 
 const SLOT: &str = "rt_slot";
 
 /// Drain every pending wal2json v2 change and parse it to row events.
 fn drain(pg: &mut PgConnection, slot: &str) -> Vec<MessageV2> {
-    let mut events = Vec::new();
-    for line in &common::drain_slot(pg, slot) {
-        events.extend(parse_wal2json_v2(line.as_bytes()).unwrap());
-    }
-    events
+    common::read_wal2json_v2(&common::drain_slot(pg, slot))
+        .into_iter()
+        .map(Wal2JsonV2Event::into_message)
+        .collect()
 }
 
 #[test]

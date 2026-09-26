@@ -63,7 +63,7 @@ struct PgCursor {
     /// The cursor's `DECLARE`d name, which the per-page `FETCH` and the
     /// closing `CLOSE` are built from.
     name: String,
-    checkpoint: Option<crate::PgLsn>,
+    checkpoint: Option<crate::PgCommitPosition>,
     columns: alloc::vec::Vec<String>,
     leftover: alloc::collections::VecDeque<alloc::vec::Vec<Value<crate::backend::Postgres>>>,
 }
@@ -171,7 +171,7 @@ impl From<diesel::result::Error> for PgR2D2Error {
 impl<S: SessionSetup> Connector for PgR2D2DieselConnector<S> {
     type AuthContext = S;
     type Error = PgR2D2Error;
-    type Checkpoint = crate::PgLsn;
+    type Checkpoint = crate::PgCommitPosition;
     type Backend = crate::backend::Postgres;
 
     fn execute_scalar(
@@ -245,7 +245,7 @@ impl<S: SessionSetup> Connector for PgR2D2DieselConnector<S> {
         // `BEGIN` never touches it, so a connection released mid-transaction
         // would be handed to the next caller still inside this one. Measured
         // on the async side, where it silently ate an unrelated caller's write.
-        let opened = (|| -> QueryResult<Option<crate::PgLsn>> {
+        let opened = (|| -> QueryResult<Option<crate::PgCommitPosition>> {
             // The position is read BEFORE the snapshot exists, on purpose. It
             // is what a caller replays the change stream from, so it must sit
             // at or behind the snapshot: behind means a few changes already in
@@ -362,7 +362,7 @@ fn fetch_page_from(
     held: &mut PgCursor,
     max_bytes: usize,
     batch: usize,
-) -> QueryResult<Snapshot<RowPage<crate::backend::Postgres>, crate::PgLsn>> {
+) -> QueryResult<Snapshot<RowPage<crate::backend::Postgres>, crate::PgCommitPosition>> {
     let mut rows: alloc::vec::Vec<alloc::vec::Vec<Value<crate::backend::Postgres>>> =
         alloc::vec::Vec::new();
     let mut spent = 0_usize;

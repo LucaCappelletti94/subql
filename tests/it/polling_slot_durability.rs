@@ -397,6 +397,116 @@ fn every_change_of_one_transaction_is_delivered() {
     common::drop_slot(&mut setup, &slot);
 }
 
+/// Every row of a `COPY` arrives. Postgres writes a copied batch as one
+/// multi-insert record, so its rows share one WAL position, and anything
+/// keyed on that position alone could swallow all but the first.
+#[test]
+#[ignore = "requires Docker; run with --ignored"]
+fn every_row_of_a_copied_batch_is_delivered() {
+    common::assert_docker_available();
+    let db = common::pg_database();
+    let mut setup = db.connect();
+    let mut dml = db.connect();
+    let slot = db.slot("subql_polling_copy");
+    let publication = "subql_polling_copy_pub";
+    fixture(&mut setup, "copied batch", publication, &slot);
+
+    common::multi_thread_rt().block_on(async {
+        let mut source =
+            PollingPgCdcSource::connect(config(db.url(), &slot, publication), catalog())
+                .await
+                .expect("connect polling source");
+        // COPY has no typed DSL form, and a program source keeps the rows in the statement.
+        sql_query(r#"COPY orders (id, price) FROM PROGRAM 'printf "1\t1\n2\t2\n3\t3\n"'"#)
+            .execute(&mut dml)
+            .expect("copy three rows");
+
+        let mut seen = Vec::new();
+        for _ in 0..3 {
+            let event = tokio::time::timeout(Duration::from_secs(5), source.next_event())
+                .await
+                .unwrap_or_else(|_| panic!("all three copied rows arrive, got {seen:?}"))
+                .expect("no source error")
+                .expect("the source is open");
+            seen.push(
+                event
+                    .checkpoint()
+                    .expect("a polled event carries a position"),
+            );
+        }
+        assert!(
+            seen.windows(2).all(|pair| pair[0] < pair[1]),
+            "each copied row has a position of its own: {seen:?}"
+        );
+    });
+
+    common::drop_slot(&mut setup, &slot);
+}
+
+/// An older transaction that commits after a newer one orders after it, and
+/// its rows order among themselves.
+#[test]
+#[ignore = "requires Docker; run with --ignored"]
+fn polled_checkpoints_follow_commit_order_across_interleaved_transactions() {
+    common::assert_docker_available();
+    let db = common::pg_database();
+    let mut setup = db.connect();
+    let mut older = db.connect();
+    let mut newer = db.connect();
+    let slot = db.slot("subql_polling_commit_order");
+    let publication = "subql_polling_commit_order_pub";
+    fixture(&mut setup, "commit order", publication, &slot);
+
+    common::multi_thread_rt().block_on(async {
+        let mut source =
+            PollingPgCdcSource::connect(config(db.url(), &slot, publication), catalog())
+                .await
+                .expect("connect polling source");
+        sql_query("BEGIN").execute(&mut older).expect("begin");
+        for id in [100, 101] {
+            sql_query(format!("INSERT INTO orders VALUES ({id}, 1.0)"))
+                .execute(&mut older)
+                .expect("older insert");
+        }
+        sql_query("INSERT INTO orders VALUES (1, 2.0)")
+            .execute(&mut newer)
+            .expect("newer insert");
+        sql_query("COMMIT")
+            .execute(&mut older)
+            .expect("commit the older");
+
+        let mut delivered = Vec::new();
+        for _ in 0..3 {
+            let event = tokio::time::timeout(Duration::from_secs(5), source.next_event())
+                .await
+                .unwrap_or_else(|_| panic!("all three rows arrive, got {delivered:?}"))
+                .expect("no source error")
+                .expect("the source is open");
+            let id = event
+                .value_at(&catalog(), RowKind::New, 0)
+                .expect("the new image carries the key");
+            delivered.push((
+                id,
+                event
+                    .checkpoint()
+                    .expect("a polled event carries a position"),
+            ));
+        }
+        let ids: Vec<_> = delivered.iter().map(|(id, _)| id.clone()).collect();
+        assert_eq!(
+            ids,
+            [1, 100, 101].map(subql::backend::Value::Int),
+            "the newer transaction committed first"
+        );
+        assert!(
+            delivered.windows(2).all(|pair| pair[0].1 < pair[1].1),
+            "positions strictly increase in delivery order: {delivered:?}"
+        );
+    });
+
+    common::drop_slot(&mut setup, &slot);
+}
+
 /// The streaming source reports its distance behind the server's WAL end.
 ///
 /// Acknowledging is what releases a slot, so a consumer that never
@@ -479,16 +589,21 @@ fn the_streaming_source_reports_what_its_slot_is_holding() {
         // The held figure is a distance to the server's WAL end, which every
         // other database on a shared server also moves, so the acknowledged
         // position is what this can assert rather than a fall in the figure.
+        // The acknowledgement releases the whole transaction, so the position
+        // reported lands past its commit.
+        let released = |position: Option<subql::PgLsn>| {
+            position.is_some_and(|flushed| flushed > upto.commit_lsn())
+        };
         for _ in 0..40 {
-            if source.acknowledged_position().is_some() {
+            if released(source.acknowledged_position()) {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
-        assert_eq!(
-            source.acknowledged_position(),
-            Some(upto),
-            "the acknowledgement is what releases the slot, and it is reported"
+        assert!(
+            released(source.acknowledged_position()),
+            "the acknowledgement is what releases the slot, and it is reported, got {:?} for {upto:?}",
+            source.acknowledged_position()
         );
     });
 
