@@ -37,10 +37,9 @@
 //! ```
 //! use sqlparser::dialect::PostgreSqlDialect;
 //! use subql::{
-//!     DefaultIds, PgChangeEvent, PgSqliteEmuSource, SubscriptionEngine,
+//!     DefaultIds, PgChangeEvent, PgSqliteEmuSource, SourceItem, SubscriptionEngine,
 //!     SubscriptionRequest,
 //! };
-//!
 //! const PG_DDL: &str =
 //!     "CREATE TABLE orders (id INT PRIMARY KEY, amount INT, status TEXT);";
 //!
@@ -55,7 +54,7 @@
 //!
 //! source.execute_sql("INSERT INTO orders (id, amount, status) VALUES (1, 250, 'paid')")?;
 //!
-//! let event = source.poll_next_event()?.expect("insert reaches the queue");
+//! let event = source.poll_next_item()?.and_then(SourceItem::into_event).expect("insert reaches the queue");
 //! let notifs = engine.consumers(&event)?;
 //! assert_eq!(notifs.inserted(), &[1]);
 //! # Ok::<(), Box<dyn std::error::Error>>(())

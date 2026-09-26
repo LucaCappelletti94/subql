@@ -33,7 +33,7 @@ use std::collections::BTreeMap;
 use proptest::prelude::*;
 use sql_traits::structs::ParserDB;
 use subql::backend::{CdcEvent, RowKind, Value};
-use subql::{ColumnId, EventKind, PgChangeEvent, PgSqliteEmuSource};
+use subql::{ColumnId, EventKind, PgChangeEvent, PgSqliteEmuSource, SourceItem};
 
 const PG_DDL: &str = "CREATE TABLE orders (id INT PRIMARY KEY, price FLOAT, status TEXT);";
 
@@ -204,9 +204,11 @@ proptest! {
             expected.push(exp.clone());
 
             let act = source
-                .poll_next_event()
+                .poll_next_item()
                 .unwrap()
+                .and_then(SourceItem::into_event)
                 .expect("op should produce a drained event");
+            let _ = source.poll_next_item().unwrap(); // commit
             let i = expected.len() - 1;
 
             match &exp {
@@ -260,7 +262,7 @@ proptest! {
         }
 
         prop_assert!(
-            source.poll_next_event().unwrap().is_none(),
+            source.poll_next_item().unwrap().is_none(),
             "emulator queue should be empty after drain",
         );
     }

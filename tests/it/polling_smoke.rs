@@ -59,11 +59,14 @@ fn polling_source_drains_insert_and_updates_counters() {
             .execute(&mut dml)
             .expect("insert");
 
-        let event = tokio::time::timeout(Duration::from_secs(2), source.next_event())
+        let item = tokio::time::timeout(Duration::from_secs(2), source.next_item())
             .await
-            .expect("next_event timeout")
-            .expect("next_event err")
+            .expect("next_item timeout")
+            .expect("next_item err")
             .expect("source closed");
+        let event = item
+            .into_event()
+            .expect("first item from a single INSERT is the event");
         assert_eq!(event.kind(), EventKind::Insert);
 
         assert!(source.events_received() >= 1);

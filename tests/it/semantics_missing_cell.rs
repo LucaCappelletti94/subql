@@ -568,14 +568,16 @@ fn unchanged_toast_does_not_drop_a_subscription() {
 
             let mut update = None;
             while update.is_none() {
-                let event =
-                    tokio::time::timeout(core::time::Duration::from_secs(30), source.next_event())
+                let item =
+                    tokio::time::timeout(core::time::Duration::from_secs(30), source.next_item())
                         .await
-                        .expect("next_event timed out")
-                        .expect("next_event failed")
+                        .expect("next_item timed out")
+                        .expect("next_item failed")
                         .expect("the slot closed before the update arrived");
-                if event.kind() == subql::EventKind::Update {
-                    update = Some(event);
+                if let Some(event) = item.into_event() {
+                    if event.kind() == subql::EventKind::Update {
+                        update = Some(event);
+                    }
                 }
             }
             let update = update.expect("the update arrived");

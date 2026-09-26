@@ -13,7 +13,7 @@
 #![allow(clippy::unwrap_used)]
 
 use subql::backend::{CdcEvent, RowKind, Value};
-use subql::{catalog_helpers, EventKind, PgSqliteEmuSource};
+use subql::{catalog_helpers, EventKind, PgSqliteEmuSource, SourceItem};
 
 const PG_DDL: &str =
     "CREATE TABLE orders (id INT PRIMARY KEY, price FLOAT, quantity INT, status TEXT);";
@@ -32,8 +32,9 @@ fn insert_round_trips_through_the_emulator() {
             .expect("orders resolves");
 
     let event = source
-        .poll_next_event()
+        .poll_next_item()
         .expect("poll succeeds")
+        .and_then(SourceItem::into_event)
         .expect("exactly one event pending");
 
     assert_eq!(event.kind(), EventKind::Insert);
@@ -82,7 +83,15 @@ fn insert_round_trips_through_the_emulator() {
 
     assert!(
         source
-            .poll_next_event()
+            .poll_next_item()
+            .unwrap()
+            .and_then(SourceItem::into_commit)
+            .is_some(),
+        "commit follows the INSERT event"
+    );
+    assert!(
+        source
+            .poll_next_item()
             .expect("subsequent poll succeeds")
             .is_none(),
         "exactly one event should have been queued"

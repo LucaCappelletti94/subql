@@ -305,7 +305,7 @@ pub fn harness_pgoutput(data: &[u8]) {
 ///
 /// # Per-iteration contract
 ///
-/// Panics inside `source.execute`, `source.poll_next_event`, or
+/// Panics inside `source.execute`, `source.poll_next_item`, or
 /// `engine.consumers` are bugs. Errors at those seams are fine because
 /// adversarial DML can legitimately produce them (constraint
 /// violations, dispatch errors when an UPDATE arrives without the old
@@ -417,9 +417,7 @@ impl E2eFixture {
         // flows through the drain loop; we discard everything so the
         // next iter starts with an empty stream.
         let _ = self.source.execute_sql("DELETE FROM orders");
-        while let Ok(Some(_)) = self.source.poll_next_event() {
-            // Discard residual events from the bulk DELETE.
-        }
+        while let Ok(Some(_)) = self.source.poll_next_item() {}
     }
 
     fn execute_sql(&mut self, sql: &str) -> Result<usize, crate::PgSqliteEmuError> {
@@ -443,8 +441,11 @@ impl E2eFixture {
         ),
     {
         loop {
-            let event = match self.source.poll_next_event() {
-                Ok(Some(ev)) => ev,
+            let event = match self.source.poll_next_item() {
+                Ok(Some(item)) => match item.into_event() {
+                    Some(ev) => ev,
+                    None => continue,
+                },
                 Ok(None) | Err(_) => break,
             };
             let result = self.engine.consumers(&event);

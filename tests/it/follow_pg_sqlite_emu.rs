@@ -26,9 +26,24 @@
 
 use sqlparser::dialect::PostgreSqlDialect;
 use subql::backend::{CdcEvent, Value};
-use subql::{DefaultIds, EventKind, PgChangeEvent, PgSqliteEmuSource, SubscriptionEngine};
+use subql::{
+    DefaultIds, EventKind, PgChangeEvent, PgSqliteEmuSource, SourceItem, SubscriptionEngine,
+};
 
 const PG_DDL: &str = "CREATE TABLE users (id INT PRIMARY KEY, name TEXT);";
+
+fn next_event(source: &mut PgSqliteEmuSource) -> PgChangeEvent {
+    loop {
+        match source
+            .poll_next_item()
+            .unwrap()
+            .expect("an event in the queue")
+        {
+            SourceItem::Event(ev) => return ev,
+            SourceItem::Commit(_) => {}
+        }
+    }
+}
 
 #[test]
 fn follow_row_receives_inserted_row_delta() {
@@ -51,10 +66,7 @@ fn follow_row_receives_inserted_row_delta() {
         .execute_sql("INSERT INTO users (id, name) VALUES (1, 'ann')")
         .expect("insert ann");
 
-    let event = source
-        .poll_next_event()
-        .expect("poll succeeds")
-        .expect("insert emitted an event");
+    let event = next_event(&mut source);
     assert_eq!(event.kind(), EventKind::Insert);
 
     let notifs = engine.consumers(&event).expect("dispatch");
@@ -86,14 +98,14 @@ fn follow_row_ignores_unrelated_deletes() {
     source
         .execute_sql("INSERT INTO users (id, name) VALUES (7, 'seven')")
         .expect("insert seven");
-    let insert_event = source.poll_next_event().unwrap().expect("insert event");
+    let insert_event = next_event(&mut source);
     let notifs = engine.consumers(&insert_event).unwrap();
     assert!(notifs.inserted().contains(&1), "follow observes its INSERT");
 
     source
         .execute_sql("DELETE FROM users WHERE id = 7")
         .expect("delete seven");
-    let delete_event = source.poll_next_event().unwrap().expect("delete event");
+    let delete_event = next_event(&mut source);
     let notifs = engine.consumers(&delete_event).unwrap();
     assert!(
         notifs.deleted().contains(&1),
@@ -106,7 +118,7 @@ fn follow_row_ignores_unrelated_deletes() {
     source
         .execute_sql("INSERT INTO users (id, name) VALUES (99, 'other')")
         .expect("insert other");
-    let event = source.poll_next_event().unwrap().expect("insert event");
+    let event = next_event(&mut source);
     let notifs = engine.consumers(&event).unwrap();
     assert!(
         !notifs.inserted().contains(&1),
@@ -129,10 +141,7 @@ fn deleting_a_followed_row_auto_closes_the_pk_follow() {
     source
         .execute_sql("INSERT INTO users (id, name) VALUES (11, 'eleven')")
         .expect("insert eleven");
-    let insert_event = source
-        .poll_next_event()
-        .unwrap()
-        .expect("insert event pending");
+    let insert_event = next_event(&mut source);
 
     engine
         .follow_row(1, "users", vec![Value::Int(11)])
@@ -152,10 +161,7 @@ fn deleting_a_followed_row_auto_closes_the_pk_follow() {
     source
         .execute_sql("DELETE FROM users WHERE id = 11")
         .expect("delete eleven");
-    let delete_event = source
-        .poll_next_event()
-        .unwrap()
-        .expect("delete event pending");
+    let delete_event = next_event(&mut source);
     assert_eq!(delete_event.kind(), EventKind::Delete);
 
     // Dispatch closes the pk-follow because its tracked row was just
@@ -183,8 +189,8 @@ fn deleting_an_unrelated_row_leaves_the_pk_follow_open() {
     source
         .execute_sql("INSERT INTO users (id, name) VALUES (21, 'twentyone')")
         .expect("insert twentyone");
-    let _ = source.poll_next_event().unwrap().expect("first insert");
-    let _ = source.poll_next_event().unwrap().expect("second insert");
+    let _ = next_event(&mut source);
+    let _ = next_event(&mut source);
 
     // Follow id=20; delete id=21. The follow on id=20 must survive.
     engine
@@ -195,10 +201,7 @@ fn deleting_an_unrelated_row_leaves_the_pk_follow_open() {
     source
         .execute_sql("DELETE FROM users WHERE id = 21")
         .expect("delete twentyone");
-    let event = source
-        .poll_next_event()
-        .unwrap()
-        .expect("delete event pending");
+    let event = next_event(&mut source);
     assert_eq!(event.kind(), EventKind::Delete);
 
     let _ = engine.dispatch(&event).unwrap();

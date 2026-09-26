@@ -4,9 +4,10 @@
 //! mode plus an attached `START_REPLICATION` stream. Surfaces each row
 //! change as a [`crate::PgChangeEvent`] through the [`crate::CdcSource`]
 //! trait, placed in commit order by its transaction's commit position and
-//! its ordinal in that transaction. Acks flow back so the slot's
-//! `confirmed_flush_lsn` tracks what the consumer has applied, one whole
-//! transaction at a time.
+//! its ordinal in that transaction, and then the transaction's
+//! [`crate::PgCommit`]. Acks flow back so the slot's `confirmed_flush_lsn`
+//! moves to the end of each commit the consumer has acknowledged, and no
+//! further.
 
 use alloc::format;
 use alloc::string::{String, ToString};
@@ -21,7 +22,10 @@ use pg_walstream::{Lsn, PgOutputDecoder, PgReplicationConnection};
 use sql_traits::prelude::DatabaseLike;
 use tokio_util::sync::CancellationToken;
 
-use super::{PgChangeEvent, PgOutputOrder, ReleaseQueue, TransactionOrderError};
+use super::{
+    PgChangeEvent, PgCommit, PgOutputOrder, PgSourceItem, ReleaseQueue, SourceItem,
+    TransactionOrderError,
+};
 use crate::{PgCommitPosition, PgLsn};
 
 mod wire_format_helpers;
@@ -49,11 +53,12 @@ pub struct PgStreamingConfig {
     /// Name of the publication the slot should follow
     /// (`CREATE PUBLICATION pub FOR TABLE ...`).
     pub publication_name: String,
-    /// Optional resume position. The source delivers only the events after
+    /// Optional resume position. The source delivers only the items after
     /// it. `None` starts from the slot's current `confirmed_flush_lsn`.
     ///
-    /// Any checkpoint a source delivered resumes exactly after that event,
-    /// including one in the middle of a transaction.
+    /// Any checkpoint a source delivered resumes exactly after that item,
+    /// including a row in the middle of a transaction. Resuming after a
+    /// transaction's rows but before its commit delivers the commit again.
     pub start: Option<PgCommitPosition>,
     /// Cadence at which the source sends `StandbyStatusUpdate` ack
     /// messages even without explicit consumer acks. Must be shorter
@@ -158,7 +163,7 @@ pub struct ClusterIdentity {
 /// the lifecycle contract.
 pub struct PgStreamingCdcSource {
     config: PgStreamingConfig,
-    event_rx: tokio::sync::mpsc::Receiver<Result<PgChangeEvent, PgStreamingError>>,
+    event_rx: tokio::sync::mpsc::Receiver<Result<PgSourceItem, PgStreamingError>>,
     ack_tx: tokio::sync::mpsc::UnboundedSender<PgCommitPosition>,
     status_updates_sent: Arc<AtomicU64>,
     events_received: Arc<AtomicU64>,
@@ -325,9 +330,9 @@ impl PgStreamingCdcSource {
     /// Latest position this source has reported to the server as flushed.
     ///
     /// `None` until the first [`CdcSource::ack`](crate::CdcSource::ack). It
-    /// advances to the end of the last transaction acknowledged in full, and
-    /// the task publishes it once the server has it, so a read right after
-    /// `ack` can still report the previous position.
+    /// advances to the [`PgCommit::end_lsn`] of the last commit acknowledged,
+    /// and the task publishes it once the server has it, so a read right
+    /// after `ack` can still report the previous position.
     #[must_use]
     pub fn acknowledged_position(&self) -> Option<PgLsn> {
         self.acked_seen
@@ -383,13 +388,14 @@ impl Drop for PgStreamingCdcSource {
 
 impl crate::CdcSource for PgStreamingCdcSource {
     type Event = PgChangeEvent;
+    type Commit = PgCommit;
     type Error = PgStreamingError;
 
     #[allow(clippy::manual_async_fn)]
-    fn next_event(
+    fn next_item(
         &mut self,
-    ) -> impl core::future::Future<Output = Result<Option<Self::Event>, Self::Error>> + Send {
-        super::shared_helpers::recv_source_event(&mut self.event_rx)
+    ) -> impl core::future::Future<Output = Result<Option<PgSourceItem>, Self::Error>> + Send {
+        super::shared_helpers::recv_source_item(&mut self.event_rx)
     }
 
     // The body is sync (unbounded channel send is sync), but the trait
@@ -416,7 +422,7 @@ async fn streaming_task(
     mut conn: PgReplicationConnection,
     base_lsn: u64,
     start: Option<PgCommitPosition>,
-    event_tx: tokio::sync::mpsc::Sender<Result<PgChangeEvent, PgStreamingError>>,
+    event_tx: tokio::sync::mpsc::Sender<Result<PgSourceItem, PgStreamingError>>,
     mut ack_rx: tokio::sync::mpsc::UnboundedReceiver<PgCommitPosition>,
     status_counter: Arc<AtomicU64>,
     events_counter: Arc<AtomicU64>,
@@ -596,14 +602,12 @@ async fn streaming_task(
 }
 
 /// Row delivery for the streaming task: the transaction frame, the resume
-/// filter, and the transactions the slot still holds.
+/// filter, and the commits the slot still holds.
 struct Delivery {
     order: PgOutputOrder,
     rows: Vec<PgChangeEvent>,
     releases: ReleaseQueue,
     start: Option<PgCommitPosition>,
-    /// Whether the open transaction delivered a row past `start`.
-    delivered: bool,
 }
 
 impl Delivery {
@@ -613,16 +617,16 @@ impl Delivery {
             rows: Vec::new(),
             releases: ReleaseQueue::new(),
             start,
-            delivered: false,
         }
     }
 
-    /// Send the rows `change` carries past `start`, and continue with the
-    /// flush position a commit releases, if any. Breaks once the task must end.
+    /// Send the rows and the commit `change` carries past `start`, and
+    /// continue with the flush position that releases, if any. Breaks once
+    /// the task must end.
     async fn deliver(
         &mut self,
         change: pg_walstream::ChangeEvent,
-        event_tx: &tokio::sync::mpsc::Sender<Result<PgChangeEvent, PgStreamingError>>,
+        event_tx: &tokio::sync::mpsc::Sender<Result<PgSourceItem, PgStreamingError>>,
         events_counter: &AtomicU64,
     ) -> ControlFlow<(), Option<PgLsn>> {
         let committed = match self.order.apply(change, &mut self.rows) {
@@ -632,23 +636,25 @@ impl Delivery {
                 return ControlFlow::Break(());
             }
         };
+        let start = self.start;
+        let unseen = |position: PgCommitPosition| start.is_none_or(|start| position > start);
         for ev in self.rows.drain(..) {
-            if self.start.is_some_and(|start| ev.position() <= start) {
+            if !unseen(ev.position()) {
                 continue;
             }
-            self.delivered = true;
             events_counter.fetch_add(1, Ordering::Relaxed);
-            if event_tx.send(Ok(ev)).await.is_err() {
+            if event_tx.send(Ok(SourceItem::Event(ev))).await.is_err() {
                 return ControlFlow::Break(());
             }
         }
-        let Some(committed) = committed else {
+        let Some(commit) = committed.filter(|commit| unseen(commit.position())) else {
             return ControlFlow::Continue(None);
         };
-        if core::mem::take(&mut self.delivered) {
-            self.releases.committed(committed);
+        self.releases.committed(commit);
+        if event_tx.send(Ok(SourceItem::Commit(commit))).await.is_err() {
+            return ControlFlow::Break(());
         }
-        // The consumer may have acknowledged the last row before its commit arrived.
+        // The consumer may have acknowledged past this commit before it arrived.
         ControlFlow::Continue(self.releases.release())
     }
 

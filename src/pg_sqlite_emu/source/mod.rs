@@ -5,7 +5,8 @@
 //! surrounding orchestration: PG DDL translation via [`pg2sqlite`],
 //! session lifecycle, per-table [`RelationSchema`] cache, the
 //! unchanged-column row lookup, and the `PgOutputDecoder` feedback loop
-//! that turns the encoded frames back into [`crate::PgChangeEvent`]s.
+//! that turns the encoded frames back into [`crate::PgChangeEvent`]s and
+//! the [`crate::PgCommit`] ending each transaction.
 
 use alloc::collections::VecDeque;
 use alloc::string::{String, ToString};
@@ -25,7 +26,7 @@ use sqlite_diff_rs::pg_walstream_reverse::{
 use sqlite_diff_rs::{ChangesetOp, ParsedDiffSet, TableSchema};
 
 use super::error::PgSqliteEmuError;
-use crate::wal::{PgChangeEvent, PgOutputOrder};
+use crate::wal::{PgChangeEvent, PgOutputOrder, PgSourceItem, SourceItem};
 use crate::TableId;
 
 mod row_lookup;
@@ -45,12 +46,13 @@ const PROTOCOL_VERSION: u8 = 1;
 ///
 /// Build a source, drive one INSERT through the wrapped connection,
 /// and inspect the [`PgChangeEvent`] the source materialises
-/// from SQLite's session changeset. Full engine-dispatch pipeline
-/// lives in the [module docs](super#quickstart).
+/// from SQLite's session changeset, then the [`crate::PgCommit`] ending
+/// its transaction. Full engine-dispatch pipeline lives in the
+/// [module docs](super#quickstart).
 ///
 /// ```
 /// use subql::backend::{RowKind, Value};
-/// use subql::{EventKind, PgSqliteEmuSource};
+/// use subql::{EventKind, PgSqliteEmuSource, SourceItem};
 /// use subql::backend::CdcEvent;
 ///
 /// let mut source = PgSqliteEmuSource::open_in_memory(
@@ -58,10 +60,19 @@ const PROTOCOL_VERSION: u8 = 1;
 /// )?;
 /// source.execute_sql("INSERT INTO orders (id, amount) VALUES (7, 250)")?;
 ///
-/// let event = source.poll_next_event()?.expect("insert reaches the queue");
+/// let event = source
+///     .poll_next_item()?
+///     .and_then(SourceItem::into_event)
+///     .expect("insert reaches the queue");
 /// assert_eq!(event.kind(), EventKind::Insert);
 /// assert_eq!(event.value_at(source.pg_catalog(), RowKind::New, 0).unwrap(), Value::Int(7));
 /// assert_eq!(event.value_at(source.pg_catalog(), RowKind::New, 1).unwrap(), Value::Int(250));
+///
+/// let commit = source
+///     .poll_next_item()?
+///     .and_then(SourceItem::into_commit)
+///     .expect("its commit follows");
+/// assert!(event.position() < commit.position());
 /// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
 pub struct PgSqliteEmuSource {
@@ -76,7 +87,7 @@ pub struct PgSqliteEmuSource {
     pg_catalog: ParserDB,
     decoder: PgOutputDecoder,
     order: PgOutputOrder,
-    pending: VecDeque<PgChangeEvent>,
+    pending: VecDeque<PgSourceItem>,
     announced: HashSet<Oid>,
     tables: HashMap<String, TableMeta>,
     /// WAL position of the last frame, which the next transaction's
@@ -199,14 +210,17 @@ impl PgSqliteEmuSource {
     ///
     /// ```
     /// use subql::backend::{CdcEvent, RowKind, Value};
-    /// use subql::{EventKind, PgSqliteEmuSource};
+    /// use subql::{EventKind, PgSqliteEmuSource, SourceItem};
     ///
     /// let mut source = PgSqliteEmuSource::open_in_memory(
     ///     "CREATE TABLE orders (id INT PRIMARY KEY, status TEXT);",
     /// )?;
     /// source.execute_sql("INSERT INTO orders VALUES (1, 'paid')")?;
     ///
-    /// let event = source.poll_next_event()?.expect("one event pending");
+    /// let event = source
+    ///     .poll_next_item()?
+    ///     .and_then(SourceItem::into_event)
+    ///     .expect("one event pending");
     /// assert_eq!(event.kind(), EventKind::Insert);
     /// assert_eq!(
     ///     event.value_at(source.pg_catalog(), RowKind::New, 1).unwrap(),
@@ -255,23 +269,26 @@ impl PgSqliteEmuSource {
         Ok(sql_query(sql).execute(&mut self.connection)?)
     }
 
-    /// Drain every event currently pending.
+    /// Drain every item currently pending.
     ///
-    /// Loops [`Self::poll_next_event`] until the session and pending
-    /// queue both report empty, collecting the yielded events in
-    /// order. Useful in tests that do not care about per-event
-    /// pacing; production consumers should call `poll_next_event`
+    /// Loops [`Self::poll_next_item`] until the session and pending
+    /// queue both report empty, collecting the yielded items in
+    /// order. Useful in tests that do not care about per-item
+    /// pacing; production consumers should call `poll_next_item`
     /// directly.
     ///
     /// # Errors
     ///
     /// See [`PgSqliteEmuError`]. The first failure short-circuits and
-    /// returns without yielding any of the events already collected.
+    /// returns without yielding any of the items already collected.
     ///
     /// # Examples
     ///
+    /// Changes accumulated between two drains form one transaction, so
+    /// three inserts yield three rows and then one commit.
+    ///
     /// ```
-    /// use subql::PgSqliteEmuSource;
+    /// use subql::{PgSqliteEmuSource, SourceItem};
     ///
     /// let mut source = PgSqliteEmuSource::open_in_memory(
     ///     "CREATE TABLE items (id INT PRIMARY KEY);",
@@ -279,20 +296,22 @@ impl PgSqliteEmuSource {
     /// for id in 1..=3 {
     ///     source.execute_sql(&format!("INSERT INTO items VALUES ({id})"))?;
     /// }
-    /// let events = source.drain()?;
-    /// assert_eq!(events.len(), 3);
+    /// let items = source.drain()?;
+    /// assert_eq!(items.len(), 4);
+    /// assert!(matches!(items[3], SourceItem::Commit(_)));
     /// assert!(source.drain()?.is_empty(), "queue is now flushed");
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
-    pub fn drain(&mut self) -> Result<Vec<PgChangeEvent>, PgSqliteEmuError> {
+    pub fn drain(&mut self) -> Result<Vec<PgSourceItem>, PgSqliteEmuError> {
         let mut out = Vec::new();
-        while let Some(ev) = self.poll_next_event()? {
-            out.push(ev);
+        while let Some(item) = self.poll_next_item()? {
+            out.push(item);
         }
         Ok(out)
     }
 
-    /// Drain the next event from the source.
+    /// Drain the next item from the source, a row change or the commit
+    /// ending the transaction its row changes belong to.
     ///
     /// Returns `Ok(None)` when the session has accumulated no new
     /// changes since the last drain and the pending buffer is empty.
@@ -313,10 +332,10 @@ impl PgSqliteEmuSource {
     /// let mut source = PgSqliteEmuSource::open_in_memory(
     ///     "CREATE TABLE items (id INT PRIMARY KEY);",
     /// )?;
-    /// assert!(source.poll_next_event()?.is_none());
+    /// assert!(source.poll_next_item()?.is_none());
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
-    pub fn poll_next_event(&mut self) -> Result<Option<PgChangeEvent>, PgSqliteEmuError> {
+    pub fn poll_next_item(&mut self) -> Result<Option<PgSourceItem>, PgSqliteEmuError> {
         if self.pending.is_empty() && !self.session.is_empty() {
             self.drain_session()?;
             // SQLite sessions accumulate: `.changeset()` snapshots
@@ -349,7 +368,7 @@ impl PgSqliteEmuSource {
     ///
     /// ```
     /// use subql::backend::CdcEvent;
-    /// use subql::{catalog_helpers, EventKind, PgSqliteEmuSource};
+    /// use subql::{catalog_helpers, EventKind, PgSqliteEmuSource, SourceItem};
     ///
     /// let mut source = PgSqliteEmuSource::open_in_memory(
     ///     "CREATE TABLE items (id INT PRIMARY KEY);",
@@ -357,7 +376,10 @@ impl PgSqliteEmuSource {
     /// let table_id = catalog_helpers::table_id::<subql::backend::Postgres, _>(source.pg_catalog(), "items")
     ///     .expect("items table resolves");
     /// source.inject_truncate(table_id)?;
-    /// let event = source.poll_next_event()?.expect("truncate emitted");
+    /// let event = source
+    ///     .poll_next_item()?
+    ///     .and_then(SourceItem::into_event)
+    ///     .expect("truncate emitted");
     /// assert_eq!(event.kind(), EventKind::Truncate);
     /// assert_eq!(event.table_id(source.pg_catalog()), table_id);
     /// # Ok::<(), Box<dyn std::error::Error>>(())
@@ -490,7 +512,10 @@ impl PgSqliteEmuSource {
         encode_message(msg, PROTOCOL_VERSION, &mut buf);
         self.next_lsn += 1;
         if let Some(decoded) = self.decoder.decode_message(buf, Lsn::new(self.next_lsn))? {
-            self.order.apply(decoded, &mut self.pending)?;
+            let commit = self
+                .order
+                .apply(decoded, &mut AsEvents(&mut self.pending))?;
+            self.pending.extend(commit.map(SourceItem::Commit));
         }
         Ok(())
     }
@@ -571,14 +596,24 @@ impl TableMeta {
     }
 }
 
+/// Queues the row events a frame carries as source items.
+struct AsEvents<'a>(&'a mut VecDeque<PgSourceItem>);
+
+impl Extend<PgChangeEvent> for AsEvents<'_> {
+    fn extend<I: IntoIterator<Item = PgChangeEvent>>(&mut self, rows: I) {
+        self.0.extend(rows.into_iter().map(SourceItem::Event));
+    }
+}
+
 impl crate::CdcSource for PgSqliteEmuSource {
     type Event = PgChangeEvent;
+    type Commit = crate::PgCommit;
     type Error = PgSqliteEmuError;
 
-    fn next_event(
+    fn next_item(
         &mut self,
-    ) -> impl core::future::Future<Output = Result<Option<Self::Event>, Self::Error>> + Send {
-        core::future::ready(self.poll_next_event())
+    ) -> impl core::future::Future<Output = Result<Option<PgSourceItem>, Self::Error>> + Send {
+        core::future::ready(self.poll_next_item())
     }
 
     fn ack(
@@ -598,6 +633,7 @@ mod tests {
     use super::PgSqliteEmuSource;
     use crate::backend::{CdcEvent, RowKind, Value};
     use crate::catalog_helpers;
+    use crate::SourceItem;
     use diesel::{sql_query, Connection, RunQueryDsl, SqliteConnection};
     use sqlite_diff_rs::Value as WireValue;
 
@@ -651,7 +687,7 @@ mod tests {
     #[test]
     fn empty_source_yields_none() {
         let mut src = build_source();
-        assert!(src.poll_next_event().unwrap().is_none());
+        assert!(src.poll_next_item().unwrap().is_none());
     }
 
     #[test]
@@ -660,7 +696,11 @@ mod tests {
         sql_query("INSERT INTO orders (id, amount, status) VALUES (1, 250, 'paid')")
             .execute(src.connection())
             .unwrap();
-        let ev = src.poll_next_event().unwrap().expect("one event pending");
+        let ev = src
+            .poll_next_item()
+            .unwrap()
+            .and_then(SourceItem::into_event)
+            .expect("one event pending");
         assert_eq!(ev.kind(), crate::EventKind::Insert);
         assert_eq!(
             ev.value_at(src.pg_catalog(), RowKind::New, 0).unwrap(),
@@ -674,7 +714,14 @@ mod tests {
             ev.value_at(src.pg_catalog(), RowKind::New, 2).unwrap(),
             Value::String("paid".into())
         );
-        assert!(src.poll_next_event().unwrap().is_none());
+        assert!(
+            src.poll_next_item()
+                .unwrap()
+                .and_then(SourceItem::into_commit)
+                .is_some(),
+            "commit follows"
+        );
+        assert!(src.poll_next_item().unwrap().is_none());
     }
 
     #[test]
@@ -683,11 +730,16 @@ mod tests {
         sql_query("INSERT INTO orders (id, amount, status) VALUES (5, 100, 'pending')")
             .execute(src.connection())
             .unwrap();
-        let _ = src.poll_next_event().unwrap();
+        let _ = src.poll_next_item().unwrap(); // INSERT event
+        let _ = src.poll_next_item().unwrap(); // INSERT commit
         sql_query("UPDATE orders SET status = 'shipped' WHERE id = 5")
             .execute(src.connection())
             .unwrap();
-        let ev = src.poll_next_event().unwrap().expect("update event");
+        let ev = src
+            .poll_next_item()
+            .unwrap()
+            .and_then(SourceItem::into_event)
+            .expect("update event");
         assert_eq!(ev.kind(), crate::EventKind::Update);
         assert_eq!(
             ev.value_at(src.pg_catalog(), RowKind::Pk, 0).unwrap(),
@@ -723,14 +775,30 @@ mod tests {
         sql_query("INSERT INTO orders (id, amount, status) VALUES (7, 500, 'paid')")
             .execute(src.connection())
             .unwrap();
-        let _ = src.poll_next_event().unwrap();
+        let _ = src.poll_next_item().unwrap(); // INSERT event
+        let _ = src.poll_next_item().unwrap(); // INSERT commit
         sql_query("UPDATE orders SET id = 8 WHERE id = 7")
             .execute(src.connection())
             .unwrap();
 
-        let first = src.poll_next_event().unwrap().expect("first event");
-        let second = src.poll_next_event().unwrap().expect("second event");
-        assert!(src.poll_next_event().unwrap().is_none());
+        let first = src
+            .poll_next_item()
+            .unwrap()
+            .and_then(SourceItem::into_event)
+            .expect("first event");
+        let second = src
+            .poll_next_item()
+            .unwrap()
+            .and_then(SourceItem::into_event)
+            .expect("second event");
+        assert!(
+            src.poll_next_item()
+                .unwrap()
+                .and_then(SourceItem::into_commit)
+                .is_some(),
+            "commit follows the two events"
+        );
+        assert!(src.poll_next_item().unwrap().is_none());
 
         let mut events = [first, second];
         events.sort_by_key(|e| match e.kind() {
@@ -775,11 +843,16 @@ mod tests {
         sql_query("INSERT INTO orders (id, amount, status) VALUES (9, 500, 'paid')")
             .execute(src.connection())
             .unwrap();
-        let _ = src.poll_next_event().unwrap();
+        let _ = src.poll_next_item().unwrap(); // INSERT event
+        let _ = src.poll_next_item().unwrap(); // INSERT commit
         sql_query("DELETE FROM orders WHERE id = 9")
             .execute(src.connection())
             .unwrap();
-        let ev = src.poll_next_event().unwrap().expect("delete event");
+        let ev = src
+            .poll_next_item()
+            .unwrap()
+            .and_then(SourceItem::into_event)
+            .expect("delete event");
         assert_eq!(ev.kind(), crate::EventKind::Delete);
         assert_eq!(
             ev.value_at(src.pg_catalog(), RowKind::Old, 0).unwrap(),
@@ -802,7 +875,11 @@ mod tests {
             catalog_helpers::table_id::<crate::backend::Postgres, _>(src.pg_catalog(), "orders")
                 .expect("orders id");
         src.inject_truncate(table_id).expect("truncate");
-        let ev = src.poll_next_event().unwrap().expect("truncate event");
+        let ev = src
+            .poll_next_item()
+            .unwrap()
+            .and_then(SourceItem::into_event)
+            .expect("truncate event");
         assert_eq!(ev.kind(), crate::EventKind::Truncate);
         assert_eq!(ev.table_id(src.pg_catalog()), table_id);
     }
@@ -821,9 +898,13 @@ mod tests {
         };
         insert(&mut src, 1);
         insert(&mut src, 2);
-        let mut events = src.drain().unwrap();
+        let mut items = src.drain().unwrap();
         insert(&mut src, 3);
-        events.extend(src.drain().unwrap());
+        items.extend(src.drain().unwrap());
+        let events: Vec<crate::PgChangeEvent> = items
+            .into_iter()
+            .filter_map(crate::SourceItem::into_event)
+            .collect();
 
         let checkpoints: Vec<crate::PgCommitPosition> = events
             .iter()

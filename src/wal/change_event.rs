@@ -29,9 +29,7 @@ use crate::backend::{Postgres, RowKind, Value};
 use crate::catalog_helpers;
 use crate::types::{ColumnId, EventKind, TableId};
 use crate::wal::wire_event::{wire_cdc_event, WireEvent};
-use crate::PgCommitPosition;
-#[cfg(any(feature = "pg-streaming", feature = "pg-sqlite-emu"))]
-use crate::PgLsn;
+use crate::{PgCommitPosition, PgLsn};
 
 /// A pgoutput row change and where it falls in commit order.
 ///
@@ -86,27 +84,49 @@ const fn dml_kind(event: &ChangeEvent) -> Option<EventKind> {
     }
 }
 
-/// A transaction a pgoutput stream committed.
-#[cfg(any(feature = "pg-streaming", feature = "pg-sqlite-emu"))]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct CommittedTransaction {
-    /// The position of its last row event, or [`PgCommitPosition::before_commit`]
-    /// of its commit when it carried none.
-    pub last: PgCommitPosition,
-    /// Where its commit record ends, the flush position that releases it.
-    pub end_lsn: PgLsn,
+/// The commit a Postgres source yields after the last row of its transaction.
+///
+/// Acknowledging its [`position`](Self::position) moves the slot's
+/// `confirmed_flush_lsn` to its [`end_lsn`](Self::end_lsn), and acknowledging
+/// rows alone never moves it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct PgCommit {
+    position: PgCommitPosition,
+    end_lsn: PgLsn,
 }
 
-/// Delivered transactions the slot still holds, and how far the consumer has
+impl PgCommit {
+    /// The commit at `position` whose record ends at `end_lsn`.
+    #[must_use]
+    pub const fn new(position: PgCommitPosition, end_lsn: PgLsn) -> Self {
+        Self { position, end_lsn }
+    }
+
+    /// Where the commit falls in commit order, after every row of its
+    /// transaction.
+    #[must_use]
+    pub const fn position(&self) -> PgCommitPosition {
+        self.position
+    }
+
+    /// Where the commit record ends, the flush position acknowledging this
+    /// commit releases the slot to.
+    #[must_use]
+    pub const fn end_lsn(&self) -> PgLsn {
+        self.end_lsn
+    }
+}
+
+/// Delivered commits the slot still holds, and how far the consumer has
 /// acknowledged.
 ///
-/// The flush position moves only to the end of a transaction whose every row
-/// the consumer acknowledged, since a flush past a transaction's rows tells
-/// the server they were received.
+/// The flush position moves only to the end of a transaction whose commit
+/// the consumer acknowledged, since a flush past a transaction tells the
+/// server the consumer holds all of it.
 #[cfg(feature = "pg-streaming")]
 pub struct ReleaseQueue {
     /// In commit order, so the releasable ones are a prefix.
-    held: alloc::collections::VecDeque<CommittedTransaction>,
+    held: alloc::collections::VecDeque<PgCommit>,
     acknowledged: Option<PgCommitPosition>,
 }
 
@@ -119,10 +139,9 @@ impl ReleaseQueue {
         }
     }
 
-    /// Hold `transaction`, which delivered rows the consumer has not yet
-    /// acknowledged.
-    pub fn committed(&mut self, transaction: CommittedTransaction) {
-        self.held.push_back(transaction);
+    /// Hold `commit`, delivered and not yet acknowledged.
+    pub fn committed(&mut self, commit: PgCommit) {
+        self.held.push_back(commit);
     }
 
     /// Record that the consumer applied every event up to `upto`.
@@ -130,24 +149,25 @@ impl ReleaseQueue {
         self.acknowledged = self.acknowledged.max(Some(upto));
     }
 
-    /// Let go of every held transaction acknowledged in full, returning the
+    /// Let go of every held commit the consumer acknowledged, returning the
     /// flush position that releases them, or `None` when there is none.
     pub fn release(&mut self) -> Option<PgLsn> {
         let acknowledged = self.acknowledged?;
         let released = self
             .held
             .iter()
-            .take_while(|transaction| transaction.last <= acknowledged)
+            .take_while(|commit| commit.position <= acknowledged)
             .count();
         self.held
             .drain(..released)
             .next_back()
-            .map(|transaction| transaction.end_lsn)
+            .map(|commit| commit.end_lsn)
     }
 }
 
 /// Reduces a decoded pgoutput stream to the row events subql's engine
-/// consumes, each at its [`PgCommitPosition`].
+/// consumes, each at its [`PgCommitPosition`], and the commits that end
+/// them.
 ///
 /// Insert, Update, and Delete become one event each. A `Truncate` naming
 /// several tables fans out into one single-table `Truncate` per table, since
@@ -169,12 +189,12 @@ impl PgOutputOrder {
     }
 
     /// Place `change`, appending the row events it carries to `rows`, and
-    /// report the transaction when `change` is its commit.
+    /// report the commit when `change` ends a transaction that carried rows.
     pub fn apply(
         &mut self,
         change: ChangeEvent,
         rows: &mut impl Extend<PgChangeEvent>,
-    ) -> Result<Option<CommittedTransaction>, TransactionOrderError> {
+    ) -> Result<Option<PgCommit>, TransactionOrderError> {
         match &change.event_type {
             EventType::Insert { .. } | EventType::Update { .. } | EventType::Delete { .. } => {
                 let (commit, ordinal) = self.order.next_row()?;
@@ -218,9 +238,8 @@ impl PgOutputOrder {
                 if committed != began {
                     return Err(TransactionOrderError::CommitMismatch { began, committed });
                 }
-                return Ok(Some(CommittedTransaction {
-                    last: PgCommitPosition::new(began, placed),
-                    end_lsn: PgLsn(end_lsn.value()),
+                return Ok((placed > 0).then(|| {
+                    PgCommit::new(PgCommitPosition::at_commit(began), PgLsn(end_lsn.value()))
                 }));
             }
             EventType::Relation { .. }
@@ -564,7 +583,7 @@ mod tests {
 
     #[cfg(any(feature = "pg-streaming", feature = "pg-sqlite-emu"))]
     mod order {
-        use super::super::{CommittedTransaction, PgChangeEvent, PgOutputOrder};
+        use super::super::{PgChangeEvent, PgCommit, PgOutputOrder};
         use crate::wal::TransactionOrderError;
         use crate::{PgCommitPosition, PgLsn};
         use alloc::sync::Arc;
@@ -639,28 +658,29 @@ mod tests {
         }
 
         #[test]
-        fn a_commit_reports_its_last_row_and_where_it_ends() {
+        fn a_commit_reports_its_position_after_its_rows_and_where_it_ends() {
             let mut order = PgOutputOrder::new();
             let mut rows = Vec::new();
             for change in [begin(1500), insert(1000), insert(1100)] {
                 assert_eq!(order.apply(change, &mut rows), Ok(None));
             }
+            let commit = order
+                .apply(commit(1500, 1510), &mut rows)
+                .expect("frames in place")
+                .expect("a transaction with rows reports its commit");
             assert_eq!(
-                order.apply(commit(1500, 1510), &mut rows),
-                Ok(Some(CommittedTransaction {
-                    last: PgCommitPosition::new(PgLsn(1500), 2),
-                    end_lsn: PgLsn(1510),
-                }))
+                commit,
+                PgCommit::new(PgCommitPosition::at_commit(PgLsn(1500)), PgLsn(1510))
             );
+            assert!(rows.iter().all(|row| row.position() < commit.position()));
+        }
+
+        #[test]
+        fn a_transaction_without_rows_reports_no_commit() {
+            let mut order = PgOutputOrder::new();
+            let mut rows = Vec::new();
             order.apply(begin(1600), &mut rows).unwrap();
-            assert_eq!(
-                order.apply(commit(1600, 1610), &mut rows),
-                Ok(Some(CommittedTransaction {
-                    last: PgCommitPosition::before_commit(PgLsn(1600)),
-                    end_lsn: PgLsn(1610),
-                })),
-                "a transaction without rows reports the position before its commit"
-            );
+            assert_eq!(order.apply(commit(1600, 1610), &mut rows), Ok(None));
         }
 
         #[test]
@@ -779,55 +799,62 @@ mod tests {
 
     #[cfg(feature = "pg-streaming")]
     mod release {
-        use super::super::{CommittedTransaction, ReleaseQueue};
+        use super::super::{PgCommit, ReleaseQueue};
         use crate::{PgCommitPosition, PgLsn};
 
-        fn position(commit: u64, ordinal: u64) -> PgCommitPosition {
-            PgCommitPosition::new(PgLsn(commit), ordinal)
-        }
-
-        /// A transaction committing at `commit` with `rows` rows, ending ten past it.
-        fn transaction(commit: u64, rows: u64) -> CommittedTransaction {
-            CommittedTransaction {
-                last: position(commit, rows),
-                end_lsn: PgLsn(commit + 10),
-            }
+        /// The commit of a transaction committing at `commit`, ending ten past it.
+        fn commit(commit: u64) -> PgCommit {
+            PgCommit::new(
+                PgCommitPosition::at_commit(PgLsn(commit)),
+                PgLsn(commit + 10),
+            )
         }
 
         #[test]
-        fn a_transaction_is_released_only_once_every_row_is_acknowledged() {
+        fn acknowledging_every_row_without_the_commit_releases_nothing() {
             let mut queue = ReleaseQueue::new();
-            queue.committed(transaction(1300, 1));
-            queue.committed(transaction(1500, 2));
-            queue.acknowledge(position(1500, 1));
-            assert_eq!(queue.release(), Some(PgLsn(1310)), "only T2 is whole");
-            assert_eq!(queue.release(), None, "T1 is still half acknowledged");
-            queue.acknowledge(position(1500, 2));
-            assert_eq!(queue.release(), Some(PgLsn(1510)));
+            queue.committed(commit(1300));
+            queue.acknowledge(PgCommitPosition::new(PgLsn(1300), 2));
+            assert_eq!(queue.release(), None);
+            queue.acknowledge(PgCommitPosition::at_commit(PgLsn(1300)));
+            assert_eq!(queue.release(), Some(PgLsn(1310)));
+        }
+
+        #[test]
+        fn a_commit_is_released_with_every_commit_before_it_and_none_after() {
+            let mut queue = ReleaseQueue::new();
+            queue.committed(commit(1300));
+            queue.committed(commit(1500));
+            queue.committed(commit(1700));
+            queue.acknowledge(PgCommitPosition::new(PgLsn(1700), 1));
+            assert_eq!(queue.release(), Some(PgLsn(1510)), "T1 and T2 are whole");
+            assert_eq!(queue.release(), None, "T3's commit is unacknowledged");
+            queue.acknowledge(PgCommitPosition::at_commit(PgLsn(1700)));
+            assert_eq!(queue.release(), Some(PgLsn(1710)));
         }
 
         #[test]
         fn an_acknowledgement_ahead_of_the_commit_releases_it_when_it_arrives() {
             let mut queue = ReleaseQueue::new();
-            queue.acknowledge(position(1500, 2));
+            queue.acknowledge(PgCommitPosition::at_commit(PgLsn(1500)));
             assert_eq!(queue.release(), None);
-            queue.committed(transaction(1500, 2));
+            queue.committed(commit(1500));
             assert_eq!(queue.release(), Some(PgLsn(1510)));
         }
 
         #[test]
         fn an_older_acknowledgement_never_takes_the_position_back() {
             let mut queue = ReleaseQueue::new();
-            queue.acknowledge(position(1500, 2));
-            queue.acknowledge(position(1300, 1));
-            queue.committed(transaction(1500, 2));
+            queue.acknowledge(PgCommitPosition::at_commit(PgLsn(1500)));
+            queue.acknowledge(PgCommitPosition::at_commit(PgLsn(1300)));
+            queue.committed(commit(1500));
             assert_eq!(queue.release(), Some(PgLsn(1510)));
         }
 
         #[test]
         fn nothing_is_released_before_any_acknowledgement() {
             let mut queue = ReleaseQueue::new();
-            queue.committed(transaction(1300, 1));
+            queue.committed(commit(1300));
             assert_eq!(queue.release(), None);
         }
     }

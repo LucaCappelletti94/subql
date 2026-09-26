@@ -1,10 +1,10 @@
 //! The polling source's slot protocol, against a real Postgres.
 //!
-//! [`subql::CdcSource::ack`] promises that an event is retained until it is
+//! [`subql::CdcSource::ack`] promises that an item is retained until it is
 //! acknowledged, so these pin where the slot's `confirmed_flush_lsn` moves
 //! rather than only what a consumer happens to receive. The position is the
 //! contract, and reading it is the only way to tell a source that retains
-//! from one that has already thrown the events away.
+//! from one that has already thrown the items away.
 
 #![allow(clippy::unwrap_used, clippy::print_stdout)]
 
@@ -16,7 +16,53 @@ use diesel::{sql_query, Connection, PgConnection, QueryableByName, RunQueryDsl};
 use sql_traits::structs::ParserDB;
 use sqlparser::dialect::PostgreSqlDialect;
 use subql::backend::{CdcEvent, RowKind};
-use subql::{CdcSource, EventKind, PollingPgCdcConfig, PollingPgCdcSource};
+use subql::{
+    CdcSource, EventKind, PgChangeEvent, PgCommit, PgCommitPosition, PgLsn, PollingPgCdcConfig,
+    PollingPgCdcSource, SourceItem,
+};
+
+type Item = SourceItem<PgChangeEvent, PgCommit>;
+
+/// The next item, which must arrive within five seconds.
+async fn next_item<S>(source: &mut S, what: &str) -> Item
+where
+    S: CdcSource<Event = PgChangeEvent, Commit = PgCommit>,
+{
+    tokio::time::timeout(Duration::from_secs(5), source.next_item())
+        .await
+        .unwrap_or_else(|_| panic!("{what} arrives"))
+        .expect("no source error")
+        .expect("the source is open")
+}
+
+/// The next item, which must be a row.
+async fn next_row<S>(source: &mut S, what: &str) -> PgChangeEvent
+where
+    S: CdcSource<Event = PgChangeEvent, Commit = PgCommit>,
+{
+    match next_item(source, what).await {
+        SourceItem::Event(event) => event,
+        SourceItem::Commit(commit) => panic!("expected {what}, got {commit:?}"),
+    }
+}
+
+/// The next item, which must be a commit.
+async fn next_commit<S>(source: &mut S, what: &str) -> PgCommit
+where
+    S: CdcSource<Event = PgChangeEvent, Commit = PgCommit>,
+{
+    match next_item(source, what).await {
+        SourceItem::Commit(commit) => commit,
+        SourceItem::Event(event) => panic!("expected {what}, got {event:?}"),
+    }
+}
+
+const fn position(item: &Item) -> PgCommitPosition {
+    match item {
+        SourceItem::Event(event) => event.position(),
+        SourceItem::Commit(commit) => commit.position(),
+    }
+}
 
 const DDL: &str = "CREATE TABLE orders (id INT PRIMARY KEY, price FLOAT);";
 const PG_DDL: &str = "CREATE TABLE orders (id INT PRIMARY KEY, price DOUBLE PRECISION)";
@@ -100,11 +146,7 @@ fn an_unacknowledged_event_replays_after_the_source_is_dropped() {
             sql_query("INSERT INTO orders VALUES (1, 5.0)")
                 .execute(&mut dml)
                 .expect("insert");
-            let event = tokio::time::timeout(Duration::from_secs(5), source.next_event())
-                .await
-                .expect("the first source receives the insert")
-                .expect("no source error")
-                .expect("the source is open");
+            let event = next_row(&mut source, "the insert on the first source").await;
             assert_eq!(event.kind(), EventKind::Insert);
             // Dropped without an ack, as a crash or a shutdown drops it.
         }
@@ -113,11 +155,7 @@ fn an_unacknowledged_event_replays_after_the_source_is_dropped() {
             PollingPgCdcSource::connect(config(db.url(), &slot, publication), catalog())
                 .await
                 .expect("reconnect polling source");
-        let event = tokio::time::timeout(Duration::from_secs(5), replay.next_event())
-            .await
-            .expect("the unacknowledged insert is still in the slot")
-            .expect("no source error")
-            .expect("the source is open");
+        let event = next_row(&mut replay, "the unacknowledged insert, still in the slot").await;
         assert_eq!(
             event.kind(),
             EventKind::Insert,
@@ -150,15 +188,12 @@ fn an_acknowledged_event_does_not_replay_and_a_later_one_does() {
             sql_query("INSERT INTO orders VALUES (1, 5.0)")
                 .execute(&mut dml)
                 .expect("first insert");
-            let first = tokio::time::timeout(Duration::from_secs(5), source.next_event())
+            next_row(&mut source, "the first insert").await;
+            let commit = next_commit(&mut source, "the first insert's commit").await;
+            source
+                .ack(commit.position())
                 .await
-                .expect("the first insert arrives")
-                .expect("no source error")
-                .expect("the source is open");
-            let upto = first
-                .checkpoint()
-                .expect("a polled event carries its position");
-            source.ack(upto).await.expect("the ack reaches the source");
+                .expect("the ack reaches the source");
             // Give the loop an iteration to carry the ack to the server.
             tokio::time::sleep(Duration::from_millis(400)).await;
         }
@@ -171,11 +206,7 @@ fn an_acknowledged_event_does_not_replay_and_a_later_one_does() {
             PollingPgCdcSource::connect(config(db.url(), &slot, publication), catalog())
                 .await
                 .expect("reconnect polling source");
-        let event = tokio::time::timeout(Duration::from_secs(5), replay.next_event())
-            .await
-            .expect("the second insert arrives")
-            .expect("no source error")
-            .expect("the source is open");
+        let event = next_row(&mut replay, "the second insert").await;
         let id = event
             .value_at(&catalog(), RowKind::New, 0)
             .expect("the new image carries the key");
@@ -189,12 +220,13 @@ fn an_acknowledged_event_does_not_replay_and_a_later_one_does() {
     common::drop_slot(&mut setup, &slot);
 }
 
-/// The position moves when the consumer says it has the data, and not when
-/// the source merely read it. This is the protocol itself rather than a
-/// symptom of it.
+/// The position moves to the end of a commit when the consumer acknowledges
+/// that commit, and not when the source merely read it or the consumer
+/// acknowledged its rows. This is the protocol itself rather than a symptom
+/// of it.
 #[test]
 #[ignore = "requires Docker; run with --ignored"]
-fn the_slot_moves_on_an_acknowledgement_and_not_on_a_poll() {
+fn the_slot_moves_on_an_acknowledged_commit_and_not_on_a_poll_or_a_row() {
     common::assert_docker_available();
     let db = common::pg_database();
     let mut setup = db.connect();
@@ -214,35 +246,39 @@ fn the_slot_moves_on_an_acknowledgement_and_not_on_a_poll() {
         sql_query("INSERT INTO orders VALUES (1, 5.0)")
             .execute(&mut dml)
             .expect("insert");
-        let event = tokio::time::timeout(Duration::from_secs(5), source.next_event())
-            .await
-            .expect("the insert arrives")
-            .expect("no source error")
-            .expect("the source is open");
+        let event = next_row(&mut source, "the insert").await;
+        let commit = next_commit(&mut source, "its commit").await;
 
+        source
+            .ack(event.position())
+            .await
+            .expect("the ack reaches the source");
         // Several more polls have certainly run by now, and none of them may
         // have moved the position.
         tokio::time::sleep(Duration::from_millis(400)).await;
         assert_eq!(
             confirmed_flush(&mut probe, &slot),
             before,
-            "reading the slot must not advance it"
+            "reading the slot or acknowledging a row must not advance it"
         );
 
-        let upto = event
-            .checkpoint()
-            .expect("a polled event carries its position");
-        source.ack(upto).await.expect("the ack reaches the source");
-
-        let mut moved = false;
+        source
+            .ack(commit.position())
+            .await
+            .expect("the ack reaches the source");
+        let mut flushed = None;
         for _ in 0..40 {
             tokio::time::sleep(Duration::from_millis(100)).await;
-            if confirmed_flush(&mut probe, &slot) != before {
-                moved = true;
+            flushed = confirmed_flush(&mut probe, &slot);
+            if flushed != before {
                 break;
             }
         }
-        assert!(moved, "the acknowledgement must advance the slot");
+        assert_eq!(
+            flushed.as_deref().and_then(PgLsn::parse),
+            Some(commit.end_lsn()),
+            "the acknowledged commit moves the slot to its end"
+        );
     });
 
     common::drop_slot(&mut setup, &slot);
@@ -269,20 +305,17 @@ fn a_repeated_peek_delivers_each_event_once() {
         sql_query("INSERT INTO orders VALUES (1, 5.0)")
             .execute(&mut dml)
             .expect("insert");
-        let event = tokio::time::timeout(Duration::from_secs(5), source.next_event())
-            .await
-            .expect("the insert arrives")
-            .expect("no source error")
-            .expect("the source is open");
+        let event = next_row(&mut source, "the insert").await;
         assert_eq!(event.kind(), EventKind::Insert);
+        next_commit(&mut source, "its commit").await;
 
         // Nothing is acknowledged, so every later poll peeks this same
         // transaction again.
         tokio::time::sleep(Duration::from_millis(500)).await;
-        let again = tokio::time::timeout(Duration::from_millis(500), source.next_event()).await;
+        let again = tokio::time::timeout(Duration::from_millis(500), source.next_item()).await;
         assert!(
             again.is_err(),
-            "an unacknowledged event must not be delivered twice, got {again:?}"
+            "an unacknowledged item must not be delivered twice, got {again:?}"
         );
         assert_eq!(
             source.events_received(),
@@ -321,11 +354,8 @@ fn a_long_lived_source_keeps_delivering_later_transactions() {
             sql_query(format!("INSERT INTO orders VALUES ({id}, {id}.0)"))
                 .execute(&mut dml)
                 .expect("insert");
-            let event = tokio::time::timeout(Duration::from_secs(5), source.next_event())
-                .await
-                .unwrap_or_else(|_| panic!("insert {id} arrives on the same source"))
-                .expect("no source error")
-                .expect("the source is open");
+            let event = next_row(&mut source, &format!("insert {id} on the same source")).await;
+            next_commit(&mut source, &format!("the commit of insert {id}")).await;
             let seen = event
                 .value_at(&catalog(), RowKind::New, 0)
                 .expect("the new image carries the key");
@@ -374,17 +404,18 @@ fn every_change_of_one_transaction_is_delivered() {
         .expect("three statements in one transaction");
 
         let mut seen = Vec::new();
-        for _ in 0..6 {
-            let event = tokio::time::timeout(Duration::from_secs(5), source.next_event())
-                .await
-                .unwrap_or_else(|_| panic!("all three changes arrive, got {seen:?}"))
-                .expect("no source error")
-                .expect("the source is open");
-            let id = event
-                .value_at(&catalog(), RowKind::New, 0)
-                .expect("the new image carries the key");
-            seen.push(id);
+        let mut commits = 0;
+        for _ in 0..8 {
+            match next_item(&mut source, &format!("every item, got {seen:?}")).await {
+                SourceItem::Event(event) => seen.push(
+                    event
+                        .value_at(&catalog(), RowKind::New, 0)
+                        .expect("the new image carries the key"),
+                ),
+                SourceItem::Commit(_) => commits += 1,
+            }
         }
+        assert_eq!(commits, 2, "one commit per transaction");
         assert_eq!(
             seen,
             (1..=6)
@@ -422,22 +453,16 @@ fn every_row_of_a_copied_batch_is_delivered() {
             .expect("copy three rows");
 
         let mut seen = Vec::new();
-        for _ in 0..3 {
-            let event = tokio::time::timeout(Duration::from_secs(5), source.next_event())
-                .await
-                .unwrap_or_else(|_| panic!("all three copied rows arrive, got {seen:?}"))
-                .expect("no source error")
-                .expect("the source is open");
-            seen.push(
-                event
-                    .checkpoint()
-                    .expect("a polled event carries a position"),
-            );
+        for _ in 0..4 {
+            seen.push(position(
+                &next_item(&mut source, &format!("every copied row, got {seen:?}")).await,
+            ));
         }
         assert!(
             seen.windows(2).all(|pair| pair[0] < pair[1]),
-            "each copied row has a position of its own: {seen:?}"
+            "each copied row has a position of its own, and the commit follows them: {seen:?}"
         );
+        assert_eq!(seen[3], PgCommitPosition::at_commit(seen[0].commit_lsn()));
     });
 
     common::drop_slot(&mut setup, &slot);
@@ -476,30 +501,30 @@ fn polled_checkpoints_follow_commit_order_across_interleaved_transactions() {
             .expect("commit the older");
 
         let mut delivered = Vec::new();
-        for _ in 0..3 {
-            let event = tokio::time::timeout(Duration::from_secs(5), source.next_event())
-                .await
-                .unwrap_or_else(|_| panic!("all three rows arrive, got {delivered:?}"))
-                .expect("no source error")
-                .expect("the source is open");
-            let id = event
-                .value_at(&catalog(), RowKind::New, 0)
-                .expect("the new image carries the key");
-            delivered.push((
-                id,
-                event
-                    .checkpoint()
-                    .expect("a polled event carries a position"),
-            ));
+        for _ in 0..5 {
+            delivered.push(next_item(&mut source, &format!("every item, got {delivered:?}")).await);
         }
-        let ids: Vec<_> = delivered.iter().map(|(id, _)| id.clone()).collect();
+        let ids: Vec<_> = delivered
+            .iter()
+            .map(|item| match item {
+                SourceItem::Event(event) => Some(
+                    event
+                        .value_at(&catalog(), RowKind::New, 0)
+                        .expect("the new image carries the key"),
+                ),
+                SourceItem::Commit(_) => None,
+            })
+            .collect();
         assert_eq!(
             ids,
-            [1, 100, 101].map(subql::backend::Value::Int),
-            "the newer transaction committed first"
+            [Some(1), None, Some(100), Some(101), None]
+                .map(|id| id.map(subql::backend::Value::Int)),
+            "the newer transaction and its commit, then the older one's rows and commit"
         );
         assert!(
-            delivered.windows(2).all(|pair| pair[0].1 < pair[1].1),
+            delivered
+                .windows(2)
+                .all(|pair| position(&pair[0]) < position(&pair[1])),
             "positions strictly increase in delivery order: {delivered:?}"
         );
     });
@@ -543,24 +568,23 @@ fn the_streaming_source_reports_what_its_slot_is_holding() {
         sql_query("INSERT INTO orders VALUES (1, 5.0)")
             .execute(&mut dml)
             .expect("insert");
-        let event = tokio::time::timeout(Duration::from_secs(5), source.next_event())
-            .await
-            .expect("the insert arrives")
-            .expect("no source error")
-            .expect("the source is open");
+        next_row(&mut source, "the insert").await;
 
         // A data frame carries the position of the record in it, measured
         // as equal to its start on every frame of this suite, and the first
         // record of a transaction sits where the slot already was. Only the
         // commit frame, or a keepalive, moves the figure, so growth is a
         // bounded wait rather than a reading taken the instant one lands.
+        let mut commit = None;
         let mut held = base;
         let started = std::time::Instant::now();
         while held <= base && started.elapsed() < Duration::from_secs(10) {
             if let Ok(polled) =
-                tokio::time::timeout(Duration::from_millis(100), source.next_event()).await
+                tokio::time::timeout(Duration::from_millis(100), source.next_item()).await
             {
-                polled.expect("no source error");
+                if let Some(SourceItem::Commit(polled)) = polled.expect("no source error") {
+                    commit = Some(polled);
+                }
             }
             held = source.unacknowledged_bytes();
         }
@@ -584,26 +608,27 @@ fn the_streaming_source_reports_what_its_slot_is_holding() {
             "nothing has been acknowledged yet"
         );
 
-        let upto = event.checkpoint().expect("the event carries its position");
-        source.ack(upto).await.expect("the ack reaches the source");
+        let commit = match commit {
+            Some(commit) => commit,
+            None => next_commit(&mut source, "the insert's commit").await,
+        };
+        source
+            .ack(commit.position())
+            .await
+            .expect("the ack reaches the source");
         // The held figure is a distance to the server's WAL end, which every
         // other database on a shared server also moves, so the acknowledged
         // position is what this can assert rather than a fall in the figure.
-        // The acknowledgement releases the whole transaction, so the position
-        // reported lands past its commit.
-        let released = |position: Option<subql::PgLsn>| {
-            position.is_some_and(|flushed| flushed > upto.commit_lsn())
-        };
         for _ in 0..40 {
-            if released(source.acknowledged_position()) {
+            if source.acknowledged_position().is_some() {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
-        assert!(
-            released(source.acknowledged_position()),
-            "the acknowledgement is what releases the slot, and it is reported, got {:?} for {upto:?}",
-            source.acknowledged_position()
+        assert_eq!(
+            source.acknowledged_position(),
+            Some(commit.end_lsn()),
+            "the acknowledged commit releases the slot to its end, and it is reported"
         );
     });
 
@@ -652,8 +677,8 @@ fn an_idle_publication_still_reports_the_source_falling_behind() {
         let started = std::time::Instant::now();
         let mut grew = base;
         while started.elapsed() < Duration::from_secs(30) {
-            // next_event drives the frame loop, and must not produce one.
-            match tokio::time::timeout(Duration::from_millis(200), source.next_event()).await {
+            // next_item drives the frame loop, and must not produce one.
+            match tokio::time::timeout(Duration::from_millis(200), source.next_item()).await {
                 Err(_) => {}
                 Ok(Err(e)) => panic!("the source failed while idle: {e}"),
                 Ok(Ok(other)) => panic!("the publication is idle, got {other:?}"),

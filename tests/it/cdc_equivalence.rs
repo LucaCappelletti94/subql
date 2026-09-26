@@ -134,7 +134,7 @@ fn canonicalize<E: CdcEvent<Backend = subql::backend::Postgres>>(
 /// tests at once, where a five second budget failed on an event that takes
 /// under one and a half seconds locally. The claim that delivery rides the
 /// wire rather than a tick belongs to
-/// `pg_streaming_e2e::next_event_delivers_an_insert_without_waiting_for_a_tick`.
+/// `pg_streaming_e2e::next_item_delivers_an_insert_without_waiting_for_a_tick`.
 const DRAIN_HANG_GUARD: Duration = Duration::from_secs(30);
 
 async fn drain_n<S>(source: &mut S, n: usize) -> Vec<S::Event>
@@ -143,12 +143,14 @@ where
 {
     let mut out = Vec::with_capacity(n);
     while out.len() < n {
-        let ev = tokio::time::timeout(DRAIN_HANG_GUARD, source.next_event())
+        let item = tokio::time::timeout(DRAIN_HANG_GUARD, source.next_item())
             .await
-            .expect("next_event timeout draining")
-            .expect("next_event err")
+            .expect("next_item timeout draining")
+            .expect("next_item err")
             .expect("source closed before drain target reached");
-        out.push(ev);
+        if let Some(ev) = item.into_event() {
+            out.push(ev);
+        }
     }
     out
 }

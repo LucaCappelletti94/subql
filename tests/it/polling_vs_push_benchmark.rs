@@ -53,8 +53,8 @@ use sql_traits::structs::ParserDB;
 use sqlparser::dialect::PostgreSqlDialect;
 use subql::backend::CdcEvent;
 use subql::{
-    CdcSource, EventKind, PgCommitPosition, PgStreamingCdcSource, PgStreamingConfig,
-    PollingPgCdcConfig, PollingPgCdcSource,
+    CdcSource, EventKind, PgCommit, PgCommitPosition, PgStreamingCdcSource, PgStreamingConfig,
+    PollingPgCdcConfig, PollingPgCdcSource, SourceItem,
 };
 
 const DDL: &str = "CREATE TABLE orders (id INT PRIMARY KEY, price FLOAT);";
@@ -160,10 +160,9 @@ async fn collect_latencies(
     }
     samples
 }
-
-/// Spawn a task that drains `source.next_event()` and forwards
+/// Spawn a task that drains `source.next_item()` and forwards
 /// `(id, observed_at)` tuples to the channel. Generic over any
-/// `CdcSource<Checkpoint = PgCommitPosition>` so the same loop drives both
+/// `CdcSource<Commit = PgCommit, Checkpoint = PgCommitPosition>` so the same loop drives both
 /// push and polling.
 fn spawn_receiver<S>(
     mut source: S,
@@ -172,7 +171,7 @@ fn spawn_receiver<S>(
     tokio::task::JoinHandle<()>,
 )
 where
-    S: CdcSource + Send + 'static,
+    S: CdcSource<Commit = PgCommit> + Send + 'static,
     S::Event:
         subql::backend::CdcEvent<Backend = subql::backend::Postgres, Checkpoint = PgCommitPosition>,
 {
@@ -180,29 +179,31 @@ where
     let schema = ParserDB::parse::<PostgreSqlDialect>(DDL).expect("parse DDL");
     let task = tokio::spawn(async move {
         loop {
-            let Ok(Some(ev)) = source.next_event().await else {
+            let Ok(Some(item)) = source.next_item().await else {
                 return;
             };
-            let observed_at = Instant::now();
-            // A source retains an event until it is acknowledged, so a
-            // consumer that never acknowledged would make every poll re-read
-            // the whole unacknowledged history.
-            if let Some(upto) = ev.checkpoint() {
-                if source.ack(upto).await.is_err() {
-                    return;
+            match item {
+                SourceItem::Commit(commit) => {
+                    // Only a commit's position releases confirmed_flush_lsn.
+                    if source.ack(commit.position()).await.is_err() {
+                        return;
+                    }
                 }
-            }
-            if ev.kind() != EventKind::Insert {
-                continue;
-            }
-            let subql::backend::Value::Int(id) = ev
-                .value_at(&schema, subql::backend::RowKind::New, 0)
-                .unwrap()
-            else {
-                continue;
-            };
-            if tx.send((id, observed_at)).is_err() {
-                return;
+                SourceItem::Event(ev) => {
+                    let observed_at = Instant::now();
+                    if ev.kind() != EventKind::Insert {
+                        continue;
+                    }
+                    let subql::backend::Value::Int(id) = ev
+                        .value_at(&schema, subql::backend::RowKind::New, 0)
+                        .unwrap()
+                    else {
+                        continue;
+                    };
+                    if tx.send((id, observed_at)).is_err() {
+                        return;
+                    }
+                }
             }
         }
     });
