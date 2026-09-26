@@ -70,6 +70,7 @@ All notable changes to subql are recorded here. The format follows [Keep a Chang
 
 ### Fixed
 
+- A PostgreSQL `timestamptz` whose offset has seconds, as PostgreSQL prints an instant before a zone's standard time (`1900-01-01 00:19:32+00:19:32`), decodes from pgoutput and wal2json, as do dates and timestamps before 1 AD or past 9999. Each was refused and answered by a database read.
 - `IS [NOT] NULL` over a condition, as in `WHERE (a > 0) IS NOT NULL`, asks whether the condition is unknown, as every engine does. It was compiled to a null test of a value, so every dispatch on the subscription's table failed with a VM type error and took every other subscription on that table with it.
 - A keyed re-read that a change with no key, such as a truncate, moves to a whole re-read is written to the store under its new tier. It was taken out of the reads file and never written back, so the next restart silently lost the subscription.
 - An in-process aggregate that stops mid-dispatch, on an update without its old image, a group cap or a sum out of range, is written to the store as the whole re-read it became. The store kept naming the stopped aggregate, so a restart brought back the tier the subscriber had been told was gone.
