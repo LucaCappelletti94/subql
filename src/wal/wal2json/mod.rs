@@ -309,4 +309,50 @@ mod tests {
             Value::Int(9)
         );
     }
+
+    /// wal2json writes `null` for a float or numeric `NaN` or infinity as
+    /// well as for `NULL`, so a `null` in such a column is unanswerable, in
+    /// both formats. Every other column's `null` is `NULL`.
+    #[test]
+    fn a_null_float_or_numeric_cell_is_unanswerable() {
+        let db = ParserDB::parse::<PostgreSqlDialect>(
+            "CREATE TABLE m (id INT PRIMARY KEY, r REAL, d DOUBLE PRECISION, n NUMERIC, i INT, s TEXT);",
+        )
+        .expect("parse DDL");
+        let v2 = one_v2(
+            br#"{"action":"I","schema":"public","table":"m",
+                 "columns":[{"name":"id","type":"integer","value":1},
+                            {"name":"r","type":"real","value":null},
+                            {"name":"d","type":"double precision","value":null},
+                            {"name":"n","type":"numeric","value":null},
+                            {"name":"i","type":"integer","value":null},
+                            {"name":"s","type":"text","value":null}]}"#,
+        );
+        let v1 = parse_wal2json_v1(
+            br#"{"xid":1,"change":[{"kind":"insert","schema":"public","table":"m",
+                 "columnnames":["id","r","d","n","i","s"],
+                 "columntypes":["integer","real","double precision","numeric","integer","text"],
+                 "columnvalues":[1,null,null,null,null,null]}]}"#,
+        )
+        .expect("parse succeeds");
+        let expected = [
+            Value::Missing,
+            Value::Missing,
+            Value::Missing,
+            Value::Null,
+            Value::Null,
+        ];
+        for (column, want) in (1u16..).zip(&expected) {
+            assert_eq!(
+                &v2.value_at(&db, RowKind::New, column).expect("v2 decodes"),
+                want
+            );
+            assert_eq!(
+                &v1[0]
+                    .value_at(&db, RowKind::New, column)
+                    .expect("v1 decodes"),
+                want
+            );
+        }
+    }
 }
