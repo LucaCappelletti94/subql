@@ -12,6 +12,7 @@ use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::ops::ControlFlow;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use core::time::Duration;
 
@@ -429,11 +430,7 @@ async fn streaming_task(
     let _exit_guard = crate::wal::ExitFlagGuard(task_exited);
 
     let mut decoder = PgOutputDecoder::with_protocol_version(1);
-    let mut order = PgOutputOrder::new();
-    let mut rows: Vec<PgChangeEvent> = Vec::new();
-    let mut releases = ReleaseQueue::new();
-    // Whether the open transaction delivered a row past `start`.
-    let mut delivered = false;
+    let mut delivery = Delivery::new(start);
     // Both start where the slot already is, which is what the gauges
     // published at connect. Starting at zero reports a client that has
     // received nothing and lets the first frame store a position below the
@@ -504,30 +501,11 @@ async fn streaming_task(
                                 return;
                             }
                         };
-                        let committed = match order.apply(change, &mut rows) {
-                            Ok(committed) => committed,
-                            Err(e) => {
-                                let _ = event_tx.send(Err(e.into())).await;
-                                return;
-                            }
+                        let end = match delivery.deliver(change, &event_tx, &events_counter).await {
+                            ControlFlow::Continue(Some(end)) => end,
+                            ControlFlow::Continue(None) => continue,
+                            ControlFlow::Break(()) => return,
                         };
-                        #[expect(clippy::iter_with_drain, reason = "the buffer is reused for every message")]
-                        for ev in rows.drain(..) {
-                            if start.is_some_and(|start| ev.position() <= start) {
-                                continue;
-                            }
-                            delivered = true;
-                            events_counter.fetch_add(1, Ordering::Relaxed);
-                            if event_tx.send(Ok(ev)).await.is_err() {
-                                return;
-                            }
-                        }
-                        let Some(committed) = committed else { continue };
-                        if core::mem::take(&mut delivered) {
-                            releases.committed(committed);
-                        }
-                        // The consumer may have acknowledged the last row before its commit arrived.
-                        let Some(end) = releases.release() else { continue };
                         latest_acked_lsn = latest_acked_lsn.max(end.0);
                         if send_status_update(
                             &mut conn,
@@ -581,8 +559,7 @@ async fn streaming_task(
             }
             ack = ack_rx.recv() => {
                 let Some(upto) = ack else { continue; };
-                releases.acknowledge(upto);
-                if let Some(end) = releases.release() {
+                if let Some(end) = delivery.acknowledge(upto) {
                     latest_acked_lsn = latest_acked_lsn.max(end.0);
                 }
                 if send_status_update(
@@ -615,6 +592,71 @@ async fn streaming_task(
                 }
             }
         }
+    }
+}
+
+/// Row delivery for the streaming task: the transaction frame, the resume
+/// filter, and the transactions the slot still holds.
+struct Delivery {
+    order: PgOutputOrder,
+    rows: Vec<PgChangeEvent>,
+    releases: ReleaseQueue,
+    start: Option<PgCommitPosition>,
+    /// Whether the open transaction delivered a row past `start`.
+    delivered: bool,
+}
+
+impl Delivery {
+    const fn new(start: Option<PgCommitPosition>) -> Self {
+        Self {
+            order: PgOutputOrder::new(),
+            rows: Vec::new(),
+            releases: ReleaseQueue::new(),
+            start,
+            delivered: false,
+        }
+    }
+
+    /// Send the rows `change` carries past `start`, and continue with the
+    /// flush position a commit releases, if any. Breaks once the task must end.
+    async fn deliver(
+        &mut self,
+        change: pg_walstream::ChangeEvent,
+        event_tx: &tokio::sync::mpsc::Sender<Result<PgChangeEvent, PgStreamingError>>,
+        events_counter: &AtomicU64,
+    ) -> ControlFlow<(), Option<PgLsn>> {
+        let committed = match self.order.apply(change, &mut self.rows) {
+            Ok(committed) => committed,
+            Err(e) => {
+                let _ = event_tx.send(Err(e.into())).await;
+                return ControlFlow::Break(());
+            }
+        };
+        for ev in self.rows.drain(..) {
+            if self.start.is_some_and(|start| ev.position() <= start) {
+                continue;
+            }
+            self.delivered = true;
+            events_counter.fetch_add(1, Ordering::Relaxed);
+            if event_tx.send(Ok(ev)).await.is_err() {
+                return ControlFlow::Break(());
+            }
+        }
+        let Some(committed) = committed else {
+            return ControlFlow::Continue(None);
+        };
+        if core::mem::take(&mut self.delivered) {
+            self.releases.committed(committed);
+        }
+        // The consumer may have acknowledged the last row before its commit arrived.
+        ControlFlow::Continue(self.releases.release())
+    }
+
+    /// Record the consumer's acknowledgement, returning the flush position it
+    /// releases, if any.
+    fn acknowledge(&mut self, upto: PgCommitPosition) -> Option<PgLsn> {
+        self.releases.acknowledge(upto);
+        self.releases.release()
     }
 }
 
