@@ -389,9 +389,7 @@ mod coalesce;
 
 mod between_null_bound;
 
-mod pattern_operands;
-
-mod arithmetic_operands;
+mod operand_kinds;
 
 mod literal_text_comparison;
 
