@@ -60,3 +60,18 @@ where
         .register(SubscriptionRequest::new(1u64, predicate))
         .expect("registration succeeds, in process or as a read")
 }
+
+/// Whether `predicate` is answered in process. A registration that fails,
+/// as a statement the engine itself would refuse does, is not.
+pub fn served<B>(ddl: &str, predicate: &str) -> bool
+where
+    B: Backend + SqlLiteralParse,
+    B::Dialect: Dialect + Default + 'static,
+{
+    let db = ParserDB::parse::<B::Dialect>(ddl).expect("DDL parses");
+    let mut engine: SubscriptionEngine<TestEvent<B>, DefaultIds, ParserDB> =
+        SubscriptionEngine::new(db, <B::Dialect as Default>::default());
+    engine
+        .register(SubscriptionRequest::new(1u64, predicate))
+        .is_ok_and(|registered| registered.not_served_because.is_none())
+}
