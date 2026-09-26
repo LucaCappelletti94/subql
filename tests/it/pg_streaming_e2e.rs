@@ -559,10 +559,12 @@ fn resuming_from_a_position_delivers_exactly_the_items_after_it() {
     let publication = "subql_pg_streaming_resume_pub";
     common::create_publication(&mut setup, publication, "orders");
     common::create_pgoutput_slot(&mut setup, &slot);
-    let config = PgStreamingConfig::new(db.url(), &slot, publication);
+    let config = |start: Option<PgCommitPosition>| {
+        PgStreamingConfig::new(db.url(), &slot, publication).start(start)
+    };
 
     current_thread_rt().block_on(async move {
-        let mut source = connect_when_free(&config).await;
+        let mut source = connect_when_free(&config(None)).await;
         insert(&mut dml, &[1, 2, 3]);
         let rows = [
             next_row(&mut source).await.position(),
@@ -572,7 +574,7 @@ fn resuming_from_a_position_delivers_exactly_the_items_after_it() {
         let commit = next_commit(&mut source).await;
         drop(source);
 
-        let mut source = connect_when_free(&config.clone().start(Some(rows[0]))).await;
+        let mut source = connect_when_free(&config(Some(rows[0]))).await;
         let rest = [
             next_row(&mut source).await.position(),
             next_row(&mut source).await.position(),
@@ -591,7 +593,7 @@ fn resuming_from_a_position_delivers_exactly_the_items_after_it() {
         );
         drop(source);
 
-        let mut source = connect_when_free(&config.clone().start(Some(rows[2]))).await;
+        let mut source = connect_when_free(&config(Some(rows[2]))).await;
         assert_eq!(
             next_commit(&mut source).await,
             commit,
@@ -599,7 +601,7 @@ fn resuming_from_a_position_delivers_exactly_the_items_after_it() {
         );
         drop(source);
 
-        let mut source = connect_when_free(&config.start(Some(commit.position()))).await;
+        let mut source = connect_when_free(&config(Some(commit.position()))).await;
         assert_eq!(
             next_row(&mut source).await.position(),
             next,

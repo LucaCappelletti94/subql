@@ -208,7 +208,10 @@ proptest! {
                 .unwrap()
                 .and_then(SourceItem::into_event)
                 .expect("op should produce a drained event");
-            let _ = source.poll_next_item().unwrap(); // commit
+            prop_assert!(
+                matches!(source.poll_next_item().unwrap(), Some(SourceItem::Commit(_))),
+                "each op is one transaction, so its commit follows its row",
+            );
             let i = expected.len() - 1;
 
             match &exp {

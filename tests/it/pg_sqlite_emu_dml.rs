@@ -31,7 +31,10 @@ fn drain_one(source: &mut PgSqliteEmuSource) -> PgChangeEvent {
         .expect("poll succeeds")
         .and_then(SourceItem::into_event)
         .expect("expected an event on the queue");
-    let _ = source.poll_next_item(); // commit
+    assert!(
+        matches!(source.poll_next_item(), Ok(Some(SourceItem::Commit(_)))),
+        "the row's commit follows it"
+    );
     ev
 }
 
@@ -361,7 +364,10 @@ fn a_quoted_column_survives_the_update_fallback() {
         .and_then(SourceItem::into_event)
         .expect("an insert event");
     assert_eq!(insert.kind(), EventKind::Insert);
-    let _ = source.poll_next_item(); // INSERT commit
+    assert!(matches!(
+        source.poll_next_item(),
+        Ok(Some(SourceItem::Commit(_)))
+    ));
 
     // Touch only `note`, so the quoted column arrives as `(None, None)` and the
     // emulator has to go and read it.
@@ -406,7 +412,10 @@ fn the_update_fallback_preserves_storage_classes() {
         .and_then(SourceItem::into_event)
         .expect("an insert event");
     assert_eq!(insert.kind(), EventKind::Insert);
-    let _ = source.poll_next_item(); // INSERT commit
+    assert!(matches!(
+        source.poll_next_item(),
+        Ok(Some(SourceItem::Commit(_)))
+    ));
 
     source
         .execute_sql("UPDATE blobs SET note = 'changed' WHERE id = 1")
