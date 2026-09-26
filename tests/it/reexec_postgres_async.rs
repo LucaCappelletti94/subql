@@ -72,14 +72,34 @@ const IDLE_IN_TXN: &str =
      AND state = 'idle in transaction' AND xact_start IS NOT NULL";
 
 /// Poll a future exactly once with a waker that does nothing.
-///
-/// Deterministic suspension: a network round trip cannot complete in one poll,
-/// and unlike a timer this does not depend on the runtime's timer granularity
-/// being coarser than a local database round trip, which it is not.
 fn poll_once<F: core::future::Future>(fut: &mut core::pin::Pin<Box<F>>) -> bool {
     let waker = std::task::Waker::noop();
     let mut cx = core::task::Context::from_waker(waker);
     fut.as_mut().poll(&mut cx).is_pending()
+}
+
+/// A cursor over `orders` whose first `FETCH` waits until [`Gate::open`].
+const GATED_ORDERS: &str =
+    "SELECT id, price, pg_advisory_xact_lock_shared(1)::text AS gate FROM orders ORDER BY id";
+
+/// Holds the advisory lock a [`GATED_ORDERS`] fetch waits on, so a read stays in
+/// flight until the test lets it finish, however fast the round trip is.
+struct Gate(PgConnection);
+
+impl Gate {
+    fn closed(mut conn: PgConnection) -> Self {
+        // A void-returning function, which the query DSL cannot load.
+        sql_query("SELECT pg_advisory_lock(1)")
+            .execute(&mut conn)
+            .expect("close the gate");
+        Self(conn)
+    }
+
+    fn open(mut self) {
+        sql_query("SELECT pg_advisory_unlock(1)")
+            .execute(&mut self.0)
+            .expect("open the gate");
+    }
 }
 
 const SLOT: &str = "subql_test_async";
@@ -408,6 +428,7 @@ fn a_busy_cursor_and_a_broken_one_report_differently() {
     let mut setup = db.connect();
     common::pg::setup_orders(&mut setup, &[(1, 10.0), (2, 20.0), (3, 30.0)], &slot);
     let mut observer = db.connect();
+    let gate = Gate::closed(db.connect());
 
     common::multi_thread_rt().block_on(async move {
         let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(&url);
@@ -420,21 +441,18 @@ fn a_busy_cursor_and_a_broken_one_report_differently() {
 
         let cursor = connector
             .open_cursor(
-                &subql::reexec::ReadQuery::without_binds(
-                    "SELECT id, price FROM orders ORDER BY id",
-                ),
+                &subql::reexec::ReadQuery::without_binds(GATED_ORDERS),
                 &(),
             )
             .await
             .expect("open cursor");
 
-        // Deterministic contention rather than a race between two tasks: one
-        // poll leaves the first read in flight holding the cursor, and the
-        // second call then has to say what it finds.
+        // The gate holds the first read on the server, so the second call
+        // meets a cursor that is genuinely in use.
         let mut holding = Box::pin(connector.fetch_cursor(cursor, 1));
         assert!(
             poll_once(&mut holding),
-            "one poll must leave the first read in flight, else nothing contends"
+            "the gated read must still be in flight, else nothing contends"
         );
         let contended = connector.fetch_cursor(cursor, 1).await;
         assert!(
@@ -442,6 +460,7 @@ fn a_busy_cursor_and_a_broken_one_report_differently() {
             "a second reader must be told the cursor is busy, not that it is \
              unknown, got {contended:?}"
         );
+        gate.open();
         holding.await.expect("the first read finishes");
 
         // Drain the buffered rows first. A fetch served from the leftover
@@ -506,6 +525,7 @@ fn closing_a_cursor_during_a_read_does_not_orphan_it() {
     let mut setup = db.connect();
     common::pg::setup_orders(&mut setup, &[(1, 10.0), (2, 20.0), (3, 30.0)], &slot);
     let mut observer = db.connect();
+    let gate = Gate::closed(db.connect());
 
     common::multi_thread_rt().block_on(async move {
         let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(&url);
@@ -517,22 +537,16 @@ fn closing_a_cursor_during_a_read_does_not_orphan_it() {
         let connector = PgAsyncDieselConnector::new(pool);
 
         let cursor = connector
-            .open_cursor(
-                &subql::reexec::ReadQuery::without_binds(
-                    "SELECT id, price FROM orders ORDER BY id",
-                ),
-                &(),
-            )
+            .open_cursor(&subql::reexec::ReadQuery::without_binds(GATED_ORDERS), &())
             .await
             .expect("open cursor");
 
-        // Deterministically suspend a read mid-flight: one poll cannot finish a
-        // network round trip, and a zero deadline returns without dropping the
-        // future, so the cursor is genuinely in use when the close arrives.
+        // The gate holds the read on the server, so the cursor is genuinely in
+        // use when the close arrives.
         let mut reading = Box::pin(connector.fetch_cursor(cursor, 1));
         assert!(
             poll_once(&mut reading),
-            "one poll must leave the read in flight, else nothing is being raced"
+            "the gated read must still be in flight, else nothing is being raced"
         );
 
         connector
@@ -541,6 +555,7 @@ fn closing_a_cursor_during_a_read_does_not_orphan_it() {
             .expect("closing a cursor being read is not an error");
 
         // Let the read finish. It must not resurrect the closed cursor.
+        gate.open();
         let _ = reading.await;
         tokio::time::sleep(core::time::Duration::from_millis(500)).await;
         assert_eq!(
@@ -572,6 +587,7 @@ fn a_cancelled_read_does_not_poison_its_cursor_id() {
     let slot = db.slot(SLOT);
     let mut setup = db.connect();
     common::pg::setup_orders(&mut setup, &[(1, 10.0), (2, 20.0), (3, 30.0)], &slot);
+    let gate = Gate::closed(db.connect());
 
     common::multi_thread_rt().block_on(async move {
         let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(&url);
@@ -583,23 +599,17 @@ fn a_cancelled_read_does_not_poison_its_cursor_id() {
         let connector = PgAsyncDieselConnector::new(pool);
 
         let cursor = connector
-            .open_cursor(
-                &subql::reexec::ReadQuery::without_binds(
-                    "SELECT id, price FROM orders ORDER BY id",
-                ),
-                &(),
-            )
+            .open_cursor(&subql::reexec::ReadQuery::without_binds(GATED_ORDERS), &())
             .await
             .expect("open cursor");
 
-        // Cancel deterministically: poll once, which cannot complete a network
-        // round trip, then drop the future. A timer race is not reliable here,
-        // because tokio's timer granularity is coarser than a local round trip.
+        // The gate holds the read on the server, so dropping it after one poll
+        // cancels a read that is genuinely in flight.
         {
             let mut reading = Box::pin(connector.fetch_cursor(cursor, 1));
             assert!(
                 poll_once(&mut reading),
-                "one poll must leave the read in flight, else nothing is cancelled"
+                "the gated read must still be in flight, else nothing is cancelled"
             );
         }
 
@@ -614,6 +624,7 @@ fn a_cancelled_read_does_not_poison_its_cursor_id() {
             .close_cursor(cursor)
             .await
             .expect("closing a cancelled cursor is idempotent");
+        gate.open();
     });
 }
 
