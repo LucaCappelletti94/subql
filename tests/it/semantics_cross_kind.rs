@@ -220,6 +220,42 @@ fn non_numeric_cross_kind_is_not_served_in_process() {
     );
 }
 
+/// The same holds when a side is arithmetic over a column rather than the
+/// column itself. SQLite gives `1 * price` no affinity and `label` TEXT, so it
+/// compares `(1 * price) >= label` as text, which no numeric answer reproduces.
+#[test]
+fn an_expression_against_a_column_of_another_kind_is_not_served() {
+    const SQLITE_WITH_LABEL: &str =
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, qty INTEGER, price REAL, label TEXT)";
+    for predicate in [
+        "(1 * price) >= label",
+        "label < (qty + 1)",
+        "(- qty) = label",
+    ] {
+        let sql = format!("SELECT * FROM t WHERE {predicate}");
+        assert!(
+            crate::common::semantics::register::<Postgres>(PG_DDL, &sql)
+                .served()
+                .is_none(),
+            "PostgreSQL does not serve {predicate}"
+        );
+        assert!(
+            crate::common::semantics::register::<SQLite>(SQLITE_WITH_LABEL, &sql)
+                .served()
+                .is_none(),
+            "SQLite does not serve {predicate}"
+        );
+    }
+    let widened = crate::common::semantics::register::<Postgres>(
+        PG_DDL,
+        "SELECT * FROM t WHERE (qty + 1) > price",
+    );
+    assert!(
+        widened.served().is_some(),
+        "a numeric pair with a widening stays served"
+    );
+}
+
 /// The control: a same-kind comparison is untouched by any of this.
 #[test]
 fn same_kind_comparison_still_folds_in_process() {

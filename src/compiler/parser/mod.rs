@@ -149,16 +149,26 @@ impl<B: Backend> Compiling<B> {
 
         let mut text_column = None;
         let mut columns = alloc::vec::Vec::with_capacity(2);
+        let mut kinds = alloc::vec::Vec::with_capacity(2);
         for side in [left, right] {
             let Some(column) = crate::compiler::literals::resolve_column_ref::<B, DB>(
                 crate::compiler::literals::value_column(side),
                 table_id,
                 database,
             ) else {
+                // Arithmetic over a column carries that column's kind.
+                if let Some(kind) = compilation_helpers::nested_column_scalar_of::<B, DB>(
+                    side, table_id, database, 0,
+                )
+                .and_then(|kind| kind.family())
+                {
+                    kinds.push(kind);
+                }
                 continue;
             };
             let kind = crate::catalog_helpers::column_scalar_family(database, table_id, column);
             columns.push((column, kind));
+            kinds.extend(kind);
             match kind {
                 Some(crate::backend::ScalarFamily::Jsonb)
                     if operation == TextOperation::Ordering =>
@@ -189,6 +199,16 @@ impl<B: Backend> Compiling<B> {
                         right_kind,
                     },
                 ));
+            }
+        }
+
+        // The same rule when a side is arithmetic over a column. SQLite gives
+        // such a side no affinity, so against a text column it compares text.
+        if let [left_kind, right_kind] = kinds[..] {
+            if left_kind != right_kind && B::numeric_widening(left_kind, right_kind).is_none() {
+                return Err(RegisterError::UnsupportedSql(format!(
+                    "a {left_kind:?} side is not compared with a {right_kind:?} side in process"
+                )));
             }
         }
 

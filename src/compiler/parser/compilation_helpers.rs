@@ -42,7 +42,7 @@ fn column_scalar_of<B: Backend, DB: DatabaseLike>(
 /// Stops at [`sql_shape::MAX_EXPR_DEPTH`], the ceiling compilation itself
 /// refuses past, so a flat operator chain cannot walk the stack down here
 /// before the compiler reports it.
-fn nested_column_scalar_of<B: Backend, DB: DatabaseLike>(
+pub(super) fn nested_column_scalar_of<B: Backend, DB: DatabaseLike>(
     expr: &Expr,
     table_id: TableId,
     database: &DB,
