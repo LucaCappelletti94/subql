@@ -410,6 +410,9 @@ mod sync_cursors;
 #[cfg(all(feature = "diesel-typed-sqlite", feature = "executor-diesel"))]
 mod keyed_reads_key_change;
 
+#[cfg(all(feature = "diesel-typed-sqlite", feature = "executor-diesel"))]
+mod auto_engine_durability;
+
 mod column_subset;
 
 mod semantics_float_width;
