@@ -128,6 +128,22 @@ fn sqlite_overflow_promotes_to_float() {
     );
 }
 
+/// The promoted real keeps computing as SQLite computes it: a real beside an
+/// integer is a real, so `qty * qty + qty` over the largest integer is about
+/// `8.5e37`, and above `qty`.
+#[test]
+fn sqlite_arithmetic_continues_on_the_promoted_real() {
+    let notifications = dispatch!(
+        SQLite,
+        SQLiteDialect,
+        SQLITE_DDL,
+        "SELECT * FROM t WHERE ((qty * qty) + qty) >= qty",
+        i64::MAX
+    );
+    assert!(notifications.evaluation_failures().is_empty());
+    assert_eq!(notifications.inserted(), &[1], "8.5e37 is above qty");
+}
+
 /// A failure is per subscription: another subscription reading the same
 /// event still gets its answer.
 #[test]
