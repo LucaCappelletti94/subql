@@ -137,6 +137,16 @@ fn snapshot_reads_value_and_binlog_pos_from_mysql() {
         pos.pos > 0,
         "SHOW MASTER STATUS byte offset should be non-zero on a live server, got {pos:?}"
     );
+
+    let now = engine
+        .connector()
+        .read_fence(&())
+        .expect("fence read")
+        .expect("MysqlDieselConnector reports a binlog fence");
+    assert!(
+        now >= pos,
+        "the current coordinate is at or past the read's"
+    );
 }
 
 #[test]

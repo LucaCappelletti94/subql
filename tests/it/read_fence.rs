@@ -1072,3 +1072,178 @@ fn the_auto_resolving_engine_serves_a_fence_read_through_its_connector() {
     assert_eq!(engine.connector().calls(), 0, "no query ran");
     assert_eq!(engine.pending_read_count(), 0);
 }
+
+const GROUPED_MIN: &str =
+    "SELECT region, MIN(amount) FROM orders WHERE status = 'paid' GROUP BY region";
+
+/// A grouped extreme seeded with north holding `rows` rows, the smallest
+/// worth `min`, under `cap`.
+fn grouped_engine(cap: usize, min: i64, rows: i64) -> (Engine, TableId, u64, Vec<u8>) {
+    let catalog = ParserDB::parse::<PostgreSqlDialect>(DDL).unwrap();
+    let orders = catalog_helpers::table_id::<Postgres, _>(&catalog, "orders").unwrap();
+    let mut engine: Engine = SubscriptionEngine::new(catalog, PostgreSqlDialect {})
+        .with_max_changes_during_aggregate_read(cap);
+    let sub = register(&mut engine, GROUPED_MIN);
+    let opening = Install::install(
+        &mut engine,
+        sub,
+        GroupedScalarSeedInstall {
+            rows: vec![vec![
+                Value::String("north".into()),
+                Value::Int(min),
+                Value::Int(rows),
+            ]],
+            fence: Some(early_fence()),
+        },
+    )
+    .unwrap();
+    let north = opening.updates[0].group.clone().unwrap().key;
+    (engine, orders, sub, north)
+}
+
+#[test]
+fn a_filling_group_log_asks_for_a_fence_read_which_trims_it_and_the_truncates() {
+    let (mut engine, orders, sub, _) = grouped_engine(4, 1, 1);
+    let first = engine
+        .dispatch(&insert(orders, 30, "north", 9, at(2100, 750)))
+        .unwrap();
+    assert_eq!(fence_reads(&first), 0);
+    let second = engine
+        .dispatch(&insert(orders, 31, "north", 9, at(2200, 751)))
+        .unwrap();
+    assert_eq!(fence_reads(&second), 1, "half the cap asks for a fence");
+    for (lsn, xid) in [(2300, 752), (2400, 753)] {
+        engine
+            .dispatch(&Event::truncate(orders).with_checkpoint(at(lsn, xid)))
+            .unwrap();
+    }
+
+    Install::install(
+        &mut engine,
+        sub,
+        FenceInstall {
+            fence: Some(PgSnapshotFence::parse("760:760:", PgLsn(3000)).unwrap()),
+        },
+    )
+    .unwrap();
+    let after = engine
+        .dispatch(&insert(orders, 33, "north", 9, at(3100, 770)))
+        .unwrap();
+    assert_eq!(fence_reads(&after), 0, "the fence emptied both logs");
+}
+
+#[test]
+fn a_scoped_group_read_after_its_log_overflowed_asks_again() {
+    let (mut engine, orders, sub, north) = grouped_engine(2, 5, 2);
+    for (id, lsn, xid) in [(30, 2100, 750), (31, 2200, 751), (32, 2300, 752)] {
+        engine
+            .dispatch(&insert(orders, id, "north", 9, at(lsn, xid)))
+            .unwrap();
+    }
+    engine.dispatch(&sparse_delete_at(orders, 2400)).unwrap();
+
+    let installed = Install::install(
+        &mut engine,
+        sub,
+        GroupedScalarInstall {
+            group: north.clone(),
+            row: vec![Value::Int(5), Value::Int(4)],
+            checkpoint: Some(at(2400, 754)),
+            fence: Some(PgSnapshotFence::parse("760:760:", PgLsn(3000)).unwrap()),
+        },
+    )
+    .unwrap();
+    assert!(matches!(
+        &installed.triggers[..],
+        [trigger] if matches!(&trigger.read, ReExecutionRead::GroupedScalar { group, .. } if *group == north)
+    ));
+}
+
+/// A kept truncate lands between the kept changes around it, so a row the
+/// read missed that came after the truncate survives the replay.
+#[test]
+fn a_scoped_group_read_replays_kept_truncates_in_stream_order() {
+    let (mut engine, orders, sub, north) = grouped_engine(4096, 5, 2);
+    engine.dispatch(&sparse_delete_at(orders, 1100)).unwrap();
+    engine
+        .dispatch(&insert(orders, 20, "north", 3, at(1200, 742)))
+        .unwrap();
+    engine
+        .dispatch(&Event::truncate(orders).with_checkpoint(at(2100, 750)))
+        .unwrap();
+    engine
+        .dispatch(&insert(orders, 21, "north", 8, at(2200, 751)))
+        .unwrap();
+
+    // The read saw neither 742's row, nor the truncate, nor the row after it.
+    let installed = Install::install(
+        &mut engine,
+        sub,
+        GroupedScalarInstall {
+            group: north,
+            row: vec![Value::Int(5), Value::Int(1)],
+            checkpoint: Some(at(1100, 720)),
+            fence: Some(read_fence()),
+        },
+    )
+    .unwrap();
+    assert!(
+        installed.updates.is_empty() && installed.triggers.is_empty(),
+        "north holds the 8 inserted after the truncate, got {:?}",
+        installed.updates
+    );
+}
+
+fn sparse_delete_at(orders: TableId, lsn: u64) -> Event {
+    Event::delete(
+        orders,
+        vec![
+            Value::Int(21),
+            Value::String("north".into()),
+            Value::Int(9),
+            Value::Missing,
+        ],
+    )
+    .with_pk_columns([0u16])
+    .with_checkpoint(at(lsn, if lsn < 2000 { 720 } else { 754 }))
+}
+
+#[test]
+fn the_async_engine_serves_a_fence_read_through_its_connector() {
+    let catalog = ParserDB::parse::<PostgreSqlDialect>(DDL).unwrap();
+    let orders = catalog_helpers::table_id::<Postgres, _>(&catalog, "orders").unwrap();
+    let mut engine = AutoResolvingEngine::new(
+        SubscriptionEngine::<Event, DefaultIds, ParserDB>::new(catalog, PostgreSqlDialect {})
+            .with_max_changes_during_aggregate_read(2),
+        AsyncMode::new(FencedReads::new(Vec::new())),
+    );
+    let sub = engine
+        .register(SubscriptionRequest::new(7u64, MIN_PAID), ())
+        .unwrap()
+        .subscription_id;
+    Install::install(
+        &mut engine,
+        sub,
+        ScalarInstall {
+            value: Value::Int(4),
+            checkpoint: None,
+            fence: Some(early_fence()),
+        },
+    )
+    .unwrap();
+    drop(
+        engine
+            .apply(&insert(orders, 30, "north", 9, at(2100, 750)))
+            .unwrap(),
+    );
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(engine.resolve_collect())
+        .unwrap();
+
+    assert_eq!(engine.connector().fence_reads(), 1);
+    assert_eq!(engine.connector().calls(), 0, "no query ran");
+    assert_eq!(engine.pending_read_count(), 0);
+}

@@ -93,6 +93,17 @@ fn snapshot_reads_value_and_binlog_pos_from_mysql_async() {
             pos.pos > 0,
             "log_status byte offset should be non-zero on a live server, got {pos:?}"
         );
+
+        let now = engine
+            .connector()
+            .read_fence(&())
+            .await
+            .expect("fence read")
+            .expect("MysqlAsyncDieselConnector reports a binlog fence");
+        assert!(
+            now >= pos,
+            "the current coordinate is at or past the read's"
+        );
     });
 }
 

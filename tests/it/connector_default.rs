@@ -86,3 +86,8 @@ fn execute_scalar_still_works_without_overriding_the_row_method() {
     assert_eq!(value, Value::Int(0));
     assert!(checkpoint.is_none());
 }
+
+#[test]
+fn default_read_fence_reports_none() {
+    assert!(matches!(MinimalConnector.read_fence(&()), Ok(None)));
+}
