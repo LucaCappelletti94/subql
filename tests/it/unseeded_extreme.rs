@@ -71,7 +71,8 @@ fn an_insert_after_the_answer_arrives_is_decided_in_process() {
         subscription,
         subql::ScalarInstall {
             value: Value::Float(9.0),
-            checkpoint: None::<subql::NoCheckpoint>
+            checkpoint: None::<subql::NoCheckpoint>,
+            fence: None,
         }
     )
     .is_ok());
@@ -103,7 +104,8 @@ fn an_empty_answer_is_known_and_an_insert_wins_it() {
         subscription,
         subql::ScalarInstall {
             value: Value::Null,
-            checkpoint: None::<subql::NoCheckpoint>
+            checkpoint: None::<subql::NoCheckpoint>,
+            fence: None,
         }
     )
     .is_ok());

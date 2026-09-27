@@ -53,7 +53,13 @@ impl Connector for RecordingConnector {
         query: &ReadQuery<'_, Postgres>,
         _kind: ScalarFamily,
         _auth: &(),
-    ) -> Result<(Value<Postgres>, Option<NoCheckpoint>), Self::Error> {
+    ) -> Result<
+        (
+            Value<Postgres>,
+            Option<<NoCheckpoint as subql::Checkpoint>::Fence>,
+        ),
+        Self::Error,
+    > {
         self.record(query);
         Ok((Value::Null, None))
     }
@@ -71,7 +77,7 @@ impl Connector for RecordingConnector {
                 rows: Vec::new(),
                 more: false,
             },
-            checkpoint: None,
+            fence: None,
         })
     }
 
@@ -559,7 +565,7 @@ fn grouped_read_restores_registration_binds() {
                 Value::Float(5.0),
                 Value::Int(2),
             ]],
-            read_at: None::<subql::NoCheckpoint>,
+            fence: None,
         },
     )
     .expect("seed installs");
@@ -626,7 +632,7 @@ fn a_having_extreme_restores_with_its_condition() {
                 subql::backend::Value::Float(9.0),
                 subql::backend::Value::Int(1),
             ]],
-            read_at: None::<subql::NoCheckpoint>,
+            fence: None,
         },
     )
     .expect("restored plan accepts its seed");

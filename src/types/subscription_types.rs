@@ -1087,6 +1087,9 @@ pub struct ScalarInstall<B: Backend, C: Checkpoint = NoCheckpoint> {
     pub value: Value<B>,
     /// Position of the change that caused the read, when known.
     pub checkpoint: Option<C>,
+    /// What the read saw, so changes it already holds are not applied again
+    /// and changes it missed are.
+    pub fence: Option<C::Fence>,
 }
 
 /// One page in a complete row result.
@@ -1139,8 +1142,9 @@ pub struct AggregateSeedInstall<B: Backend, C: Checkpoint = NoCheckpoint> {
     /// An ungrouped aggregate supplies exactly one row. A grouped aggregate
     /// supplies one row per group.
     pub rows: Vec<Vec<Value<B>>>,
-    /// Stream position taken before the read snapshot opened.
-    pub read_at: Option<C>,
+    /// What the read saw, so changes it already holds are not applied again
+    /// and changes it missed are.
+    pub fence: Option<C::Fence>,
 }
 
 /// Starting rows for a grouped extreme.
@@ -1148,8 +1152,9 @@ pub struct AggregateSeedInstall<B: Backend, C: Checkpoint = NoCheckpoint> {
 pub struct GroupedScalarSeedInstall<B: Backend, C: Checkpoint = NoCheckpoint> {
     /// Group values, extreme and source-row count in bootstrap order.
     pub rows: Vec<Vec<Value<B>>>,
-    /// Stream position taken before the read snapshot opened.
-    pub read_at: Option<C>,
+    /// What the read saw, so changes it already holds are not applied again
+    /// and changes it missed are.
+    pub fence: Option<C::Fence>,
 }
 
 /// Result of re-reading one displaced extreme.
@@ -1161,6 +1166,9 @@ pub struct GroupedScalarInstall<B: Backend, C: Checkpoint = NoCheckpoint> {
     pub row: Vec<Value<B>>,
     /// Position of the change that caused the read.
     pub checkpoint: Option<C>,
+    /// What the read saw, so changes it already holds are not applied again
+    /// and changes it missed are.
+    pub fence: Option<C::Fence>,
 }
 
 /// A result struct does not match the registered tier or identity.

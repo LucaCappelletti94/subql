@@ -146,7 +146,8 @@ fn debounce_skips_within_window_and_fires_after() {
         qid,
         crate::ScalarInstall {
             value: Value::Float(7.0),
-            checkpoint: None::<crate::NoCheckpoint>
+            checkpoint: None::<crate::NoCheckpoint>,
+            fence: None,
         }
     )
     .is_ok());

@@ -92,7 +92,7 @@ pub use mysql_diesel_connector::MysqlDieselConnector;
 #[cfg(feature = "executor-diesel-postgres")]
 pub use pg_diesel_connector::PgDieselConnector;
 #[cfg(feature = "executor-diesel-async-postgres")]
-pub use pg_diesel_connector::PgLsnRow;
+pub use pg_diesel_connector::PgSnapshotFenceRow;
 #[cfg(feature = "executor-diesel-postgres-r2d2")]
 pub use pg_r2d2_diesel_connector::{PgR2D2DieselConnector, PgR2D2Error};
 
@@ -243,22 +243,22 @@ impl<B: Backend> PartialEq for ReadQuery<'_, B> {
     }
 }
 
-/// A captured-state snapshot of a query's value, together with the
-/// [`Checkpoint`] at which it was read.
+/// A captured-state snapshot of a query's value, together with the fence of
+/// the read that took it.
 ///
 /// Returned by the row-returning reads and by
 /// [`AutoResolvingEngine::snapshot`](super::AutoResolvingEngine::snapshot)
-/// so downstream replay layers (oplogs, client cursors) can anchor a
-/// snapshot to a position in the source stream. The `checkpoint` is
-/// `None` when the backend has no native notion of position (e.g.
-/// in-memory SQLite).
+/// so downstream replay layers (oplogs, client cursors) can judge which
+/// stream changes the snapshot's rows already hold. The `fence` is `None`
+/// when the backend has no notion of a read fence (e.g. in-memory SQLite).
 #[derive(Clone, Debug, PartialEq)]
 #[allow(clippy::derive_partial_eq_without_eq)]
 pub struct Snapshot<T, C: Checkpoint> {
     /// The snapshot value (a scalar [`Value`], or a [`RowPage`]).
     pub value: T,
-    /// The position at which the snapshot was read, when known.
-    pub checkpoint: Option<C>,
+    /// What the read saw, so changes it already holds are not applied again
+    /// and changes it missed are.
+    pub fence: Option<C::Fence>,
 }
 
 /// One bounded page of a row-returning read.
@@ -368,17 +368,18 @@ pub trait Connector {
     ///
     /// [`execute_scalar`]: Self::execute_scalar
     type Error;
-    /// Position token the connector tags reads with.
+    /// The change-stream domain the read's fence lives in.
     ///
-    /// An implementation MUST take the position before the read's snapshot
-    /// opens, never after: behind the snapshot re-delivers changes the
-    /// snapshot already holds, which keyed application absorbs, while ahead
-    /// of it silently drops a transaction the snapshot never saw. PG-aware
-    /// connectors read `pg_current_wal_lsn()`, which is not snapshot-bound,
-    /// before opening the read's transaction and report
-    /// [`crate::PgCommitPosition::before_commit`] of it.
-    /// Backends with no native position (in-memory SQLite, MySQL absent of
-    /// binlog tracking) choose [`crate::NoCheckpoint`] and return `None`.
+    /// Every read reports the fence of the snapshot that served it, so a
+    /// caller can judge each stream change against those rows with
+    /// [`Checkpoint::seen_by`]. The rule is to report what the snapshot saw,
+    /// not a position taken beside it. Postgres-aware connectors read the
+    /// transaction's own snapshot and report a [`crate::PgSnapshotFence`].
+    /// MySQL connectors report the binlog position read just before the
+    /// read's transaction opens, a positional fence whose window the
+    /// checkpoint's own docs state. Backends with no notion of a read fence
+    /// (in-memory SQLite) choose [`crate::NoCheckpoint`], whose fence type
+    /// has no values, and report `None`.
     type Checkpoint: Checkpoint;
     /// Subql backend whose [`Value`] shape this connector produces.
     type Backend: Backend;
@@ -392,9 +393,9 @@ pub trait Connector {
     /// `QueryableByName` row, sqlx `Row::try_get` slot, etc., or ignore it
     /// and inspect the runtime row shape.
     ///
-    /// The returned tuple is `(value, Option<checkpoint>)`. The checkpoint
-    /// is informational for downstream replay layers. Subql does not gate
-    /// on it. Which side of the snapshot the position is taken on is
+    /// The returned tuple is `(value, Option<fence>)`. The fence is what the
+    /// read's snapshot saw, which an install judges later changes against.
+    /// Which fence a backend reports is
     /// [`Checkpoint`](Self::Checkpoint)'s rule. An empty result set must
     /// return [`Value::Null`] as the value (matches the "set went empty"
     /// semantics of MIN/MAX).
@@ -403,7 +404,13 @@ pub trait Connector {
         query: &ReadQuery<'_, Self::Backend>,
         kind: ScalarFamily,
         auth: &Self::AuthContext,
-    ) -> Result<(Value<Self::Backend>, Option<Self::Checkpoint>), Self::Error>;
+    ) -> Result<
+        (
+            Value<Self::Backend>,
+            Option<<Self::Checkpoint as Checkpoint>::Fence>,
+        ),
+        Self::Error,
+    >;
 
     /// Read one page of `sql`, stopping once the decoded rows reach
     /// `max_bytes`.
@@ -415,10 +422,7 @@ pub trait Connector {
     /// is what keeps a large result from pinning a connection: the price is
     /// that successive pages see successive states, which the caller
     /// reconciles against the change stream using
-    /// [`Snapshot::checkpoint`].
-    ///
-    /// Which side of the snapshot the position is taken on is
-    /// [`Checkpoint`](Self::Checkpoint)'s rule.
+    /// [`Snapshot::fence`].
     ///
     /// Stop at the first row that would take the page past `max_bytes`, and
     /// report [`RowPage::more`] as whether the result had further rows. A page
@@ -441,8 +445,8 @@ pub trait Connector {
     /// connection until [`close_cursor`](Self::close_cursor), which is why it
     /// is not the path a keyed result takes.
     ///
-    /// The snapshot opens when the cursor is declared, so
-    /// [`Checkpoint`](Self::Checkpoint)'s rule puts the position before that.
+    /// The snapshot opens when the cursor is declared, so the fence every
+    /// page reports is the one that declaration's transaction saw.
     ///
     /// The default refuses: a connector over a source with no cursors is
     /// honest to say so, and the refusal names what the caller loses.
@@ -458,7 +462,7 @@ pub trait Connector {
     /// Read the next page from an open cursor, under the same budget rule as
     /// [`read_page`](Self::read_page).
     ///
-    /// Every page carries the same [`Snapshot::checkpoint`], because every
+    /// Every page carries the same [`Snapshot::fence`], because every
     /// page is the same snapshot.
     ///
     /// A cursor is serial, so an implementation MUST report a concurrent read
@@ -499,8 +503,8 @@ pub trait Connector {
     /// the empty-aggregate row over an empty table). Run the components in
     /// the same read-only repeatable-read transaction
     /// [`execute_scalar`](Self::execute_scalar) uses so they share one
-    /// snapshot. The single returned checkpoint is the transaction's, taken on
-    /// the side [`Checkpoint`](Self::Checkpoint) requires.
+    /// snapshot. The single returned fence is the transaction's, what that
+    /// snapshot saw.
     ///
     /// The default rejects the seed with [`ScalarRowError::Unsupported`] so
     /// existing external impls keep compiling. The shipped diesel connectors
@@ -513,7 +517,7 @@ pub trait Connector {
     ) -> Result<
         (
             alloc::vec::Vec<Value<Self::Backend>>,
-            Option<Self::Checkpoint>,
+            Option<<Self::Checkpoint as Checkpoint>::Fence>,
         ),
         ScalarRowError<Self::Error>,
     > {
@@ -548,8 +552,8 @@ impl SessionSetup for () {
     }
 }
 
-/// The statement that puts an open transaction on the snapshot every
-/// LSN-anchored Postgres read takes.
+/// The statement that puts an open transaction on the repeatable-read
+/// snapshot every Postgres read takes, the one its fence then reports.
 ///
 /// `SET TRANSACTION` is DDL-like, so there is no typed DSL spelling of it.
 #[cfg(any(

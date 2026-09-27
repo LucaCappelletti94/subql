@@ -76,7 +76,7 @@ fn install_seed(
         subscription,
         subql::AggregateSeedInstall {
             rows: vec![row],
-            read_at: None,
+            fence: None,
         },
     )?;
     assert_eq!(updates.len(), 1);

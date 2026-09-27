@@ -62,7 +62,7 @@ Placeholder SQL plus typed binds is the engine's own contract, and `register_sel
 
 Alongside row-match subscriptions, register an aggregate instead of a `SELECT *`. Diesel spells `COUNT(*)`, `COUNT(col)`, `SUM(col)` and `AVG(col)` as `.count()`, `diesel::dsl::count(col)`, `sum(col)` and `avg(col)`. The variance/stddev family (`VAR_POP`/`VAR_SAMP`/`STDDEV_POP`/`STDDEV_SAMP`) has no diesel built-in and arrives as SQL text through `register`. The engine keeps the running value and reports it whenever it moves, so the caller stores nothing and folds nothing.
 
-A registration answers with an `aggregate_bootstrap`, a runnable query for the starting numbers. Run it, then pass an `AggregateSeedInstall` to `Install::install` with the decoded row and stream position the read was taken at. Take that position **before** the read's snapshot opens: it is what lets the engine drop the changes the read already saw rather than counting them twice. Until the numbers land the subscription reports nothing, and a read the engine cannot line up against what it folded is refused with a `AggregateInstallError` so the caller can `reset_aggregate` and read again.
+A registration answers with an `aggregate_bootstrap`, a runnable query for the starting numbers. Run it, then pass an `AggregateSeedInstall` to `Install::install` with the decoded row and the fence the read reports, which the shipped Postgres connectors take from the read's own snapshot. The fence is what lets the engine drop every change the read already saw, including one the stream delivers after the install, rather than counting it twice. Until the numbers land the subscription reports nothing, and a read the engine cannot line up against what it folded is refused with a `AggregateInstallError` so the caller can `reset_aggregate` and read again.
 
 Aggregate subscribers never appear in `consumers()` output, and vice versa. `UPDATE` deltas need both old and new row images, so a source that omits old images (`before` / `old`) gets an error for update events. A `TRUNCATE` needs nothing from the caller: the table is empty afterwards, so the engine empties the value itself and reports it.
 
@@ -109,7 +109,7 @@ let totalled = engine
     .expect("the sum registers");
 
 // Starting numbers over an empty table. Nothing has been folded yet, so this
-// read cannot have raced a change and needs no stream position.
+// read cannot have raced a change and needs no fence.
 subql::Install::install(
     &mut engine,
     counted.subscription_id,
@@ -117,7 +117,7 @@ subql::Install::install(
         // An empty table: a NULL total over no contributing rows, and a
         // contributor count of zero.
         rows: vec![vec![Value::Null, Value::Int(0)]],
-        read_at: None,
+        fence: None,
     },
 )
 .expect("the count's numbers land");
@@ -126,7 +126,7 @@ subql::Install::install(
     totalled.subscription_id,
     subql::AggregateSeedInstall {
         rows: vec![vec![Value::Int(0)]],
-        read_at: None,
+        fence: None,
     },
 )
 .expect("the sum's numbers land");

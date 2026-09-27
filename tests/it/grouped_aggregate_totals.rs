@@ -68,9 +68,9 @@ fn seed(
     engine: &mut Engine,
     subscription: u64,
     rows: Vec<Vec<Value<Postgres>>>,
-    read_at: Option<PgLsn>,
+    fence: Option<PgLsn>,
 ) -> Vec<subql::AggregateValueUpdate<DefaultIds>> {
-    Install::install(engine, subscription, AggregateSeedInstall { rows, read_at })
+    Install::install(engine, subscription, AggregateSeedInstall { rows, fence })
         .expect("all grouped seed rows install together")
         .updates
 }

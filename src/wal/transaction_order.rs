@@ -38,9 +38,9 @@ pub enum TransactionOrderError {
 
 /// The open transaction, if any, and how many row events it has placed.
 ///
-/// `K` is what the begin says about the commit: a [`PgLsn`] for pgoutput, and
-/// an optional one for wal2json, whose begin names it only under
-/// `include-lsn`.
+/// `K` is what the begin says about the commit. pgoutput keys on
+/// `([`PgLsn`], [`PgXid`](crate::PgXid))`, and wal2json on an optional one, since its begin
+/// names both only under `include-lsn` and `include-xids`.
 pub struct TransactionOrder<K> {
     open: Option<(K, u64)>,
 }

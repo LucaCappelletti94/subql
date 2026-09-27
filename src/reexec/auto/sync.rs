@@ -1,10 +1,10 @@
 //! The synchronous half of [`AutoResolvingEngine`], for `M = SyncMode<X>`.
 
 use super::{
-    absorb_keyed_page, decode_grouped_seed_rows, deltas_from, one_grouped_row,
-    reconcile_checkpoint, AutoResolvingEngine, CdcEvent, Connector, DatabaseLike, IdTypes,
-    InProcessKind, KeyBatches, KeyedPage, ReExecError, RowDelta, RowsUpdate, SeenKeys,
-    SnapshotResult, SqlLiteralParse, String, SubscriptionId, SyncMode, Value, Vec,
+    absorb_keyed_page, decode_grouped_seed_rows, deltas_from, one_grouped_row, reconcile_fence,
+    AutoResolvingEngine, CdcEvent, Connector, DatabaseLike, IdTypes, InProcessKind, KeyBatches,
+    KeyedPage, ReExecError, RowDelta, RowsUpdate, SeenKeys, SnapshotResult, SqlLiteralParse,
+    String, SubscriptionId, SyncMode, Value, Vec,
 };
 
 /// Closes a cursor if the read using it is abandoned by an unwinding panic.
@@ -57,8 +57,11 @@ where
     /// and stayed there.
     ///
     /// A scalar's value is also installed via [`Install::install`](crate::Install::install), so the
-    /// engine is fully primed once this returns. Neither row tier installs
-    /// anything, because neither holds an answer: the rows go to the caller.
+    /// engine is fully primed once this returns, with the changes the read
+    /// missed applied on top. When one of them removed the read's answer the
+    /// value is unknown, another read is queued for the next `resolve`, and
+    /// this returns `Ok(None)`. Neither row tier installs anything, because
+    /// neither holds an answer: the rows go to the caller.
     ///
     /// # Errors
     ///
@@ -80,14 +83,14 @@ where
         }
         let grouped_bootstrap = context.grouped_bootstrap.clone();
         if let Some(bootstrap) = grouped_bootstrap {
-            let (_, mut rows, checkpoint) = self.read_whole(&context.query, subscription_id)?;
+            let (_, mut rows, fence) = self.read_whole(&context.query, subscription_id)?;
             decode_grouped_seed_rows::<E::Backend>(&mut rows, &bootstrap.kinds);
             let mut installed = crate::Install::install(
                 &mut self.inner,
                 subscription_id,
                 crate::GroupedScalarSeedInstall {
                     rows,
-                    read_at: reconcile_checkpoint(checkpoint.as_ref()),
+                    fence: reconcile_fence::<X::Checkpoint, E::Checkpoint>(fence.as_ref()),
                 },
             )?;
             let mut pending = core::mem::take(&mut installed.triggers);
@@ -112,28 +115,27 @@ where
                             .expect("a transitioned read keeps its connector context")
                             .query
                             .clone();
-                        let (columns, rows, checkpoint) =
-                            self.read_whole(&query, subscription_id)?;
+                        let (columns, rows, fence) = self.read_whole(&query, subscription_id)?;
                         return Ok(Some(SnapshotResult::Rows {
                             columns,
                             rows,
-                            checkpoint,
+                            fence,
                         }));
                     }
                 }
             }
             return Ok(Some(SnapshotResult::GroupedAggregate {
                 updates: installed.updates,
-                checkpoint,
+                fence,
             }));
         }
         if context.whole_result || context.keyed {
             let query = context.query.clone();
-            let (columns, rows, checkpoint) = self.read_whole(&query, subscription_id)?;
+            let (columns, rows, fence) = self.read_whole(&query, subscription_id)?;
             return Ok(Some(SnapshotResult::Rows {
                 columns,
                 rows,
-                checkpoint,
+                fence,
             }));
         }
         // A still-folding in-process aggregate is seeded through Install, not
@@ -142,7 +144,7 @@ where
         if context.in_process == Some(InProcessKind::FoldingAggregate) {
             return Ok(None);
         }
-        let (value, checkpoint) = self
+        let (value, fence) = self
             .mode
             .0
             .execute_scalar(
@@ -154,15 +156,23 @@ where
                 subscription: subscription_id,
                 error,
             })?;
-        let _installed = crate::Install::install(
+        let installed = crate::Install::install(
             &mut self.inner,
             subscription_id,
             crate::ScalarInstall {
-                value: value.clone(),
-                checkpoint: checkpoint.clone(),
+                value,
+                checkpoint: None,
+                fence: reconcile_fence::<X::Checkpoint, E::Checkpoint>(fence.as_ref()),
             },
         )?;
-        Ok(Some(SnapshotResult::Scalar(value, checkpoint)))
+        let value = match installed {
+            crate::reexec::ScalarInstalled::Value(update) => update.value,
+            crate::reexec::ScalarInstalled::ReadAgain(trigger) => {
+                self.deferred_reads.push(trigger);
+                return Ok(None);
+            }
+        };
+        Ok(Some(SnapshotResult::Scalar(value, fence)))
     }
 
     /// Read a captured query's whole answer from one cursor, concatenating its
@@ -180,7 +190,7 @@ where
         (
             Vec<String>,
             Vec<Vec<Value<E::Backend>>>,
-            Option<X::Checkpoint>,
+            Option<<X::Checkpoint as crate::Checkpoint>::Fence>,
         ),
         ReExecError<X::Error>,
     > {
@@ -210,7 +220,7 @@ where
 
         let mut columns = Vec::new();
         let mut rows = Vec::new();
-        let mut checkpoint = None;
+        let mut fence = None;
         let outcome = (|| -> Result<(), ReExecError<X::Error>> {
             loop {
                 let page = self
@@ -224,7 +234,7 @@ where
                 if columns.is_empty() {
                     columns = page.value.columns;
                 }
-                checkpoint = page.checkpoint;
+                fence = page.fence;
                 let more = page.value.more;
                 rows.extend(page.value.rows);
                 if !more {
@@ -243,7 +253,7 @@ where
         guard.armed = false;
         outcome?;
         closed?;
-        Ok((columns, rows, checkpoint))
+        Ok((columns, rows, fence))
     }
 
     /// Execute every queued read through the connector, delivering each
@@ -269,6 +279,7 @@ where
     where
         S: FnMut(crate::reexec::ReadDelivery<I, E::Backend, E::Checkpoint>),
     {
+        self.release_deferred_reads();
         while let Some(trigger) = self.pending_reads.pop_front() {
             match self.resolve_one(&trigger, &mut sink) {
                 Ok(()) => self.stamp_reexec(trigger.subscription_id, &trigger.read),
@@ -326,7 +337,7 @@ where
                 sink(crate::reexec::ReadDelivery::Transition(transition));
             }
             for followup in installed.triggers {
-                self.enqueue_read(followup);
+                self.enqueue_followup(trigger, followup);
             }
             return Ok(());
         }
@@ -355,7 +366,7 @@ where
             )?;
             return Ok(());
         }
-        let (value, _db_checkpoint) = self
+        let (value, fence) = self
             .mode
             .0
             .execute_scalar(&ctx.query.as_read_query(), ctx.column_kind, &ctx.auth)
@@ -363,15 +374,23 @@ where
                 subscription: trigger.subscription_id,
                 error,
             })?;
-        let update = crate::Install::install(
+        let installed = crate::Install::install(
             &mut self.inner,
             trigger.subscription_id,
             crate::ScalarInstall {
                 value,
                 checkpoint: trigger.checkpoint.clone(),
+                fence: reconcile_fence::<X::Checkpoint, E::Checkpoint>(fence.as_ref()),
             },
         )?;
-        sink(crate::reexec::ReadDelivery::Scalar(update));
+        match installed {
+            crate::reexec::ScalarInstalled::Value(update) => {
+                sink(crate::reexec::ReadDelivery::Scalar(update));
+            }
+            crate::reexec::ScalarInstalled::ReadAgain(new_trigger) => {
+                self.enqueue_followup(trigger, new_trigger);
+            }
+        }
         Ok(())
     }
 
@@ -398,6 +417,7 @@ where
                 subscription: subscription_id,
                 error,
             })?;
+        let fence = snapshot.fence;
         let row = one_grouped_row(subscription_id, snapshot.value)?;
         crate::Install::install(
             &mut self.inner,
@@ -406,6 +426,7 @@ where
                 group: group.to_vec(),
                 row,
                 checkpoint,
+                fence: reconcile_fence::<X::Checkpoint, E::Checkpoint>(fence.as_ref()),
             },
         )
         .map_err(Into::into)

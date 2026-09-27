@@ -67,7 +67,7 @@ fn served(sql: &str, components: Vec<Value<Postgres>>) -> (Engine, TableId) {
         registered.subscription_id,
         subql::AggregateSeedInstall {
             rows: vec![components],
-            read_at: Some(PgLsn(5)),
+            fence: Some(PgLsn(5)),
         },
     )
     .expect("the empty seed lands");

@@ -58,7 +58,7 @@ fn seed(
         subscription,
         GroupedScalarSeedInstall {
             rows,
-            read_at: Some(PgLsn(5)),
+            fence: Some(PgLsn(5)),
         },
     )
     .expect("grouped extreme seed installs")
@@ -146,6 +146,7 @@ fn insert_folds_delete_requeries_only_the_displaced_group() {
             group: north.key.clone(),
             row: vec![Value::Int(5), Value::Int(1)],
             checkpoint: Some(PgLsn(30)),
+            fence: None,
         },
     )
     .expect("scoped result installs");
@@ -232,7 +233,7 @@ fn positional_registration_binds_follow_rewritten_sql_order_mysql() {
                 Value::Int(5),
                 Value::Int(2),
             ]],
-            read_at: Some(PgLsn(5)),
+            fence: Some(PgLsn(5)),
         },
     )
     .expect("grouped extreme seed installs");
@@ -308,7 +309,7 @@ fn positional_registration_binds_follow_rewritten_sql_order_sqlite() {
                 Value::Int(5),
                 Value::Int(2),
             ]],
-            read_at: Some(PgLsn(5)),
+            fence: Some(PgLsn(5)),
         },
     )
     .expect("grouped extreme seed installs");
@@ -380,7 +381,7 @@ fn positional_registration_binds_skip_null_group_values_sqlite() {
                 Value::Int(5),
                 Value::Int(2),
             ]],
-            read_at: Some(PgLsn(5)),
+            fence: Some(PgLsn(5)),
         },
     )
     .expect("grouped extreme seed installs");
@@ -597,6 +598,7 @@ fn a_readable_group_recovers_a_missing_old_extreme_with_one_group_read() {
             group: group.clone(),
             row: vec![Value::Int(4), Value::Int(2)],
             checkpoint: Some(PgLsn(10)),
+            fence: None,
         },
     )
     .expect("complete group state installs");
@@ -649,6 +651,7 @@ fn an_installed_group_replaces_the_extreme() {
             group: group.clone(),
             row: vec![Value::Int(7), Value::Int(2)],
             checkpoint: Some(PgLsn(10)),
+            fence: None,
         },
     )
     .expect("scoped result installs");
@@ -692,6 +695,7 @@ fn an_installed_group_replaces_the_source_row_count() {
             group: group.clone(),
             row: vec![Value::Int(7), Value::Int(1)],
             checkpoint: Some(PgLsn(10)),
+            fence: None,
         },
     )
     .expect("scoped result installs");
@@ -825,7 +829,7 @@ fn seeding_more_groups_than_the_limit_stops_the_seed_read() {
                 vec![Value::String("north".into()), Value::Int(2), Value::Int(1)],
                 vec![Value::String("south".into()), Value::Int(3), Value::Int(1)],
             ],
-            read_at: Some(PgLsn(5)),
+            fence: Some(PgLsn(5)),
         },
     )
     .expect("the limit changes tier rather than failing installation");
@@ -1091,6 +1095,7 @@ mod having_on_grouped_extreme {
                 group: group.clone(),
                 row: vec![Value::Int(7), Value::Int(1)],
                 checkpoint: Some(PgLsn(20)),
+                fence: None,
             },
         )
         .expect("scoped result installs");
@@ -1232,6 +1237,7 @@ mod having_on_grouped_extreme {
                 group: group.clone(),
                 row: vec![Value::Int(2), Value::Int(2)],
                 checkpoint: Some(PgLsn(10)),
+                fence: None,
             },
         )
         .expect("confirming result installs");

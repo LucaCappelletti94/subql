@@ -58,8 +58,8 @@ mod sync;
 mod tests;
 
 pub(super) use shared_reads::{
-    absorb_keyed_page, decode_grouped_seed_rows, deltas_from, one_grouped_row,
-    reconcile_checkpoint, KeyBatches, KeyedPage, SeenKeys,
+    absorb_keyed_page, decode_grouped_seed_rows, deltas_from, one_grouped_row, reconcile_fence,
+    KeyBatches, KeyedPage, SeenKeys,
 };
 pub(super) use state::{InProcessKind, ReadQueue, ResolveContext};
 
@@ -71,25 +71,26 @@ pub(super) use state::{InProcessKind, ReadQueue, ResolveContext};
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub enum SnapshotResult<B: Backend, C: crate::Checkpoint, I: IdTypes = crate::DefaultIds> {
-    /// A scalar captured query: a `MIN`/`MAX` value.
-    Scalar(Value<B>, Option<C>),
-    /// Initial grouped aggregate rows installed under one checkpoint.
+    /// A scalar captured query: a `MIN`/`MAX` value read at a fence.
+    Scalar(Value<B>, Option<C::Fence>),
+    /// Initial grouped aggregate rows installed under one fence.
     GroupedAggregate {
         updates: Vec<crate::AggregateValueUpdate<I, B>>,
-        checkpoint: Option<C>,
+        fence: Option<C::Fence>,
     },
     /// A whole-re-read captured query: its answer, in pages, all read from one
     /// snapshot so they describe a single instant.
     ///
-    /// Every page carries that snapshot's position, so a caller can anchor the
-    /// answer to the change stream and know which events follow it.
+    /// A caller replaying the stream on top of these rows applies exactly the
+    /// changes the fence does not report as [`crate::Seen::Held`].
     Rows {
         /// Column names as the database reported them, in projection order.
         columns: Vec<String>,
         /// Every row of the answer, in `columns` order, pages concatenated.
         rows: Vec<Vec<Value<B>>>,
-        /// Position the snapshot was read at, when the connector reports one.
-        checkpoint: Option<C>,
+        /// The fence of the snapshot the pages were read under, when the
+        /// connector reports one.
+        fence: Option<C::Fence>,
     },
 }
 /// Connector execution mode used by [`AutoResolvingEngine`].
@@ -139,6 +140,11 @@ where
     /// abandoned resolve leaves them here, so retrying costs a read and
     /// never a second application of the event.
     pub(super) pending_reads: ReadQueue<I, E::Checkpoint, E::Backend>,
+    /// Reads an install asked for again of the very value it just set, held
+    /// until the next `resolve`. The change that read missed may stay
+    /// invisible for as long as its commit waits, so reading at once would
+    /// spin.
+    pub(super) deferred_reads: Vec<super::ReExecutionTrigger<I, E::Checkpoint, E::Backend>>,
     /// In-process notifications of an event whose asynchronous drain was
     /// abandoned before it could hand them back.
     ///
@@ -169,6 +175,7 @@ where
             debounce: None,
             last_reexec_at: HashMap::new(),
             pending_reads: ReadQueue::new(),
+            deferred_reads: Vec::new(),
             undelivered: None,
         }
     }
@@ -438,6 +445,29 @@ where
         true
     }
 
+    /// Queue a read an install of `resolved` asked for, holding one of the
+    /// same value until the next `resolve`.
+    pub(super) fn enqueue_followup(
+        &mut self,
+        resolved: &super::ReExecutionTrigger<I, E::Checkpoint, E::Backend>,
+        followup: super::ReExecutionTrigger<I, E::Checkpoint, E::Backend>,
+    ) {
+        if followup.subscription_id == resolved.subscription_id
+            && followup.read.group_key() == resolved.read.group_key()
+        {
+            self.deferred_reads.push(followup);
+        } else {
+            self.enqueue_read(followup);
+        }
+    }
+
+    /// Move the held reads into the queue, at the start of a `resolve`.
+    pub(super) fn release_deferred_reads(&mut self) {
+        for trigger in self.deferred_reads.drain(..) {
+            self.pending_reads.enqueue(trigger);
+        }
+    }
+
     /// Drop one queued read after its answer was installed and delivered.
     pub(super) fn dequeue_read(
         &mut self,
@@ -450,7 +480,7 @@ where
     /// Reads waiting for the next `resolve`.
     #[must_use]
     pub fn pending_read_count(&self) -> usize {
-        self.pending_reads.len()
+        self.pending_reads.len() + self.deferred_reads.len()
     }
 
     /// Hold notifications across an asynchronous drain's awaits, per
@@ -747,6 +777,8 @@ where
     fn purge_unregistered_reads(&mut self) {
         let contexts = &self.contexts;
         self.pending_reads
+            .retain(|trigger| contexts.contains_key(&trigger.subscription_id));
+        self.deferred_reads
             .retain(|trigger| contexts.contains_key(&trigger.subscription_id));
     }
 

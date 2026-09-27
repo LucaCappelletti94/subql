@@ -45,15 +45,23 @@ fn scalar_install_returns_the_typed_scalar_update() {
         }
     ));
 
-    let update = Install::install(
+    let installed = Install::install(
         &mut engine,
         registered.subscription_id,
         ScalarInstall {
             value: Value::Float(5.0),
             checkpoint: None::<subql::NoCheckpoint>,
+            fence: None,
         },
     )
     .expect("the scalar result matches the scalar tier");
+
+    let update = match installed {
+        subql::reexec::ScalarInstalled::Value(update) => update,
+        subql::reexec::ScalarInstalled::ReadAgain(trigger) => {
+            panic!("nothing has displaced the read's value: {trigger:?}")
+        }
+    };
 
     assert_eq!(update.subscription_id, registered.subscription_id);
     assert_eq!(update.consumer_id, 7);
@@ -143,7 +151,7 @@ fn aggregate_seed_install_keeps_its_own_output_and_error_type() {
         registered.subscription_id,
         AggregateSeedInstall {
             rows: vec![vec![Value::Int(2)]],
-            read_at: None,
+            fence: None,
         },
     )
     .expect("one ungrouped seed row installs");
@@ -217,7 +225,7 @@ fn a_seeded_aggregate_updates_without_a_trigger() {
         registered.subscription_id,
         AggregateSeedInstall {
             rows: vec![vec![Value::Int(0)]],
-            read_at: None,
+            fence: None,
         },
     )
     .expect("seed");

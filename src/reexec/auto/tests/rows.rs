@@ -45,6 +45,7 @@ fn match_rows_replays_without_reading_or_folding() {
         crate::ScalarInstall {
             value: Value::Float(5.0),
             checkpoint: None::<crate::NoCheckpoint>,
+            fence: None,
         },
     )
     .unwrap();

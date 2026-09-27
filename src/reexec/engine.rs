@@ -54,6 +54,17 @@ pub struct ScalarUpdate<I: IdTypes, B: Backend, C: crate::Checkpoint = crate::No
     pub checkpoint: Option<C>,
 }
 
+/// What installing a scalar read produced.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ScalarInstalled<I: IdTypes, B: Backend, C: crate::Checkpoint = crate::NoCheckpoint> {
+    /// The value to deliver, the read's answer with every change it missed
+    /// applied on top.
+    Value(ScalarUpdate<I, B, C>),
+    /// A change the read missed removed its answer, so only another read can
+    /// say what the value is.
+    ReadAgain(ReExecutionTrigger<I, C, B>),
+}
+
 /// One page of a re-read captured query, delivered to its consumer.
 ///
 /// A whole-re-read capture holds no answer, so a change does not produce a

@@ -227,7 +227,8 @@ fn applied_burst_keeps_distinct_queries_apart() {
         qid1,
         crate::ScalarInstall {
             value: Value::Float(7.0),
-            checkpoint: None::<crate::NoCheckpoint>
+            checkpoint: None::<crate::NoCheckpoint>,
+            fence: None,
         }
     )
     .is_ok());
@@ -236,7 +237,8 @@ fn applied_burst_keeps_distinct_queries_apart() {
         qid2,
         crate::ScalarInstall {
             value: Value::Float(7.0),
-            checkpoint: None::<crate::NoCheckpoint>
+            checkpoint: None::<crate::NoCheckpoint>,
+            fence: None,
         }
     )
     .is_ok());
@@ -286,7 +288,7 @@ fn grouped_batch_keeps_one_trigger_per_displaced_group() {
                     Value::Int(2),
                 ],
             ],
-            read_at: None::<crate::NoCheckpoint>,
+            fence: None,
         },
     )
     .expect("group map installs");
@@ -341,7 +343,7 @@ fn a_failed_install_drops_the_read_instead_of_requeueing_it() {
                 Value::Float(5.0),
                 Value::Int(2),
             ]],
-            read_at: None::<crate::NoCheckpoint>,
+            fence: None,
         },
     )
     .expect("group map installs");
@@ -432,6 +434,7 @@ fn burst_of_displacements_costs_one_read() {
         crate::ScalarInstall {
             value: Value::Float(5.0),
             checkpoint: None::<crate::NoCheckpoint>,
+            fence: None,
         },
     )
     .unwrap();
@@ -483,7 +486,7 @@ fn a_row_moving_groups_reads_for_the_group_it_left() {
                     Value::Int(2),
                 ],
             ],
-            read_at: None::<crate::NoCheckpoint>,
+            fence: None,
         },
     )
     .expect("group map installs");

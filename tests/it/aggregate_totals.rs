@@ -91,14 +91,14 @@ fn install_seed(
     engine: &mut Engine,
     subscription: u64,
     row: Vec<Value<Postgres>>,
-    read_at: Option<PgLsn>,
+    fence: Option<PgLsn>,
 ) -> Result<AggValue, AggregateInstallError> {
     subql::Install::install(
         engine,
         subscription,
         subql::AggregateSeedInstall {
             rows: vec![row],
-            read_at,
+            fence,
         },
     )
     .map(|updates| installed_value(&updates))
@@ -163,6 +163,32 @@ fn a_change_at_the_read_position_belongs_to_the_starting_numbers() {
     // or before it is in the numbers the read returns.
     let value = install_seed(&mut engine, sub, vec![Value::Int(1)], Some(PgLsn(20))).unwrap();
     assert_eq!(value, AggValue::CountStar(1));
+}
+
+#[test]
+fn a_change_the_starting_numbers_hold_is_not_counted_again_after_the_install() {
+    let (mut engine, orders) = engine();
+    let sub = engine
+        .register(SubscriptionRequest::new(
+            7,
+            "SELECT COUNT(*) FROM orders WHERE status = 'paid'",
+        ))
+        .unwrap()
+        .subscription_id;
+
+    // The order committed at 10 and the read ran at 20, so the count of 1 holds it.
+    let value = install_seed(&mut engine, sub, vec![Value::Int(1)], Some(PgLsn(20))).unwrap();
+    assert_eq!(value, AggValue::CountStar(1));
+
+    // The stream lags the database and delivers the order after the install.
+    let late = engine.aggregate_updates(&paid(orders, 1, 250, 10)).unwrap();
+    assert!(
+        late.is_empty(),
+        "the order is already in the starting numbers, got {:?}",
+        reported(&late),
+    );
+    let next = engine.aggregate_updates(&paid(orders, 2, 250, 30)).unwrap();
+    assert_eq!(reported(&next), vec![(sub, 7, AggValue::CountStar(2))]);
 }
 
 #[test]

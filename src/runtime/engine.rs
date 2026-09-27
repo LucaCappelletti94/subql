@@ -2413,7 +2413,7 @@ where
                 }));
                 continue;
             }
-            match entry.runtime.on_event(event, vm, database) {
+            match entry.runtime.on_event(event, vm, database, pending_cap) {
                 Maintenance::Unchanged => {}
                 Maintenance::Updated(value) => {
                     scalar_updates.push(crate::reexec::ScalarUpdate {
@@ -4476,7 +4476,7 @@ where
     ///     counted.subscription_id,
     ///     subql::AggregateSeedInstall {
     ///         rows: vec![vec![Value::Int(0)]],
-    ///         read_at: None,
+    ///         fence: None,
     ///     },
     /// )
     /// .expect("the starting numbers land");

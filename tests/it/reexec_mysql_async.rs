@@ -124,7 +124,8 @@ fn delete_displacing_extreme_resolves_via_mysql_async_connector() {
             captured_qid,
             subql::ScalarInstall {
                 value: Value::Float(5.0),
-                checkpoint: None::<subql::NoCheckpoint>
+                checkpoint: None::<subql::NoCheckpoint>,
+                fence: None,
             }
         )
         .is_ok());

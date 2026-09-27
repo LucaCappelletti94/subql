@@ -27,7 +27,7 @@ pub type PlannedJobs<I, C, B, E> =
 /// with the failure too, so phase three can drop a read whose failure is
 /// not retryable.
 pub type ReadOutcome<I, C, B, E> = Result<
-    (crate::reexec::ReExecutionTrigger<I, C, B>, Resolved<B>),
+    (crate::reexec::ReExecutionTrigger<I, C, B>, Resolved<B, C>),
     (crate::reexec::ReExecutionTrigger<I, C, B>, ReExecError<E>),
 >;
 
@@ -66,12 +66,17 @@ pub struct KeyedJob<B: Backend> {
     pub max_keys: usize,
 }
 
-/// What the database answered, still owned, ready to install.
-pub enum Resolved<B: Backend> {
-    Scalar(Value<B>),
+/// What the database answered, still owned, with the read's fence in the
+/// event domain, ready to install.
+pub enum Resolved<B: Backend, C: crate::Checkpoint> {
+    Scalar {
+        value: Value<B>,
+        fence: Option<C::Fence>,
+    },
     GroupedScalar {
         group: Vec<u8>,
         row: Vec<Value<B>>,
+        fence: Option<C::Fence>,
     },
     Keyed {
         keys: Vec<Vec<Value<B>>>,

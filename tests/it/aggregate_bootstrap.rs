@@ -53,7 +53,7 @@ fn seeded_value(sql: &str, row: &[Value<Postgres>]) -> AggValue {
         registered.subscription_id,
         subql::AggregateSeedInstall {
             rows: vec![row.to_vec()],
-            read_at: None,
+            fence: None,
         },
     )
     .expect("the starting numbers land");
@@ -301,7 +301,7 @@ fn reseed_matches_recompute() {
         subscription,
         subql::AggregateSeedInstall {
             rows: vec![vec![Value::Int(3), Value::Int(1)]],
-            read_at: None,
+            fence: None,
         },
     )
     .expect("the first numbers land");
@@ -314,7 +314,7 @@ fn reseed_matches_recompute() {
         subscription,
         subql::AggregateSeedInstall {
             rows: vec![vec![Value::Int(12), Value::Int(3)]],
-            read_at: None,
+            fence: None,
         },
     )
     .expect("the new starting numbers land");
@@ -537,7 +537,7 @@ fn a_widened_group_passes_its_having_on_the_seeded_total() {
         registered.subscription_id,
         subql::AggregateSeedInstall {
             rows: vec![row],
-            read_at: None,
+            fence: None,
         },
     )
     .expect("the starting numbers land");

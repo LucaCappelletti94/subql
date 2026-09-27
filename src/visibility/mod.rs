@@ -95,9 +95,12 @@ mod tests {
     use sql_traits::structs::ParserDB;
     use sqlparser::dialect::PostgreSqlDialect;
 
-    /// `change` as the first row of a transaction committing at `0x10`.
+    /// `change` as the first row of transaction 3, committing at `0x10`.
     fn positioned(change: ChangeEvent) -> crate::PgChangeEvent {
-        crate::PgChangeEvent::new(change, crate::PgCommitPosition::new(crate::PgLsn(0x10), 1))
+        crate::PgChangeEvent::new(
+            change,
+            crate::PgCommitPosition::new(crate::PgLsn(0x10), crate::PgXid(3), 1),
+        )
     }
 
     fn catalog() -> (ParserDB, TableId) {

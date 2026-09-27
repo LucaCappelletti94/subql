@@ -8,7 +8,7 @@
 //! simpler testing surface.
 
 use super::async_connector::AsyncConnector;
-use super::auto::{reconcile_checkpoint, AutoResolvingEngine, ResolverMode, SnapshotResult};
+use super::auto::{reconcile_fence, AutoResolvingEngine, ResolverMode, SnapshotResult};
 use super::connector::ReExecError;
 use crate::backend::{Backend, CdcEvent, Value};
 use crate::compiler::literals::SqlLiteralParse;
@@ -136,7 +136,9 @@ where
     ///
     /// Returns [`ReExecError::Connector`] if the connector fails, and
     /// [`ReExecError::Cursor`] if a row tier's read fails or the connector
-    /// holds no cursors. Returns `Ok(None)` if `subscription_id` does not exist.
+    /// holds no cursors. Returns `Ok(None)` if `subscription_id` does not
+    /// exist, and when a change the scalar read missed removed its answer,
+    /// which queues another read for the next `resolve`.
     #[allow(
         clippy::too_many_lines,
         reason = "snapshot handles each explicit read tier and always closes grouped cursors"
@@ -156,7 +158,7 @@ where
         }
         let grouped_bootstrap = context.grouped_bootstrap.clone();
         if let Some(bootstrap) = grouped_bootstrap {
-            let (pages, checkpoint) = Self::read_whole_with(
+            let (pages, fence) = Self::read_whole_with(
                 &self.mode.connector,
                 subscription_id,
                 &context.query,
@@ -171,7 +173,7 @@ where
                 subscription_id,
                 crate::GroupedScalarSeedInstall {
                     rows,
-                    read_at: reconcile_checkpoint(checkpoint.as_ref()),
+                    fence: reconcile_fence::<X::Checkpoint, E::Checkpoint>(fence.as_ref()),
                 },
             )?;
             self.apply_transitions(&installed.transitions);
@@ -192,6 +194,7 @@ where
                                 subscription: subscription_id,
                                 error,
                             })?;
+                        let fence = page.fence;
                         let row = super::auto::one_grouped_row(subscription_id, page.value)?;
                         let resolved = crate::Install::install(
                             &mut self.inner,
@@ -200,6 +203,9 @@ where
                                 group: group.clone(),
                                 row,
                                 checkpoint: trigger.checkpoint.clone(),
+                                fence: reconcile_fence::<X::Checkpoint, E::Checkpoint>(
+                                    fence.as_ref(),
+                                ),
                             },
                         )?;
                         self.apply_transitions(&resolved.transitions);
@@ -212,7 +218,7 @@ where
                             .contexts
                             .get(&subscription_id)
                             .expect("a transitioned read keeps its connector context");
-                        let (pages, checkpoint) = Self::read_whole_with(
+                        let (pages, fence) = Self::read_whole_with(
                             &self.mode.connector,
                             subscription_id,
                             &context.query,
@@ -231,19 +237,19 @@ where
                         return Ok(Some(SnapshotResult::Rows {
                             columns,
                             rows,
-                            checkpoint,
+                            fence,
                         }));
                     }
                 }
             }
             return Ok(Some(SnapshotResult::GroupedAggregate {
                 updates: installed.updates,
-                checkpoint,
+                fence,
             }));
         }
         if context.whole_result || context.keyed {
             let query = context.query.clone();
-            let (pages, checkpoint) = Self::read_whole_with(
+            let (pages, fence) = Self::read_whole_with(
                 &self.mode.connector,
                 subscription_id,
                 &query,
@@ -262,7 +268,7 @@ where
             return Ok(Some(SnapshotResult::Rows {
                 columns,
                 rows,
-                checkpoint,
+                fence,
             }));
         }
         // A still-folding in-process aggregate is seeded through Install, not
@@ -271,7 +277,7 @@ where
         if context.in_process == Some(super::auto::InProcessKind::FoldingAggregate) {
             return Ok(None);
         }
-        let (value, checkpoint) = self
+        let (value, fence) = self
             .mode
             .connector
             .execute_scalar(
@@ -284,15 +290,23 @@ where
                 subscription: subscription_id,
                 error,
             })?;
-        let _installed = crate::Install::install(
+        let installed = crate::Install::install(
             &mut self.inner,
             subscription_id,
             crate::ScalarInstall {
-                value: value.clone(),
-                checkpoint: checkpoint.clone(),
+                value,
+                checkpoint: None,
+                fence: reconcile_fence::<X::Checkpoint, E::Checkpoint>(fence.as_ref()),
             },
         )?;
-        Ok(Some(SnapshotResult::Scalar(value, checkpoint)))
+        let value = match installed {
+            crate::reexec::ScalarInstalled::Value(update) => update.value,
+            crate::reexec::ScalarInstalled::ReadAgain(trigger) => {
+                self.deferred_reads.push(trigger);
+                return Ok(None);
+            }
+        };
+        Ok(Some(SnapshotResult::Scalar(value, fence)))
     }
 
     /// Execute every queued read through the connector, delivering each
@@ -326,6 +340,7 @@ where
     {
         use futures_util::stream::{FuturesUnordered, StreamExt};
 
+        self.release_deferred_reads();
         loop {
             if self.pending_reads.is_empty() {
                 return Ok(());
@@ -512,25 +527,33 @@ where
     fn apply_answer<S>(
         &mut self,
         trigger: &super::ReExecutionTrigger<I, E::Checkpoint, E::Backend>,
-        answer: Resolved<E::Backend>,
+        answer: Resolved<E::Backend, E::Checkpoint>,
         sink: &mut S,
     ) -> Result<(), ReExecError<X::Error>>
     where
         S: FnMut(super::ReadDelivery<I, E::Backend, E::Checkpoint>),
     {
         match answer {
-            Resolved::Scalar(value) => {
-                let update = crate::Install::install(
+            Resolved::Scalar { value, fence } => {
+                let installed = crate::Install::install(
                     &mut self.inner,
                     trigger.subscription_id,
                     crate::ScalarInstall {
                         value,
                         checkpoint: trigger.checkpoint.clone(),
+                        fence,
                     },
                 )?;
-                sink(super::ReadDelivery::Scalar(update));
+                match installed {
+                    crate::reexec::ScalarInstalled::Value(update) => {
+                        sink(super::ReadDelivery::Scalar(update));
+                    }
+                    crate::reexec::ScalarInstalled::ReadAgain(new_trigger) => {
+                        self.enqueue_followup(trigger, new_trigger);
+                    }
+                }
             }
-            Resolved::GroupedScalar { group, row } => {
+            Resolved::GroupedScalar { group, row, fence } => {
                 let installed = crate::Install::install(
                     &mut self.inner,
                     trigger.subscription_id,
@@ -538,6 +561,7 @@ where
                         group,
                         row,
                         checkpoint: trigger.checkpoint.clone(),
+                        fence,
                     },
                 )?;
                 self.apply_transitions(&installed.transitions);
@@ -548,7 +572,7 @@ where
                     sink(super::ReadDelivery::Transition(transition));
                 }
                 for followup in installed.triggers {
-                    self.enqueue_read(followup);
+                    self.enqueue_followup(trigger, followup);
                 }
             }
             Resolved::Keyed {
@@ -650,17 +674,20 @@ where
         subscription: SubscriptionId,
         max_page_bytes: usize,
         auth: &X::AuthContext,
-    ) -> Result<Resolved<E::Backend>, ReExecError<X::Error>> {
+    ) -> Result<Resolved<E::Backend, E::Checkpoint>, ReExecError<X::Error>> {
         match job {
             ResolveJob::Scalar { query, column_kind } => {
-                let (value, _db_checkpoint) = connector
+                let (value, fence) = connector
                     .execute_scalar(&query.as_read_query(), column_kind, auth)
                     .await
                     .map_err(|error| ReExecError::Connector {
                         subscription,
                         error,
                     })?;
-                Ok(Resolved::Scalar(value))
+                Ok(Resolved::Scalar {
+                    value,
+                    fence: reconcile_fence::<X::Checkpoint, E::Checkpoint>(fence.as_ref()),
+                })
             }
             ResolveJob::GroupedScalar { group, query } => {
                 let page = connector
@@ -670,8 +697,13 @@ where
                         subscription,
                         error,
                     })?;
+                let fence = page.fence;
                 let row = super::auto::one_grouped_row(subscription, page.value)?;
-                Ok(Resolved::GroupedScalar { group, row })
+                Ok(Resolved::GroupedScalar {
+                    group,
+                    row,
+                    fence: reconcile_fence::<X::Checkpoint, E::Checkpoint>(fence.as_ref()),
+                })
             }
             ResolveJob::Keyed(job) => {
                 let KeyedJob {
@@ -839,7 +871,13 @@ where
         query: &super::BoundQuery<E::Backend>,
         max_page_bytes: usize,
         auth: &X::AuthContext,
-    ) -> Result<(Vec<ReadPage<E::Backend>>, Option<X::Checkpoint>), ReExecError<X::Error>> {
+    ) -> Result<
+        (
+            Vec<ReadPage<E::Backend>>,
+            Option<<X::Checkpoint as crate::Checkpoint>::Fence>,
+        ),
+        ReExecError<X::Error>,
+    > {
         let cursor = connector
             .open_cursor(&query.as_read_query(), auth)
             .await
@@ -849,7 +887,7 @@ where
             })?;
 
         let mut pages = Vec::new();
-        let mut checkpoint = None;
+        let mut fence = None;
         let outcome = async {
             loop {
                 let page = connector
@@ -860,7 +898,7 @@ where
                         error,
                     })?;
                 let more = page.value.more;
-                checkpoint = page.checkpoint;
+                fence = page.fence;
                 pages.push(ReadPage {
                     columns: page.value.columns,
                     rows: page.value.rows,
@@ -884,7 +922,7 @@ where
             });
         outcome?;
         closed?;
-        Ok((pages, checkpoint))
+        Ok((pages, fence))
     }
 }
 

@@ -93,5 +93,5 @@ pub use dispatch::{Dispatch, Settled};
 pub(crate) use engine::ReExecEntry;
 pub use engine::{
     Dispatched, ReExecNotifications, ReExecutionRead, ReExecutionTrigger, ReadDelivery,
-    ResolvedReads, RowDelta, RowsUpdate, ScalarUpdate,
+    ResolvedReads, RowDelta, RowsUpdate, ScalarInstalled, ScalarUpdate,
 };

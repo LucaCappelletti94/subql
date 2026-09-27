@@ -2,10 +2,10 @@
 //!
 //! Exercises the pool-backed PG connector: a captured `MIN(price)`
 //! subscription is registered, snapshot bootstraps via the pool, then a
-//! DELETE-of-the-extreme drives a re-execution that round-trips through
-//! the pool. Asserts the snapshot carries a real commit position and that the
+//! DELETE-of-the-extreme drives a re-execution that round-trips through the
+//! pool. Asserts the snapshot carries the read's fence and that the
 //! ScalarUpdate emitted by re-execution carries the originating event's
-//! LSN.
+//! commit position.
 //!
 //! Gated by `#[cfg(feature = "executor-diesel-postgres-r2d2")]` in
 //! `tests/it/main.rs`.
@@ -31,8 +31,8 @@ use subql::reexec::{
     AutoResolvingEngine, Connector, PgR2D2DieselConnector, SessionSetup, SnapshotResult, SyncMode,
 };
 use subql::{
-    AggregateResultValue, AggregateValueChange, DefaultIds, MaintenanceStopReason, Registered,
-    SubscriptionEngine, SubscriptionRequest, Tier, TierKind, Wal2JsonV2Event,
+    AggregateResultValue, AggregateValueChange, Checkpoint, DefaultIds, MaintenanceStopReason,
+    Registered, SubscriptionEngine, SubscriptionRequest, Tier, TierKind, Wal2JsonV2Event,
 };
 
 mod grouped_schema {
@@ -111,9 +111,9 @@ fn build_engine(
     AutoResolvingEngine::new(inner, SyncMode(PgR2D2DieselConnector::new(pool)))
 }
 
-/// Snapshot through the pool returns the right value + an LSN tied to
-/// the read transaction. Then a DELETE driven through real PG flows
-/// back as a re-execution that goes through the pool.
+/// Snapshot through the pool returns the right value plus the read's fence.
+/// Then a DELETE driven through real PG flows back as a re-execution that
+/// goes through the pool.
 #[test]
 #[ignore = "requires Docker; run with --ignored"]
 fn r2d2_pool_drives_snapshot_and_reexec() {
@@ -130,20 +130,20 @@ fn r2d2_pool_drives_snapshot_and_reexec() {
     let captured_qid =
         common::reexec::register_captured(&mut engine, 1u64, "SELECT MIN(price) FROM orders");
 
-    // Snapshot: must come back with value=5.0 and a non-zero LSN.
+    // Snapshot: must come back with value=5.0 and a non-zero insert LSN.
     let snap = engine
         .snapshot(captured_qid)
         .expect("snapshot")
         .expect("subscription_id exists");
-    let (value, snapshot_lsn) = match snap {
-        SnapshotResult::Scalar(value, checkpoint) => (value, checkpoint),
+    let (value, snapshot_fence) = match snap {
+        SnapshotResult::Scalar(value, fence) => (value, fence),
         other => panic!("unexpected variant: {other:?}"),
     };
     assert_eq!(value, Value::Float(5.0));
-    let snapshot_lsn = snapshot_lsn.expect("PgR2D2DieselConnector must report a checkpoint");
+    let snapshot_fence = snapshot_fence.expect("PgR2D2DieselConnector must report a fence");
     assert!(
-        snapshot_lsn.commit_lsn() > subql::PgLsn(0),
-        "pg_current_wal_lsn() must be non-zero on a live server"
+        snapshot_fence.insert_lsn() > subql::PgLsn(0),
+        "the fence's insert LSN must be non-zero on a live server"
     );
 
     // Delete the current MIN row and drive a re-execution through the
@@ -162,15 +162,16 @@ fn r2d2_pool_drives_snapshot_and_reexec() {
     let notifs = settled.reads.expect("consumers dispatch");
     assert_eq!(notifs.scalar_updates.len(), 1);
     assert_eq!(notifs.scalar_updates[0].value, Value::Float(9.0));
-    // The re-execution LSN should be at or after the snapshot LSN
-    // (clock-monotonic). Use the event's checkpoint, propagated into
-    // the ScalarUpdate.
-    let event_lsn = events[0].checkpoint().expect("wal2json event LSN");
-    assert!(
-        event_lsn >= snapshot_lsn,
-        "post-snapshot WAL event LSN must be >= snapshot LSN"
+    // The DELETE committed after the snapshot read, so the snapshot's fence
+    // judges it Beyond. Use the event's checkpoint, propagated into the
+    // ScalarUpdate.
+    let event_pos = events[0].checkpoint().expect("wal2json event position");
+    assert_eq!(
+        event_pos.seen_by(&snapshot_fence),
+        subql::Seen::Beyond,
+        "a commit that lands after the snapshot read must sit beyond its fence"
     );
-    assert_eq!(notifs.scalar_updates[0].checkpoint, Some(event_lsn));
+    assert_eq!(notifs.scalar_updates[0].checkpoint, Some(event_pos));
 }
 
 /// `PgR2D2DieselConnector: Send + Sync` so it can move across async
@@ -225,8 +226,8 @@ fn a_cursor_pages_one_snapshot_of_a_keyless_result() {
         let page = connector.fetch_cursor(cursor, 96).expect("fetch page");
         pages += 1;
         assert!(
-            page.checkpoint.is_some(),
-            "a cursor's pages carry the snapshot's position"
+            page.fence.is_some(),
+            "a cursor's pages carry the snapshot's fence"
         );
         for row in &page.value.rows {
             match row[0] {
@@ -393,7 +394,7 @@ fn a_captured_query_snapshots_its_answer_at_registration() {
         SnapshotResult::Rows {
             columns,
             rows,
-            checkpoint,
+            fence,
         } => {
             assert_eq!(columns, vec!["id", "status"]);
             // Every row, though the budget forced several round trips to get
@@ -407,8 +408,9 @@ fn a_captured_query_snapshots_its_answer_at_registration() {
                 .collect();
             assert_eq!(ids, (1..=30_i64).collect::<Vec<_>>());
             assert!(
-                checkpoint.is_some(),
-                "the answer is anchored to a position in the change stream"
+                fence.is_some(),
+                "the answer is anchored to a fence, which is what lets a consumer \
+                 judge changes against the read"
             );
         }
         other => panic!("a whole-re-read capture snapshots as rows, got {other:?}"),
@@ -559,18 +561,17 @@ fn the_wal_position_is_not_bound_to_the_transaction_snapshot() {
     );
 }
 
-/// Every read reports a position taken before its own snapshot opened.
+/// Every read reports the fence of its own snapshot.
 ///
-/// The contract a caller replays from: a position at or behind the snapshot
-/// re-delivers changes the snapshot already holds, which keyed application
-/// absorbs, while a position ahead of it silently drops a transaction the
-/// snapshot never saw. An advisory lock parks each read inside its own
-/// snapshot, a commit lands while it waits, and the returned position has to
-/// sit behind that commit. The row count is asserted too, because a read that
-/// somehow saw the commit would make the position comparison meaningless.
+/// The contract a caller judges changes against: a change the snapshot
+/// holds is dropped, one it missed is applied. An advisory lock parks each
+/// read inside its own snapshot, a commit lands while it waits, and the
+/// fence read inside that parked transaction has to sit behind that
+/// commit. The row count is asserted too, because a read that somehow saw
+/// the commit would make the LSN comparison meaningless.
 #[test]
 #[ignore = "requires Docker; run with --ignored"]
-fn every_read_reports_a_position_taken_before_its_snapshot() {
+fn every_read_reports_the_fence_of_its_own_snapshot() {
     common::assert_docker_available();
     let db = common::pg_database();
     let slot = db.slot(SLOT);
@@ -580,7 +581,7 @@ fn every_read_reports_a_position_taken_before_its_snapshot() {
 
     let held = Arc::clone(&connector);
     let sql = format!("SELECT count(*)::bigint AS v FROM orders {}", common::PARK);
-    let ((value, position), after_commit) =
+    let ((value, fence), after_commit) =
         common::park_a_read(&db, &common::pg::orders_insert(2), move || {
             held.execute_scalar(
                 &subql::reexec::ReadQuery::without_binds(&sql),
@@ -595,11 +596,8 @@ fn every_read_reports_a_position_taken_before_its_snapshot() {
         "the scalar read's snapshot holds one row"
     );
     assert!(
-        position
-            .expect("a PG connector reports a position")
-            .commit_lsn()
-            < after_commit,
-        "the scalar read's position must sit behind the commit at {after_commit:?}"
+        fence.expect("a PG connector reports a fence").insert_lsn() < after_commit,
+        "the scalar read's fence must sit behind the commit at {after_commit:?}"
     );
 
     let held = Arc::clone(&connector);
@@ -614,16 +612,16 @@ fn every_read_reports_a_position_taken_before_its_snapshot() {
         "the page's snapshot holds two rows"
     );
     assert!(
-        page.checkpoint
-            .expect("a PG connector reports a position")
-            .commit_lsn()
+        page.fence
+            .expect("a PG connector reports a fence")
+            .insert_lsn()
             < after_commit,
-        "the page read's position must sit behind the commit at {after_commit:?}"
+        "the page read's fence must sit behind the commit at {after_commit:?}"
     );
 
     let held = Arc::clone(&connector);
     let sql = format!("SELECT count(*)::bigint AS c0 FROM orders {}", common::PARK);
-    let ((values, position), after_commit) =
+    let ((values, fence), after_commit) =
         common::park_a_read(&db, &common::pg::orders_insert(4), move || {
             held.execute_scalar_row(
                 &subql::reexec::ReadQuery::without_binds(&sql),
@@ -638,11 +636,8 @@ fn every_read_reports_a_position_taken_before_its_snapshot() {
         "the seed read's snapshot holds three rows"
     );
     assert!(
-        position
-            .expect("a PG connector reports a position")
-            .commit_lsn()
-            < after_commit,
-        "the seed read's position must sit behind the commit at {after_commit:?}"
+        fence.expect("a PG connector reports a fence").insert_lsn() < after_commit,
+        "the seed read's fence must sit behind the commit at {after_commit:?}"
     );
 }
 
@@ -799,7 +794,13 @@ impl Connector for PanicMidRead {
         query: &subql::reexec::ReadQuery<'_, Postgres>,
         kind: subql::backend::ScalarFamily,
         auth: &(),
-    ) -> Result<(Value<Postgres>, Option<Self::Checkpoint>), Self::Error> {
+    ) -> Result<
+        (
+            Value<Postgres>,
+            Option<<Self::Checkpoint as subql::Checkpoint>::Fence>,
+        ),
+        Self::Error,
+    > {
         self.inner.execute_scalar(query, kind, auth)
     }
 
@@ -821,7 +822,10 @@ impl Connector for PanicMidRead {
         kinds: &[subql::backend::ScalarFamily],
         auth: &(),
     ) -> Result<
-        (Vec<Value<Postgres>>, Option<Self::Checkpoint>),
+        (
+            Vec<Value<Postgres>>,
+            Option<<Self::Checkpoint as subql::Checkpoint>::Fence>,
+        ),
         subql::reexec::ScalarRowError<Self::Error>,
     > {
         self.inner.execute_scalar_row(query, kinds, auth)
@@ -982,7 +986,7 @@ fn a_keyed_capture_snapshots_its_rows() {
         SnapshotResult::Rows {
             columns,
             rows,
-            checkpoint,
+            fence,
         } => {
             assert_eq!(columns, vec!["id", "price", "quantity", "status"]);
             let ids: Vec<i64> = rows
@@ -998,9 +1002,9 @@ fn a_keyed_capture_snapshots_its_rows() {
                 "every matching row and only the matching rows"
             );
             assert!(
-                checkpoint.is_some(),
-                "the starting rows are anchored to a position in the change stream, \
-                 which is what lets a consumer replay from there without a gap"
+                fence.is_some(),
+                "the starting rows are anchored to a fence, \
+                 which is what lets a consumer judge changes against the read"
             );
         }
         other => panic!("a keyed capture snapshots as rows, got {other:?}"),

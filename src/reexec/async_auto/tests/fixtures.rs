@@ -73,8 +73,15 @@ impl AsyncConnector for MockAsyncConnector {
         query: &crate::reexec::ReadQuery<'_, Postgres>,
         _kind: ScalarFamily,
         _auth: &(),
-    ) -> impl Future<Output = Result<(Value<Postgres>, Option<Self::Checkpoint>), Self::Error>> + Send
-    {
+    ) -> impl Future<
+        Output = Result<
+            (
+                Value<Postgres>,
+                Option<<Self::Checkpoint as crate::Checkpoint>::Fence>,
+            ),
+            Self::Error,
+        >,
+    > + Send {
         async move {
             if core::mem::take(&mut *self.pend_next_read.lock()) {
                 YieldOnce(false).await;
@@ -108,7 +115,7 @@ impl AsyncConnector for MockAsyncConnector {
             };
             Ok(Snapshot {
                 value: page,
-                checkpoint: None,
+                fence: None,
             })
         }
     }
@@ -151,7 +158,7 @@ impl AsyncConnector for MockAsyncConnector {
             let page = self.cursor_pages.lock().remove(0);
             Ok(Snapshot {
                 value: page,
-                checkpoint: None,
+                fence: None,
             })
         }
     }

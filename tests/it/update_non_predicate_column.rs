@@ -180,7 +180,7 @@ fn aggregate_subscription_sees_an_update_of_the_column_it_sums() {
         subscription,
         subql::AggregateSeedInstall {
             rows: vec![vec![Value::Float(9.5), Value::Int(1)]],
-            read_at: None,
+            fence: None,
         },
     )
     .expect("the starting numbers land");

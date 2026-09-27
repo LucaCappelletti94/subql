@@ -36,7 +36,8 @@ fn async_applied_burst_respects_max_concurrent_cap() {
         qid1,
         crate::ScalarInstall {
             value: Value::Float(7.0),
-            checkpoint: None::<crate::NoCheckpoint>
+            checkpoint: None::<crate::NoCheckpoint>,
+            fence: None,
         }
     )
     .is_ok());
@@ -45,7 +46,8 @@ fn async_applied_burst_respects_max_concurrent_cap() {
         qid2,
         crate::ScalarInstall {
             value: Value::Float(7.0),
-            checkpoint: None::<crate::NoCheckpoint>
+            checkpoint: None::<crate::NoCheckpoint>,
+            fence: None,
         }
     )
     .is_ok());
@@ -115,7 +117,8 @@ fn throttle_inflight_returns_to_zero_after_batch() {
         qid1,
         crate::ScalarInstall {
             value: Value::Float(7.0),
-            checkpoint: None::<crate::NoCheckpoint>
+            checkpoint: None::<crate::NoCheckpoint>,
+            fence: None,
         }
     )
     .is_ok());
@@ -124,7 +127,8 @@ fn throttle_inflight_returns_to_zero_after_batch() {
         qid2,
         crate::ScalarInstall {
             value: Value::Float(7.0),
-            checkpoint: None::<crate::NoCheckpoint>
+            checkpoint: None::<crate::NoCheckpoint>,
+            fence: None,
         }
     )
     .is_ok());
@@ -162,7 +166,8 @@ fn throttle_inflight_returns_to_zero_after_connector_error() {
         qid1,
         crate::ScalarInstall {
             value: Value::Float(7.0),
-            checkpoint: None::<crate::NoCheckpoint>
+            checkpoint: None::<crate::NoCheckpoint>,
+            fence: None,
         }
     )
     .is_ok());
@@ -171,7 +176,8 @@ fn throttle_inflight_returns_to_zero_after_connector_error() {
         qid2,
         crate::ScalarInstall {
             value: Value::Float(7.0),
-            checkpoint: None::<crate::NoCheckpoint>
+            checkpoint: None::<crate::NoCheckpoint>,
+            fence: None,
         }
     )
     .is_ok());

@@ -66,9 +66,13 @@ pub trait WalParser<DB: DatabaseLike>: Send + Sync {
     /// The [`Checkpoint`] type events from this parser anchor at.
     ///
     /// Must equal [`crate::backend::CdcEvent::Checkpoint`] on
-    /// [`Self::Event`]. PostgreSQL-flavored parsers choose [`crate::PgCommitPosition`];
-    /// MySQL parsers choose [`crate::MysqlBinlogPos`]; position-free
-    /// parsers use [`crate::NoCheckpoint`].
+    /// [`Self::Event`]. The checkpoint is the stream's position, which a
+    /// source resumes and a consumer acknowledges. A database read reports
+    /// a [`Checkpoint::Fence`] instead, and a change is judged against it
+    /// with [`Checkpoint::seen_by`]. PostgreSQL-flavored parsers choose
+    /// [`crate::PgCommitPosition`]; MySQL parsers choose
+    /// [`crate::MysqlBinlogPos`]; position-free parsers use
+    /// [`crate::NoCheckpoint`].
     type Checkpoint: Checkpoint;
 
     /// The typed CDC event this parser emits. Implements

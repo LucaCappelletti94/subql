@@ -202,8 +202,9 @@ pub fn drop_slot(conn: &mut PgConnection, name: &str) {
 /// Drain every queued WAL change from the named slot as wal2json v2 JSON
 /// strings, in commit order. The options match what
 /// [`subql::Wal2JsonV2Reader`] expects: `format-version=2` with its
-/// transaction boundaries, `include-pk=true`, and `include-lsn=true` so each
-/// begin names the commit position the reader places its rows at.
+/// transaction boundaries, `include-pk=true`, and `include-lsn=true` with
+/// `include-xids=true` so each begin names the commit position and the
+/// transaction the reader places its rows at.
 pub fn drain_slot(conn: &mut PgConnection, name: &str) -> Vec<String> {
     #[derive(diesel::QueryableByName)]
     struct Row {
@@ -216,7 +217,8 @@ pub fn drain_slot(conn: &mut PgConnection, name: &str) -> Vec<String> {
             '{name}', NULL, NULL, \
             'format-version', '2', \
             'include-pk', 'true', \
-            'include-lsn', 'true'\
+            'include-lsn', 'true', \
+            'include-xids', 'true'\
         )"
     ))
     .load(conn)

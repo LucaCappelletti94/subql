@@ -7,27 +7,26 @@ use super::{
     Backend, IdTypes, ReExecError, RowDelta, ScalarFamily, String, SubscriptionId, Value, Vec,
 };
 
-/// Carry a connector's read position into the event-checkpoint domain.
+/// Carry a connector's read fence into the event-fence domain.
 ///
-/// Identity when the two domains are the same type, which is every shipped
-/// pairing (`PgCommitPosition` reads with `PgCommitPosition` events, and so on). `None` when one
-/// side has no position domain (`NoCheckpoint`): a Maxwell-fed MySQL engine
-/// reads binlog positions its events cannot spell, and a positionless seed
-/// is what the install layer already handles. Two DIFFERENT real position
-/// domains are a wiring mistake, caught by the debug assertion rather than
-/// degraded into a silent `None`.
-pub fn reconcile_checkpoint<F: crate::Checkpoint, T: crate::Checkpoint>(
-    checkpoint: Option<&F>,
-) -> Option<T> {
+/// Identity when the two checkpoint types share a fence type, which is every
+/// shipped pairing (a `PgCommitPosition` connector with `PgCommitPosition`
+/// events, and so on). `None` when one side has no fence domain
+/// (`NoCheckpoint`), a positionless seed the install layer already handles.
+/// Two DIFFERENT real fence domains are a wiring mistake, caught by the debug
+/// assertion rather than degraded into a silent `None`.
+pub fn reconcile_fence<F: crate::Checkpoint, T: crate::Checkpoint>(
+    fence: Option<&F::Fence>,
+) -> Option<T::Fence> {
     use core::any::{Any, TypeId};
     debug_assert!(
-        TypeId::of::<F>() == TypeId::of::<T>()
-            || TypeId::of::<F>() == TypeId::of::<crate::NoCheckpoint>()
-            || TypeId::of::<T>() == TypeId::of::<crate::NoCheckpoint>(),
-        "a connector and its events speak different position domains"
+        TypeId::of::<F::Fence>() == TypeId::of::<T::Fence>()
+            || TypeId::of::<F::Fence>() == TypeId::of::<core::convert::Infallible>()
+            || TypeId::of::<T::Fence>() == TypeId::of::<core::convert::Infallible>(),
+        "a connector and its events speak different fence domains"
     );
-    checkpoint
-        .and_then(|value| (value as &dyn Any).downcast_ref::<T>())
+    fence
+        .and_then(|value| (value as &dyn Any).downcast_ref::<T::Fence>())
         .cloned()
 }
 

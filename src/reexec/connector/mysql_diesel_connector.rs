@@ -1,5 +1,5 @@
 #![allow(clippy::type_complexity)]
-//! Binlog-position-aware sync [`Connector`] for MySQL.
+//! Sync [`Connector`](super::Connector) for MySQL that reports the read's fence, the binlog position the read ran under.
 
 // The async connector reads `LogStatusRow` from this module, so the module is
 // compiled without the sync feature: everything the sync connector alone needs
@@ -19,8 +19,8 @@ use diesel::sql_types::{BigInt, Nullable, Text};
 #[cfg(feature = "executor-diesel-mysql")]
 use diesel::{sql_query, Connection, RunQueryDsl};
 
-/// Sync [`Connector`] backed by a diesel `MysqlConnection` that anchors every
-/// read to a MySQL binary-log position.
+/// Sync [`Connector`] backed by a diesel `MysqlConnection` that reports the
+/// fence of each read, the MySQL binary-log position the read ran under.
 ///
 /// On each `execute_scalar` call the connector reads
 /// `performance_schema.log_status` and then runs the user's SQL, returning the
@@ -33,12 +33,11 @@ use diesel::{sql_query, Connection, RunQueryDsl};
 /// commands ("No metadata exists"). `log_status` is a regular table, so the
 /// metadata is present.
 ///
-/// Unlike PostgreSQL's `pg_current_wal_lsn()`, this reports the server's
-/// *current* binlog coordinate rather than one tied to the transaction's
-/// snapshot, so reading it first makes it an "at or before the read" marker
-/// rather than a strict MVCC-consistent position. Returns `None` for the
-/// checkpoint when binary
-/// logging is disabled (no `log_status` row).
+/// Unlike PostgreSQL's `pg_current_snapshot()`, MySQL offers no per-read
+/// visibility test, so the fence is the server's *current* binlog coordinate
+/// read before the read's transaction: taken after the query it can sit ahead
+/// of the snapshot and a replay from there loses a commit. Returns `None` for
+/// the fence when binary logging is disabled (no `log_status` row).
 ///
 /// Holds the connection in a [`RefCell`]; not `Send`/`Sync`. Requires MySQL
 /// 8.0.22+ binary logging (`--log-bin`) and `BACKUP_ADMIN` to read
@@ -111,7 +110,7 @@ pub struct LogStatusRow {
 /// otherwise parse to nothing. A name with no dot at all is not a binlog name
 /// and reports nothing, rather than being read whole as a file number. The
 /// offset is kept as `u32`, so an offset past four gibibytes reports no
-/// coordinate rather than a wrapped one: the checkpoint is informational, and
+/// coordinate rather than a wrapped one: the fence is informational, and
 /// a wrong position is worse than none.
 #[cfg(any(
     feature = "executor-diesel-mysql",
@@ -131,7 +130,7 @@ pub fn binlog_pos_from(file: &str, position: u64) -> Option<crate::MysqlBinlogPo
 /// position)` is read from `performance_schema.log_status` (MySQL 8.0.22+,
 /// requires the `BACKUP_ADMIN` privilege). Returns `None` when binary logging is
 /// off, the table/privilege is unavailable, or the coordinate doesn't fit the
-/// compact [`crate::MysqlBinlogPos`]. Best-effort: the checkpoint is
+/// compact [`crate::MysqlBinlogPos`]. Best-effort: the fence is
 /// informational (subql does not gate on it), so any failure degrades to `None`
 /// rather than failing the re-execution.
 #[cfg(feature = "executor-diesel-mysql")]
@@ -159,10 +158,10 @@ fn read_binlog_pos(conn: &mut diesel::MysqlConnection) -> Option<crate::MysqlBin
     binlog_pos_from(&file, position)
 }
 
-/// Take the binlog position, then run `body` inside one transaction with
+/// Read the binlog fence, then run `body` inside one transaction with
 /// `setup` applied.
 ///
-/// The position is read first, per `Connector::Checkpoint`: it is the
+/// The fence is read first, before the read's transaction: it is the
 /// server's current coordinate, so taken after the read it can sit ahead of
 /// the snapshot and a replay from there loses a commit.
 #[cfg(feature = "executor-diesel-mysql")]
@@ -207,10 +206,10 @@ impl<S: SessionSetup, C: crate::backend::MySqlTableNameCase> Connector
         auth: &S,
     ) -> Result<Snapshot<RowPage<Self::Backend>, Self::Checkpoint>, Self::Error> {
         let mut conn = self.conn.borrow_mut();
-        let (value, checkpoint) = read_at_binlog_pos(&mut conn, auth.setup_statements(), |conn| {
+        let (value, fence) = read_at_binlog_pos(&mut conn, auth.setup_statements(), |conn| {
             load_page::<_, Self::Backend>(conn, query, max_bytes)
         })?;
-        Ok(Snapshot { value, checkpoint })
+        Ok(Snapshot { value, fence })
     }
 
     fn execute_scalar_row(

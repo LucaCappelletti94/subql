@@ -147,7 +147,7 @@ impl DemoState {
         // is its own database, so it computes the same component row from the
         // rows it is holding. Nothing has been folded for a subscription that
         // was created a line ago, so the read cannot have raced a change and
-        // needs no stream position.
+        // needs no fence.
         let agg = if let Some(spec) = result.aggregate_spec() {
             let row = seed_components(spec, &self.capture.snapshot_rows());
             let updates = subql::Install::install(
@@ -155,7 +155,7 @@ impl DemoState {
                 subscription_id,
                 subql::AggregateSeedInstall {
                     rows: vec![row],
-                    read_at: None,
+                    fence: None,
                 },
             )?;
             updates

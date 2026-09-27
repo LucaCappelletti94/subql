@@ -27,7 +27,7 @@ fn async_ungrouped_aggregate_folds_through_the_wrapper() {
         count_id,
         crate::AggregateSeedInstall {
             rows: vec![vec![Value::Int(5)]],
-            read_at: None::<NoCheckpoint>,
+            fence: None,
         },
     )
     .unwrap();
@@ -73,7 +73,7 @@ fn async_ungrouped_aggregate_folds_across_an_applied_burst() {
         count_id,
         crate::AggregateSeedInstall {
             rows: vec![vec![Value::Int(5)]],
-            read_at: None::<NoCheckpoint>,
+            fence: None,
         },
     )
     .unwrap();
@@ -111,7 +111,7 @@ fn async_ungrouped_aggregate_demotion_resolves_through_the_wrapper() {
         count_id,
         crate::AggregateSeedInstall {
             rows: vec![vec![Value::Int(1)]],
-            read_at: None::<NoCheckpoint>,
+            fence: None,
         },
     )
     .unwrap();
@@ -152,7 +152,7 @@ fn async_snapshot_of_a_folding_aggregate_is_none() {
         count_id,
         crate::AggregateSeedInstall {
             rows: vec![vec![Value::Int(5)]],
-            read_at: None::<NoCheckpoint>,
+            fence: None,
         },
     )
     .unwrap();
@@ -197,7 +197,7 @@ fn async_a_seed_that_demotes_at_install_serves_the_whole_read() {
                 vec![Value::String("open".into()), Value::Int(2), Value::Int(2)],
                 vec![Value::String("done".into()), Value::Int(1), Value::Int(1)],
             ],
-            read_at: None::<NoCheckpoint>,
+            fence: None,
         },
     )
     .unwrap();

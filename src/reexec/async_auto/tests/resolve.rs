@@ -121,6 +121,7 @@ fn async_connector_error_names_its_subscription() {
         crate::ScalarInstall {
             value: Value::Float(5.0),
             checkpoint: None::<NoCheckpoint>,
+            fence: None,
         },
     )
     .unwrap();

@@ -1,9 +1,9 @@
 #![allow(clippy::type_complexity)]
-//! Pool-backed LSN-aware sync [`Connector`] for PostgreSQL via r2d2.
+//! Pool-backed sync [`Connector`] for PostgreSQL via r2d2, reporting the read's own snapshot fence.
 
 use super::diesel_backend::boxed_postgres_read_query;
 use super::diesel_connector::{load_page_postgres, load_scalar, load_scalar_row};
-use super::pg_diesel_connector::{read_at_lsn, read_current_lsn};
+use super::pg_diesel_connector::{read_fence, read_in_snapshot};
 use super::{
     drain_cursor_buffer, run_setup_statements, Connector, CursorError, CursorId, ReadQuery,
     RowPage, ScalarRowError, SessionSetup, Snapshot, PG_READ_SNAPSHOT,
@@ -16,8 +16,8 @@ use thiserror::Error;
 /// Pool-backed [`Connector`] for PostgreSQL.
 ///
 /// Wraps an `r2d2::Pool` over `ConnectionManager<PgConnection>`, is
-/// `Send + Sync`, and reads `pg_current_wal_lsn()` before the user query's
-/// transaction for LSN-anchored snapshots.
+/// `Send + Sync`, and reports the fence of the repeatable-read snapshot each
+/// read takes, read inside the transaction that serves it.
 ///
 /// Use this connector when the engine dispatches re-executions
 /// concurrently (the async engine resolving a burst of reads) or when
@@ -50,8 +50,8 @@ pub struct PgR2D2DieselConnector<S = ()> {
     _setup: core::marker::PhantomData<fn() -> S>,
 }
 
-/// One open cursor: the connection it pins, the position its snapshot sits at,
-/// and rows already fetched but not yet delivered.
+/// One open cursor: the connection it pins, the fence of the snapshot its
+/// pages report, and rows already fetched but not yet delivered.
 ///
 /// The leftover buffer is what keeps the byte budget exact. `FETCH` cannot be
 /// undone, so a batch that overshoots the budget would otherwise have to be
@@ -63,7 +63,7 @@ struct PgCursor {
     /// The cursor's `DECLARE`d name, which the per-page `FETCH` and the
     /// closing `CLOSE` are built from.
     name: String,
-    checkpoint: Option<crate::PgCommitPosition>,
+    fence: Option<crate::PgSnapshotFence>,
     columns: alloc::vec::Vec<String>,
     leftover: alloc::collections::VecDeque<alloc::vec::Vec<Value<crate::backend::Postgres>>>,
 }
@@ -179,11 +179,13 @@ impl<S: SessionSetup> Connector for PgR2D2DieselConnector<S> {
         query: &ReadQuery<'_, Self::Backend>,
         kind: ScalarFamily,
         auth: &S,
-    ) -> Result<(Value<Self::Backend>, Option<Self::Checkpoint>), Self::Error> {
+    ) -> Result<(Value<Self::Backend>, Option<crate::PgSnapshotFence>), Self::Error> {
         let mut conn = self.pool.get()?;
-        Ok(read_at_lsn(&mut conn, auth.setup_statements(), |conn| {
-            load_scalar::<_, Self::Backend>(conn, query, kind)
-        })?)
+        Ok(read_in_snapshot(
+            &mut conn,
+            auth.setup_statements(),
+            |conn| load_scalar::<_, Self::Backend>(conn, query, kind),
+        )?)
     }
 
     fn read_page(
@@ -193,10 +195,10 @@ impl<S: SessionSetup> Connector for PgR2D2DieselConnector<S> {
         auth: &S,
     ) -> Result<Snapshot<RowPage<crate::backend::Postgres>, Self::Checkpoint>, Self::Error> {
         let mut conn = self.pool.get().map_err(PgR2D2Error::Pool)?;
-        let (value, checkpoint) = read_at_lsn(&mut conn, auth.setup_statements(), |conn| {
+        let (value, fence) = read_in_snapshot(&mut conn, auth.setup_statements(), |conn| {
             load_page_postgres(conn, query, max_bytes)
         })?;
-        Ok(Snapshot { value, checkpoint })
+        Ok(Snapshot { value, fence })
     }
 
     fn execute_scalar_row(
@@ -207,7 +209,7 @@ impl<S: SessionSetup> Connector for PgR2D2DieselConnector<S> {
     ) -> Result<
         (
             alloc::vec::Vec<Value<Self::Backend>>,
-            Option<Self::Checkpoint>,
+            Option<crate::PgSnapshotFence>,
         ),
         ScalarRowError<Self::Error>,
     > {
@@ -215,7 +217,7 @@ impl<S: SessionSetup> Connector for PgR2D2DieselConnector<S> {
             .pool
             .get()
             .map_err(|e| ScalarRowError::Connector(e.into()))?;
-        read_at_lsn(&mut conn, auth.setup_statements(), |conn| {
+        read_in_snapshot(&mut conn, auth.setup_statements(), |conn| {
             load_scalar_row::<_, Self::Backend>(conn, query, kinds)
         })
         .map_err(|e| ScalarRowError::Connector(e.into()))
@@ -245,35 +247,25 @@ impl<S: SessionSetup> Connector for PgR2D2DieselConnector<S> {
         // `BEGIN` never touches it, so a connection released mid-transaction
         // would be handed to the next caller still inside this one. Measured
         // on the async side, where it silently ate an unrelated caller's write.
-        let opened = (|| -> QueryResult<Option<crate::PgCommitPosition>> {
-            // The position is read BEFORE the snapshot exists, on purpose. It
-            // is what a caller replays the change stream from, so it must sit
-            // at or behind the snapshot: behind means a few changes already in
-            // the snapshot arrive again, which keyed application absorbs, while
-            // ahead means a transaction that committed after the position but
-            // is invisible to the snapshot is never delivered at all. Reading
-            // it after `DECLARE` would give exactly that, because `DECLARE` is
-            // what establishes the snapshot and `pg_current_wal_lsn()` is not
-            // snapshot-bound. Debezium orders its initial snapshot the same
-            // way, position first and scan second.
-            let lsn = read_current_lsn(&mut conn)?;
+        let opened = (|| -> QueryResult<Option<crate::PgSnapshotFence>> {
             PgTxn::begin_transaction(&mut *conn)?;
             // SET TRANSACTION is DDL-like; no typed DSL equivalent exists.
             diesel::sql_query(PG_READ_SNAPSHOT).execute(&mut *conn)?;
+            // `DECLARE` would fix the snapshot, so the fence is read first.
+            let fence = read_fence(&mut conn)?;
             run_setup_statements(&mut *conn, auth.setup_statements())?;
             let declaration = ReadQuery::owned(
                 alloc::format!("DECLARE {name} NO SCROLL CURSOR FOR {}", query.sql()),
                 query.binds().to_vec(),
             );
             boxed_postgres_read_query(&declaration)?.execute(&mut *conn)?;
-            Ok(lsn)
+            Ok(Some(fence))
         })();
 
-        let checkpoint = match opened {
-            Ok(lsn) => lsn,
+        let fence = match opened {
+            Ok(fence) => fence,
             Err(e) => {
-                // Leave no transaction behind on a failed open. Through the
-                // manager, so its depth counter matches the server's state.
+                // Leave no transaction behind on a failed open.
                 let _ = PgTxn::rollback_transaction(&mut *conn);
                 return Err(CursorError::Connector(PgR2D2Error::Diesel(e)));
             }
@@ -284,7 +276,7 @@ impl<S: SessionSetup> Connector for PgR2D2DieselConnector<S> {
             alloc::sync::Arc::new(parking_lot::Mutex::new(PgCursor {
                 conn,
                 name,
-                checkpoint,
+                fence,
                 columns: alloc::vec::Vec::new(),
                 leftover: alloc::collections::VecDeque::new(),
             })),
@@ -374,7 +366,7 @@ fn fetch_page_from(
                     rows,
                     more: true,
                 },
-                checkpoint: held.checkpoint,
+                fence: held.fence.clone(),
             });
         }
         // `FETCH FORWARD` is a cursor command with no typed DSL equivalent.
@@ -399,7 +391,7 @@ fn fetch_page_from(
                     rows,
                     more: false,
                 },
-                checkpoint: held.checkpoint,
+                fence: held.fence.clone(),
             });
         }
     }

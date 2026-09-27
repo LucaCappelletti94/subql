@@ -43,6 +43,7 @@ fn sync_scalar_event_forwards_registration_binds() {
         crate::ScalarInstall {
             value: Value::Float(5.0),
             checkpoint: None::<crate::NoCheckpoint>,
+            fence: None,
         },
     )
     .expect("scalar installs");
@@ -191,7 +192,7 @@ fn sync_grouped_scoped_read_orders_registration_binds() {
                 Value::Float(5.0),
                 Value::Int(2),
             ]],
-            read_at: None::<crate::NoCheckpoint>,
+            fence: None,
         },
     )
     .expect("grouped seed installs");

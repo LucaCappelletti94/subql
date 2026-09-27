@@ -100,10 +100,10 @@ fn snapshot_installs_via_connector() {
     // No bootstrap install: snapshot does it.
     let snap = e.snapshot(qid).unwrap().expect("subscription_id exists");
     match snap {
-        SnapshotResult::Scalar(value, checkpoint) => {
+        SnapshotResult::Scalar(value, fence) => {
             assert_eq!(value, Value::Float(12.5));
-            // MockConnector returns checkpoint = None.
-            assert!(checkpoint.is_none());
+            // MockConnector reports no fence.
+            assert!(fence.is_none());
         }
         other => panic!("a scalar capture snapshots as a scalar, got {other:?}"),
     }
@@ -144,6 +144,7 @@ fn connector_error_names_its_subscription() {
         crate::ScalarInstall {
             value: Value::Float(5.0),
             checkpoint: None::<crate::NoCheckpoint>,
+            fence: None,
         },
     )
     .unwrap();
@@ -216,7 +217,7 @@ fn applied_event_survives_failed_resolve() {
         count,
         crate::AggregateSeedInstall {
             rows: alloc::vec![alloc::vec![Value::Int(5)]],
-            read_at: None::<crate::NoCheckpoint>,
+            fence: None,
         },
     )
     .unwrap();
@@ -233,6 +234,7 @@ fn applied_event_survives_failed_resolve() {
         crate::ScalarInstall {
             value: Value::Float(5.0),
             checkpoint: None::<crate::NoCheckpoint>,
+            fence: None,
         },
     )
     .unwrap();

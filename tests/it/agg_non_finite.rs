@@ -86,7 +86,7 @@ where
         registered.subscription_id,
         subql::AggregateSeedInstall {
             rows: vec![seed],
-            read_at: Some(PgLsn(5)),
+            fence: Some(PgLsn(5)),
         },
     )
     .expect("the empty seed lands");
@@ -278,7 +278,7 @@ fn pg_stream(sql: &str, changes: &[Change], components: usize) -> Option<AggValu
         registered.subscription_id,
         subql::AggregateSeedInstall {
             rows: vec![seed],
-            read_at: Some(PgLsn(5)),
+            fence: Some(PgLsn(5)),
         },
     )
     .expect("the empty seed lands");
@@ -558,7 +558,7 @@ fn a_widened_count_counts_a_non_finite_float() {
         registered.subscription_id,
         subql::AggregateSeedInstall {
             rows: Vec::new(),
-            read_at: Some(PgLsn(5)),
+            fence: Some(PgLsn(5)),
         },
     )
     .expect("the empty grouped seed lands");
@@ -649,7 +649,7 @@ fn a_seed_keeps_a_non_finite_total() {
             registered.subscription_id,
             subql::AggregateSeedInstall {
                 rows: vec![vec![Value::Float(seeded), Value::Int(1)]],
-                read_at: Some(PgLsn(5)),
+                fence: Some(PgLsn(5)),
             },
         )
         .expect("the seed lands")
@@ -680,7 +680,7 @@ fn a_seed_keeps_a_nan_total() {
         registered.subscription_id,
         subql::AggregateSeedInstall {
             rows: vec![vec![Value::Float(f64::NAN), Value::Int(1)]],
-            read_at: Some(PgLsn(5)),
+            fence: Some(PgLsn(5)),
         },
     )
     .expect("the seed lands")

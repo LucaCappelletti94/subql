@@ -10,7 +10,7 @@ use crate::types::{ColumnId, EventKind, TableId};
 use crate::wal::transaction_order::{TransactionOrder, TransactionOrderError};
 use crate::wal::wire_event::{wire_cdc_event, WireEvent};
 use crate::wal::{changed_columns_by_name, resolve_table, WalParseError};
-use crate::{PgCommitPosition, PgLsn};
+use crate::{PgCommitPosition, PgLsn, PgXid};
 
 use super::decode_helpers::{column_value, decode_cell, IndexedName};
 use super::parse_helpers::v2_row_kind;
@@ -20,7 +20,7 @@ use super::parse_helpers::v2_row_kind;
 /// The message's own `lsn` is the position of its WAL record, which does not
 /// follow commit order when transactions interleave. The checkpoint this
 /// event carries is its [`PgCommitPosition`], or none when the stream was
-/// decoded without `include-lsn`.
+/// decoded without `include-lsn` or `include-xids`.
 #[derive(Clone, Debug)]
 pub struct Wal2JsonV2Event {
     message: MessageV2,
@@ -61,22 +61,23 @@ impl Wal2JsonV2Event {
 /// commit order.
 ///
 /// The stream must carry its transaction boundaries (`include-transaction`,
-/// on by default), since a row is placed by the begin before it. The begin
-/// names the transaction's commit position under `include-lsn=true`, and
-/// without it the events carry no position.
+/// on by default), since a row is placed by the begin before it. A row's
+/// position needs the begin's commit position (`include-lsn`) and its
+/// transaction id (`include-xids`), so a begin with either absent names no
+/// position and its rows carry none.
 ///
 /// # Examples
 ///
 /// ```
 /// use subql::backend::CdcEvent;
-/// use subql::{PgCommitPosition, PgLsn, Wal2JsonV2Reader};
+/// use subql::{PgCommitPosition, PgLsn, PgXid, Wal2JsonV2Reader};
 ///
 /// let mut reader = Wal2JsonV2Reader::new();
 /// let lines: [&[u8]; 4] = [
-///     br#"{"action":"B","lsn":"0/5DC"}"#,
+///     br#"{"action":"B","lsn":"0/5DC","xid":5}"#,
 ///     br#"{"action":"I","schema":"public","table":"orders","lsn":"0/3E8","columns":[{"name":"id","type":"integer","value":1}]}"#,
 ///     br#"{"action":"I","schema":"public","table":"orders","lsn":"0/44C","columns":[{"name":"id","type":"integer","value":2}]}"#,
-///     br#"{"action":"C","lsn":"0/5DC"}"#,
+///     br#"{"action":"C","lsn":"0/5DC","xid":5}"#,
 /// ];
 /// let mut checkpoints = Vec::new();
 /// for line in lines {
@@ -87,14 +88,14 @@ impl Wal2JsonV2Event {
 /// assert_eq!(
 ///     checkpoints,
 ///     [
-///         Some(PgCommitPosition::new(PgLsn(0x5DC), 1)),
-///         Some(PgCommitPosition::new(PgLsn(0x5DC), 2)),
+///         Some(PgCommitPosition::new(PgLsn(0x5DC), PgXid(5), 1)),
+///         Some(PgCommitPosition::new(PgLsn(0x5DC), PgXid(5), 2)),
 ///     ]
 /// );
 /// # Ok::<(), subql::WalParseError>(())
 /// ```
 pub struct Wal2JsonV2Reader {
-    order: TransactionOrder<Option<PgLsn>>,
+    order: TransactionOrder<Option<(PgLsn, PgXid)>>,
 }
 
 impl Default for Wal2JsonV2Reader {
@@ -129,16 +130,18 @@ impl Wal2JsonV2Reader {
             wal2json_events::parse_v2(text).map_err(|e| WalParseError::JsonError(e.to_string()))?;
         match &message {
             MessageV2::Begin(boundary) => {
-                self.order.begin(boundary_lsn(boundary)?)?;
+                self.order.begin(boundary_position(boundary)?)?;
                 Ok(None)
             }
             MessageV2::Commit(boundary) => {
                 let (began, _) = self.order.commit()?;
-                if let (Some(began), Some(committed)) = (began, boundary_lsn(boundary)?) {
-                    if began != committed {
-                        return Err(
-                            TransactionOrderError::CommitMismatch { began, committed }.into()
-                        );
+                if let (Some(began), Some((committed, _))) = (began, boundary_position(boundary)?) {
+                    if began.0 != committed {
+                        let mismatch = TransactionOrderError::CommitMismatch {
+                            began: began.0,
+                            committed,
+                        };
+                        return Err(mismatch.into());
                     }
                 }
                 Ok(None)
@@ -149,23 +152,28 @@ impl Wal2JsonV2Reader {
             | MessageV2::Delete(_)
             | MessageV2::Truncate(_) => {
                 let (commit, ordinal) = self.order.next_row()?;
-                let position = commit.map(|commit| PgCommitPosition::new(commit, ordinal));
+                let position =
+                    commit.map(|(commit, xid)| PgCommitPosition::new(commit, xid, ordinal));
                 Ok(Some(Wal2JsonV2Event::new(message, position)))
             }
         }
     }
 }
 
-/// The commit position a boundary names, under `include-lsn=true`.
-fn boundary_lsn(boundary: &TransactionBoundary) -> Result<Option<PgLsn>, WalParseError> {
-    boundary
+/// The commit position a boundary names, present under `include-lsn` and
+/// `include-xids` both on and absent when either is off.
+fn boundary_position(
+    boundary: &TransactionBoundary,
+) -> Result<Option<(PgLsn, PgXid)>, WalParseError> {
+    let lsn = boundary
         .lsn
         .as_deref()
         .map(|text| {
             PgLsn::parse(text)
                 .ok_or_else(|| WalParseError::MalformedPayload(alloc::format!("lsn {text:?}")))
         })
-        .transpose()
+        .transpose()?;
+    Ok(lsn.zip(boundary.xid.map(PgXid)))
 }
 
 /// The row payload, for the row actions that carry one.

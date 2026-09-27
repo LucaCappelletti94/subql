@@ -128,7 +128,8 @@ fn register(engine: &mut Engine, is_min: bool) -> u64 {
         subscription_id,
         subql::ScalarInstall {
             value: Value::Null,
-            checkpoint: None::<subql::NoCheckpoint>
+            checkpoint: None::<subql::NoCheckpoint>,
+            fence: None,
         }
     )
     .is_ok());
@@ -161,6 +162,7 @@ fn dispatch_and_service(
             subql::ScalarInstall {
                 value: next.clone(),
                 checkpoint: None::<subql::NoCheckpoint>,
+                fence: None,
             },
         )
         .is_ok());

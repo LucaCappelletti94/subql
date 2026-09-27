@@ -114,7 +114,8 @@ fn register_min(e: &mut Engine, bootstrap: Value<Postgres>) -> u64 {
         qid,
         subql::ScalarInstall {
             value: bootstrap,
-            checkpoint: None::<subql::NoCheckpoint>
+            checkpoint: None::<subql::NoCheckpoint>,
+            fence: None,
         }
     )
     .is_ok());

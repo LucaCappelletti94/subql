@@ -27,7 +27,7 @@ impl<I: IdTypes, B: crate::backend::Backend, C: crate::Checkpoint> InstallOutput
 }
 
 impl<I: IdTypes, B: crate::backend::Backend, C: crate::Checkpoint> InstallOutputTransitions<B>
-    for crate::reexec::ScalarUpdate<I, B, C>
+    for crate::reexec::ScalarInstalled<I, B, C>
 {
 }
 
