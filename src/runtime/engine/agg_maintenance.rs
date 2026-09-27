@@ -280,6 +280,10 @@ where
         self.aggregate_updates_resolved(&event)
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one pass folds every total the event touches and then asks for what they need"
+    )]
     pub(super) fn aggregate_updates_resolved(
         &mut self,
         event: &crate::backend::ResolvedEvent<'_, E>,
@@ -299,6 +303,7 @@ where
             let mut output: crate::AggregateMaintenanceOutput<I, E::Backend, E::Checkpoint> =
                 crate::AggregateMaintenanceOutput::empty();
             output.updates = self.empty_aggregate_totals(table_id, at.as_ref());
+            self.push_fence_probe(table_id, at, &mut output);
             return Ok(output);
         }
 
@@ -333,6 +338,7 @@ where
                     at.as_ref(),
                     cap,
                     self.max_groups_per_aggregate,
+                    &self.latest_fence,
                 ) {
                     crate::runtime::aggregate::GroupedFoldOutcome::Unchanged => {}
                     crate::runtime::aggregate::GroupedFoldOutcome::Change(identity, change) => {
@@ -357,7 +363,7 @@ where
             else {
                 continue;
             };
-            match total.fold(change, at.as_ref(), cap) {
+            match total.fold(change, at.as_ref(), cap, &self.latest_fence) {
                 Ok(Some(value)) => output.updates.push(crate::AggregateValueUpdate {
                     subscription: delta.subscription,
                     consumer: total.consumer(),
@@ -389,7 +395,45 @@ where
             at.as_ref(),
             &mut output,
         )?;
+        self.push_fence_probe(table_id, at, &mut output);
         Ok(output)
+    }
+
+    /// Ask for a fence-only read when a total on `table_id` keeps enough
+    /// unseen changes that one should trim them, unless one is already out.
+    fn push_fence_probe(
+        &mut self,
+        table_id: TableId,
+        at: Option<E::Checkpoint>,
+        output: &mut crate::AggregateMaintenanceOutput<I, E::Backend, E::Checkpoint>,
+    ) {
+        if self.latest_fence.probing {
+            return;
+        }
+        let cap = self.max_changes_during_aggregate_read;
+        let on_table = |subscription: &SubscriptionId| {
+            self.subscription_to_table.get(subscription) == Some(&table_id)
+        };
+        let wanting = self
+            .aggregates
+            .iter()
+            .find(|(subscription, total)| on_table(subscription) && total.wants_fence(cap))
+            .map(|(subscription, total)| (*subscription, total.consumer()))
+            .or_else(|| {
+                self.grouped_aggregates
+                    .iter()
+                    .find(|(subscription, total)| on_table(subscription) && total.wants_fence(cap))
+                    .map(|(subscription, total)| (*subscription, total.consumer()))
+            });
+        if let Some((subscription_id, consumer_id)) = wanting {
+            self.latest_fence.probing = true;
+            output.triggers.push(crate::reexec::ReExecutionTrigger {
+                subscription_id,
+                consumer_id,
+                read: crate::reexec::ReExecutionRead::Fence,
+                checkpoint: at,
+            });
+        }
     }
 
     /// Install one ungrouped aggregate row after its database read.
@@ -409,13 +453,17 @@ where
     }
 
     /// Empty an aggregate value and require another database read.
+    ///
+    /// The changes no read of the total has shown held are buffered for the
+    /// new read, which may miss them too.
     pub fn reset_aggregate_value(&mut self, subscription: SubscriptionId) -> bool {
+        let asked = self.latest_fence.now();
         if let Some(total) = self.aggregates.get_mut(&subscription) {
-            total.reset();
+            total.reset(asked);
             return true;
         }
         if let Some(total) = self.grouped_aggregates.get_mut(&subscription) {
-            total.reset();
+            total.reset(asked);
             return true;
         }
         false
@@ -524,7 +572,7 @@ where
             if self.subscription_to_table.get(&subscription) != Some(&table_id) {
                 continue;
             }
-            if let Some(value) = total.empty(at, cap) {
+            if let Some(value) = total.empty(at, cap, &self.latest_fence) {
                 updates.push(crate::AggregateValueUpdate {
                     subscription,
                     consumer: total.consumer(),
@@ -539,7 +587,7 @@ where
             if self.subscription_to_table.get(&subscription) != Some(&table_id) {
                 continue;
             }
-            for (group, change) in total.empty(at, cap) {
+            for (group, change) in total.empty(at, cap, &self.latest_fence) {
                 updates.push(crate::AggregateValueUpdate {
                     subscription,
                     consumer: total.consumer(),

@@ -50,6 +50,12 @@ where
         for entry in self.reexec.values_mut() {
             entry.runtime.forget_seen(&self.latest_fence, cap);
         }
+        for total in self.aggregates.values_mut() {
+            total.forget_seen(&self.latest_fence);
+        }
+        for total in self.grouped_aggregates.values_mut() {
+            total.forget_seen(&self.latest_fence);
+        }
         Ok(())
     }
 }
