@@ -423,6 +423,19 @@ struct Store {
     path: std::path::PathBuf,
 }
 
+/// Where a run keeps its store: a memory filesystem when the host has one,
+/// the temporary directory otherwise.
+///
+/// Every registration, removal and tier change writes the store and syncs it
+/// to disk twice, so on a disk a sequence spends most of its time waiting
+/// for the sync. In memory the sync returns at once, and the writes take the
+/// same path.
+fn store_root() -> std::path::PathBuf {
+    Some(std::path::Path::new("/dev/shm"))
+        .filter(|shm| shm.is_dir())
+        .map_or_else(std::env::temp_dir, std::path::Path::to_path_buf)
+}
+
 impl Drop for Store {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.path);
@@ -492,7 +505,7 @@ impl Run {
         let table = catalog_helpers::table_id::<SQLite, _>(&database, "t")
             .expect("the model table is in the catalog");
         let store = Store {
-            path: std::env::temp_dir().join(url.replace(['?', '=', '&', ':'], "_")),
+            path: store_root().join(url.replace(['?', '=', '&', ':'], "_")),
         };
         let mut inner =
             SubscriptionEngine::with_storage(database, SQLiteDialect {}, store.path.clone())
