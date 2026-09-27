@@ -1331,15 +1331,14 @@ impl<C: Checkpoint, T> Unseen<C, T> {
             .collect()
     }
 
-    /// Drop the kept changes, and the buffered ones, that the engine's latest
-    /// fence holds, when that is safe for the seed read outstanding.
-    fn forget_seen(&mut self, latest: &LatestFence<C>, buffered: Option<&mut Vec<(Option<C>, T)>>) {
-        let Some(fence) = latest.trims(self.asked) else {
-            return;
-        };
-        self.log.forget_held(fence);
-        if let Some(buffered) = buffered {
-            buffered.retain(|(at, _)| at.as_ref().is_none_or(|at| at.seen_by(fence) != Seen::Held));
+    /// Drop the kept changes the engine's latest fence holds, when that is
+    /// safe for the seed read outstanding.
+    ///
+    /// A buffered seed read was asked before any fence installed since, so
+    /// the fence may be newer than its snapshot and the buffer stays whole.
+    fn forget_seen(&mut self, latest: &LatestFence<C>) {
+        if let Some(fence) = latest.trims(self.asked) {
+            self.log.forget_held(fence);
         }
     }
 }
@@ -1409,10 +1408,7 @@ impl<C: Checkpoint, T: Absorb> SeedState<C, T> {
     }
 
     fn forget_seen(&mut self, latest: &LatestFence<C>) {
-        self.unseen.forget_seen(
-            latest,
-            self.pending.as_mut().map(|pending| &mut pending.changes),
-        );
+        self.unseen.forget_seen(latest);
     }
 
     /// The buffered changes a seed read behind `fence` can be lined up
@@ -1534,7 +1530,7 @@ impl<I: IdTypes, C: Checkpoint> AggregateTotal<I, C> {
         self.seed.wants_fence(cap)
     }
 
-    /// Drop the kept and buffered changes the engine's latest fence holds.
+    /// Drop the kept changes the engine's latest fence holds.
     pub fn forget_seen(&mut self, latest: &LatestFence<C>) {
         self.seed.forget_seen(latest);
     }
@@ -1908,7 +1904,7 @@ impl<I: IdTypes, B: Backend, C: Checkpoint> GroupedAggregateTotal<I, B, C> {
         self.seed.wants_fence(cap)
     }
 
-    /// Drop the kept and buffered changes the engine's latest fence holds.
+    /// Drop the kept changes the engine's latest fence holds.
     pub fn forget_seen(&mut self, latest: &LatestFence<C>) {
         self.seed.forget_seen(latest);
     }

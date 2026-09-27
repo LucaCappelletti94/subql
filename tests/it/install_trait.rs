@@ -241,6 +241,50 @@ fn a_seeded_aggregate_updates_without_a_trigger() {
     );
 }
 
+const GROUPED_COUNT: &str = "SELECT status, COUNT(*) FROM orders GROUP BY status";
+
+#[test]
+fn an_unseeded_grouped_aggregate_is_a_registry_trigger() {
+    let (mut engine, table) = engine();
+    let registered = register(&mut engine, 14, GROUPED_COUNT);
+
+    let output = engine.dispatch(&insert(table, 1, 5.0)).expect("dispatch");
+
+    assert!(output.aggregate_updates().is_empty());
+    assert_eq!(
+        output
+            .triggers()
+            .iter()
+            .map(|trigger| trigger.subscription_id)
+            .collect::<Vec<_>>(),
+        vec![registered.subscription_id]
+    );
+}
+
+#[test]
+fn a_seeded_grouped_aggregate_updates_without_a_trigger() {
+    let (mut engine, table) = engine();
+    let registered = register(&mut engine, 15, GROUPED_COUNT);
+    Install::install(
+        &mut engine,
+        registered.subscription_id,
+        AggregateSeedInstall {
+            rows: vec![vec![
+                Value::String("paid".into()),
+                Value::Int(1),
+                Value::Int(1),
+            ]],
+            fence: None,
+        },
+    )
+    .expect("seed");
+
+    let output = engine.dispatch(&insert(table, 1, 5.0)).expect("dispatch");
+
+    assert!(output.triggers().is_empty());
+    assert_eq!(output.aggregate_updates().len(), 1);
+}
+
 #[test]
 fn an_unknown_scalar_is_a_registry_trigger() {
     let (mut engine, table) = engine();

@@ -590,14 +590,25 @@ impl FencedReads {
             .ok_or(FencedReadError::Unqueued)?;
         Ok((value, Some(fence)))
     }
+
+    /// A scoped group read, answered as the queued extreme over two rows.
+    fn group_page(&self) -> Result<Snapshot<RowPage<Postgres>, PgCommitPosition>, FencedReadError> {
+        let (value, fence) = self.answer()?;
+        Ok(Snapshot {
+            value: RowPage {
+                columns: vec!["v".into(), "c1".into()],
+                rows: vec![vec![value, Value::Int(2)]],
+                more: false,
+            },
+            fence,
+        })
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
 enum FencedReadError {
     #[error("no answer is queued")]
     Unqueued,
-    #[error("this connector reads no rows")]
-    NoRows,
 }
 
 impl Connector for FencedReads {
@@ -621,7 +632,7 @@ impl Connector for FencedReads {
         _max_bytes: usize,
         _auth: &(),
     ) -> Result<Snapshot<RowPage<Postgres>, PgCommitPosition>, FencedReadError> {
-        Err(FencedReadError::NoRows)
+        self.group_page()
     }
 
     fn read_fence(&self, _auth: &()) -> Result<Option<PgSnapshotFence>, FencedReadError> {
@@ -656,7 +667,8 @@ impl AsyncConnector for FencedReads {
     ) -> impl core::future::Future<
         Output = Result<Snapshot<RowPage<Postgres>, PgCommitPosition>, FencedReadError>,
     > + Send {
-        async move { Err(FencedReadError::NoRows) }
+        let page = self.group_page();
+        async move { page }
     }
 
     fn read_fence(
@@ -1440,12 +1452,15 @@ fn grouped_count_engine(cap: usize) -> (Engine, TableId, u64) {
     (engine, orders, sub)
 }
 
-fn grouped_seed(fence: PgSnapshotFence) -> AggregateSeedInstall<Postgres, PgCommitPosition> {
+fn grouped_seed(
+    count: i64,
+    fence: PgSnapshotFence,
+) -> AggregateSeedInstall<Postgres, PgCommitPosition> {
     AggregateSeedInstall {
         rows: vec![vec![
             Value::String("north".into()),
-            Value::Int(1),
-            Value::Int(1),
+            Value::Int(count),
+            Value::Int(count),
         ]],
         fence: Some(fence),
     }
@@ -1461,7 +1476,7 @@ fn a_grouped_seed_buffers_one_slot_per_group_of_a_transaction() {
             .aggregate_updates(&insert(orders, id, "north", 9, at(2100, 750)))
             .unwrap();
     }
-    let installed = Install::install(&mut engine, sub, grouped_seed(read_fence())).unwrap();
+    let installed = Install::install(&mut engine, sub, grouped_seed(1, read_fence())).unwrap();
     assert_eq!(folded(&installed), vec![AggValue::CountStar(3)]);
 
     let (mut engine, orders, sub) = grouped_count_engine(1);
@@ -1471,7 +1486,7 @@ fn a_grouped_seed_buffers_one_slot_per_group_of_a_transaction() {
             .unwrap();
     }
     assert_eq!(
-        Install::install(&mut engine, sub, grouped_seed(read_fence())).unwrap_err(),
+        Install::install(&mut engine, sub, grouped_seed(1, read_fence())).unwrap_err(),
         AggregateInstallError::TooManyChangesDuringRead {
             subscription: sub,
             cap: 1,
@@ -1479,25 +1494,413 @@ fn a_grouped_seed_buffers_one_slot_per_group_of_a_transaction() {
     );
 }
 
+/// A fence read taken after the 742 commit, which no change from 770 on
+/// passes.
+fn later_fence() -> PgSnapshotFence {
+    PgSnapshotFence::parse("760:760:", PgLsn(3000)).unwrap()
+}
+
+/// A seed read newer than [`later_fence`] that misses every change from 770
+/// on.
+fn newest_fence() -> PgSnapshotFence {
+    PgSnapshotFence::parse("770:770:", PgLsn(3000)).unwrap()
+}
+
+/// Four changes the next seed read misses, filling a buffer of four.
+fn four_unseen_inserts(engine: &mut Engine, orders: TableId) {
+    for (id, lsn, xid) in [
+        (30, 3100, 770),
+        (31, 3200, 771),
+        (32, 3300, 772),
+        (33, 3400, 773),
+    ] {
+        engine
+            .aggregate_updates(&insert(orders, id, "north", 9, at(lsn, xid)))
+            .unwrap();
+    }
+}
+
+/// A fence read drops the kept changes it holds, so a reset hands none of
+/// them to the new seed read and its buffer keeps room for every change
+/// arriving while that read runs.
 #[test]
-fn a_fence_read_drops_the_kept_changes_a_grouped_total_holds() {
-    let (mut engine, orders, sub) = grouped_count_engine(4);
-    Install::install(&mut engine, sub, grouped_seed(early_fence())).unwrap();
+fn a_fence_read_leaves_a_reset_total_its_whole_seed_buffer() {
+    let (mut engine, orders, sub) = count_engine(4);
     engine.aggregate_updates(&unseen_insert(orders)).unwrap();
     Install::install(
         &mut engine,
         sub,
         FenceInstall {
-            fence: Some(PgSnapshotFence::parse("760:760:", PgLsn(3000)).unwrap()),
+            fence: Some(later_fence()),
+        },
+    )
+    .unwrap();
+    assert!(engine.reset_aggregate_value(sub));
+    four_unseen_inserts(&mut engine, orders);
+
+    let installed = Install::install(
+        &mut engine,
+        sub,
+        AggregateSeedInstall {
+            rows: vec![vec![Value::Int(2)]],
+            fence: Some(newest_fence()),
+        },
+    )
+    .unwrap();
+    assert_eq!(folded(&installed), vec![AggValue::CountStar(6)]);
+}
+
+#[test]
+fn a_fence_read_leaves_a_reset_grouped_total_its_whole_seed_buffer() {
+    let (mut engine, orders, sub) = grouped_count_engine(4);
+    Install::install(&mut engine, sub, grouped_seed(1, early_fence())).unwrap();
+    engine.aggregate_updates(&unseen_insert(orders)).unwrap();
+    Install::install(
+        &mut engine,
+        sub,
+        FenceInstall {
+            fence: Some(later_fence()),
+        },
+    )
+    .unwrap();
+    assert!(engine.reset_aggregate_value(sub));
+    four_unseen_inserts(&mut engine, orders);
+
+    let installed = Install::install(&mut engine, sub, grouped_seed(2, newest_fence())).unwrap();
+    assert_eq!(folded(&installed), vec![AggValue::CountStar(6)]);
+}
+
+/// A change the first seed read missed is kept, so a reset whose read misses
+/// it too still counts it, while one that read held is not counted twice.
+#[test]
+fn a_reset_total_keeps_a_change_its_first_seed_read_missed() {
+    let (mut engine, orders) = engine();
+    let sub = register(
+        &mut engine,
+        "SELECT COUNT(*) FROM orders WHERE status = 'paid'",
+    );
+    engine
+        .aggregate_updates(&insert(orders, 30, "north", 9, at(1100, 741)))
+        .unwrap();
+    engine.aggregate_updates(&unseen_insert(orders)).unwrap();
+    let seeded = Install::install(
+        &mut engine,
+        sub,
+        AggregateSeedInstall {
+            rows: vec![vec![Value::Int(2)]],
+            fence: Some(read_fence()),
+        },
+    )
+    .unwrap();
+    assert_eq!(folded(&seeded), vec![AggValue::CountStar(3)]);
+
+    assert_eq!(
+        reseed(&mut engine, sub, 2, read_fence()),
+        vec![AggValue::CountStar(3)]
+    );
+}
+
+/// Two rows of one transaction into a new group share a buffer slot and
+/// still count as two rows, so deleting one leaves the group standing.
+#[test]
+fn a_group_buffered_in_one_slot_keeps_every_row() {
+    let (mut engine, orders, sub) = grouped_count_engine(4);
+    for id in [30, 31] {
+        engine
+            .aggregate_updates(&insert(orders, id, "south", 9, at(2100, 750)))
+            .unwrap();
+    }
+    let installed = Install::install(&mut engine, sub, grouped_seed(1, read_fence())).unwrap();
+    assert_eq!(
+        folded(&installed),
+        vec![AggValue::CountStar(1), AggValue::CountStar(2)]
+    );
+
+    let deleted = engine
+        .aggregate_updates(&delete(orders, 30, "south", 9, at(2200, 751)))
+        .unwrap();
+    assert_eq!(folded(&deleted.updates), vec![AggValue::CountStar(1)]);
+}
+
+#[test]
+fn a_seeded_grouped_total_asks_for_one_fence_read_as_its_kept_changes_fill() {
+    let (mut engine, orders, sub) = grouped_count_engine(4);
+    Install::install(&mut engine, sub, grouped_seed(1, early_fence())).unwrap();
+    let first = engine
+        .aggregate_updates(&insert(orders, 30, "north", 9, at(2100, 750)))
+        .unwrap();
+    assert!(first.triggers.is_empty());
+    let second = engine
+        .aggregate_updates(&insert(orders, 31, "north", 9, at(2200, 751)))
+        .unwrap();
+    assert!(matches!(
+        &second.triggers[..],
+        [trigger] if matches!(trigger.read, ReExecutionRead::Fence)
+    ));
+}
+
+fn north_read(
+    engine: &mut Engine,
+    sub: u64,
+    north: &[u8],
+    min: i64,
+    rows: i64,
+) -> subql::AggregateMaintenanceOutput<DefaultIds, Postgres, PgCommitPosition> {
+    Install::install(
+        engine,
+        sub,
+        GroupedScalarInstall {
+            group: north.to_vec(),
+            row: vec![Value::Int(min), Value::Int(rows)],
+            checkpoint: Some(at(1300, 741)),
+            fence: Some(read_fence()),
+        },
+    )
+    .unwrap()
+}
+
+/// A change a group read missed stays kept after the read lands, so it counts
+/// toward the next fence read.
+#[test]
+fn a_change_a_group_read_missed_counts_toward_the_next_fence_read() {
+    let (mut engine, orders, sub, north) = grouped_engine(6, 5, 2);
+    engine.dispatch(&unseen_insert(orders)).unwrap();
+    engine.dispatch(&sparse_delete(orders)).unwrap();
+    north_read(&mut engine, sub, &north, 5, 2);
+
+    let first = engine
+        .dispatch(&insert(orders, 30, "north", 9, at(2100, 750)))
+        .unwrap();
+    assert_eq!(fence_reads(&first), 0);
+    let second = engine
+        .dispatch(&insert(orders, 31, "north", 9, at(2200, 751)))
+        .unwrap();
+    assert_eq!(
+        fence_reads(&second),
+        1,
+        "742 and two more reach half of six"
+    );
+}
+
+/// A fence read that holds none of a filling group log leaves it filling, so
+/// the next change anywhere asks for another fence read.
+#[test]
+fn a_fence_read_that_holds_none_of_a_group_log_asks_again() {
+    let (mut engine, orders, sub, _) = grouped_engine(4, 1, 1);
+    for (id, lsn, xid) in [(30, 2100, 750), (31, 2200, 751)] {
+        engine
+            .dispatch(&insert(orders, id, "north", 9, at(lsn, xid)))
+            .unwrap();
+    }
+    Install::install(
+        &mut engine,
+        sub,
+        FenceInstall {
+            fence: Some(read_fence()),
         },
     )
     .unwrap();
 
     let next = engine
-        .aggregate_updates(&insert(orders, 30, "north", 9, at(3100, 770)))
+        .dispatch(&insert(orders, 32, "south", 9, at(2300, 752)))
         .unwrap();
+    assert_eq!(fence_reads(&next), 1);
+}
+
+#[test]
+fn a_group_read_after_its_log_overflowed_asks_again_past_a_fence_read() {
+    let (mut engine, orders, sub, north) = grouped_engine(2, 5, 2);
+    for (id, lsn, xid) in [(30, 2100, 750), (31, 2200, 751), (32, 2300, 752)] {
+        engine
+            .dispatch(&insert(orders, id, "north", 9, at(lsn, xid)))
+            .unwrap();
+    }
+    Install::install(
+        &mut engine,
+        sub,
+        FenceInstall {
+            fence: Some(later_fence()),
+        },
+    )
+    .unwrap();
+    engine.dispatch(&sparse_delete_at(orders, 2400)).unwrap();
+
+    let installed = Install::install(
+        &mut engine,
+        sub,
+        GroupedScalarInstall {
+            group: north.clone(),
+            row: vec![Value::Int(5), Value::Int(4)],
+            checkpoint: Some(at(2400, 754)),
+            fence: Some(later_fence()),
+        },
+    )
+    .unwrap();
+    assert!(matches!(
+        &installed.triggers[..],
+        [trigger] if matches!(&trigger.read, ReExecutionRead::GroupedScalar { group, .. } if *group == north)
+    ));
+}
+
+#[test]
+fn filling_kept_truncates_ask_for_a_fence_read() {
+    let (mut engine, orders, _, _) = grouped_engine(4, 1, 1);
+    let first = engine
+        .dispatch(&Event::truncate(orders).with_checkpoint(at(2100, 750)))
+        .unwrap();
+    assert_eq!(fence_reads(&first), 0);
+    let second = engine
+        .dispatch(&Event::truncate(orders).with_checkpoint(at(2200, 751)))
+        .unwrap();
+    assert_eq!(fence_reads(&second), 1);
+}
+
+/// A fence installed while a group read is outstanding may be newer than
+/// that read's snapshot, so it keeps a truncate the read has to replay.
+#[test]
+fn a_shared_fence_keeps_a_truncate_an_older_group_read_missed() {
+    let (mut engine, orders, sub, north) = grouped_engine(4096, 5, 2);
+    engine.dispatch(&sparse_delete(orders)).unwrap();
+    engine
+        .dispatch(&Event::truncate(orders).with_checkpoint(at(1400, 742)))
+        .unwrap();
+    Install::install(
+        &mut engine,
+        sub,
+        FenceInstall {
+            fence: Some(later_fence()),
+        },
+    )
+    .unwrap();
+
+    let installed = north_read(&mut engine, sub, &north, 5, 2);
     assert!(
-        next.triggers.is_empty(),
-        "one kept change is under half the cap"
+        installed.updates.is_empty() && installed.triggers.is_empty(),
+        "the truncate the read missed empties north, got {:?}",
+        installed.updates
     );
+}
+
+/// Holds 743 and not 741, as of a WAL position the stream has not reached.
+fn lagging_fence() -> PgSnapshotFence {
+    PgSnapshotFence::parse("740:760:741", PgLsn(3000)).unwrap()
+}
+
+/// A read asked after the latest fence installed takes a newer snapshot, so
+/// the value trims its kept changes by that fence.
+#[test]
+fn a_read_asked_after_the_latest_fence_trims_by_it() {
+    let (mut engine, orders, sub) = small_cap_engine();
+    Install::install(
+        &mut engine,
+        sub,
+        FenceInstall {
+            fence: Some(lagging_fence()),
+        },
+    )
+    .unwrap();
+    engine.dispatch(&sparse_delete(orders)).unwrap();
+
+    let held = engine
+        .dispatch(&insert(orders, 30, "north", 9, at(1400, 743)))
+        .unwrap();
+    assert_eq!(fence_reads(&held), 0, "the fence drops 743");
+}
+
+/// A group read that has to be asked again waits for the next drain, as a
+/// value's does.
+#[test]
+fn the_auto_resolving_engine_holds_a_second_group_read_until_the_next_drain() {
+    let catalog = ParserDB::parse::<PostgreSqlDialect>(DDL).unwrap();
+    let orders = catalog_helpers::table_id::<Postgres, _>(&catalog, "orders").unwrap();
+    let mut engine = AutoResolvingEngine::new(
+        SubscriptionEngine::<Event, DefaultIds, ParserDB>::new(catalog, PostgreSqlDialect {}),
+        SyncMode(two_reads()),
+    );
+    let sub = engine
+        .register(SubscriptionRequest::new(7u64, GROUPED_MIN), ())
+        .unwrap()
+        .subscription_id;
+    Install::install(
+        &mut engine,
+        sub,
+        GroupedScalarSeedInstall {
+            rows: vec![vec![
+                Value::String("north".into()),
+                Value::Int(4),
+                Value::Int(3),
+            ]],
+            fence: Some(early_fence()),
+        },
+    )
+    .unwrap();
+    drop(
+        engine
+            .apply(&delete(orders, 10, "north", 4, at(1100, 720)))
+            .unwrap(),
+    );
+    drop(
+        engine
+            .apply(&delete(orders, 11, "north", 5, at(1200, 742)))
+            .unwrap(),
+    );
+
+    engine.resolve_collect().unwrap();
+    assert_eq!(engine.connector().calls(), 1);
+    assert_eq!(engine.pending_read_count(), 1, "the second read waits");
+
+    engine.resolve_collect().unwrap();
+    assert_eq!(engine.connector().calls(), 2);
+    assert_eq!(engine.pending_read_count(), 0);
+}
+
+/// A row moving between two groups with its value missing asks for both
+/// groups' reads, which come out in key order however the event met them.
+#[test]
+fn one_event_asks_its_group_reads_in_key_order() {
+    let catalog = ParserDB::parse::<PostgreSqlDialect>(DDL).unwrap();
+    let orders = catalog_helpers::table_id::<Postgres, _>(&catalog, "orders").unwrap();
+    let mut engine: Engine = SubscriptionEngine::new(catalog, PostgreSqlDialect {});
+    let sub = register(&mut engine, GROUPED_MIN);
+    Install::install(
+        &mut engine,
+        sub,
+        GroupedScalarSeedInstall {
+            rows: ["north", "south"]
+                .map(|region| vec![Value::String(region.into()), Value::Int(4), Value::Int(2)])
+                .into(),
+            fence: Some(early_fence()),
+        },
+    )
+    .unwrap();
+    let sparse = |region: &str| {
+        vec![
+            Value::Int(2),
+            Value::String(region.into()),
+            Value::Missing,
+            Value::String("paid".into()),
+        ]
+    };
+
+    // The engine hashes an event's groups with a fresh seed each time, so
+    // many events meet the two groups in both orders.
+    for (from, to) in [("south", "north"), ("north", "south")].repeat(8) {
+        let moved = engine
+            .dispatch(
+                &Event::update(orders, sparse(from), sparse(to))
+                    .with_pk_columns([0u16])
+                    .with_checkpoint(at(1100, 720)),
+            )
+            .unwrap();
+        let groups: Vec<_> = moved
+            .triggers()
+            .iter()
+            .map(|trigger| match &trigger.read {
+                ReExecutionRead::GroupedScalar { group, .. } => group.clone(),
+                other => panic!("expected a group read, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(groups.len(), 2);
+        assert!(groups[0] < groups[1], "got {groups:?}");
+    }
 }
