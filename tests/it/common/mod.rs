@@ -122,6 +122,7 @@ pub fn pg_image_ref() -> String {
     feature = "apply-patchset-mysql-async",
     feature = "executor-diesel-async-postgres",
     feature = "executor-diesel-async-mysql",
+    feature = "pg-streaming",
 ))]
 pub fn multi_thread_rt() -> tokio::runtime::Runtime {
     tokio::runtime::Builder::new_multi_thread()
