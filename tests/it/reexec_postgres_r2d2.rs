@@ -877,8 +877,16 @@ fn a_panic_during_a_read_leaves_no_transaction_behind() {
     common::pg::setup_orders(&mut conn, &[(1, 10.0), (2, 20.0), (3, 30.0)], &slot);
     let mut observer = db.connect();
 
+    // The panic discards its pooled connection, and a replenishing pool would
+    // reconnect on a background thread that can still be in libpq at exit.
+    let pool = r2d2::Pool::builder()
+        .max_size(4)
+        .min_idle(Some(0))
+        .connection_timeout(Duration::from_secs(10))
+        .build(ConnectionManager::<PgConnection>::new(db.url()))
+        .expect("build r2d2 pool");
     let connector = PanicMidRead {
-        inner: PgR2D2DieselConnector::new(build_pool(&db.url())),
+        inner: PgR2D2DieselConnector::new(pool),
         fetches: parking_lot::Mutex::new(0),
     };
     let cat = common::pg::orders_catalog();
