@@ -13,8 +13,11 @@
 
 use sql_traits::structs::ParserDB;
 use sqlparser::dialect::PostgreSqlDialect;
-use subql::backend::{Postgres, Value};
-use subql::reexec::{ReExecutionRead, ScalarInstalled};
+use subql::backend::{Postgres, ScalarFamily, Value};
+use subql::reexec::{
+    AutoResolvingEngine, Connector, ReExecutionRead, ReadQuery, RowPage, ScalarInstalled, Snapshot,
+    SyncMode,
+};
 use subql::testing::TestEvent;
 use subql::{
     catalog_helpers, AggValue, AggregateResultValue, AggregateSeedInstall, AggregateValueChange,
@@ -386,4 +389,265 @@ fn a_scalar_read_whose_answer_a_missed_change_removed_asks_again() {
     )
     .unwrap();
     assert_eq!(scalar_value(reread), Value::Int(6));
+}
+
+#[test]
+fn a_scoped_group_read_whose_answer_a_missed_delete_removed_asks_again() {
+    let (mut engine, orders) = engine();
+    let sub = register(
+        &mut engine,
+        "SELECT region, MIN(amount) FROM orders WHERE status = 'paid' GROUP BY region",
+    );
+    let opening = Install::install(
+        &mut engine,
+        sub,
+        GroupedScalarSeedInstall {
+            rows: vec![vec![
+                Value::String("north".into()),
+                Value::Int(3),
+                Value::Int(3),
+            ]],
+            fence: Some(early_fence()),
+        },
+    )
+    .unwrap();
+    let north = opening.updates[0].group.clone().unwrap();
+    engine
+        .dispatch(&delete(orders, 10, "north", 3, at(1100, 720)))
+        .unwrap();
+    engine
+        .dispatch(&delete(orders, 11, "north", 5, at(1200, 742)))
+        .unwrap();
+
+    // The read still saw the 742 row worth 5 as the smallest.
+    let installed = Install::install(
+        &mut engine,
+        sub,
+        GroupedScalarInstall {
+            group: north.key.clone(),
+            row: vec![Value::Int(5), Value::Int(2)],
+            checkpoint: Some(at(1100, 720)),
+            fence: Some(read_fence()),
+        },
+    )
+    .unwrap();
+    assert!(installed.updates.is_empty(), "{:?}", installed.updates);
+    assert!(matches!(
+        &installed.triggers[..],
+        [trigger] if matches!(&trigger.read, ReExecutionRead::GroupedScalar { group, .. } if *group == north.key)
+    ));
+
+    // The next read holds that delete, so its answer stands.
+    let reread = Install::install(
+        &mut engine,
+        sub,
+        GroupedScalarInstall {
+            group: north.key,
+            row: vec![Value::Int(6), Value::Int(1)],
+            checkpoint: Some(at(1100, 720)),
+            fence: Some(PgSnapshotFence::parse("760:760:", PgLsn(3000)).unwrap()),
+        },
+    )
+    .unwrap();
+    assert_eq!(reread.updates[0].change, scalar(6));
+    assert!(reread.triggers.is_empty());
+}
+
+#[test]
+fn a_truncate_a_scoped_group_read_missed_empties_the_group_it_answers() {
+    let (mut engine, orders) = engine();
+    let sub = register(
+        &mut engine,
+        "SELECT region, MIN(amount) FROM orders WHERE status = 'paid' GROUP BY region",
+    );
+    let opening = Install::install(
+        &mut engine,
+        sub,
+        GroupedScalarSeedInstall {
+            rows: vec![vec![
+                Value::String("north".into()),
+                Value::Int(3),
+                Value::Int(2),
+            ]],
+            fence: Some(early_fence()),
+        },
+    )
+    .unwrap();
+    let north = opening.updates[0].group.clone().unwrap();
+    engine
+        .dispatch(&delete(orders, 10, "north", 3, at(1100, 720)))
+        .unwrap();
+    let truncated = engine
+        .dispatch(&Event::truncate(orders).with_checkpoint(at(1200, 742)))
+        .unwrap();
+    assert_eq!(
+        truncated.aggregate_updates()[0].change,
+        AggregateValueChange::Remove
+    );
+
+    // The read ran before the truncate reached its snapshot.
+    let installed = Install::install(
+        &mut engine,
+        sub,
+        GroupedScalarInstall {
+            group: north.key,
+            row: vec![Value::Int(4), Value::Int(1)],
+            checkpoint: Some(at(1100, 720)),
+            fence: Some(read_fence()),
+        },
+    )
+    .unwrap();
+    assert!(
+        installed.updates.is_empty() && installed.triggers.is_empty(),
+        "the table is empty, got {:?}",
+        installed.updates
+    );
+}
+
+#[test]
+fn a_scalar_read_whose_kept_changes_overflowed_asks_again() {
+    let catalog = ParserDB::parse::<PostgreSqlDialect>(DDL).unwrap();
+    let orders = catalog_helpers::table_id::<Postgres, _>(&catalog, "orders").unwrap();
+    let mut engine: Engine = SubscriptionEngine::new(catalog, PostgreSqlDialect {})
+        .with_max_changes_during_aggregate_read(1);
+    let sub = register(
+        &mut engine,
+        "SELECT MIN(amount) FROM orders WHERE status = 'paid'",
+    );
+    Install::install(
+        &mut engine,
+        sub,
+        ScalarInstall {
+            value: Value::Int(4),
+            checkpoint: None,
+            fence: Some(early_fence()),
+        },
+    )
+    .unwrap();
+    engine
+        .dispatch(&delete(orders, 10, "north", 4, at(1100, 720)))
+        .unwrap();
+    engine
+        .dispatch(&insert(orders, 11, "north", 9, at(1200, 742)))
+        .unwrap();
+
+    let installed = Install::install(
+        &mut engine,
+        sub,
+        ScalarInstall {
+            value: Value::Int(5),
+            checkpoint: None,
+            fence: Some(read_fence()),
+        },
+    )
+    .unwrap();
+    assert!(
+        matches!(installed, ScalarInstalled::ReadAgain(_)),
+        "got {installed:?}"
+    );
+}
+
+/// Serves queued answers, each with the fence of the read that produced it.
+struct FencedReads {
+    answers: core::cell::RefCell<Vec<(Value<Postgres>, PgSnapshotFence)>>,
+    calls: core::cell::Cell<usize>,
+}
+
+#[derive(Debug, thiserror::Error)]
+enum FencedReadError {
+    #[error("no answer is queued")]
+    Unqueued,
+    #[error("this connector reads no rows")]
+    NoRows,
+}
+
+impl Connector for FencedReads {
+    type AuthContext = ();
+    type Error = FencedReadError;
+    type Checkpoint = PgCommitPosition;
+    type Backend = Postgres;
+
+    fn execute_scalar(
+        &self,
+        _query: &ReadQuery<'_, Postgres>,
+        _kind: ScalarFamily,
+        _auth: &(),
+    ) -> Result<(Value<Postgres>, Option<PgSnapshotFence>), FencedReadError> {
+        self.calls.set(self.calls.get() + 1);
+        let (value, fence) = self
+            .answers
+            .borrow_mut()
+            .pop()
+            .ok_or(FencedReadError::Unqueued)?;
+        Ok((value, Some(fence)))
+    }
+
+    fn read_page(
+        &self,
+        _query: &ReadQuery<'_, Postgres>,
+        _max_bytes: usize,
+        _auth: &(),
+    ) -> Result<Snapshot<RowPage<Postgres>, PgCommitPosition>, FencedReadError> {
+        Err(FencedReadError::NoRows)
+    }
+}
+
+/// A read that has to be asked again waits for the next drain, so a commit
+/// that stays invisible cannot keep one drain reading forever.
+#[test]
+fn the_auto_resolving_engine_holds_a_second_read_until_the_next_drain() {
+    let catalog = ParserDB::parse::<PostgreSqlDialect>(DDL).unwrap();
+    let orders = catalog_helpers::table_id::<Postgres, _>(&catalog, "orders").unwrap();
+    let later = PgSnapshotFence::parse("760:760:", PgLsn(3000)).unwrap();
+    let connector = FencedReads {
+        // Popped from the back.
+        answers: core::cell::RefCell::new(vec![
+            (Value::Int(6), later),
+            (Value::Int(5), read_fence()),
+        ]),
+        calls: core::cell::Cell::new(0),
+    };
+    let mut engine = AutoResolvingEngine::new(
+        SubscriptionEngine::<Event, DefaultIds, ParserDB>::new(catalog, PostgreSqlDialect {}),
+        SyncMode(connector),
+    );
+    let sub = crate::common::reexec::register_captured(
+        &mut engine,
+        7,
+        "SELECT MIN(amount) FROM orders WHERE status = 'paid'",
+    );
+    Install::install(
+        &mut engine,
+        sub,
+        ScalarInstall {
+            value: Value::Int(4),
+            checkpoint: None,
+            fence: Some(early_fence()),
+        },
+    )
+    .unwrap();
+    drop(
+        engine
+            .apply(&delete(orders, 10, "north", 4, at(1100, 720)))
+            .unwrap(),
+    );
+    drop(
+        engine
+            .apply(&delete(orders, 11, "north", 5, at(1200, 742)))
+            .unwrap(),
+    );
+
+    let first = engine.resolve_collect().unwrap();
+    assert!(
+        first.scalar_updates.is_empty(),
+        "{:?}",
+        first.scalar_updates
+    );
+    assert_eq!(engine.connector().calls.get(), 1);
+    assert_eq!(engine.pending_read_count(), 1, "the second read waits");
+
+    let second = engine.resolve_collect().unwrap();
+    assert_eq!(engine.connector().calls.get(), 2);
+    assert_eq!(second.scalar_updates[0].value, Value::Int(6));
+    assert_eq!(engine.pending_read_count(), 0);
 }
