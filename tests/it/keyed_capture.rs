@@ -641,9 +641,8 @@ fn a_key_with_no_literal_spelling_is_refused_at_registration() {
 /// happens again, which may be never.
 #[test]
 fn a_failed_read_keeps_the_keys_it_was_going_to_ask_about() {
-    let dir = std::env::temp_dir().join(format!("subql_keyed_{}", std::process::id()));
-    std::fs::create_dir_all(&dir).expect("temp dir");
-    let path = dir.join("keyed.db");
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join("keyed.db");
     let url = path.to_str().expect("utf8 path");
 
     // Two connections to one file, so the test can break the read underneath
@@ -700,7 +699,6 @@ fn a_failed_read_keeps_the_keys_it_was_going_to_ask_about() {
         keys.contains(&vec![Value::Int(2)]),
         "the new change must be answered too, got {keys:?}"
     );
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// One row changed twice in a batch is asked about once.
