@@ -316,8 +316,36 @@ jobs:
         with:
           tool: cargo-llvm-cov,nextest
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      # The runner pipes cores to apport, which keeps nothing, so a test process that crashes leaves no trace.
+      # %E is the executable's path with `/` spelled `!`, which the backtrace step needs.
+      - run: mkdir -p /tmp/cores && sudo sysctl -w kernel.core_pattern='/tmp/cores/core.%p.%E'
       # Ignored tests are the Docker-backed ones, and code only they reach would otherwise read as uncovered.
-      - run: cargo llvm-cov nextest --workspace --all-features --cargo-profile coverage --locked --run-ignored all --no-fail-fast --test-threads 8 --codecov --output-path codecov.json
+      - run: |
+          ulimit -c unlimited
+          cargo llvm-cov nextest --workspace --all-features --cargo-profile coverage --locked --run-ignored all --no-fail-fast --test-threads 8 --codecov --output-path codecov.json
+      - name: Backtrace crashed test processes
+        if: failure()
+        run: |
+          shopt -s nullglob
+          cores=(/tmp/cores/core.*)
+          if [ ${#cores[@]} -eq 0 ]; then echo "No test process dumped core."; exit 0; fi
+          sudo apt-get install -y gdb
+          mkdir -p /tmp/crashes
+          for core in "${cores[@]}"; do
+            exe=$(basename "$core" | cut -d. -f3- | tr '!' '/')
+            sudo chmod a+r "$core"
+            echo "::group::Backtrace of $exe ($core)"
+            gdb -batch -ex 'thread apply all bt' "$exe" "$core" 2>&1 | tee "/tmp/crashes/$(basename "$core").txt"
+            echo "::endgroup::"
+            cp "$core" "$exe" /tmp/crashes/
+          done
+      - if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: coverage-crashes
+          path: /tmp/crashes
+          if-no-files-found: ignore
+          retention-days: 7
       - uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
         with:
           files: codecov.json
