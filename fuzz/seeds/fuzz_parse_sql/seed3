@@ -1,0 +1,1 @@
+SELECT * FROM orders WHERE amount IN (1, 2, 3)

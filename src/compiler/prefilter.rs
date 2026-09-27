@@ -342,6 +342,9 @@ fn analyze_between<B: crate::backend::Backend, DB: DatabaseLike>(
     let Some(column_id) = resolve_column::<B, DB>(expr, table_id, database) else {
         return Analysis::unknown();
     };
+    if !is_integer_column(database, table_id, column_id) {
+        return Analysis::unknown();
+    }
 
     let Some(low_int) = literal_int_from_expr(low) else {
         return Analysis::unknown();
@@ -407,7 +410,17 @@ fn analyze_comparison<B: SqlLiteralParse, DB: DatabaseLike>(
         return Analysis::unknown();
     };
 
-    match apply_negation_to_comparison(normalized_op, negated) {
+    let op = apply_negation_to_comparison(normalized_op, negated);
+    // A range is filed as integers, where `> 0` starts at `1`, so only an
+    // integer column has no value between two of its bounds.
+    if matches!(
+        op,
+        BinaryOperator::Gt | BinaryOperator::GtEq | BinaryOperator::Lt | BinaryOperator::LtEq
+    ) && !is_integer_column(database, table_id, column_id)
+    {
+        return Analysis::unknown();
+    }
+    match op {
         BinaryOperator::Eq => literal_index_key::<B, DB>(literal, table_id, column_id, database)
             .map_or_else(Analysis::unknown, |value| {
                 Analysis::indexed_atom(PlannerAtom::Equality { column_id, value })
@@ -451,6 +464,17 @@ fn analyze_comparison<B: SqlLiteralParse, DB: DatabaseLike>(
 
         _ => Analysis::unknown(),
     }
+}
+
+/// Whether `column_id` holds integers, the only kind a range atom's bounds
+/// describe exactly.
+fn is_integer_column<DB: DatabaseLike>(
+    database: &DB,
+    table_id: TableId,
+    column_id: ColumnId,
+) -> bool {
+    catalog_helpers::column_scalar_family(database, table_id, column_id)
+        == Some(crate::backend::ScalarFamily::Int)
 }
 
 fn apply_negation_to_comparison(op: BinaryOperator, negated: bool) -> BinaryOperator {

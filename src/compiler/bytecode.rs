@@ -288,7 +288,9 @@ pub enum Instruction<B: Backend> {
     /// `BETWEEN a AND b`: closed-range membership. Equivalent to
     /// `value >= lower AND value <= upper`.
     ///
-    /// Any `Missing` / `Null` operand yields `Tri::Unknown`.
+    /// A `Missing` or `Null` value makes the answer `Tri::Unknown`. A
+    /// `Missing` or `Null` bound leaves only its own side unknown, so a
+    /// `False` on the other side still decides the row.
     ///
     /// Stack: `[..., value, lower, upper] -> [..., Tri]`.
     Between {

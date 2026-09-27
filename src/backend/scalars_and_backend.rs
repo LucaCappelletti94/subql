@@ -440,6 +440,20 @@ pub trait Backend: 'static {
         Ok(None)
     }
 
+    /// An integer operand of arithmetic beside a float, read as this
+    /// backend's float, or `None` when there is no such reading.
+    ///
+    /// Every shipped engine computes `1 + 2.5` as a double, and SQLite reaches
+    /// the pair on its own when an overflowed integer is promoted to a real.
+    /// Defaults to `None`, which answers such arithmetic `NULL`, for a backend
+    /// whose carriers this crate cannot convert.
+    fn int_as_float(_value: &Self::Int) -> Option<Self::Float>
+    where
+        Self: Sized,
+    {
+        None
+    }
+
     /// What this backend answers when a divisor is zero.
     ///
     /// Required, and per backend, because the engines disagree: measured,

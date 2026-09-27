@@ -1,0 +1,1 @@
+SELECT * FROM orders WHERE amount IS NOT DISTINCT FROM c1

@@ -503,25 +503,22 @@ impl<B: Backend> Vm<B> {
                 let value = peek(&self.stack, 2, src)?;
                 let lower = peek(&self.stack, 1, src)?;
                 let upper = peek(&self.stack, 0, src)?;
-                let result = if value.is_absent() || lower.is_absent() || upper.is_absent() {
-                    Tri::Unknown
-                } else {
-                    let ge_lower = compare_ordered_values(
-                        comparison_context(program, *lower_facts)?,
-                        value,
-                        lower,
-                        |ord| !matches!(ord, core::cmp::Ordering::Less),
-                    )
-                    .map_err(VmError::Refused)?;
-                    let le_upper = compare_ordered_values(
-                        comparison_context(program, *upper_facts)?,
-                        value,
-                        upper,
-                        |ord| !matches!(ord, core::cmp::Ordering::Greater),
-                    )
-                    .map_err(VmError::Refused)?;
-                    ge_lower.and(le_upper)
+                // `x BETWEEN low AND high` is `x >= low AND x <= high`, so an
+                // absent bound leaves only its own side unknown.
+                let side = |bound: &Value<B>, facts, holds: fn(core::cmp::Ordering) -> bool| {
+                    if value.is_absent() || bound.is_absent() {
+                        return Ok(Tri::Unknown);
+                    }
+                    compare_ordered_values(comparison_context(program, facts)?, value, bound, holds)
+                        .map_err(VmError::Refused)
                 };
+                let ge_lower = side(lower, *lower_facts, |ord| {
+                    !matches!(ord, core::cmp::Ordering::Less)
+                })?;
+                let le_upper = side(upper, *upper_facts, |ord| {
+                    !matches!(ord, core::cmp::Ordering::Greater)
+                })?;
+                let result = ge_lower.and(le_upper);
                 self.replace_top(3, result);
             }
 

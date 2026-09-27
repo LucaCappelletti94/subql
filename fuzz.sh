@@ -13,6 +13,7 @@ TARGETS=(
     fuzz_wal_json_postparse
     fuzz_aggregate_consistency
     fuzz_snapshot_restore_roundtrip
+    fuzz_predicate_verdict_sqlite
 )
 
 # libFuzzer runtime knobs (passed after `--` to cargo-fuzz):
