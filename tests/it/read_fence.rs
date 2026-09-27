@@ -15,8 +15,8 @@ use sql_traits::structs::ParserDB;
 use sqlparser::dialect::PostgreSqlDialect;
 use subql::backend::{Postgres, ScalarFamily, Value};
 use subql::reexec::{
-    AutoResolvingEngine, Connector, ReExecutionRead, ReadQuery, RowPage, ScalarInstalled, Snapshot,
-    SyncMode,
+    AsyncConnector, AsyncMode, AutoResolvingEngine, Connector, ReExecutionRead, ReadQuery, RowPage,
+    ScalarInstalled, Snapshot, SyncMode,
 };
 use subql::testing::TestEvent;
 use subql::{
@@ -549,8 +549,33 @@ fn a_scalar_read_whose_kept_changes_overflowed_asks_again() {
 
 /// Serves queued answers, each with the fence of the read that produced it.
 struct FencedReads {
-    answers: core::cell::RefCell<Vec<(Value<Postgres>, PgSnapshotFence)>>,
-    calls: core::cell::Cell<usize>,
+    answers: std::sync::Mutex<Vec<(Value<Postgres>, PgSnapshotFence)>>,
+    calls: std::sync::atomic::AtomicUsize,
+}
+
+impl FencedReads {
+    /// `answers` in the order the reads get them.
+    fn new(answers: Vec<(Value<Postgres>, PgSnapshotFence)>) -> Self {
+        Self {
+            answers: std::sync::Mutex::new(answers.into_iter().rev().collect()),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    fn calls(&self) -> usize {
+        self.calls.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn answer(&self) -> Result<(Value<Postgres>, Option<PgSnapshotFence>), FencedReadError> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let (value, fence) = self
+            .answers
+            .lock()
+            .unwrap()
+            .pop()
+            .ok_or(FencedReadError::Unqueued)?;
+        Ok((value, Some(fence)))
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -573,13 +598,7 @@ impl Connector for FencedReads {
         _kind: ScalarFamily,
         _auth: &(),
     ) -> Result<(Value<Postgres>, Option<PgSnapshotFence>), FencedReadError> {
-        self.calls.set(self.calls.get() + 1);
-        let (value, fence) = self
-            .answers
-            .borrow_mut()
-            .pop()
-            .ok_or(FencedReadError::Unqueued)?;
-        Ok((value, Some(fence)))
+        self.answer()
     }
 
     fn read_page(
@@ -592,30 +611,68 @@ impl Connector for FencedReads {
     }
 }
 
-/// A read that has to be asked again waits for the next drain, so a commit
-/// that stays invisible cannot keep one drain reading forever.
-#[test]
-fn the_auto_resolving_engine_holds_a_second_read_until_the_next_drain() {
+#[allow(clippy::manual_async_fn)]
+impl AsyncConnector for FencedReads {
+    type AuthContext = ();
+    type Error = FencedReadError;
+    type Checkpoint = PgCommitPosition;
+    type Backend = Postgres;
+
+    fn execute_scalar(
+        &self,
+        _query: &ReadQuery<'_, Postgres>,
+        _kind: ScalarFamily,
+        _auth: &(),
+    ) -> impl core::future::Future<
+        Output = Result<(Value<Postgres>, Option<PgSnapshotFence>), FencedReadError>,
+    > + Send {
+        let answer = self.answer();
+        async move { answer }
+    }
+
+    fn read_page(
+        &self,
+        _query: &ReadQuery<'_, Postgres>,
+        _max_bytes: usize,
+        _auth: &(),
+    ) -> impl core::future::Future<
+        Output = Result<Snapshot<RowPage<Postgres>, PgCommitPosition>, FencedReadError>,
+    > + Send {
+        async move { Err(FencedReadError::NoRows) }
+    }
+}
+
+const MIN_PAID: &str = "SELECT MIN(amount) FROM orders WHERE status = 'paid'";
+
+/// The read answers 5 though the 742 delete of the row worth 5 already
+/// arrived, and the second read, which sees it, answers 6.
+fn two_reads() -> FencedReads {
+    FencedReads::new(vec![
+        (Value::Int(5), read_fence()),
+        (
+            Value::Int(6),
+            PgSnapshotFence::parse("760:760:", PgLsn(3000)).unwrap(),
+        ),
+    ])
+}
+
+fn fenced_engine<M: subql::reexec::ResolverMode<Postgres, AuthContext = ()>>(
+    mode: M,
+) -> (
+    AutoResolvingEngine<Event, DefaultIds, ParserDB, M>,
+    TableId,
+    u64,
+) {
     let catalog = ParserDB::parse::<PostgreSqlDialect>(DDL).unwrap();
     let orders = catalog_helpers::table_id::<Postgres, _>(&catalog, "orders").unwrap();
-    let later = PgSnapshotFence::parse("760:760:", PgLsn(3000)).unwrap();
-    let connector = FencedReads {
-        // Popped from the back.
-        answers: core::cell::RefCell::new(vec![
-            (Value::Int(6), later),
-            (Value::Int(5), read_fence()),
-        ]),
-        calls: core::cell::Cell::new(0),
-    };
     let mut engine = AutoResolvingEngine::new(
         SubscriptionEngine::<Event, DefaultIds, ParserDB>::new(catalog, PostgreSqlDialect {}),
-        SyncMode(connector),
+        mode,
     );
-    let sub = crate::common::reexec::register_captured(
-        &mut engine,
-        7,
-        "SELECT MIN(amount) FROM orders WHERE status = 'paid'",
-    );
+    let sub = engine
+        .register(SubscriptionRequest::new(7u64, MIN_PAID), ())
+        .unwrap()
+        .subscription_id;
     Install::install(
         &mut engine,
         sub,
@@ -626,6 +683,14 @@ fn the_auto_resolving_engine_holds_a_second_read_until_the_next_drain() {
         },
     )
     .unwrap();
+    (engine, orders, sub)
+}
+
+/// A read that has to be asked again waits for the next drain, so a commit
+/// that stays invisible cannot keep one drain reading forever.
+#[test]
+fn the_auto_resolving_engine_holds_a_second_read_until_the_next_drain() {
+    let (mut engine, orders, _) = fenced_engine(SyncMode(two_reads()));
     drop(
         engine
             .apply(&delete(orders, 10, "north", 4, at(1100, 720)))
@@ -643,11 +708,113 @@ fn the_auto_resolving_engine_holds_a_second_read_until_the_next_drain() {
         "{:?}",
         first.scalar_updates
     );
-    assert_eq!(engine.connector().calls.get(), 1);
+    assert_eq!(engine.connector().calls(), 1);
     assert_eq!(engine.pending_read_count(), 1, "the second read waits");
 
     let second = engine.resolve_collect().unwrap();
-    assert_eq!(engine.connector().calls.get(), 2);
+    assert_eq!(engine.connector().calls(), 2);
     assert_eq!(second.scalar_updates[0].value, Value::Int(6));
     assert_eq!(engine.pending_read_count(), 0);
+}
+
+#[test]
+fn the_async_engine_holds_a_second_read_until_the_next_drain() {
+    let (mut engine, orders, _) = fenced_engine(AsyncMode::new(two_reads()));
+    drop(
+        engine
+            .apply(&delete(orders, 10, "north", 4, at(1100, 720)))
+            .unwrap(),
+    );
+    drop(
+        engine
+            .apply(&delete(orders, 11, "north", 5, at(1200, 742)))
+            .unwrap(),
+    );
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    let first = runtime.block_on(engine.resolve_collect()).unwrap();
+    assert!(
+        first.scalar_updates.is_empty(),
+        "{:?}",
+        first.scalar_updates
+    );
+    assert_eq!(engine.connector().calls(), 1);
+    assert_eq!(engine.pending_read_count(), 1, "the second read waits");
+
+    let second = runtime.block_on(engine.resolve_collect()).unwrap();
+    assert_eq!(engine.connector().calls(), 2);
+    assert_eq!(second.scalar_updates[0].value, Value::Int(6));
+    assert_eq!(engine.pending_read_count(), 0);
+}
+
+fn scalar_engine() -> (Engine, TableId, u64) {
+    let (mut engine, orders) = engine();
+    let sub = register(&mut engine, MIN_PAID);
+    Install::install(
+        &mut engine,
+        sub,
+        ScalarInstall {
+            value: Value::Int(4),
+            checkpoint: None,
+            fence: Some(early_fence()),
+        },
+    )
+    .unwrap();
+    engine
+        .dispatch(&delete(orders, 10, "north", 4, at(1100, 720)))
+        .unwrap();
+    (engine, orders, sub)
+}
+
+fn install_min(
+    engine: &mut Engine,
+    sub: u64,
+    value: i64,
+) -> ScalarInstalled<DefaultIds, Postgres, PgCommitPosition> {
+    Install::install(
+        engine,
+        sub,
+        ScalarInstall {
+            value: Value::Int(value),
+            checkpoint: Some(at(1100, 720)),
+            fence: Some(read_fence()),
+        },
+    )
+    .unwrap()
+}
+
+#[test]
+fn a_truncate_a_scalar_read_missed_empties_its_answer() {
+    let (mut engine, orders, sub) = scalar_engine();
+    engine
+        .dispatch(&Event::truncate(orders).with_checkpoint(at(1200, 742)))
+        .unwrap();
+
+    assert_eq!(scalar_value(install_min(&mut engine, sub, 5)), Value::Null);
+}
+
+#[test]
+fn a_missed_delete_whose_row_image_lacks_a_filtered_column_asks_again() {
+    let (mut engine, orders, sub) = scalar_engine();
+    let sparse = Event::delete(
+        orders,
+        vec![
+            Value::Int(11),
+            Value::String("north".into()),
+            Value::Int(9),
+            Value::Missing,
+        ],
+    )
+    .with_pk_columns([0u16])
+    .with_checkpoint(at(1200, 742));
+    engine.dispatch(&sparse).unwrap();
+
+    let installed = install_min(&mut engine, sub, 5);
+    assert!(
+        matches!(installed, ScalarInstalled::ReadAgain(_)),
+        "got {installed:?}"
+    );
 }

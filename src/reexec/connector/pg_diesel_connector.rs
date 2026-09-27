@@ -193,3 +193,28 @@ impl<S: SessionSetup> Connector for PgDieselConnector<S> {
         .map_err(ScalarRowError::Connector)
     }
 }
+
+#[cfg(all(test, feature = "executor-diesel-postgres"))]
+mod tests {
+    use super::PgSnapshotFenceRow;
+
+    fn row(snapshot: &str, lsn: &str) -> PgSnapshotFenceRow {
+        PgSnapshotFenceRow {
+            snapshot: snapshot.into(),
+            lsn: lsn.into(),
+        }
+    }
+
+    /// A server answer that is not the text Postgres prints fails the read
+    /// rather than passing it off as one without a fence.
+    #[test]
+    fn an_unparseable_fence_answer_fails_the_read() {
+        let fence = row("740:745:742", "0/7D0").into_fence();
+        assert_eq!(
+            fence.map(|fence| fence.insert_lsn()).ok(),
+            Some(crate::PgLsn(0x7D0))
+        );
+        assert!(row("740:745:742", "not an lsn").into_fence().is_err());
+        assert!(row("745:740:", "0/7D0").into_fence().is_err());
+    }
+}

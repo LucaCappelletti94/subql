@@ -683,6 +683,13 @@ mod tests {
         assert_eq!(judged(&fence, 2, 50), Seen::Missed, "running, new epoch");
         assert_eq!(judged(&fence, 5, 50), Seen::Missed, "at xmax");
         assert_eq!(judged(&fence, 9, 50), Seen::Missed, "after xmax");
+
+        let first_epoch = PgSnapshotFence::parse("3:5:", PgLsn(100)).unwrap();
+        assert_eq!(
+            judged(&first_epoch, u32::MAX - 1, 50),
+            Seen::Held,
+            "nearest to xmax lies before the first epoch"
+        );
     }
 
     /// The insert position decides before the snapshot does, and a position
@@ -708,11 +715,25 @@ mod tests {
         assert!(parse("740:745:739").is_none(), "running before xmin");
         assert!(parse("740:745:741:").is_none(), "a fourth field");
         assert!(parse("x:745:").is_none());
+        assert!(parse("740:x:").is_none());
+        assert!(parse("740:745:741,x").is_none());
     }
 
     #[test]
     fn a_position_fence_holds_what_lies_at_or_before_it() {
         assert_eq!(PgLsn(20).seen_by(&PgLsn(20)), Seen::Held);
         assert_eq!(PgLsn(21).seen_by(&PgLsn(20)), Seen::Beyond);
+        let binlog = MysqlBinlogPos { file: 3, pos: 40 };
+        assert_eq!(
+            MysqlBinlogPos { file: 3, pos: 40 }.seen_by(&binlog),
+            Seen::Held
+        );
+        assert_eq!(
+            MysqlBinlogPos { file: 4, pos: 1 }.seen_by(&binlog),
+            Seen::Beyond
+        );
+        let opaque = OpaqueCheckpoint(vec![1, 2]);
+        assert_eq!(OpaqueCheckpoint(vec![1]).seen_by(&opaque), Seen::Held);
+        assert_eq!(OpaqueCheckpoint(vec![1, 3]).seen_by(&opaque), Seen::Beyond);
     }
 }
