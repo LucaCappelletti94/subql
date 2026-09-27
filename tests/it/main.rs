@@ -402,6 +402,20 @@ mod literal_text_comparison;
 
 mod float_range_bounds;
 
+mod null_test_of_condition;
+
+#[cfg(all(feature = "diesel-typed-sqlite", feature = "executor-diesel"))]
+mod sync_cursors;
+
+#[cfg(all(feature = "diesel-typed-sqlite", feature = "executor-diesel"))]
+mod keyed_reads_key_change;
+
+#[cfg(all(feature = "diesel-typed-sqlite", feature = "executor-diesel"))]
+mod auto_engine_durability;
+
+#[cfg(all(feature = "pg-sqlite-emu", feature = "executor-diesel"))]
+mod engine_model;
+
 mod column_subset;
 
 mod semantics_float_width;

@@ -47,8 +47,12 @@ use diesel::{sql_query, Connection, RunQueryDsl};
 ///
 /// Returns [`diesel::result::Error`] for any underlying database failure.
 #[cfg(feature = "executor-diesel-mysql")]
-pub struct MysqlDieselConnector<S = (), C = crate::backend::NamesStoredAsWritten> {
+pub struct MysqlDieselConnector<
+    S = (),
+    C: crate::backend::MySqlTableNameCase = crate::backend::NamesStoredAsWritten,
+> {
     conn: RefCell<diesel::MysqlConnection>,
+    cursors: super::HeldCursors<crate::backend::MySql<C>, crate::MysqlBinlogPos>,
     _setup: core::marker::PhantomData<fn() -> S>,
     _table_name_case: core::marker::PhantomData<fn() -> C>,
 }
@@ -62,6 +66,7 @@ impl MysqlDieselConnector {
     pub const fn new(conn: diesel::MysqlConnection) -> Self {
         Self {
             conn: RefCell::new(conn),
+            cursors: super::HeldCursors::new(),
             _setup: core::marker::PhantomData,
             _table_name_case: core::marker::PhantomData,
         }
@@ -76,6 +81,7 @@ impl<S: SessionSetup, C: crate::backend::MySqlTableNameCase> MysqlDieselConnecto
     pub const fn with_session_setup(conn: diesel::MysqlConnection) -> Self {
         Self {
             conn: RefCell::new(conn),
+            cursors: super::HeldCursors::new(),
             _setup: core::marker::PhantomData,
             _table_name_case: core::marker::PhantomData,
         }
@@ -210,6 +216,28 @@ impl<S: SessionSetup, C: crate::backend::MySqlTableNameCase> Connector
             load_page::<_, Self::Backend>(conn, query, max_bytes)
         })?;
         Ok(Snapshot { value, fence })
+    }
+
+    fn open_cursor(
+        &self,
+        query: &ReadQuery<'_, Self::Backend>,
+        auth: &S,
+    ) -> Result<super::CursorId, super::CursorError<Self::Error>> {
+        self.cursors.hold(self.read_page(query, usize::MAX, auth))
+    }
+
+    fn fetch_cursor(
+        &self,
+        cursor: super::CursorId,
+        max_bytes: usize,
+    ) -> Result<Snapshot<RowPage<Self::Backend>, Self::Checkpoint>, super::CursorError<Self::Error>>
+    {
+        self.cursors.fetch(cursor, max_bytes)
+    }
+
+    fn close_cursor(&self, cursor: super::CursorId) -> Result<(), super::CursorError<Self::Error>> {
+        self.cursors.close(cursor);
+        Ok(())
     }
 
     fn execute_scalar_row(

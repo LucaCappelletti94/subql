@@ -10,7 +10,7 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
-subql = { path = "..", features = ["testing", "pg-sqlite-emu"] }
+subql = { path = "..", features = ["testing", "pg-sqlite-emu", "executor-diesel"] }
 
 # Standalone workspace - kept out of the parent on purpose. The root
 # workspace has `lto = true` on its release profile, and cargo-fuzz
@@ -115,6 +115,13 @@ bench = false
 [[bin]]
 name = "fuzz_predicate_verdict_sqlite"
 path = "fuzz_targets/fuzz_predicate_verdict_sqlite.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_engine_model_sqlite"
+path = "fuzz_targets/fuzz_engine_model_sqlite.rs"
 test = false
 doc = false
 bench = false

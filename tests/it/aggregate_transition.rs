@@ -344,3 +344,56 @@ fn unfiltered_count_needs_no_old_row_and_stays_in_process() {
     assert_eq!(output.transitions(), []);
     assert!(output.triggers().is_empty());
 }
+
+/// An aggregate stopped mid-dispatch comes back from the store as the whole
+/// re-read it became, and not as the aggregate it stopped being.
+#[test]
+fn a_stopped_aggregate_comes_back_as_its_whole_reread() {
+    let store = tempfile::tempdir().expect("temp dir");
+    let open = || {
+        Engine::with_storage(
+            ParserDB::parse::<PostgreSqlDialect>(DDL).unwrap(),
+            PostgreSqlDialect {},
+            store.path().to_path_buf(),
+        )
+        .unwrap()
+    };
+    let (mut engine, _) = open().into_parts();
+    engine.set_rotation_threshold(0);
+    let orders = catalog_helpers::table_id::<Postgres, _>(engine.database(), "orders").unwrap();
+    let aggregate = engine
+        .register(SubscriptionRequest::new(7u64, FILTERED_SQL))
+        .unwrap();
+    Install::install(
+        &mut engine,
+        aggregate.subscription_id,
+        AggregateSeedInstall {
+            rows: vec![vec![Value::Int(1)]],
+            fence: None,
+        },
+    )
+    .unwrap();
+    let event = TestEvent::update(orders, Vec::new(), row(1, "north", "paid"))
+        .with_pk_columns([0u16])
+        .with_changed_columns([3u16])
+        .with_checkpoint(PgLsn(40));
+    assert_eq!(engine.dispatch(&event).unwrap().transitions().len(), 1);
+    drop(engine);
+
+    let restored = open();
+    let reads = restored.reads();
+    let whole: Vec<_> = reads
+        .restored
+        .iter()
+        .filter(|read| matches!(read.tier, Tier::WholeRows { .. }))
+        .map(|read| read.subscription_id)
+        .collect();
+    let in_process = reads.in_process.len();
+    drop(restored);
+    assert_eq!(
+        whole,
+        vec![aggregate.subscription_id],
+        "the whole re-read comes back"
+    );
+    assert_eq!(in_process, 0, "the stopped aggregate does not");
+}

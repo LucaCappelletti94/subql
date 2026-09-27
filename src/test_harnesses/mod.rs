@@ -22,11 +22,15 @@
 )]
 
 pub(crate) mod aggregate_consistency;
+#[cfg(all(feature = "pg-sqlite-emu", feature = "executor-diesel"))]
+pub(crate) mod engine_model;
 pub(crate) mod harness_functions;
 pub mod predicate_grammar;
 pub(crate) mod snapshot_restore;
 
 pub use aggregate_consistency::harness_aggregate_consistency;
+#[cfg(all(feature = "pg-sqlite-emu", feature = "executor-diesel"))]
+pub use engine_model::{engine_model_sqlite, harness_engine_model_sqlite, EngineModelCoverage};
 pub use harness_functions::{
     fuzz_catalog, harness_canonicalize, harness_codec_decode, harness_deserialize_shard,
     harness_parse_sql, harness_vm_eval, harness_wal_json_postparse,
@@ -293,6 +297,15 @@ mod regression_tests {
         replay_crashes(
             "fuzz_predicate_verdict_sqlite",
             super::harness_predicate_verdict_sqlite,
+        );
+    }
+
+    #[cfg(all(feature = "pg-sqlite-emu", feature = "executor-diesel"))]
+    #[test]
+    fn regression_fuzz_engine_model_sqlite() {
+        replay_crashes(
+            "fuzz_engine_model_sqlite",
+            super::harness_engine_model_sqlite,
         );
     }
 

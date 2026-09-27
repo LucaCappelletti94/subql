@@ -401,6 +401,49 @@ where
         self.inner.reread_count()
     }
 
+    /// Set the estimated shard size past which a registration writes its
+    /// table's shard, per
+    /// [`SubscriptionEngine::set_rotation_threshold`](crate::SubscriptionEngine::set_rotation_threshold).
+    ///
+    /// A restart comes back at the default, so a caller wanting every
+    /// registration written sets it again after [`adopt`](Self::adopt).
+    pub const fn set_rotation_threshold(&mut self, threshold: usize) {
+        self.inner.set_rotation_threshold(threshold);
+    }
+
+    /// The estimated shard size past which a registration writes its table's
+    /// shard.
+    #[must_use]
+    pub const fn rotation_threshold(&self) -> usize {
+        self.inner.rotation_threshold()
+    }
+
+    /// Choose whether a failed write fails the registration, per
+    /// [`SubscriptionEngine::set_durability_mode`](crate::SubscriptionEngine::set_durability_mode).
+    #[cfg(feature = "std")]
+    pub const fn set_durability_mode(&mut self, mode: crate::DurabilityMode) {
+        self.inner.set_durability_mode(mode);
+    }
+
+    /// Whether a failed write fails the registration.
+    #[cfg(feature = "std")]
+    #[must_use]
+    pub const fn durability_mode(&self) -> crate::DurabilityMode {
+        self.inner.durability_mode()
+    }
+
+    /// Write one table's shard now, per
+    /// [`SubscriptionEngine::snapshot_table`](crate::SubscriptionEngine::snapshot_table).
+    ///
+    /// # Errors
+    ///
+    /// [`StorageError`](crate::StorageError) when the shard or the reads file
+    /// cannot be written.
+    #[cfg(feature = "std")]
+    pub fn snapshot_table(&self, table_id: crate::TableId) -> Result<(), crate::StorageError> {
+        self.inner.snapshot_table(table_id)
+    }
+
     pub(super) fn debounce_skip(
         &self,
         subscription_id: SubscriptionId,

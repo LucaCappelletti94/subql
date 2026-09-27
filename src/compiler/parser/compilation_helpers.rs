@@ -816,27 +816,11 @@ where
 
         // NULL Checks
         Expr::IsNull(inner) => {
-            compile_expr_recursive::<B, DB>(
-                inner,
-                table_id,
-                database,
-                out,
-                depth + 1,
-                ScalarFamily::String.into(),
-            )?;
-            out.push(Instruction::IsNull);
+            compile_null_test::<B, DB>(inner, false, table_id, database, out, depth)?;
         }
 
         Expr::IsNotNull(inner) => {
-            compile_expr_recursive::<B, DB>(
-                inner,
-                table_id,
-                database,
-                out,
-                depth + 1,
-                ScalarFamily::String.into(),
-            )?;
-            out.push(Instruction::IsNotNull);
+            compile_null_test::<B, DB>(inner, true, table_id, database, out, depth)?;
         }
 
         // Unary Operations
@@ -1481,6 +1465,47 @@ where
     }
     ensure_condition::<B, DB>(condition, table_id, database, out)?;
     out.push(Instruction::IsTruth { value, negated });
+    Ok(())
+}
+
+/// Compile `IS NULL`, or `IS NOT NULL` when `negated`.
+///
+/// A condition is null exactly when it is unknown, on every engine, so a
+/// null test of a condition is its unknown test. Only a value is tested by
+/// `IsNull`, which reads a value.
+fn compile_null_test<B, DB>(
+    operand: &Expr,
+    negated: bool,
+    table_id: TableId,
+    database: &DB,
+    out: &mut Compiling<B>,
+    depth: usize,
+) -> Result<(), RegisterError>
+where
+    B: Backend + SqlLiteralParse,
+    DB: DatabaseLike,
+{
+    compile_expr_recursive::<B, DB>(
+        operand,
+        table_id,
+        database,
+        out,
+        depth + 1,
+        ScalarFamily::String.into(),
+    )?;
+    if out.out.last().is_some_and(instruction_is_tri_typed) {
+        refuse_term_operand(operand)?;
+        out.push(Instruction::IsTruth {
+            value: Tri::Unknown,
+            negated,
+        });
+    } else {
+        out.push(if negated {
+            Instruction::IsNotNull
+        } else {
+            Instruction::IsNull
+        });
+    }
     Ok(())
 }
 

@@ -38,6 +38,10 @@ use diesel::{sql_query, Connection, RunQueryDsl};
 #[cfg(feature = "executor-diesel-postgres")]
 pub struct PgDieselConnector<S = ()> {
     conn: RefCell<diesel::PgConnection>,
+    /// Cursors `DECLARE`d on the one connection, inside one read-only
+    /// repeatable-read transaction that the first opens and the last closes.
+    cursors: RefCell<alloc::collections::BTreeMap<super::CursorId, PgCursorState>>,
+    next_cursor: core::cell::Cell<u64>,
     _setup: core::marker::PhantomData<fn() -> S>,
 }
 
@@ -50,6 +54,8 @@ impl PgDieselConnector {
     pub const fn new(conn: diesel::PgConnection) -> Self {
         Self {
             conn: RefCell::new(conn),
+            cursors: RefCell::new(alloc::collections::BTreeMap::new()),
+            next_cursor: core::cell::Cell::new(0),
             _setup: core::marker::PhantomData,
         }
     }
@@ -63,6 +69,8 @@ impl<S: SessionSetup> PgDieselConnector<S> {
     pub const fn with_session_setup(conn: diesel::PgConnection) -> Self {
         Self {
             conn: RefCell::new(conn),
+            cursors: RefCell::new(alloc::collections::BTreeMap::new()),
+            next_cursor: core::cell::Cell::new(0),
             _setup: core::marker::PhantomData,
         }
     }
@@ -174,6 +182,101 @@ impl<S: SessionSetup> Connector for PgDieselConnector<S> {
         Ok(Snapshot { value, fence })
     }
 
+    /// A cursor here lives on the connector's one connection, so while any is
+    /// open every read on this connector runs inside the cursors'
+    /// transaction. The first cursor's session setup is the transaction's.
+    fn open_cursor(
+        &self,
+        query: &ReadQuery<'_, Self::Backend>,
+        auth: &S,
+    ) -> Result<super::CursorId, super::CursorError<Self::Error>> {
+        use diesel::connection::TransactionManager as _;
+        type PgTxn = <diesel::PgConnection as Connection>::TransactionManager;
+
+        let mut conn = self.conn.borrow_mut();
+        let mut cursors = self.cursors.borrow_mut();
+        let id = super::CursorId(self.next_cursor.get());
+        self.next_cursor.set(id.0 + 1);
+        let name = alloc::format!("subql_cursor_{}", id.0);
+        let first = cursors.is_empty();
+        let opened = (|| -> diesel::QueryResult<Option<crate::PgSnapshotFence>> {
+            // The fence is read inside the transaction, before `DECLARE` fixes
+            // the snapshot, as `read_in_snapshot` reads it. A later cursor
+            // shares the transaction and so the first one's fence.
+            let fence = if first {
+                PgTxn::begin_transaction(&mut *conn)?;
+                // SET TRANSACTION is DDL-like; no typed DSL equivalent exists.
+                sql_query(PG_READ_SNAPSHOT).execute(&mut *conn)?;
+                let fence = read_fence(&mut conn)?;
+                run_setup_statements(&mut *conn, auth.setup_statements())?;
+                Some(fence)
+            } else {
+                cursors.values().next().and_then(|held| held.fence.clone())
+            };
+            // `DECLARE CURSOR` has no query-DSL spelling.
+            let declaration = ReadQuery::owned(
+                alloc::format!("DECLARE {name} NO SCROLL CURSOR FOR {}", query.sql()),
+                query.binds().to_vec(),
+            );
+            super::diesel_backend::boxed_postgres_read_query(&declaration)?.execute(&mut *conn)?;
+            Ok(fence)
+        })();
+        match opened {
+            Ok(fence) => {
+                cursors.insert(id, PgCursorState::new(name, fence));
+                Ok(id)
+            }
+            Err(error) => {
+                if first {
+                    let _ = PgTxn::rollback_transaction(&mut *conn);
+                }
+                Err(super::CursorError::Connector(error))
+            }
+        }
+    }
+
+    fn fetch_cursor(
+        &self,
+        cursor: super::CursorId,
+        max_bytes: usize,
+    ) -> Result<Snapshot<RowPage<Self::Backend>, Self::Checkpoint>, super::CursorError<Self::Error>>
+    {
+        let mut conn = self.conn.borrow_mut();
+        let mut cursors = self.cursors.borrow_mut();
+        let held = cursors
+            .get_mut(&cursor)
+            .ok_or(super::CursorError::Unknown(cursor))?;
+        match fetch_page_from(&mut conn, held, max_bytes, CURSOR_BATCH) {
+            Ok(page) => Ok(page),
+            // A failed fetch aborts the transaction every cursor here shares,
+            // so all of them are gone, and the transaction is ended.
+            Err(error) => {
+                cursors.clear();
+                end_cursor_transaction(&mut conn, false);
+                Err(super::CursorError::Connector(error))
+            }
+        }
+    }
+
+    fn close_cursor(&self, cursor: super::CursorId) -> Result<(), super::CursorError<Self::Error>> {
+        let mut conn = self.conn.borrow_mut();
+        let mut cursors = self.cursors.borrow_mut();
+        // Idempotent: an already-closed cursor is not an error.
+        let Some(held) = cursors.remove(&cursor) else {
+            return Ok(());
+        };
+        // `CLOSE` is a cursor command with no typed DSL spelling. The name is
+        // the connector's own, never a caller's.
+        let closed = sql_query(alloc::format!("CLOSE {}", held.name)).execute(&mut *conn);
+        if closed.is_err() {
+            cursors.clear();
+        }
+        if cursors.is_empty() {
+            end_cursor_transaction(&mut conn, closed.is_ok());
+        }
+        closed.map(|_| ()).map_err(super::CursorError::Connector)
+    }
+
     fn execute_scalar_row(
         &self,
         query: &ReadQuery<'_, Self::Backend>,
@@ -199,6 +302,109 @@ impl<S: SessionSetup> Connector for PgDieselConnector<S> {
         // position after it, so no transaction is needed. The statement
         // touches no table, so no setup statements run.
         Ok(Some(read_fence(&mut conn)?))
+    }
+}
+
+/// End the transaction the cursors held, committing when they closed cleanly.
+/// Best-effort on the way out of a failure, since the transaction is read
+/// only and failing to end it politely loses nothing.
+#[cfg(feature = "executor-diesel-postgres")]
+fn end_cursor_transaction(conn: &mut diesel::PgConnection, commit: bool) {
+    use diesel::connection::TransactionManager as _;
+    type PgTxn = <diesel::PgConnection as Connection>::TransactionManager;
+    if !commit || PgTxn::commit_transaction(conn).is_err() {
+        let _ = PgTxn::rollback_transaction(conn);
+    }
+}
+
+/// Rows per `FETCH`. Overshoot is carried into the next page rather than
+/// discarded, so this trades round trips against buffered rows and never
+/// against correctness.
+#[cfg(feature = "executor-diesel-postgres")]
+pub(super) const CURSOR_BATCH: usize = 64;
+
+/// One `DECLARE`d cursor apart from the connection it lives on, with its
+/// name, the fence of the snapshot its pages report, and rows already
+/// fetched but not yet delivered.
+///
+/// The leftover buffer is what keeps the byte budget exact. `FETCH` cannot be
+/// undone, so a batch that overshoots the budget would otherwise have to be
+/// returned whole or thrown away, and carrying the remainder into the next
+/// page does neither.
+#[cfg(feature = "executor-diesel-postgres")]
+pub(super) struct PgCursorState {
+    /// The cursor's `DECLARE`d name, which the per-page `FETCH` and the
+    /// closing `CLOSE` are built from.
+    pub(super) name: String,
+    fence: Option<crate::PgSnapshotFence>,
+    columns: alloc::vec::Vec<String>,
+    leftover: alloc::collections::VecDeque<alloc::vec::Vec<Value<crate::backend::Postgres>>>,
+}
+
+#[cfg(feature = "executor-diesel-postgres")]
+impl PgCursorState {
+    pub(super) const fn new(name: String, fence: Option<crate::PgSnapshotFence>) -> Self {
+        Self {
+            name,
+            fence,
+            columns: alloc::vec::Vec::new(),
+            leftover: alloc::collections::VecDeque::new(),
+        }
+    }
+}
+
+/// Fill one page from an open cursor, buffering whatever a `FETCH` overshot.
+///
+/// The sync twin of `PgAsyncDieselConnector::fetch_from`, shared by the r2d2
+/// and the single-connection connectors, and split out for the same reason.
+/// The caller decides what a failure means for the cursor's registration,
+/// and that decision does not belong inside the read loop.
+#[cfg(feature = "executor-diesel-postgres")]
+pub(super) fn fetch_page_from(
+    conn: &mut diesel::PgConnection,
+    held: &mut PgCursorState,
+    max_bytes: usize,
+    batch: usize,
+) -> diesel::QueryResult<Snapshot<RowPage<crate::backend::Postgres>, crate::PgCommitPosition>> {
+    let mut rows: alloc::vec::Vec<alloc::vec::Vec<Value<crate::backend::Postgres>>> =
+        alloc::vec::Vec::new();
+    let mut spent = 0_usize;
+    loop {
+        if super::drain_cursor_buffer(&mut held.leftover, &mut rows, &mut spent, max_bytes) {
+            return Ok(Snapshot {
+                value: RowPage {
+                    columns: held.columns.clone(),
+                    rows,
+                    more: true,
+                },
+                fence: held.fence.clone(),
+            });
+        }
+        // `FETCH FORWARD` is a cursor command with no typed DSL equivalent.
+        let page = load_page_postgres(
+            conn,
+            &ReadQuery::without_binds(&alloc::format!("FETCH FORWARD {batch} FROM {}", held.name)),
+            usize::MAX,
+        )?;
+        if held.columns.is_empty() {
+            held.columns = page.columns;
+        }
+        // An empty batch is the cursor's own end-of-result signal, so the loop
+        // exits on what the database said rather than on a short-batch guess. A
+        // guess costs a round trip when right and a hang when wrong, which is a
+        // bad trade for a loop.
+        let fetched = page.rows.len();
+        held.leftover.extend(page.rows);
+        if fetched == 0 {
+            return Ok(Snapshot {
+                value: RowPage {
+                    columns: held.columns.clone(),
+                    rows,
+                    more: false,
+                },
+                fence: held.fence.clone(),
+            });
+        }
     }
 }
 

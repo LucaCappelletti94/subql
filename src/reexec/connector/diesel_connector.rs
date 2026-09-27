@@ -55,6 +55,7 @@ pub enum ReadShapeError {
 #[cfg(feature = "executor-diesel")]
 pub struct DieselConnector<C: Connection, B: DieselBackend, S = ()> {
     conn: RefCell<C>,
+    cursors: super::HeldCursors<B, crate::NoCheckpoint>,
     _backend: core::marker::PhantomData<fn() -> B>,
     _setup: core::marker::PhantomData<fn() -> S>,
 }
@@ -66,6 +67,7 @@ impl<C: Connection, B: DieselBackend> DieselConnector<C, B> {
     pub const fn new(conn: C) -> Self {
         Self {
             conn: RefCell::new(conn),
+            cursors: super::HeldCursors::new(),
             _backend: core::marker::PhantomData,
             _setup: core::marker::PhantomData,
         }
@@ -80,6 +82,7 @@ impl<C: Connection, B: DieselBackend, S: SessionSetup> DieselConnector<C, B, S> 
     pub const fn with_session_setup(conn: C) -> Self {
         Self {
             conn: RefCell::new(conn),
+            cursors: super::HeldCursors::new(),
             _backend: core::marker::PhantomData,
             _setup: core::marker::PhantomData,
         }
@@ -300,6 +303,28 @@ where
             })?
         };
         Ok(Snapshot { value, fence: None })
+    }
+
+    fn open_cursor(
+        &self,
+        query: &ReadQuery<'_, Self::Backend>,
+        auth: &S,
+    ) -> Result<super::CursorId, super::CursorError<Self::Error>> {
+        self.cursors.hold(self.read_page(query, usize::MAX, auth))
+    }
+
+    fn fetch_cursor(
+        &self,
+        cursor: super::CursorId,
+        max_bytes: usize,
+    ) -> Result<Snapshot<RowPage<Self::Backend>, Self::Checkpoint>, super::CursorError<Self::Error>>
+    {
+        self.cursors.fetch(cursor, max_bytes)
+    }
+
+    fn close_cursor(&self, cursor: super::CursorId) -> Result<(), super::CursorError<Self::Error>> {
+        self.cursors.close(cursor);
+        Ok(())
     }
 
     fn execute_scalar_row(

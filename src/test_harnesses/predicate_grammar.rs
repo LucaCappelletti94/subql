@@ -63,7 +63,7 @@ pub struct Row {
 }
 
 impl Row {
-    fn arbitrary(u: &mut Unstructured<'_>) -> arbitrary::Result<Self> {
+    pub(crate) fn arbitrary(u: &mut Unstructured<'_>) -> arbitrary::Result<Self> {
         Ok(Self {
             a: maybe(u, |u| pick(u, &INTS))?,
             b: maybe(u, |u| pick(u, &INTS))?,
@@ -76,9 +76,15 @@ impl Row {
     /// The statement that stores the row with `id = 1`.
     #[must_use]
     pub fn insert_sql(&self, engine: Engine) -> String {
+        self.insert_sql_at(1, engine)
+    }
+
+    /// The statement that stores the row under key `id`.
+    #[must_use]
+    pub fn insert_sql_at(&self, id: i32, engine: Engine) -> String {
         let int = |v: Option<i64>| v.map_or_else(|| "NULL".into(), |n| int_literal(n, engine));
         format!(
-            "INSERT INTO t (id, a, b, r, s, f) VALUES (1, {}, {}, {}, {}, {})",
+            "INSERT INTO t (id, a, b, r, s, f) VALUES ({id}, {}, {}, {}, {}, {})",
             int(self.a),
             int(self.b),
             self.r.map_or_else(|| "NULL".into(), float_literal),
@@ -90,16 +96,26 @@ impl Row {
         )
     }
 
-    /// The row as a change event carries it, in column order.
+    /// The row as a change event carries it, in column order, with `id = 1`.
     #[must_use]
     pub fn cells<B>(&self) -> Vec<Value<B>>
     where
         B: Backend<Int = i64, Float = f64, String = String>,
         B::Bool: From<bool>,
     {
+        self.cells_at(1)
+    }
+
+    /// The row as a change event carries it, in column order, under key `id`.
+    #[must_use]
+    pub fn cells_at<B>(&self, id: i32) -> Vec<Value<B>>
+    where
+        B: Backend<Int = i64, Float = f64, String = String>,
+        B::Bool: From<bool>,
+    {
         let or_null = |value: Option<Value<B>>| value.unwrap_or(Value::Null);
         alloc::vec![
-            Value::Int(1),
+            Value::Int(i64::from(id)),
             or_null(self.a.map(Value::Int)),
             or_null(self.b.map(Value::Int)),
             or_null(self.r.map(Value::Float)),
@@ -204,7 +220,7 @@ pub enum Expr {
 }
 
 impl Expr {
-    fn arbitrary(u: &mut Unstructured<'_>, depth: u8) -> arbitrary::Result<Self> {
+    pub(crate) fn arbitrary(u: &mut Unstructured<'_>, depth: u8) -> arbitrary::Result<Self> {
         if depth == 0 || u.ratio(1u8, 4u8)? {
             return Self::leaf(u);
         }
@@ -515,9 +531,16 @@ where
     if registered.not_served_because.is_some() {
         return None;
     }
+    // A served program that fails dispatch fails every subscription on the
+    // table, which is a wrong answer for all of them.
     let notifications = subql
         .consumers(&TestEvent::insert(table, case.row.cells::<B>()))
-        .ok()?;
+        .unwrap_or_else(|error| {
+            panic!(
+                "dispatch failed on a served filter: {error}\n{}",
+                case.reproduction(engine)
+            )
+        });
     if !notifications.evaluation_failures().is_empty() || !notifications.unanswered().is_empty() {
         return None;
     }
@@ -545,7 +568,7 @@ diesel::table! {
 
 #[cfg(feature = "pg-sqlite-emu")]
 impl Row {
-    /// The row's columns as a typed insert into [`t`].
+    /// The row's columns as a typed insert into [`t`], with `id = 1`.
     #[must_use]
     #[allow(clippy::type_complexity)]
     pub fn values(
@@ -558,9 +581,26 @@ impl Row {
         diesel::dsl::Eq<t::s, Option<&'static str>>,
         diesel::dsl::Eq<t::f, Option<bool>>,
     ) {
+        self.values_at(1)
+    }
+
+    /// The row's columns as a typed insert into [`t`] under key `id`.
+    #[must_use]
+    #[allow(clippy::type_complexity)]
+    pub fn values_at(
+        &self,
+        id: i32,
+    ) -> (
+        diesel::dsl::Eq<t::id, i32>,
+        diesel::dsl::Eq<t::a, Option<i64>>,
+        diesel::dsl::Eq<t::b, Option<i64>>,
+        diesel::dsl::Eq<t::r, Option<f64>>,
+        diesel::dsl::Eq<t::s, Option<&'static str>>,
+        diesel::dsl::Eq<t::f, Option<bool>>,
+    ) {
         use diesel::ExpressionMethods as _;
         (
-            t::id.eq(1),
+            t::id.eq(id),
             t::a.eq(self.a),
             t::b.eq(self.b),
             t::r.eq(self.r),

@@ -1598,6 +1598,24 @@ impl<B: Backend> MaintainedQuery<B> for KeyedQuery<B> {
             return Maintenance::NeedsReexecution;
         };
         self.record(key);
+        // An update that moved the key leaves the row gone under its old one,
+        // which only asking about the old key reports.
+        if event.kind() == EventKind::Update {
+            let old = event.with_pk_columns(database, |columns| {
+                columns
+                    .iter()
+                    .map(|&column| {
+                        event
+                            .value_at(database, crate::backend::RowKind::Old, column)
+                            .ok()
+                            .filter(|value| !value.is_absent())
+                    })
+                    .collect::<Option<Vec<_>>>()
+            });
+            if let Some(old) = old.filter(|key| !key.is_empty()) {
+                self.record(old);
+            }
+        }
         Maintenance::NeedsReexecution
     }
 

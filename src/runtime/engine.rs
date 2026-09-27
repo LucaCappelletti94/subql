@@ -2173,7 +2173,9 @@ where
             subscription: subscription_id,
             message: error.to_string(),
         })?;
-        self.unregister_reread(subscription_id);
+        // Dropped and taken again under the same id, so the reads file is
+        // written once, for the answer's new tier, rather than without it.
+        self.unregister_reread_only(subscription_id);
         let registration = RereadRegistration {
             consumer,
             session,
@@ -2181,6 +2183,7 @@ where
             database_reads_per_consumer,
         };
         let registered = self.capture_whole(subscription_id, plan, &registration);
+        self.persist_reads_after_transition();
         Ok((
             crate::MaintenanceTransition {
                 subscription_id,
@@ -2833,6 +2836,29 @@ where
     #[cfg(not(feature = "std"))]
     #[allow(clippy::unused_self)]
     fn persist_reads_after_removal(&self) {}
+
+    /// Rewrite the reads file after an answer moved to another tier.
+    ///
+    /// A restart reads the file, so an answer the file names at its old tier,
+    /// or not at all, comes back wrong or not at all. The move already
+    /// happened inside a dispatch, so a failed write is logged, as after a
+    /// removal.
+    #[cfg(feature = "std")]
+    fn persist_reads_after_transition(&self) {
+        if self.storage_path.is_none() {
+            return;
+        }
+        if let Err(e) = self.snapshot_reads() {
+            Self::log_best_effort_durability(&format!(
+                "Reads file not rewritten after an answer changed tier: {e}"
+            ));
+        }
+    }
+
+    /// Without the standard library there is no file to write.
+    #[cfg(not(feature = "std"))]
+    #[allow(clippy::unused_self)]
+    fn persist_reads_after_transition(&self) {}
 
     /// Write every re-read answer to its own file.
     ///

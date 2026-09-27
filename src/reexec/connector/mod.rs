@@ -303,6 +303,86 @@ impl<B: Backend> RowPage<B> {
     }
 }
 
+/// Cursors a connector holding one connection serves.
+///
+/// One connection cannot keep a transaction open across calls while other
+/// reads run on it, so a cursor here is its whole answer, read in one
+/// snapshot when it opens and paged from memory under each fetch's budget.
+#[cfg(feature = "executor-diesel")]
+pub(super) struct HeldCursors<B: Backend, K: Checkpoint> {
+    next: core::cell::Cell<u64>,
+    open: core::cell::RefCell<alloc::collections::BTreeMap<CursorId, HeldCursor<B, K>>>,
+}
+
+#[cfg(feature = "executor-diesel")]
+struct HeldCursor<B: Backend, K: Checkpoint> {
+    columns: alloc::vec::Vec<alloc::string::String>,
+    rows: alloc::collections::VecDeque<alloc::vec::Vec<Value<B>>>,
+    fence: Option<K::Fence>,
+}
+
+#[cfg(feature = "executor-diesel")]
+impl<B: Backend, K: Checkpoint> HeldCursors<B, K> {
+    pub(super) const fn new() -> Self {
+        Self {
+            next: core::cell::Cell::new(0),
+            open: core::cell::RefCell::new(alloc::collections::BTreeMap::new()),
+        }
+    }
+
+    /// Hold `read`, the cursor's whole answer, and name it.
+    pub(super) fn hold<E>(
+        &self,
+        read: Result<Snapshot<RowPage<B>, K>, E>,
+    ) -> Result<CursorId, CursorError<E>> {
+        let snapshot = read.map_err(CursorError::Connector)?;
+        let id = CursorId(self.next.get());
+        self.next.set(id.0 + 1);
+        self.open.borrow_mut().insert(
+            id,
+            HeldCursor {
+                columns: snapshot.value.columns,
+                rows: snapshot.value.rows.into(),
+                fence: snapshot.fence,
+            },
+        );
+        Ok(id)
+    }
+
+    /// The next page of `cursor`, at least one row while any remain.
+    pub(super) fn fetch<E>(
+        &self,
+        cursor: CursorId,
+        max_bytes: usize,
+    ) -> Result<Snapshot<RowPage<B>, K>, CursorError<E>> {
+        let mut open = self.open.borrow_mut();
+        let held = open.get_mut(&cursor).ok_or(CursorError::Unknown(cursor))?;
+        let mut rows = alloc::vec::Vec::new();
+        let mut spent = 0_usize;
+        while let Some(row) = held.rows.front() {
+            let cost = RowPage::<B>::row_bytes_of(row);
+            if !rows.is_empty() && spent.saturating_add(cost) > max_bytes {
+                break;
+            }
+            spent = spent.saturating_add(cost);
+            rows.extend(held.rows.pop_front());
+        }
+        Ok(Snapshot {
+            value: RowPage {
+                columns: held.columns.clone(),
+                rows,
+                more: !held.rows.is_empty(),
+            },
+            fence: held.fence.clone(),
+        })
+    }
+
+    /// Drop `cursor`, which closing again does not mind.
+    pub(super) fn close(&self, cursor: CursorId) {
+        self.open.borrow_mut().remove(&cursor);
+    }
+}
+
 /// Handle to a cursor a connector holds open, with the transaction behind it.
 ///
 /// A result with no key cannot be resumed by asking for "everything after the
@@ -702,7 +782,7 @@ pub enum ScalarRowError<E> {
 /// async cursor loops, whose only real difference is the await on the
 /// `FETCH` round trip.
 #[cfg(any(
-    feature = "executor-diesel-postgres-r2d2",
+    feature = "executor-diesel-postgres",
     feature = "executor-diesel-async-postgres"
 ))]
 pub(super) fn drain_cursor_buffer<B: crate::backend::Backend>(

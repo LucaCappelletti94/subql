@@ -430,3 +430,62 @@ fn session_setup_runs_on_each_read_sync_mysql() {
         .expect("scalar read");
     assert_ne!(value, Value::Int(1234), "an empty setup runs nothing");
 }
+
+/// The sync connector's cursor reads its answer in one snapshot when it opens
+/// and pages it under the byte budget, so a row committed afterwards is not
+/// in it, and a closed cursor is unknown.
+#[test]
+#[ignore = "requires Docker; run with --ignored"]
+fn a_sync_cursor_pages_one_snapshot_of_a_keyless_result() {
+    use subql::reexec::{CursorError, ReadQuery};
+
+    common::assert_docker_available();
+    let db = common::mysql_database();
+    let mut conn_setup = db.connect();
+    let seed: Vec<(i64, f64)> = (1..=40_u32)
+        .map(|id| (i64::from(id), f64::from(id)))
+        .collect();
+    common::mysql::setup_orders(&mut conn_setup, &seed);
+
+    let connector = MysqlDieselConnector::new(db.connect());
+    let cursor = connector
+        .open_cursor(
+            &ReadQuery::without_binds("SELECT DISTINCT id, status FROM orders ORDER BY id"),
+            &(),
+        )
+        .expect("open cursor");
+    sql_query("INSERT INTO orders (id, price, quantity, status) VALUES (999, 1.0, 1, 'late')")
+        .execute(&mut conn_setup)
+        .expect("concurrent insert");
+
+    let mut ids = Vec::new();
+    let mut pages = 0;
+    let mut first_fence = None;
+    loop {
+        let page = connector.fetch_cursor(cursor, 96).expect("fetch page");
+        pages += 1;
+        let fence = page.fence.expect("a cursor's pages carry its fence");
+        assert_eq!(
+            *first_fence.get_or_insert(fence),
+            fence,
+            "every page reports the one snapshot's fence"
+        );
+        for row in &page.value.rows {
+            let Value::Int(id) = row[0] else {
+                panic!("id decodes as an integer, got {:?}", row[0]);
+            };
+            ids.push(id);
+        }
+        if !page.value.more {
+            break;
+        }
+        assert!(pages < 100, "the cursor finishes");
+    }
+    assert!(pages > 1, "a 96-byte budget splits forty rows");
+    assert_eq!(ids, (1..=40).collect::<Vec<i64>>());
+    connector.close_cursor(cursor).expect("close");
+    assert!(matches!(
+        connector.fetch_cursor(cursor, 96),
+        Err(CursorError::Unknown(id)) if id == cursor
+    ));
+}
