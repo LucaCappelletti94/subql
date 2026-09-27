@@ -104,58 +104,43 @@ pub enum PgColumn {
 }
 
 impl PgColumn {
+    /// The type as the column's DDL spells it and as `format_type` names it,
+    /// which is what wal2json writes.
+    const fn names(self) -> (&'static str, &'static str) {
+        match self {
+            Self::Bool => ("BOOLEAN", "boolean"),
+            Self::Int2 => ("SMALLINT", "smallint"),
+            Self::Int4 => ("INTEGER", "integer"),
+            Self::Int8 => ("BIGINT", "bigint"),
+            Self::Float4 => ("REAL", "real"),
+            Self::Float8 => ("DOUBLE PRECISION", "double precision"),
+            Self::Numeric => ("NUMERIC", "numeric"),
+            Self::Numeric20x6 => ("NUMERIC(20,6)", "numeric(20,6)"),
+            Self::Text => ("TEXT", "text"),
+            Self::Varchar40 => ("VARCHAR(40)", "character varying(40)"),
+            Self::Char8 => ("CHAR(8)", "character(8)"),
+            Self::Bytea => ("BYTEA", "bytea"),
+            Self::Uuid => ("UUID", "uuid"),
+            Self::Timestamp => ("TIMESTAMP", "timestamp without time zone"),
+            Self::TimestampTz => ("TIMESTAMPTZ", "timestamp with time zone"),
+            Self::Date => ("DATE", "date"),
+            Self::Time => ("TIME", "time without time zone"),
+            Self::TimeTz => ("TIMETZ", "time with time zone"),
+            Self::Json => ("JSON", "json"),
+            Self::Jsonb => ("JSONB", "jsonb"),
+        }
+    }
+
     /// The type as the column's DDL spells it.
     #[must_use]
     pub const fn ddl(self) -> &'static str {
-        match self {
-            Self::Bool => "BOOLEAN",
-            Self::Int2 => "SMALLINT",
-            Self::Int4 => "INTEGER",
-            Self::Int8 => "BIGINT",
-            Self::Float4 => "REAL",
-            Self::Float8 => "DOUBLE PRECISION",
-            Self::Numeric => "NUMERIC",
-            Self::Numeric20x6 => "NUMERIC(20,6)",
-            Self::Text => "TEXT",
-            Self::Varchar40 => "VARCHAR(40)",
-            Self::Char8 => "CHAR(8)",
-            Self::Bytea => "BYTEA",
-            Self::Uuid => "UUID",
-            Self::Timestamp => "TIMESTAMP",
-            Self::TimestampTz => "TIMESTAMPTZ",
-            Self::Date => "DATE",
-            Self::Time => "TIME",
-            Self::TimeTz => "TIMETZ",
-            Self::Json => "JSON",
-            Self::Jsonb => "JSONB",
-        }
+        self.names().0
     }
 
     /// The type as `format_type` names it, which wal2json writes.
     #[must_use]
     pub const fn format_type(self) -> &'static str {
-        match self {
-            Self::Bool => "boolean",
-            Self::Int2 => "smallint",
-            Self::Int4 => "integer",
-            Self::Int8 => "bigint",
-            Self::Float4 => "real",
-            Self::Float8 => "double precision",
-            Self::Numeric => "numeric",
-            Self::Numeric20x6 => "numeric(20,6)",
-            Self::Text => "text",
-            Self::Varchar40 => "character varying(40)",
-            Self::Char8 => "character(8)",
-            Self::Bytea => "bytea",
-            Self::Uuid => "uuid",
-            Self::Timestamp => "timestamp without time zone",
-            Self::TimestampTz => "timestamp with time zone",
-            Self::Date => "date",
-            Self::Time => "time without time zone",
-            Self::TimeTz => "time with time zone",
-            Self::Json => "json",
-            Self::Jsonb => "jsonb",
-        }
+        self.names().1
     }
 
     /// The type's OID and modifier, as a `Relation` message carries them.
@@ -484,20 +469,9 @@ fn special_or<'a>(
     }
 }
 
-/// `x` as `float8out` or `float4out` prints it: the shortest digits that
-/// read back as `x`, in positional notation for decimal exponents from -4
-/// up to 14 (float8) or 5 (float4) and as `d.ddde+XX` outside them.
-#[must_use]
-pub fn pg_float(x: f64, single: bool) -> String {
-    if x.is_nan() {
-        return String::from("NaN");
-    }
-    if x.is_infinite() {
-        return String::from(if x > 0.0 { "Infinity" } else { "-Infinity" });
-    }
-    if x == 0.0 {
-        return String::from(if x.is_sign_negative() { "-0" } else { "0" });
-    }
+/// The shortest significant digits that read back as `x` at its width, its
+/// sign, and the decimal exponent of its first digit.
+fn shortest_digits(x: f64, single: bool) -> (&'static str, String, i32) {
     #[allow(clippy::cast_possible_truncation)]
     let scientific = if single {
         format!("{:e}", x as f32)
@@ -513,7 +487,28 @@ pub fn pg_float(x: f64, single: bool) -> String {
     let (sign, mantissa) = mantissa
         .strip_prefix('-')
         .map_or(("", mantissa), |rest| ("-", rest));
-    let digits: String = mantissa.chars().filter(char::is_ascii_digit).collect();
+    (
+        sign,
+        mantissa.chars().filter(char::is_ascii_digit).collect(),
+        exponent,
+    )
+}
+
+/// `x` as `float8out` or `float4out` prints it: the shortest digits that
+/// read back as `x`, in positional notation for decimal exponents from -4
+/// up to 14 (float8) or 5 (float4) and as `d.ddde+XX` outside them.
+#[must_use]
+pub fn pg_float(x: f64, single: bool) -> String {
+    if x.is_nan() {
+        return String::from("NaN");
+    }
+    if x.is_infinite() {
+        return String::from(if x > 0.0 { "Infinity" } else { "-Infinity" });
+    }
+    if x == 0.0 {
+        return String::from(if x.is_sign_negative() { "-0" } else { "0" });
+    }
+    let (sign, digits, exponent) = shortest_digits(x, single);
     let limit = if single { 6 } else { 15 };
     let body = if (-4..limit).contains(&exponent) {
         positional(&digits, exponent)
@@ -1046,22 +1041,7 @@ pub fn java_float(x: f64, single: bool) -> String {
     if x == 0.0 {
         return String::from(if x.is_sign_negative() { "-0.0" } else { "0.0" });
     }
-    #[allow(clippy::cast_possible_truncation)]
-    let scientific = if single {
-        format!("{:e}", x as f32)
-    } else {
-        format!("{x:e}")
-    };
-    let (mantissa, exponent) = scientific
-        .split_once('e')
-        .expect("LowerExp writes an exponent");
-    let exponent: i32 = exponent
-        .parse()
-        .expect("LowerExp writes an integer exponent");
-    let (sign, mantissa) = mantissa
-        .strip_prefix('-')
-        .map_or(("", mantissa), |rest| ("-", rest));
-    let digits: String = mantissa.chars().filter(char::is_ascii_digit).collect();
+    let (sign, digits, exponent) = shortest_digits(x, single);
     let body = if (-3..7).contains(&exponent) {
         let text = positional(&digits, exponent);
         if text.contains('.') {

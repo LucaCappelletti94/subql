@@ -215,29 +215,24 @@ fn generate_my_rows() -> Vec<(usize, Vec<MyCell>)> {
 /// Every row has to be inserted and every column compared on each row,
 /// and every zone has to compare some cell, or the test passed by comparing
 /// less than it names.
-fn assert_pg_coverage(
-    rejected: &[String],
-    pg_stats: &BTreeMap<&'static str, ColStats>,
-    tz_stats: &BTreeMap<(&'static str, &'static str), ColStats>,
-    zones: &[(&'static str, &'static str, bool)],
-    report: &str,
-) {
-    assert!(rejected.is_empty(), "{report}");
+fn assert_pg_coverage(stats: &PgStats, report: &str) {
+    assert!(stats.rejected.is_empty(), "{report}");
     let short: Vec<&str> = PG_COLUMNS
         .iter()
         .filter(|&&col| col != PgColumn::TimestampTz)
         .map(|col| col.ddl())
-        .filter(|ddl| pg_stats.get(ddl).map_or(0, |stats| stats.compared) < ROW_COUNT)
+        .filter(|ddl| stats.columns.get(ddl).map_or(0, |stats| stats.compared) < ROW_COUNT)
         .collect();
     assert!(
         short.is_empty(),
         "columns compared on fewer than {ROW_COUNT} rows: {short:?}\n{report}"
     );
-    let silent: Vec<&str> = zones
+    let silent: Vec<&str> = ZONES
         .iter()
         .map(|&(zone, _, _)| zone)
         .filter(|zone| {
-            tz_stats
+            stats
+                .zones
                 .get(&(PgColumn::TimestampTz.ddl(), *zone))
                 .map_or(0, |stats| stats.compared)
                 == 0
@@ -249,9 +244,175 @@ fn assert_pg_coverage(
     );
 }
 
+/// A session zone, the offset it prints, and whether it prints that offset
+/// for every instant.
+type Zone = (&'static str, &'static str, bool);
+
+/// One zone per offset the harness draws. The POSIX spellings hold one
+/// offset for every instant. PostgreSQL refuses a POSIX offset with seconds,
+/// so that one comes from Amsterdam's mean time, which it prints only before
+/// 1937 and outside summer.
+const ZONES: &[Zone] = &[
+    ("UTC", "+00", true),
+    ("Etc/GMT-1", "+01", true),
+    ("Etc/GMT+5", "-05", true),
+    ("<+0530>-05:30", "+05:30", true),
+    ("<+0545>-05:45", "+05:45", true),
+    ("Europe/Amsterdam", "+00:19:32", false),
+];
+
+/// What the PostgreSQL passes compared, by column and by zone.
+#[derive(Default)]
+struct PgStats {
+    columns: BTreeMap<&'static str, ColStats>,
+    zones: BTreeMap<(&'static str, &'static str), ColStats>,
+    rejected: Vec<String>,
+}
+
+impl PgStats {
+    /// Compare one cell of the pass in `ZONES[zi]`, or count it skipped.
+    ///
+    /// A cell other than `TIMESTAMPTZ` does not depend on the zone, so it is
+    /// compared in the first pass only, as is a `NULL`. A `TIMESTAMPTZ` is
+    /// compared in the zone printing its offset, and in a zone with a history
+    /// only where PostgreSQL printed that offset.
+    fn record(&mut self, zi: usize, at: (usize, usize), cell: &PgCell, actual: JsonValue) {
+        let (zone, zone_offset, fixed) = ZONES[zi];
+        let ddl = cell.column.ddl();
+        let entry = if cell.column == PgColumn::TimestampTz {
+            let printed = actual
+                .as_str()
+                .is_some_and(|printed| tz_matches(printed, zone_offset));
+            let entry = self.zones.entry((ddl, zone)).or_default();
+            match &cell.text {
+                None if zi > 0 => return,
+                Some(text) if !tz_matches(text, zone_offset) || (!fixed && !printed) => {
+                    entry.tz_skipped += 1;
+                    return;
+                }
+                _ => entry,
+            }
+        } else if zi > 0 {
+            return;
+        } else {
+            self.columns.entry(ddl).or_default()
+        };
+        entry.compared += 1;
+        if cell.wal2json() != actual {
+            entry.mismatches.push((at.0, at.1, actual));
+        }
+    }
+
+    fn mismatches(&self) -> usize {
+        self.columns
+            .values()
+            .chain(self.zones.values())
+            .map(|stats| stats.mismatches.len())
+            .sum()
+    }
+}
+
+/// Insert every row, recording the ones PostgreSQL refuses, and name the
+/// rows it took.
+fn insert_pg_rows(
+    conn: &mut diesel::PgConnection,
+    all_rows: &[(usize, Vec<PgCell>)],
+    zone: &str,
+    rejected: &mut Vec<String>,
+) -> Vec<usize> {
+    let col_list: String = (0..PG_COLUMNS.len())
+        .map(|i| format!("c{i}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut inserted = Vec::new();
+    for (idx, (k, cells)) in all_rows.iter().enumerate() {
+        let values: Vec<String> = cells
+            .iter()
+            .map(|c| {
+                c.text
+                    .as_deref()
+                    .map_or_else(|| "NULL".to_string(), pg_quote)
+            })
+            .collect();
+        // The column types are drawn at run time, and the typed DSL needs a schema at compile time.
+        let sql = format!(
+            "INSERT INTO t (id, {col_list}) VALUES ({k}, {})",
+            values.join(", ")
+        );
+        match sql_query(&sql).execute(conn) {
+            Ok(_) => inserted.push(idx),
+            Err(e) => rejected.extend(cells.iter().filter_map(|cell| {
+                cell.text
+                    .as_ref()
+                    .map(|text| format!("zone={zone} {:?} text={text:?}: {e}", cell.column))
+            })),
+        }
+    }
+    inserted
+}
+
+/// The columns of every insert into `t` the slot holds, by name.
+fn drain_inserts(conn: &mut diesel::PgConnection, slot: &str) -> Vec<BTreeMap<String, JsonValue>> {
+    common::drain_slot(conn, slot)
+        .iter()
+        .filter_map(|line| {
+            let v: JsonValue = serde_json::from_str(line).ok()?;
+            let obj = v.as_object()?;
+            if obj.get("action")?.as_str()? != "I" || obj.get("table")?.as_str()? != "t" {
+                return None;
+            }
+            Some(
+                obj.get("columns")?
+                    .as_array()?
+                    .iter()
+                    .filter_map(|c| {
+                        let name = c.get("name")?.as_str()?.to_owned();
+                        Some((name, c.get("value").cloned().unwrap_or(JsonValue::Null)))
+                    })
+                    .collect(),
+            )
+        })
+        .collect()
+}
+
+fn pg_report(stats: &PgStats, all_rows: &[(usize, Vec<PgCell>)]) -> String {
+    let mut report = format!(
+        "=== PG wal2json decoder spelling ===\n\
+         Rows attempted: {ROW_COUNT}, generated: {}\n\
+         Zones: one per offset the harness draws\n\n",
+        all_rows.len()
+    );
+    if !stats.rejected.is_empty() {
+        let _ = writeln!(report, "Rejected inserts ({}):", stats.rejected.len());
+        for r in stats.rejected.iter().take(40) {
+            let _ = writeln!(report, "  {r}");
+        }
+        report.push('\n');
+    }
+    report.push_str("Column comparison summary:\n");
+    let default = ColStats::default();
+    for &col in PG_COLUMNS {
+        let ddl = col.ddl();
+        if col == PgColumn::TimestampTz {
+            for &(zone, zone_offset, _) in ZONES {
+                let zone_stats = stats.zones.get(&(ddl, zone)).unwrap_or(&default);
+                report.push_str(&fmt_pg_col(
+                    &format!("TIMESTAMPTZ [{zone} {zone_offset}]"),
+                    zone_stats,
+                    all_rows,
+                ));
+            }
+        } else {
+            let col_stats = stats.columns.get(ddl).unwrap_or(&default);
+            report.push_str(&fmt_pg_col(ddl, col_stats, all_rows));
+        }
+    }
+    let _ = writeln!(report, "\nTotal mismatches: {}", stats.mismatches());
+    report
+}
+
 #[test]
 #[ignore = "requires Docker; run with --ignored"]
-#[allow(clippy::too_many_lines)]
 fn pg_wal2json_decoder_spelling() {
     common::assert_docker_available();
     let db = common::pg_database();
@@ -265,199 +426,38 @@ fn pg_wal2json_decoder_spelling() {
     common::create_slot(&mut conn, &slot);
 
     let all_rows = generate_pg_rows();
-    // One zone per offset the harness draws. The POSIX spellings hold one
-    // offset for every instant. PostgreSQL refuses a POSIX offset with
-    // seconds, so that one comes from Amsterdam's mean time, which it prints
-    // only before 1937 and outside summer. The last field says whether the
-    // zone prints its offset for every instant.
-    let zones: &[(&'static str, &'static str, bool)] = &[
-        ("UTC", "+00", true),
-        ("Etc/GMT-1", "+01", true),
-        ("Etc/GMT+5", "-05", true),
-        ("<+0530>-05:30", "+05:30", true),
-        ("<+0545>-05:45", "+05:45", true),
-        ("Europe/Amsterdam", "+00:19:32", false),
-    ];
-
-    let mut pg_stats: BTreeMap<&'static str, ColStats> = BTreeMap::new();
-    let mut tz_stats: BTreeMap<(&'static str, &'static str), ColStats> = BTreeMap::new();
-    let mut rejected: Vec<String> = Vec::new();
-
-    let col_list: String = (0..PG_COLUMNS.len())
-        .map(|i| format!("c{i}"))
-        .collect::<Vec<_>>()
-        .join(", ");
-
-    for (zi, &(zone, zone_offset, fixed)) in zones.iter().enumerate() {
+    let mut stats = PgStats::default();
+    for (zi, &(zone, _, _)) in ZONES.iter().enumerate() {
         // SET has no DSL form, and wal2json prints TIMESTAMPTZ in this zone.
         sql_query(format!("SET timezone = '{zone}'"))
             .execute(&mut conn)
             .expect("SET timezone");
-
         if zi > 0 {
             // A TRUNCATE lands in the slot as action "T", which the insert check skips.
             sql_query("TRUNCATE t")
                 .execute(&mut conn)
                 .expect("TRUNCATE t");
         }
-
-        let mut inserted_indices: Vec<usize> = Vec::new();
-        for (idx, (k, cells)) in all_rows.iter().enumerate() {
-            let values: Vec<String> = cells
-                .iter()
-                .map(|c| {
-                    c.text
-                        .as_deref()
-                        .map_or_else(|| "NULL".to_string(), pg_quote)
-                })
-                .collect();
-            // The column types are drawn at run time, and the typed DSL needs a schema at compile time.
-            let sql = format!(
-                "INSERT INTO t (id, {col_list}) VALUES ({k}, {})",
-                values.join(", ")
-            );
-            match sql_query(&sql).execute(&mut conn) {
-                Ok(_) => inserted_indices.push(idx),
-                Err(e) => {
-                    for cell in cells {
-                        if let Some(text) = &cell.text {
-                            rejected
-                                .push(format!("zone={zone} {:?} text={text:?}: {e}", cell.column));
-                        }
-                    }
-                }
-            }
-        }
-
-        let raw = common::drain_slot(&mut conn, &slot);
-
-        let wal_rows: Vec<BTreeMap<String, JsonValue>> = raw
-            .iter()
-            .filter_map(|line| {
-                let v: JsonValue = serde_json::from_str(line).ok()?;
-                let obj = v.as_object()?;
-                if obj.get("action")?.as_str()? != "I" {
-                    return None;
-                }
-                if obj.get("table")?.as_str()? != "t" {
-                    return None;
-                }
-                Some(
-                    obj.get("columns")?
-                        .as_array()?
-                        .iter()
-                        .filter_map(|c| {
-                            let name = c.get("name")?.as_str()?.to_owned();
-                            let value = c.get("value").cloned().unwrap_or(JsonValue::Null);
-                            Some((name, value))
-                        })
-                        .collect(),
-                )
-            })
-            .collect();
-
+        let inserted = insert_pg_rows(&mut conn, &all_rows, zone, &mut stats.rejected);
+        let wal_rows = drain_inserts(&mut conn, &slot);
         assert_eq!(
             wal_rows.len(),
-            inserted_indices.len(),
-            "zone {zone}: wal2json row count ({}) differs from inserted count ({})",
-            wal_rows.len(),
-            inserted_indices.len()
+            inserted.len(),
+            "zone {zone}: wal2json row count differs from inserted count"
         );
-
-        for (mut wal_row, &row_idx) in wal_rows.into_iter().zip(inserted_indices.iter()) {
-            let (_, cells) = &all_rows[row_idx];
-            for (col_idx, cell) in cells.iter().enumerate() {
-                let col_ddl = cell.column.ddl();
-                let is_tstz = cell.column == PgColumn::TimestampTz;
-
-                let col_name = format!("c{col_idx}");
-                let actual = wal_row.remove(&col_name).unwrap_or(JsonValue::Null);
-                let skip = if is_tstz {
-                    match &cell.text {
-                        // NULL does not depend on the zone, so it is compared once, in zone 0.
-                        None => zi > 0,
-                        // A zone with a history prints the offset only for
-                        // some instants, and the others say nothing about
-                        // this spelling.
-                        Some(text)
-                            if !tz_matches(text, zone_offset)
-                                || (!fixed
-                                    && !actual.as_str().is_some_and(|printed| {
-                                        tz_matches(printed, zone_offset)
-                                    })) =>
-                        {
-                            tz_stats.entry((col_ddl, zone)).or_default().tz_skipped += 1;
-                            true
-                        }
-                        _ => false,
-                    }
-                } else {
-                    zi > 0 // non-TIMESTAMPTZ: UTC pass only to avoid reporting a cell once per zone.
-                };
-
-                if skip {
-                    continue;
-                }
-
-                let expected = cell.wal2json();
-                let is_mismatch = expected != actual;
-
-                if is_tstz {
-                    let entry = tz_stats.entry((col_ddl, zone)).or_default();
-                    entry.compared += 1;
-                    if is_mismatch {
-                        entry.mismatches.push((row_idx, col_idx, actual));
-                    }
-                } else {
-                    let entry = pg_stats.entry(col_ddl).or_default();
-                    entry.compared += 1;
-                    if is_mismatch {
-                        entry.mismatches.push((row_idx, col_idx, actual));
-                    }
-                }
+        for (mut wal_row, &row_idx) in wal_rows.into_iter().zip(&inserted) {
+            for (col_idx, cell) in all_rows[row_idx].1.iter().enumerate() {
+                let actual = wal_row
+                    .remove(&format!("c{col_idx}"))
+                    .unwrap_or(JsonValue::Null);
+                stats.record(zi, (row_idx, col_idx), cell, actual);
             }
         }
     }
 
-    let total: usize = pg_stats.values().map(|s| s.mismatches.len()).sum::<usize>()
-        + tz_stats.values().map(|s| s.mismatches.len()).sum::<usize>();
-
-    let mut report = format!(
-        "=== PG wal2json decoder spelling ===\n\
-         Rows attempted: {ROW_COUNT}, generated: {}\n\
-         Zones: one per offset the harness draws\n\n",
-        all_rows.len()
-    );
-    if !rejected.is_empty() {
-        let _ = writeln!(report, "Rejected inserts ({}):", rejected.len());
-        for r in rejected.iter().take(40) {
-            let _ = writeln!(report, "  {r}");
-        }
-        report.push('\n');
-    }
-    report.push_str("Column comparison summary:\n");
-    for &col in PG_COLUMNS {
-        let ddl = col.ddl();
-        if col == PgColumn::TimestampTz {
-            for &(zone, zone_offset, _) in zones {
-                let default = ColStats::default();
-                let stats = tz_stats.get(&(ddl, zone)).unwrap_or(&default);
-                report.push_str(&fmt_pg_col(
-                    &format!("TIMESTAMPTZ [{zone} {zone_offset}]"),
-                    stats,
-                    &all_rows,
-                ));
-            }
-        } else {
-            let default = ColStats::default();
-            let stats = pg_stats.get(ddl).unwrap_or(&default);
-            report.push_str(&fmt_pg_col(ddl, stats, &all_rows));
-        }
-    }
-    let _ = writeln!(report, "\nTotal mismatches: {total}");
-
-    assert_eq!(total, 0, "{report}");
-    assert_pg_coverage(&rejected, &pg_stats, &tz_stats, zones, &report);
+    let report = pg_report(&stats, &all_rows);
+    assert_eq!(stats.mismatches(), 0, "{report}");
+    assert_pg_coverage(&stats, &report);
 }
 
 #[test]
