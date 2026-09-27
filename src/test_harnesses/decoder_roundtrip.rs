@@ -1120,6 +1120,37 @@ enum Source {
     Maxwell,
 }
 
+/// The cells one row checked, by source, so a run that checks nothing, or
+/// only `NULL`s, is visible.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DecoderCoverage {
+    /// Cells decoded from pgoutput.
+    pub pgoutput: usize,
+    /// Cells decoded from wal2json v1.
+    pub wal2json_v1: usize,
+    /// Cells decoded from wal2json v2.
+    pub wal2json_v2: usize,
+    /// Cells decoded from Maxwell.
+    pub maxwell: usize,
+    /// Of those, cells that had to come back as a value other than `NULL`.
+    pub values: usize,
+}
+
+impl core::ops::AddAssign for DecoderCoverage {
+    fn add_assign(&mut self, other: Self) {
+        self.pgoutput += other.pgoutput;
+        self.wal2json_v1 += other.wal2json_v1;
+        self.wal2json_v2 += other.wal2json_v2;
+        self.maxwell += other.maxwell;
+        self.values += other.values;
+    }
+}
+
+/// Whether `expect` demands a value other than `NULL`.
+const fn demands_value<B: crate::backend::Backend<Float = f64>>(expect: &Expect<B>) -> bool {
+    matches!(expect, Expect::Exact(value) if !matches!(value, Value::Null))
+}
+
 /// Write one generated row as a source writes it, decode it through subql,
 /// and require every cell to come back as the cell allows.
 ///
@@ -1128,41 +1159,75 @@ enum Source {
 /// When a decoder answers a cell with a value it does not hold, or refuses
 /// one it must answer.
 pub fn harness_decoder_roundtrip(data: &[u8]) {
+    let _ = decoder_roundtrip(data);
+}
+
+/// [`harness_decoder_roundtrip`], reporting what the row checked.
+///
+/// # Panics
+///
+/// As [`harness_decoder_roundtrip`].
+#[must_use]
+pub fn decoder_roundtrip(data: &[u8]) -> DecoderCoverage {
+    let mut coverage = DecoderCoverage::default();
     let mut u = Unstructured::new(data);
     let Ok(source) = Source::arbitrary(&mut u) else {
-        return;
+        return coverage;
     };
     let Ok(width) = u.int_in_range(1usize..=8) else {
-        return;
+        return coverage;
     };
     match source {
         Source::Maxwell => {
             let mut cells = Vec::with_capacity(width);
             for _ in 0..width {
                 let Ok(column) = MyColumn::arbitrary(&mut u) else {
-                    return;
+                    return coverage;
                 };
                 let Ok(cell) = MyCell::arbitrary(column, &mut u) else {
-                    return;
+                    return coverage;
                 };
                 cells.push(cell);
             }
             check_maxwell(&cells);
+            coverage.maxwell = cells.len();
+            coverage.values = cells
+                .iter()
+                .filter(|cell| demands_value(&cell.expect))
+                .count();
         }
         source => {
             let mut cells = Vec::with_capacity(width);
             for _ in 0..width {
                 let Ok(column) = PgColumn::arbitrary(&mut u) else {
-                    return;
+                    return coverage;
                 };
                 let Ok(cell) = PgCell::arbitrary(column, &mut u) else {
-                    return;
+                    return coverage;
                 };
                 cells.push(cell);
             }
             check_postgres(source, &cells);
+            let count = cells.len();
+            match source {
+                Source::PgOutput => coverage.pgoutput = count,
+                Source::Wal2JsonV1 => coverage.wal2json_v1 = count,
+                _ => coverage.wal2json_v2 = count,
+            }
+            coverage.values = if matches!(source, Source::PgOutput) {
+                cells
+                    .iter()
+                    .filter(|cell| demands_value(&cell.expect))
+                    .count()
+            } else {
+                cells
+                    .iter()
+                    .filter(|cell| demands_value(&cell.wal2json_expect()))
+                    .count()
+            };
         }
     }
+    coverage
 }
 
 fn ddl<'a>(types: impl Iterator<Item = &'a str>) -> String {

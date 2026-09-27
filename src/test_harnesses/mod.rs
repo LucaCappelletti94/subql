@@ -30,7 +30,7 @@ pub mod predicate_grammar;
 pub(crate) mod snapshot_restore;
 
 pub use aggregate_consistency::harness_aggregate_consistency;
-pub use decoder_roundtrip::harness_decoder_roundtrip;
+pub use decoder_roundtrip::{decoder_roundtrip, harness_decoder_roundtrip, DecoderCoverage};
 #[cfg(all(feature = "pg-sqlite-emu", feature = "executor-diesel"))]
 pub use engine_model::{engine_model_sqlite, harness_engine_model_sqlite, EngineModelCoverage};
 pub use harness_functions::{

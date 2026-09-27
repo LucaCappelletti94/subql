@@ -212,6 +212,43 @@ fn generate_my_rows() -> Vec<(usize, Vec<MyCell>)> {
     rows
 }
 
+/// Every row has to be inserted and every column compared on each row,
+/// and every zone has to compare some cell, or the test passed by comparing
+/// less than it names.
+fn assert_pg_coverage(
+    rejected: &[String],
+    pg_stats: &BTreeMap<&'static str, ColStats>,
+    tz_stats: &BTreeMap<(&'static str, &'static str), ColStats>,
+    zones: &[(&'static str, &'static str, bool)],
+    report: &str,
+) {
+    assert!(rejected.is_empty(), "{report}");
+    let short: Vec<&str> = PG_COLUMNS
+        .iter()
+        .filter(|&&col| col != PgColumn::TimestampTz)
+        .map(|col| col.ddl())
+        .filter(|ddl| pg_stats.get(ddl).map_or(0, |stats| stats.compared) < ROW_COUNT)
+        .collect();
+    assert!(
+        short.is_empty(),
+        "columns compared on fewer than {ROW_COUNT} rows: {short:?}\n{report}"
+    );
+    let silent: Vec<&str> = zones
+        .iter()
+        .map(|&(zone, _, _)| zone)
+        .filter(|zone| {
+            tz_stats
+                .get(&(PgColumn::TimestampTz.ddl(), *zone))
+                .map_or(0, |stats| stats.compared)
+                == 0
+        })
+        .collect();
+    assert!(
+        silent.is_empty(),
+        "zones that compared no TIMESTAMPTZ cell: {silent:?}\n{report}"
+    );
+}
+
 #[test]
 #[ignore = "requires Docker; run with --ignored"]
 #[allow(clippy::too_many_lines)]
@@ -228,8 +265,19 @@ fn pg_wal2json_decoder_spelling() {
     common::create_slot(&mut conn, &slot);
 
     let all_rows = generate_pg_rows();
-    let zones: &[(&'static str, &'static str)] =
-        &[("UTC", "+00"), ("Etc/GMT-1", "+01"), ("Etc/GMT+5", "-05")];
+    // One zone per offset the harness draws. The POSIX spellings hold one
+    // offset for every instant. PostgreSQL refuses a POSIX offset with
+    // seconds, so that one comes from Amsterdam's mean time, which it prints
+    // only before 1937 and outside summer. The last field says whether the
+    // zone prints its offset for every instant.
+    let zones: &[(&'static str, &'static str, bool)] = &[
+        ("UTC", "+00", true),
+        ("Etc/GMT-1", "+01", true),
+        ("Etc/GMT+5", "-05", true),
+        ("<+0530>-05:30", "+05:30", true),
+        ("<+0545>-05:45", "+05:45", true),
+        ("Europe/Amsterdam", "+00:19:32", false),
+    ];
 
     let mut pg_stats: BTreeMap<&'static str, ColStats> = BTreeMap::new();
     let mut tz_stats: BTreeMap<(&'static str, &'static str), ColStats> = BTreeMap::new();
@@ -240,7 +288,7 @@ fn pg_wal2json_decoder_spelling() {
         .collect::<Vec<_>>()
         .join(", ");
 
-    for (zi, &(zone, zone_offset)) in zones.iter().enumerate() {
+    for (zi, &(zone, zone_offset, fixed)) in zones.iter().enumerate() {
         // SET has no DSL form, and wal2json prints TIMESTAMPTZ in this zone.
         sql_query(format!("SET timezone = '{zone}'"))
             .execute(&mut conn)
@@ -322,26 +370,35 @@ fn pg_wal2json_decoder_spelling() {
                 let col_ddl = cell.column.ddl();
                 let is_tstz = cell.column == PgColumn::TimestampTz;
 
+                let col_name = format!("c{col_idx}");
+                let actual = wal_row.remove(&col_name).unwrap_or(JsonValue::Null);
                 let skip = if is_tstz {
                     match &cell.text {
                         // NULL does not depend on the zone, so it is compared once, in zone 0.
                         None => zi > 0,
-                        Some(text) if !tz_matches(text, zone_offset) => {
+                        // A zone with a history prints the offset only for
+                        // some instants, and the others say nothing about
+                        // this spelling.
+                        Some(text)
+                            if !tz_matches(text, zone_offset)
+                                || (!fixed
+                                    && !actual.as_str().is_some_and(|printed| {
+                                        tz_matches(printed, zone_offset)
+                                    })) =>
+                        {
                             tz_stats.entry((col_ddl, zone)).or_default().tz_skipped += 1;
                             true
                         }
                         _ => false,
                     }
                 } else {
-                    zi > 0 // non-TIMESTAMPTZ: UTC pass only to avoid triple-reporting.
+                    zi > 0 // non-TIMESTAMPTZ: UTC pass only to avoid reporting a cell once per zone.
                 };
 
                 if skip {
                     continue;
                 }
 
-                let col_name = format!("c{col_idx}");
-                let actual = wal_row.remove(&col_name).unwrap_or(JsonValue::Null);
                 let expected = cell.wal2json();
                 let is_mismatch = expected != actual;
 
@@ -368,7 +425,7 @@ fn pg_wal2json_decoder_spelling() {
     let mut report = format!(
         "=== PG wal2json decoder spelling ===\n\
          Rows attempted: {ROW_COUNT}, generated: {}\n\
-         Zones: UTC (+00), Etc/GMT-1 (+01), Etc/GMT+5 (-05)\n\n",
+         Zones: one per offset the harness draws\n\n",
         all_rows.len()
     );
     if !rejected.is_empty() {
@@ -382,7 +439,7 @@ fn pg_wal2json_decoder_spelling() {
     for &col in PG_COLUMNS {
         let ddl = col.ddl();
         if col == PgColumn::TimestampTz {
-            for &(zone, zone_offset) in zones {
+            for &(zone, zone_offset, _) in zones {
                 let default = ColStats::default();
                 let stats = tz_stats.get(&(ddl, zone)).unwrap_or(&default);
                 report.push_str(&fmt_pg_col(
@@ -400,6 +457,7 @@ fn pg_wal2json_decoder_spelling() {
     let _ = writeln!(report, "\nTotal mismatches: {total}");
 
     assert_eq!(total, 0, "{report}");
+    assert_pg_coverage(&rejected, &pg_stats, &tz_stats, zones, &report);
 }
 
 #[test]
@@ -523,4 +581,15 @@ fn mysql_maxwell_decoder_spelling() {
     let _ = writeln!(report, "\nTotal mismatches: {total}");
 
     assert_eq!(total, 0, "{report}");
+    // Every row has to be inserted and every column compared on each row.
+    assert!(rejected.is_empty(), "{report}");
+    let short: Vec<&str> = MY_COLUMNS
+        .iter()
+        .map(|col| col.ddl())
+        .filter(|ddl| my_stats.get(ddl).map_or(0, |stats| stats.compared) < ROW_COUNT)
+        .collect();
+    assert!(
+        short.is_empty(),
+        "columns compared on fewer than {ROW_COUNT} rows: {short:?}\n{report}"
+    );
 }
