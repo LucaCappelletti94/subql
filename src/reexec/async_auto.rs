@@ -240,6 +240,11 @@ where
                             fence,
                         }));
                     }
+                    super::ReExecutionRead::Fence => {
+                        unreachable!(
+                            "a grouped seed's install asks for grouped and whole reads only"
+                        )
+                    }
                 }
             }
             return Ok(Some(SnapshotResult::GroupedAggregate {
@@ -596,6 +601,14 @@ where
             }
             // Pages already streamed from the concurrent phase.
             Resolved::WholeStreamed => {}
+            // The fence is the answer itself, so nothing is delivered for it.
+            Resolved::Fence { fence } => {
+                crate::Install::install(
+                    &mut self.inner,
+                    trigger.subscription_id,
+                    crate::FenceInstall { fence },
+                )?;
+            }
         }
         Ok(())
     }
@@ -619,6 +632,9 @@ where
                 group: group.clone(),
                 query: query.clone(),
             }));
+        }
+        if matches!(trigger.read, super::ReExecutionRead::Fence) {
+            return Ok(Some(ResolveJob::Fence));
         }
         let Some(ctx) = self.contexts.get(&subscription_id) else {
             return Err(ReExecError::Unadopted {
@@ -702,6 +718,19 @@ where
                 Ok(Resolved::GroupedScalar {
                     group,
                     row,
+                    fence: reconcile_fence::<X::Checkpoint, E::Checkpoint>(fence.as_ref()),
+                })
+            }
+            ResolveJob::Fence => {
+                let fence =
+                    connector
+                        .read_fence(auth)
+                        .await
+                        .map_err(|error| ReExecError::Connector {
+                            subscription,
+                            error,
+                        })?;
+                Ok(Resolved::Fence {
                     fence: reconcile_fence::<X::Checkpoint, E::Checkpoint>(fence.as_ref()),
                 })
             }

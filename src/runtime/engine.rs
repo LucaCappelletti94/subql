@@ -411,6 +411,9 @@ where
     /// Keyed by the same identity a served subscription carries, since both are
     /// registrations of the same registry.
     reexec: HashMap<SubscriptionId, crate::reexec::ReExecEntry<I, E::Backend, E::Checkpoint>>,
+    /// The fence of the latest fenced install, which every re-read answer's
+    /// unseen changes are trimmed by.
+    latest_fence: crate::reexec::maintain::LatestFence<E::Checkpoint>,
     /// Table -> the re-read answers a change to it may move.
     table_deps: HashMap<TableId, hashbrown::HashSet<SubscriptionId>>,
     /// Plans for keyed re-reads, kept so a read renders the scoped statement
@@ -1325,6 +1328,7 @@ where
                 super::aggregate::DEFAULT_MAX_CHANGES_DURING_AGGREGATE_READ,
             max_groups_per_aggregate: super::aggregate::DEFAULT_MAX_GROUPS_PER_AGGREGATE,
             reexec: HashMap::new(),
+            latest_fence: crate::reexec::maintain::LatestFence::new(),
             table_deps: HashMap::new(),
             keyed_plans: HashMap::new(),
             reexec_sessions: HashMap::new(),
@@ -2342,6 +2346,7 @@ where
             reexec,
             vm,
             database,
+            latest_fence,
             ..
         } = self;
 
@@ -2351,6 +2356,7 @@ where
         let mut keyless = Vec::new();
         let mut grouped_stops = Vec::new();
         let mut transitions = Vec::new();
+        let mut wants_fence = None;
         for subscription_id in subscription_ids {
             let Some(entry) = reexec.get_mut(&subscription_id) else {
                 continue;
@@ -2370,7 +2376,7 @@ where
             let checkpoint = event.checkpoint();
             if let QueryRuntime::Grouped(query) = &mut entry.runtime {
                 let grouped = query
-                    .on_event(event, vm, database, pending_cap, group_limit)
+                    .on_event(event, vm, database, pending_cap, group_limit, latest_fence)
                     .map_err(|error| match error {
                         DispatchError::TierTransition { message, .. } => {
                             DispatchError::TierTransition {
@@ -2411,9 +2417,19 @@ where
                         checkpoint: read.checkpoint,
                     }
                 }));
+                if wants_fence.is_none() && query.wants_fence() {
+                    wants_fence = Some((subscription_id, consumer_id));
+                }
                 continue;
             }
-            match entry.runtime.on_event(event, vm, database, pending_cap) {
+            let maintenance =
+                entry
+                    .runtime
+                    .on_event(event, vm, database, pending_cap, latest_fence);
+            if wants_fence.is_none() && entry.runtime.wants_fence(pending_cap) {
+                wants_fence = Some((subscription_id, consumer_id));
+            }
+            match maintenance {
                 Maintenance::Unchanged => {}
                 Maintenance::Updated(value) => {
                     scalar_updates.push(crate::reexec::ScalarUpdate {
@@ -2437,6 +2453,17 @@ where
                         checkpoint,
                     });
                 }
+            }
+        }
+        if let Some((subscription_id, consumer_id)) = wants_fence {
+            if !latest_fence.probing {
+                latest_fence.probing = true;
+                triggers.push(crate::reexec::ReExecutionTrigger {
+                    subscription_id,
+                    consumer_id,
+                    read: crate::reexec::ReExecutionRead::Fence,
+                    checkpoint: event.checkpoint(),
+                });
             }
         }
         for (subscription_id, table_id, checkpoint) in keyless {
@@ -2518,12 +2545,12 @@ where
             triggers.extend(self.unseeded_aggregate_triggers(event));
         }
         triggers.sort_unstable_by(|left, right| {
-            (left.subscription_id, left.read.group_key())
-                .cmp(&(right.subscription_id, right.read.group_key()))
+            left.subscription_id
+                .cmp(&right.subscription_id)
+                .then_with(|| left.read.slot_order(&right.read))
         });
         triggers.dedup_by(|left, right| {
-            left.subscription_id == right.subscription_id
-                && left.read.group_key() == right.read.group_key()
+            left.subscription_id == right.subscription_id && left.read.same_slot(&right.read)
         });
         transitions.extend(aggregate.transitions);
         Ok(crate::DispatchOutput::from_parts(

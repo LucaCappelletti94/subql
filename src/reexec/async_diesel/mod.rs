@@ -377,6 +377,19 @@ impl<S: SessionSetup + Send + Sync, C: crate::backend::MySqlTableNameCase> Async
             .map_err(|e| ScalarRowError::Connector(DieselAsyncError::Diesel(e)))
         }
     }
+
+    fn read_fence(
+        &self,
+        _auth: &S,
+    ) -> impl Future<Output = Result<Option<Self::Checkpoint>, Self::Error>> + Send {
+        async move {
+            let mut pooled = self.pool.get().await.map_err(DieselAsyncError::Pool)?;
+            let conn: &mut diesel_async::AsyncMysqlConnection = &mut pooled;
+            // The current coordinate is the answer itself, with nothing read
+            // behind it.
+            Ok(read_binlog_pos_async(conn).await)
+        }
+    }
 }
 
 /// SQL for an eight-byte integer scalar read: wraps the projected column in

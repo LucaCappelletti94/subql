@@ -230,6 +230,14 @@ impl<S: SessionSetup, C: crate::backend::MySqlTableNameCase> Connector
         })
         .map_err(ScalarRowError::Connector)
     }
+
+    fn read_fence(&self, _auth: &S) -> Result<Option<Self::Checkpoint>, Self::Error> {
+        // The coordinate is the answer itself, with nothing read behind it,
+        // so the before-the-transaction ordering a value read needs does not
+        // apply.
+        let mut conn = self.conn.borrow_mut();
+        Ok(read_binlog_pos(&mut conn))
+    }
 }
 
 #[cfg(all(

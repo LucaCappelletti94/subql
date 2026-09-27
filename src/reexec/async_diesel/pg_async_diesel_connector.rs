@@ -540,4 +540,19 @@ impl<S: SessionSetup + Send + Sync> AsyncConnector for PgAsyncDieselConnector<S>
             .map_err(|e| ScalarRowError::Connector(DieselAsyncError::Diesel(e)))
         }
     }
+
+    fn read_fence(
+        &self,
+        _auth: &S,
+    ) -> impl Future<Output = Result<Option<crate::PgSnapshotFence>, Self::Error>> + Send {
+        async move {
+            let mut pooled = self.pool.get().await.map_err(DieselAsyncError::Pool)?;
+            let conn: &mut diesel_async::AsyncPgConnection = &mut pooled;
+            // One statement takes its snapshot at its start and reads the
+            // insert position after it, so no transaction is needed. The
+            // statement touches no table, so no setup statements run.
+            let fence = read_fence(conn).await.map_err(DieselAsyncError::Diesel)?;
+            Ok(Some(fence))
+        }
+    }
 }

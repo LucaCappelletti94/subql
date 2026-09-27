@@ -345,7 +345,8 @@ pub enum CursorError<E> {
 /// per-viewer auth policy that the execution requires. Subql calls
 /// [`execute_scalar`](Self::execute_scalar) whenever the in-process state
 /// machine emits `NeedsReexecution`, then installs the returned
-/// [`Value`].
+/// [`Value`]. It calls [`read_fence`](Self::read_fence) when a value asks for
+/// the database's current fence with no query behind it.
 ///
 /// # Auth context
 ///
@@ -488,6 +489,24 @@ pub trait Connector {
     fn close_cursor(&self, cursor: CursorId) -> Result<(), CursorError<Self::Error>> {
         let _ = cursor;
         Err(CursorError::Unsupported)
+    }
+
+    /// The database's current fence, read with no query behind it.
+    ///
+    /// Answers a [`ReExecutionRead::Fence`](super::ReExecutionRead::Fence),
+    /// one cheap round trip that lets values drop the changes they keep for
+    /// their next read. The default reports none, which is right for a
+    /// connector whose reads report no fence either.
+    ///
+    /// # Errors
+    ///
+    /// The connector's own error when the database cannot be asked.
+    fn read_fence(
+        &self,
+        auth: &Self::AuthContext,
+    ) -> Result<Option<<Self::Checkpoint as Checkpoint>::Fence>, Self::Error> {
+        let _ = auth;
+        Ok(None)
     }
 
     /// Run one bound multi-column scalar seed query and decode each column by

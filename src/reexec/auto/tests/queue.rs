@@ -406,7 +406,7 @@ fn key_removal_reclaims_queue_storage() {
             read: crate::reexec::ReExecutionRead::Subscription,
             checkpoint: None,
         });
-        queue.remove(round, None);
+        queue.remove(round, ReadSlot::Value);
     }
     assert!(queue.is_empty(), "every queued read was removed");
     assert!(

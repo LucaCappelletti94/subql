@@ -192,6 +192,14 @@ impl<S: SessionSetup> Connector for PgDieselConnector<S> {
         })
         .map_err(ScalarRowError::Connector)
     }
+
+    fn read_fence(&self, _auth: &S) -> Result<Option<crate::PgSnapshotFence>, Self::Error> {
+        let mut conn = self.conn.borrow_mut();
+        // One statement takes its snapshot at its start and reads the insert
+        // position after it, so no transaction is needed. The statement
+        // touches no table, so no setup statements run.
+        Ok(Some(read_fence(&mut conn)?))
+    }
 }
 
 #[cfg(all(test, feature = "executor-diesel-postgres"))]

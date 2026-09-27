@@ -122,6 +122,11 @@ where
                             fence,
                         }));
                     }
+                    crate::reexec::ReExecutionRead::Fence => {
+                        unreachable!(
+                            "a grouped seed's install asks for grouped and whole reads only"
+                        )
+                    }
                 }
             }
             return Ok(Some(SnapshotResult::GroupedAggregate {
@@ -339,6 +344,31 @@ where
             for followup in installed.triggers {
                 self.enqueue_followup(trigger, followup);
             }
+            return Ok(());
+        }
+
+        if matches!(trigger.read, crate::reexec::ReExecutionRead::Fence) {
+            let Some(ctx) = self.contexts.get(&trigger.subscription_id) else {
+                return Err(ReExecError::Unadopted {
+                    subscription: trigger.subscription_id,
+                });
+            };
+            let fence =
+                self.mode
+                    .0
+                    .read_fence(&ctx.auth)
+                    .map_err(|error| ReExecError::Connector {
+                        subscription: trigger.subscription_id,
+                        error,
+                    })?;
+            crate::Install::install(
+                &mut self.inner,
+                trigger.subscription_id,
+                crate::FenceInstall {
+                    fence: reconcile_fence::<X::Checkpoint, E::Checkpoint>(fence.as_ref()),
+                },
+            )
+            .map_err(ReExecError::<X::Error>::from)?;
             return Ok(());
         }
         let Some(ctx) = self.contexts.get(&trigger.subscription_id) else {

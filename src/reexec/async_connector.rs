@@ -141,6 +141,18 @@ pub trait AsyncConnector: Send + Sync {
     }
 
     /// Async peer of
+    /// [`Connector::read_fence`](super::Connector::read_fence).
+    fn read_fence(
+        &self,
+        auth: &Self::AuthContext,
+    ) -> impl core::future::Future<
+        Output = Result<Option<<Self::Checkpoint as Checkpoint>::Fence>, Self::Error>,
+    > + Send {
+        let _ = auth;
+        core::future::ready(Ok(None))
+    }
+
+    /// Async peer of
     /// [`Connector::execute_scalar_row`](super::Connector::execute_scalar_row).
     /// See it for the contract; the async surface only differs by returning
     /// a future. The default rejects with [`ScalarRowError::Unsupported`] so

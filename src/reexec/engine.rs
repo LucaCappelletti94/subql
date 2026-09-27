@@ -135,6 +135,10 @@ pub enum ReExecutionRead<B: Backend = crate::backend::Postgres> {
         /// Decode hints for the extreme and source-row count.
         column_kinds: [crate::backend::ScalarFamily; 2],
     },
+    /// Read only the database's current fence and install it with
+    /// [`FenceInstall`](crate::FenceInstall), which lets values drop the
+    /// changes they keep for their next read once the database shows them.
+    Fence,
 }
 
 // Manual rather than derived: the derive would demand `B: Clone` although
@@ -152,15 +156,54 @@ impl<B: Backend> Clone for ReExecutionRead<B> {
                 query: query.clone(),
                 column_kinds: *column_kinds,
             },
+            Self::Fence => Self::Fence,
         }
     }
 }
 
+/// What one queued read answers, so reads of different things never replace
+/// each other in a queue.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum ReadSlot {
+    Value,
+    Group(Vec<u8>),
+    Fence,
+}
+
 impl<B: Backend> ReExecutionRead<B> {
-    pub(crate) fn group_key(&self) -> Option<&[u8]> {
+    pub(crate) fn slot(&self) -> ReadSlot {
         match self {
-            Self::Subscription => None,
-            Self::GroupedScalar { group, .. } => Some(group),
+            Self::Subscription => ReadSlot::Value,
+            Self::GroupedScalar { group, .. } => ReadSlot::Group(group.clone()),
+            Self::Fence => ReadSlot::Fence,
+        }
+    }
+
+    /// Whether `self` and `other` answer the same thing.
+    pub(crate) fn same_slot(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Subscription, Self::Subscription) | (Self::Fence, Self::Fence) => true,
+            (Self::GroupedScalar { group: left, .. }, Self::GroupedScalar { group: right, .. }) => {
+                left == right
+            }
+            _ => false,
+        }
+    }
+
+    /// Orders reads as [`ReadSlot`] does, without building one.
+    pub(crate) fn slot_order(&self, other: &Self) -> core::cmp::Ordering {
+        const fn rank<B: Backend>(read: &ReExecutionRead<B>) -> u8 {
+            match read {
+                ReExecutionRead::Subscription => 0,
+                ReExecutionRead::GroupedScalar { .. } => 1,
+                ReExecutionRead::Fence => 2,
+            }
+        }
+        match (self, other) {
+            (Self::GroupedScalar { group: left, .. }, Self::GroupedScalar { group: right, .. }) => {
+                left.cmp(right)
+            }
+            _ => rank(self).cmp(&rank(other)),
         }
     }
 }

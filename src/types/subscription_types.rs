@@ -1171,6 +1171,14 @@ pub struct GroupedScalarInstall<B: Backend, C: Checkpoint = NoCheckpoint> {
     pub fence: Option<C::Fence>,
 }
 
+/// The answer to a [`ReExecutionRead::Fence`](crate::reexec::ReExecutionRead::Fence)
+/// read, the database's current fence with no query behind it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct FenceInstall<C: Checkpoint = NoCheckpoint> {
+    /// `None` when the connector reports no fences.
+    pub fence: Option<C::Fence>,
+}
+
 /// A result struct does not match the registered tier or identity.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum InstallError {
