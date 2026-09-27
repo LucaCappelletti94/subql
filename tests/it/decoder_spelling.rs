@@ -250,8 +250,8 @@ type Zone = (&'static str, &'static str, bool);
 
 /// One zone per offset the harness draws. The POSIX spellings hold one
 /// offset for every instant. PostgreSQL refuses a POSIX offset with seconds,
-/// so that one comes from Amsterdam's mean time, which it prints only before
-/// 1937 and outside summer.
+/// so that one comes from Amsterdam's mean time, which it prints in winter
+/// through 1937 and in summer before 1916.
 const ZONES: &[Zone] = &[
     ("UTC", "+00", true),
     ("Etc/GMT-1", "+01", true),

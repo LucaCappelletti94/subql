@@ -184,7 +184,7 @@ impl PgColumn {
     }
 }
 
-/// One PostgreSQL cell: its output text, `None` for `NULL`, and what a
+/// One PostgreSQL cell, with its output text or `None` for `NULL`, and what a
 /// decoder may answer.
 #[derive(Clone, Debug)]
 pub struct PgCell {
@@ -494,7 +494,7 @@ fn shortest_digits(x: f64, single: bool) -> (&'static str, String, i32) {
     )
 }
 
-/// `x` as `float8out` or `float4out` prints it: the shortest digits that
+/// `x` as `float8out` or `float4out` prints it, with the shortest digits that
 /// read back as `x`, in positional notation for decimal exponents from -4
 /// up to 14 (float8) or 5 (float4) and as `d.ddde+XX` outside them.
 #[must_use]
@@ -553,10 +553,11 @@ fn text_without_nul(u: &mut Unstructured<'_>, max_chars: usize) -> arbitrary::Re
 
 /// Server `TimeZone` offsets in seconds east of UTC, among them ones with
 /// minutes and one with seconds, Amsterdam's local mean time, which
-/// PostgreSQL prints as `+00:19:32` for an instant before 1909.
+/// PostgreSQL prints as `+00:19:32` in winter through 1937 and in summer
+/// before 1916.
 const OFFSETS: [i32; 6] = [0, 3600, -18000, 19800, 20700, 1172];
 
-/// A timestamp PostgreSQL stores: 4713 BC to 294276 AD, mostly this era.
+/// A timestamp PostgreSQL stores, from 4713 BC to 294276 AD, mostly this era.
 fn pg_datetime(u: &mut Unstructured<'_>) -> arbitrary::Result<NaiveDateTime> {
     Ok(pg_date(u)?.and_time(time(u)?))
 }
@@ -599,7 +600,7 @@ fn time_text(time: NaiveTime) -> String {
     text
 }
 
-/// A year as PostgreSQL prints it: four digits at least, and the era after
+/// A year as PostgreSQL prints it, with four digits at least and the era after
 /// the whole value when it is before Christ, where year 0 is 1 BC.
 fn year_and_era(year: i32) -> (String, &'static str) {
     if year <= 0 {
@@ -685,7 +686,7 @@ fn json_document(
     })
 }
 
-/// `document` as `jsonb` prints it: keys ordered by length and then bytes,
+/// `document` as `jsonb` prints it, with keys ordered by length and then bytes,
 /// `", "` between items and `": "` after a key.
 #[must_use]
 pub fn jsonb_text(document: &serde_json::Value) -> String {
@@ -769,7 +770,7 @@ impl MyColumn {
     }
 }
 
-/// One MySQL cell: what Maxwell writes for it, how an `INSERT` spells it,
+/// One MySQL cell, with what Maxwell writes for it, how an `INSERT` spells it,
 /// and what a decoder may answer.
 #[derive(Clone, Debug)]
 pub struct MyCell {
@@ -1034,7 +1035,7 @@ fn my_string_literal(text: &str) -> String {
 }
 
 /// `x` as Java's `Double.toString` or `Float.toString` writes it, which is
-/// what Jackson prints: positional from `1e-3` up to `1e7`, with at least
+/// what Jackson prints, positional from `1e-3` up to `1e7` with at least
 /// one digit after the point, and `d.dddE-n` outside.
 #[must_use]
 pub fn java_float(x: f64, single: bool) -> String {

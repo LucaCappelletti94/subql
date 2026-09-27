@@ -16,7 +16,7 @@ use subql::test_harnesses::{decoder_roundtrip, DecoderCoverage};
 /// Where a failing byte string is recorded.
 const REGRESSIONS: &str = "tests/it/decoder_roundtrip.proptest-regressions";
 
-/// Rows per run: `SUBQL_SWEEP_ROWS` times fifty, so the pull-request depth
+/// `SUBQL_SWEEP_ROWS` times fifty rows per run, so the pull-request depth
 /// is 2400 and the weekly one 30000.
 fn cases() -> u32 {
     std::env::var("SUBQL_SWEEP_ROWS")
