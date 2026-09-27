@@ -49,14 +49,12 @@ pub use snapshot_restore::{harness_pgoutput, harness_snapshot_restore_roundtrip}
 /// when the host has that memory filesystem, where a sync costs nothing, and
 /// in the platform's temporary directory otherwise.
 pub(crate) fn store_dir() -> std::io::Result<tempfile::TempDir> {
-    let mut builder = tempfile::Builder::new();
-    builder.prefix("subql-harness-");
-    let shm = std::path::Path::new("/dev/shm");
-    if shm.is_dir() {
-        builder.tempdir_in(shm)
-    } else {
-        builder.tempdir()
-    }
+    let root = Some(std::path::Path::new("/dev/shm"))
+        .filter(|shm| shm.is_dir())
+        .map_or_else(std::env::temp_dir, std::path::Path::to_path_buf);
+    tempfile::Builder::new()
+        .prefix("subql-harness-")
+        .tempdir_in(root)
 }
 
 #[cfg(test)]
