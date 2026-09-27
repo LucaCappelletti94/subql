@@ -8,7 +8,7 @@
 
 use crate::backend::ComparisonContext;
 use crate::backend::{Backend, CdcEvent, RowKind, ScalarText, Value};
-use crate::checkpoint::{ReadFence, Seen};
+use crate::checkpoint::{ReadFence, Seen, UnseenLog};
 use crate::compiler::literals::SqlLiteralParse;
 use crate::compiler::sql_shape::ScalarAggKind;
 use crate::compiler::value_cmp::{compare_ordered_values, values_equal};
@@ -67,61 +67,6 @@ enum Removed<B: Backend> {
     Row(Value<B>),
 }
 
-/// Changes applied to a value that no fence of its own reads has shown the
-/// database holds yet, so a later read that still misses one can have it
-/// applied on top of its answer.
-///
-/// Visibility only grows, so an entry a fence holds is held by every later
-/// snapshot and leaves for good.
-struct UnseenLog<C: Checkpoint, T> {
-    entries: Vec<(C, T)>,
-    /// Set when entries had to be forgotten, after which no read of the value
-    /// can be completed exactly and the next install asks again.
-    overflowed: bool,
-}
-
-impl<C: Checkpoint, T> UnseenLog<C, T> {
-    const fn new() -> Self {
-        Self {
-            entries: Vec::new(),
-            overflowed: false,
-        }
-    }
-
-    fn push(&mut self, at: C, entry: T, cap: usize) {
-        if self.overflowed {
-            return;
-        }
-        if self.entries.len() >= cap {
-            self.overflowed = true;
-            self.entries = Vec::new();
-            return;
-        }
-        self.entries.push((at, entry));
-    }
-
-    fn forget_held(&mut self, fence: &C::Fence) {
-        self.entries
-            .retain(|(at, _)| at.seen_by(fence) != Seen::Held);
-    }
-
-    /// Past half the cap, so a fence-only read can trim it before it
-    /// overflows.
-    const fn wants_fence(&self, cap: usize) -> bool {
-        !self.overflowed && self.entries.len() >= cap.div_ceil(2)
-    }
-
-    const fn is_empty(&self) -> bool {
-        !self.overflowed && self.entries.is_empty()
-    }
-}
-
-impl<C: Checkpoint, T> Default for UnseenLog<C, T> {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 /// The fence of the engine's latest fenced install, shared by every value.
 ///
 /// A value may forget the entries it holds unless a read of the value is
@@ -161,7 +106,7 @@ impl<C: Checkpoint> LatestFence<C> {
 
     /// The latest fence, if a value whose read was asked at `asked` may trim
     /// by it.
-    fn trims(&self, asked: Option<u64>) -> Option<&C::Fence> {
+    pub(crate) fn trims(&self, asked: Option<u64>) -> Option<&C::Fence> {
         let fence = self.latest.as_ref()?;
         asked
             .is_none_or(|asked| asked >= self.installs)

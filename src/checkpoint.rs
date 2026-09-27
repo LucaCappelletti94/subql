@@ -109,6 +109,61 @@ impl<C: Checkpoint> ReadFence<C> {
     }
 }
 
+/// Changes applied to a value that no fence of its own reads has shown the
+/// database holds yet, so a later read that still misses one can have it
+/// applied on top of its answer.
+///
+/// Visibility only grows, so an entry a fence holds is held by every later
+/// snapshot and leaves for good.
+pub(crate) struct UnseenLog<C: Checkpoint, T> {
+    pub(crate) entries: Vec<(C, T)>,
+    /// Set when entries had to be forgotten, after which no read of the value
+    /// can be completed exactly and the next install asks again.
+    pub(crate) overflowed: bool,
+}
+
+impl<C: Checkpoint, T> UnseenLog<C, T> {
+    pub(crate) const fn new() -> Self {
+        Self {
+            entries: Vec::new(),
+            overflowed: false,
+        }
+    }
+
+    pub(crate) fn push(&mut self, at: C, entry: T, cap: usize) {
+        if self.overflowed {
+            return;
+        }
+        if self.entries.len() >= cap {
+            self.overflowed = true;
+            self.entries = Vec::new();
+            return;
+        }
+        self.entries.push((at, entry));
+    }
+
+    pub(crate) fn forget_held(&mut self, fence: &C::Fence) {
+        self.entries
+            .retain(|(at, _)| at.seen_by(fence) != Seen::Held);
+    }
+
+    /// Past half the cap, so a fence-only read can trim it before it
+    /// overflows.
+    pub(crate) const fn wants_fence(&self, cap: usize) -> bool {
+        !self.overflowed && self.entries.len() >= cap.div_ceil(2)
+    }
+
+    pub(crate) const fn is_empty(&self) -> bool {
+        !self.overflowed && self.entries.is_empty()
+    }
+}
+
+impl<C: Checkpoint, T> Default for UnseenLog<C, T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// `Held` at or before a position fence, `Beyond` after it.
 fn by_position<C: Ord>(at: &C, fence: &C) -> Seen {
     if at <= fence {
