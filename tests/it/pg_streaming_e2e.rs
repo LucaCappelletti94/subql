@@ -1050,6 +1050,40 @@ fn wait_until(what: &str, mut probe: impl FnMut() -> bool) {
     }
 }
 
+/// Drop the physical slot a backup reserved, ending the walsender still holding
+/// it if waiting does not free it.
+///
+/// A physical slot is cluster-wide, so one left behind retains WAL for every
+/// test sharing the server. Function calls the DSL cannot express.
+fn drop_backup_slot(source: &mut PgConnection, slot: &str) -> Result<(), String> {
+    let started = Instant::now();
+    loop {
+        // Selecting from the view drops the slot only if it is there, so a
+        // success means it is gone either way.
+        let dropped = sql_query(format!(
+            "SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots \
+             WHERE slot_name = '{slot}'"
+        ))
+        .execute(source);
+        let Err(err) = dropped else {
+            return Ok(());
+        };
+        if started.elapsed() > ARRIVAL {
+            return Err(format!(
+                "physical slot {slot} is still on the shared server, retaining its WAL: {err}"
+            ));
+        }
+        if started.elapsed() > Duration::from_secs(5) {
+            let _ = sql_query(format!(
+                "SELECT pg_terminate_backend(active_pid) FROM pg_replication_slots \
+                 WHERE slot_name = '{slot}' AND active_pid IS NOT NULL"
+            ))
+            .execute(source);
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+}
+
 /// A promoted point-in-time clone of the shared server.
 struct PitrCluster {
     container: String,
@@ -1096,12 +1130,12 @@ impl PitrCluster {
             &seed,
         ]);
         // The walsender can still hold the slot for a moment after the backup exits.
-        wait_until("the backup slot is dropped", || {
-            sql_query(format!("SELECT pg_drop_replication_slot('{slot}')"))
-                .execute(source)
-                .is_ok()
-        });
-        seeded.unwrap_or_else(|err| panic!("{err}"));
+        match (seeded, drop_backup_slot(source, &slot)) {
+            (Ok(_), Ok(())) => {}
+            (Ok(_), Err(slot_err)) => panic!("{slot_err}"),
+            (Err(backup_err), Ok(())) => panic!("{backup_err}"),
+            (Err(backup_err), Err(slot_err)) => panic!("{backup_err}\n{slot_err}"),
+        }
         let data = format!("{}:/var/lib/postgresql/data", clone.volume);
         let mut run = vec![
             "run",
