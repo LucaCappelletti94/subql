@@ -423,8 +423,8 @@ struct Store {
     path: std::path::PathBuf,
 }
 
-/// Where a run keeps its store: a memory filesystem when the host has one,
-/// the temporary directory otherwise.
+/// Where a run keeps its store, a memory filesystem when the host has one
+/// and the temporary directory otherwise.
 ///
 /// Every registration, removal and tier change writes the store and syncs it
 /// to disk twice, so on a disk a sequence spends most of its time waiting
