@@ -1218,9 +1218,9 @@ dependencies = [
 
 [[package]]
 name = "sql-scalar-text"
-version = "0.1.0"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "53c8a68d907abe87d261288a6753ba0ce1451ecef845ad13dba2be60b652605c"
+checksum = "fe4d9c3734c9dfc32e255461a2ae1fb7493956adf798817f9adaa0af7f7c9d6c"
 dependencies = [
  "bigdecimal",
  "chrono",
@@ -1229,7 +1229,7 @@ dependencies = [
 [[package]]
 name = "sql-traits"
 version = "0.1.0"
-source = "git+https://github.com/earth-metabolome-initiative/sql-traits?branch=main#8ab50b2a42485282ca25cd9db22c5fb7b910161a"
+source = "git+https://github.com/earth-metabolome-initiative/sql-traits?branch=main#4e5d19a4aed629ff0fc6221c79fa1f460b2afae1"
 dependencies = [
  "geometric-traits",
  "serde",

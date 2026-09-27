@@ -439,6 +439,21 @@ pub fn column_scalar_kind<B: crate::backend::Backend, DB: DatabaseLike>(
     classify_scalar_kind::<B>(&column.data_type(database))
 }
 
+/// The width a fixed-length binary column pads its values to with zero
+/// bytes, as MySQL's `BINARY(n)` does, or `None` for any other column.
+#[must_use]
+pub fn fixed_binary_length<DB: DatabaseLike>(
+    database: &DB,
+    table_id: TableId,
+    column_id: ColumnId,
+) -> Option<usize> {
+    let table = database.table_by_id(usize::try_from(table_id).ok()?)?;
+    let column = table
+        .column_by_id(usize::from(column_id), database)
+        .ok()??;
+    usize::try_from(column.fixed_binary_length(database)?).ok()
+}
+
 /// Returns the scalar and comparison facts for one group-key column.
 #[must_use]
 pub fn column_comparison<B: crate::backend::Backend, DB: DatabaseLike>(

@@ -21,7 +21,7 @@ use sql_traits::prelude::DatabaseLike;
 
 use super::pg_type::json_value_to_mysql_value_by_kind;
 use super::{resolve_table, WalParseError};
-use crate::backend::{MySql, RowKind, Value};
+use crate::backend::{MySql, RowKind, ScalarFamily, Value};
 use crate::catalog_helpers;
 use crate::types::{ColumnId, EventKind, TableId};
 use crate::wal::wire_event::{wire_cdc_event, WireEvent};
@@ -199,13 +199,38 @@ impl<C: crate::backend::MySqlTableNameCase> WireEvent for MaxwellEvent<C> {
         };
         match image.get(name.as_str()) {
             None => Ok(Value::Missing),
-            Some(value) if value.is_null() => Ok(Value::Null),
-            Some(value) => catalog_helpers::column_scalar_kind::<MySql<C>, DB>(db, table_id, col)
+            // Maxwell writes a `JSON` column's `null` document as `null`, as
+            // it writes `NULL`, so a `null` there may not be `NULL`.
+            Some(value) if value.is_null() => Ok(
+                match catalog_helpers::column_scalar_kind::<MySql<C>, DB>(db, table_id, col)
+                    .and_then(|kind| kind.family())
+                {
+                    Some(ScalarFamily::Json) => Value::Missing,
+                    _ => Value::Null,
+                },
+            ),
+            Some(value) => {
+                let decoded = catalog_helpers::column_scalar_kind::<MySql<C>, DB>(
+                    db, table_id, col,
+                )
                 .map_or(Ok(Value::Missing), |kind| {
                     crate::backend::decode_cell(col, kind, |builtin| {
                         json_value_to_mysql_value_by_kind(value, builtin)
                     })
-                }),
+                });
+                // The binlog keeps a `BINARY(n)` value without its trailing
+                // zero bytes, which the column's width puts back.
+                match (
+                    decoded,
+                    catalog_helpers::fixed_binary_length(db, table_id, col),
+                ) {
+                    (Ok(Value::Bytes(mut bytes)), Some(width)) if bytes.len() < width => {
+                        bytes.resize(width, 0);
+                        Ok(Value::Bytes(bytes))
+                    }
+                    (decoded, _) => decoded,
+                }
+            }
         }
     }
 
@@ -391,5 +416,79 @@ mod tests {
                 kind: crate::backend::ScalarFamily::Int
             }
         );
+    }
+
+    fn binary_and_json() -> ParserDB {
+        ParserDB::parse::<MySqlDialect>(
+            "CREATE TABLE t (id INT PRIMARY KEY, blob VARBINARY(8), doc JSON);",
+        )
+        .expect("parse DDL")
+    }
+
+    /// Maxwell writes a binary cell in base64.
+    #[test]
+    fn a_binary_cell_decodes_from_base64() {
+        let db = binary_and_json();
+        let ev = one(br#"{"database":"test","table":"t","type":"insert",
+                 "data":{"id":1,"blob":"nusA/w=="}}"#);
+        assert_eq!(
+            ev.value_at(&db, RowKind::New, 1).unwrap(),
+            Value::Bytes(alloc::vec![0x9e, 0xeb, 0x00, 0xff])
+        );
+    }
+
+    /// The binlog keeps a `BINARY(n)` value without its trailing zero bytes,
+    /// and Maxwell writes it that way, so the column's length restores them.
+    /// A `VARBINARY` value keeps its zeros and is never padded.
+    #[test]
+    fn a_fixed_binary_cell_is_padded_to_its_length() {
+        let db = ParserDB::parse::<MySqlDialect>(
+            "CREATE TABLE t (id INT PRIMARY KEY, token BINARY(4), one BINARY, blob VARBINARY(8));",
+        )
+        .expect("parse DDL");
+        let ev = one(br#"{"database":"test","table":"t","type":"insert",
+                 "data":{"id":1,"token":"nus=","one":"","blob":"nus="}}"#);
+        assert_eq!(
+            ev.value_at(&db, RowKind::New, 1).unwrap(),
+            Value::Bytes(alloc::vec![0x9e, 0xeb, 0x00, 0x00])
+        );
+        assert_eq!(
+            ev.value_at(&db, RowKind::New, 2).unwrap(),
+            Value::Bytes(alloc::vec![0x00])
+        );
+        assert_eq!(
+            ev.value_at(&db, RowKind::New, 3).unwrap(),
+            Value::Bytes(alloc::vec![0x9e, 0xeb])
+        );
+    }
+
+    /// Maxwell writes a `JSON` cell as the document itself, so a string is a
+    /// string document and not text to parse.
+    #[test]
+    fn a_json_string_document_stays_a_string() {
+        let db = binary_and_json();
+        let ev = one(br#"{"database":"test","table":"t","type":"insert",
+                 "data":{"id":1,"doc":"12"}}"#);
+        assert_eq!(
+            ev.value_at(&db, RowKind::New, 2).unwrap(),
+            Value::Json(serde_json::Value::String("12".into()))
+        );
+        let ev = one(br#"{"database":"test","table":"t","type":"insert",
+                 "data":{"id":1,"doc":{"a":[1,"x"]}}}"#);
+        assert_eq!(
+            ev.value_at(&db, RowKind::New, 2).unwrap(),
+            Value::Json(serde_json::json!({"a": [1, "x"]}))
+        );
+    }
+
+    /// Maxwell writes `null` for a `JSON` column holding the JSON `null`
+    /// document as well as for `NULL`, so that `null` is unanswerable.
+    #[test]
+    fn a_null_json_cell_is_unanswerable() {
+        let db = binary_and_json();
+        let ev = one(br#"{"database":"test","table":"t","type":"insert",
+                 "data":{"id":1,"blob":null,"doc":null}}"#);
+        assert_eq!(ev.value_at(&db, RowKind::New, 1).unwrap(), Value::Null);
+        assert_eq!(ev.value_at(&db, RowKind::New, 2).unwrap(), Value::Missing);
     }
 }

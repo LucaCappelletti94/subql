@@ -94,6 +94,12 @@ mod connector_default;
 
 mod custom_scalar_types;
 
+#[cfg(feature = "testing")]
+mod decoder_roundtrip;
+
+#[cfg(feature = "testing")]
+mod decoder_spelling;
+
 // Integration test for the DieselConnector. Uses in-memory SQLite. Gated
 // behind the `executor-diesel` feature so default `cargo test` does not try
 // to compile it.

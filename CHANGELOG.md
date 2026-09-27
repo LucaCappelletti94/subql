@@ -70,6 +70,11 @@ All notable changes to subql are recorded here. The format follows [Keep a Chang
 
 ### Fixed
 
+- A Maxwell `BINARY(n)` cell decodes padded to its `n` bytes. The binlog drops a `BINARY(n)` value's trailing zero bytes and Maxwell writes it that way, so a value ending in zero bytes decoded short and an equality filter on the full value missed the row.
+- A PostgreSQL `timestamptz` whose offset has seconds, as PostgreSQL prints an instant before a zone's standard time (`1900-01-01 00:19:32+00:19:32`), decodes from pgoutput and wal2json, as do dates and timestamps before 1 AD or past 9999. Each was refused and answered by a database read.
+- A wal2json `null` in a float or numeric column, and a Maxwell `null` in a `JSON` column, is unanswerable and answered by a database read. wal2json writes `null` for `NaN` and the infinities, and Maxwell for the JSON `null` document, and subql read both as SQL `NULL`, so `IS NULL` selected those rows.
+- A Maxwell binary cell (`BINARY`, `VARBINARY`, `BLOB`) decodes from base64, which is how Maxwell writes it. subql read it as `\x` hex, so every Maxwell binary cell was refused and answered by a database read.
+- A Maxwell `JSON` cell holding a string document, such as `"12"`, decodes as that string. subql parsed the string as JSON text, so `"12"` became the number 12 and a string that was not JSON text was refused.
 - `IS [NOT] NULL` over a condition, as in `WHERE (a > 0) IS NOT NULL`, asks whether the condition is unknown, as every engine does. It was compiled to a null test of a value, so every dispatch on the subscription's table failed with a VM type error and took every other subscription on that table with it.
 - A keyed re-read that a change with no key, such as a truncate, moves to a whole re-read is written to the store under its new tier. It was taken out of the reads file and never written back, so the next restart silently lost the subscription.
 - An in-process aggregate that stops mid-dispatch, on an update without its old image, a group cap or a sum out of range, is written to the store as the whole re-read it became. The store kept naming the stopped aggregate, so a restart brought back the tier the subscriber had been told was gone.

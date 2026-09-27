@@ -80,7 +80,7 @@ fn decode_hex_bytes(hex: &str) -> Option<alloc::vec::Vec<u8>> {
         .collect()
 }
 
-/// The two JSON wire families the two engines read differently.
+/// The JSON wire families the two engines read differently.
 ///
 /// Every other family decodes identically from a JSON cell, so
 /// [`json_value_by_kind`] takes only these from the backend and the carrier
@@ -105,9 +105,13 @@ trait JsonWireScalars:
     /// PostgreSQL carries a native `uuid`, MySQL stores one as text.
     fn uuid_cell(value: &serde_json::Value) -> Value<Self>;
 
-    /// PostgreSQL's `bytea` prints bare hex as well as `\x` hex, Maxwell
-    /// prints only the `\x` form.
+    /// wal2json writes `bytea` as bare hex, and Maxwell writes a binary
+    /// column in base64.
     fn bytes_cell(value: &serde_json::Value) -> Value<Self>;
+
+    /// wal2json writes a `json` or `jsonb` cell as the document's text in a
+    /// string, and Maxwell writes a `JSON` cell as the document itself.
+    fn document(value: &serde_json::Value) -> Option<serde_json::Value>;
 }
 
 impl JsonWireScalars for Postgres {
@@ -121,6 +125,13 @@ impl JsonWireScalars for Postgres {
     fn bytes_cell(value: &serde_json::Value) -> Value<Self> {
         json_pg_bytea(value).map_or(Value::Missing, Value::Bytes)
     }
+
+    fn document(value: &serde_json::Value) -> Option<serde_json::Value> {
+        match value {
+            serde_json::Value::String(s) => serde_json::from_str(s).ok(),
+            other => Some(other.clone()),
+        }
+    }
 }
 
 impl<C: crate::backend::MySqlTableNameCase> JsonWireScalars for MySql<C> {
@@ -131,7 +142,14 @@ impl<C: crate::backend::MySqlTableNameCase> JsonWireScalars for MySql<C> {
     }
 
     fn bytes_cell(value: &serde_json::Value) -> Value<Self> {
-        json_bytea(value).map_or(Value::Missing, Value::Bytes)
+        value
+            .as_str()
+            .and_then(decode_base64)
+            .map_or(Value::Missing, Value::Bytes)
+    }
+
+    fn document(value: &serde_json::Value) -> Option<serde_json::Value> {
+        Some(value.clone())
     }
 }
 
@@ -173,8 +191,8 @@ fn json_value_by_kind<B: JsonWireScalars>(
         }
         ScalarFamily::Date => json_date(value).map_or(Value::Missing, Value::Date),
         ScalarFamily::Time => json_time(value).map_or(Value::Missing, Value::Time),
-        ScalarFamily::Json => json_document(value).map_or(Value::Missing, Value::Json),
-        ScalarFamily::Jsonb => json_document(value).map_or(Value::Missing, Value::Jsonb),
+        ScalarFamily::Json => B::document(value).map_or(Value::Missing, Value::Json),
+        ScalarFamily::Jsonb => B::document(value).map_or(Value::Missing, Value::Jsonb),
         // Answered above, where the width decides.
         ScalarFamily::Float => Value::Missing,
     }
@@ -272,8 +290,37 @@ fn json_pg_bytea(value: &serde_json::Value) -> Option<alloc::vec::Vec<u8>> {
     })
 }
 
-fn json_bytea(value: &serde_json::Value) -> Option<alloc::vec::Vec<u8>> {
-    value.as_str().and_then(sql_scalar_text::parse_pg_bytea_hex)
+/// Standard base64 with its `=` padding, as Java's encoder writes it.
+fn decode_base64(text: &str) -> Option<alloc::vec::Vec<u8>> {
+    let bytes = text.as_bytes();
+    if !bytes.len().is_multiple_of(4) {
+        return None;
+    }
+    let sextet = |c: u8| match c {
+        b'A'..=b'Z' => Some(c - b'A'),
+        b'a'..=b'z' => Some(c - b'a' + 26),
+        b'0'..=b'9' => Some(c - b'0' + 52),
+        b'+' => Some(62),
+        b'/' => Some(63),
+        _ => None,
+    };
+    let mut out = alloc::vec::Vec::with_capacity(bytes.len() / 4 * 3);
+    let (quads, _) = bytes.as_chunks::<4>();
+    let last = quads.len().saturating_sub(1);
+    for (index, quad) in quads.iter().enumerate() {
+        let padding = quad.iter().rev().take_while(|&&c| c == b'=').count();
+        if padding > 2 || (padding > 0 && index != last) {
+            return None;
+        }
+        let mut word = 0u32;
+        for &c in &quad[..4 - padding] {
+            word = word << 6 | u32::from(sextet(c)?);
+        }
+        word <<= 6 * padding;
+        let [_, a, b, c] = word.to_be_bytes();
+        out.extend_from_slice(&[a, b, c][..3 - padding]);
+    }
+    Some(out)
 }
 
 fn json_timestamp(value: &serde_json::Value) -> Option<NaiveDateTime> {
@@ -290,13 +337,6 @@ fn json_date(value: &serde_json::Value) -> Option<NaiveDate> {
 
 fn json_time(value: &serde_json::Value) -> Option<NaiveTime> {
     value.as_str().and_then(sql_scalar_text::parse_time)
-}
-
-fn json_document(value: &serde_json::Value) -> Option<serde_json::Value> {
-    match value {
-        serde_json::Value::String(s) => serde_json::from_str(s).ok(),
-        other => Some(other.clone()),
-    }
 }
 
 #[cfg(test)]
@@ -772,9 +812,18 @@ mod tests {
             ),
             Value::Missing
         );
+        // Maxwell writes binary in base64, so hex in either spelling is not
+        // a Maxwell cell.
         assert_eq!(
             json_value_to_mysql_value_by_kind::<crate::backend::NamesStoredAsWritten>(
                 &serde_json::json!(r"\x00"),
+                declared(ScalarFamily::Bytes)
+            ),
+            Value::Missing
+        );
+        assert_eq!(
+            json_value_to_mysql_value_by_kind::<crate::backend::NamesStoredAsWritten>(
+                &serde_json::json!("AA=="),
                 declared(ScalarFamily::Bytes)
             ),
             Value::Bytes(alloc::vec![0])
