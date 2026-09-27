@@ -783,7 +783,7 @@ fn one_update_displacing_two_groups_keeps_both_reads() {
         .iter()
         .filter_map(|trigger| match &trigger.read {
             ReExecutionRead::GroupedScalar { group, .. } => Some(group.clone()),
-            ReExecutionRead::Subscription => None,
+            ReExecutionRead::Subscription | ReExecutionRead::Fence => None,
         })
         .collect();
     groups.sort_unstable();

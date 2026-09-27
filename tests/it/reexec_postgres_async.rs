@@ -1161,6 +1161,15 @@ fn every_read_reports_the_fence_of_its_own_snapshot() {
         fence.expect("a PG connector reports a fence").insert_lsn() < after_commit,
         "the seed read's fence must sit behind the commit at {after_commit:?}"
     );
+
+    let fence = rt
+        .block_on(connector.read_fence(&()))
+        .expect("fence read")
+        .expect("a PG connector reports a fence");
+    assert!(
+        fence.insert_lsn() >= after_commit,
+        "a fence read now sits past every commit so far"
+    );
 }
 
 /// The async wrapper seeds grouped extrema and resolves a displaced group.

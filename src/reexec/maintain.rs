@@ -8,7 +8,7 @@
 
 use crate::backend::ComparisonContext;
 use crate::backend::{Backend, CdcEvent, RowKind, ScalarText, Value};
-use crate::checkpoint::ReadFence;
+use crate::checkpoint::{ReadFence, Seen};
 use crate::compiler::literals::SqlLiteralParse;
 use crate::compiler::sql_shape::ScalarAggKind;
 use crate::compiler::value_cmp::{compare_ordered_values, values_equal};
@@ -67,27 +67,111 @@ enum Removed<B: Backend> {
     Row(Value<B>),
 }
 
-/// Changes kept while a read of the value is outstanding, so the ones its
-/// snapshot missed can be applied on top of its answer.
-struct ReadBuffer<B: Backend, C: Checkpoint> {
-    changes: Vec<(C, ExtremeChange<B>)>,
+/// Changes applied to a value that no fence of its own reads has shown the
+/// database holds yet, so a later read that still misses one can have it
+/// applied on top of its answer.
+///
+/// Visibility only grows, so an entry a fence holds is held by every later
+/// snapshot and leaves for good.
+struct UnseenLog<C: Checkpoint, T> {
+    entries: Vec<(C, T)>,
+    /// Set when entries had to be forgotten, after which no read of the value
+    /// can be completed exactly and the next install asks again.
     overflowed: bool,
 }
 
-impl<B: Backend, C: Checkpoint> ReadBuffer<B, C> {
+impl<C: Checkpoint, T> UnseenLog<C, T> {
     const fn new() -> Self {
         Self {
-            changes: Vec::new(),
+            entries: Vec::new(),
             overflowed: false,
         }
     }
 
-    fn push(&mut self, at: C, change: ExtremeChange<B>, cap: usize) {
-        if self.changes.len() >= cap {
-            self.overflowed = true;
+    fn push(&mut self, at: C, entry: T, cap: usize) {
+        if self.overflowed {
             return;
         }
-        self.changes.push((at, change));
+        if self.entries.len() >= cap {
+            self.overflowed = true;
+            self.entries = Vec::new();
+            return;
+        }
+        self.entries.push((at, entry));
+    }
+
+    fn forget_held(&mut self, fence: &C::Fence) {
+        self.entries
+            .retain(|(at, _)| at.seen_by(fence) != Seen::Held);
+    }
+
+    /// Past half the cap, so a fence-only read can trim it before it
+    /// overflows.
+    const fn wants_fence(&self, cap: usize) -> bool {
+        !self.overflowed && self.entries.len() >= cap.div_ceil(2)
+    }
+
+    const fn is_empty(&self) -> bool {
+        !self.overflowed && self.entries.is_empty()
+    }
+}
+
+impl<C: Checkpoint, T> Default for UnseenLog<C, T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// The fence of the engine's latest fenced install, shared by every value.
+///
+/// A value may forget the entries it holds unless a read of the value is
+/// outstanding that was asked before that install, since such a read may take
+/// an older snapshot. Every later read takes a newer one.
+pub struct LatestFence<C: Checkpoint> {
+    /// Fenced installs so far, which also stamps when a read is asked.
+    installs: u64,
+    latest: Option<C::Fence>,
+    /// A fence-only read was asked and no fence has been installed since.
+    /// Any fenced install ends the wait, so a probe a caller dropped is asked
+    /// again once a log still wants one.
+    pub(crate) probing: bool,
+}
+
+impl<C: Checkpoint> LatestFence<C> {
+    pub const fn new() -> Self {
+        Self {
+            installs: 0,
+            latest: None,
+            probing: false,
+        }
+    }
+
+    /// Remember `fence` as the newest, before the install that brought it.
+    pub fn record(&mut self, fence: &C::Fence) -> u64 {
+        self.installs += 1;
+        self.latest = Some(fence.clone());
+        self.probing = false;
+        self.installs
+    }
+
+    /// The stamp of a read asked now.
+    pub const fn now(&self) -> u64 {
+        self.installs
+    }
+
+    /// The latest fence, if a value whose read was asked at `asked` may trim
+    /// by it.
+    fn trims(&self, asked: Option<u64>) -> Option<&C::Fence> {
+        let fence = self.latest.as_ref()?;
+        asked
+            .is_none_or(|asked| asked >= self.installs)
+            .then_some(fence)
+    }
+}
+
+impl<C: Checkpoint> Default for LatestFence<C> {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -115,8 +199,9 @@ pub struct MinMaxQuery<B: Backend, C: Checkpoint> {
     /// The extreme, once known. `Some(Value::Null)` means the filtered set is
     /// empty, `None` means nobody has said yet, which no change can decide.
     current: Option<Value<B>>,
-    /// Open from registration and from each asked-for read until its install.
-    reading: Option<ReadBuffer<B, C>>,
+    unseen: UnseenLog<C, ExtremeChange<B>>,
+    /// When the outstanding read was asked, per [`LatestFence::now`].
+    asked: Option<u64>,
     fence: ReadFence<C>,
 }
 
@@ -135,7 +220,9 @@ impl<B: Backend, C: Checkpoint> MinMaxQuery<B, C> {
             dependency_columns,
             database_reads_per_consumer,
             current: None,
-            reading: Some(ReadBuffer::new()),
+            unseen: UnseenLog::new(),
+            // The first read is asked at registration, before any install.
+            asked: Some(0),
             fence: ReadFence::none(),
         }
     }
@@ -276,13 +363,14 @@ impl<B: Backend, C: Checkpoint> MinMaxQuery<B, C> {
     }
 
     /// Feed one change. A change the last read already holds is dropped, and
-    /// every other positioned one is kept while a read is outstanding.
+    /// every other positioned one is kept until a fence shows it held.
     pub fn on_event<E, DB>(
         &mut self,
         event: &E,
         vm: &mut Vm<B>,
         db: &DB,
         cap: usize,
+        latest: &LatestFence<C>,
     ) -> Maintenance<B>
     where
         E: CdcEvent<Backend = B, Checkpoint = C>,
@@ -294,43 +382,75 @@ impl<B: Backend, C: Checkpoint> MinMaxQuery<B, C> {
         }
         let change = self.change(event, vm, db);
         let outcome = self.apply(&change);
-        if matches!(outcome, Maintenance::NeedsReexecution) && self.reading.is_none() {
-            self.reading = Some(ReadBuffer::new());
+        if matches!(outcome, Maintenance::NeedsReexecution) && self.asked.is_none() {
+            self.asked = Some(latest.now());
         }
         // An unpositioned change can never be judged against a fence.
-        if let (Some(reading), Some(at)) = (&mut self.reading, at) {
-            reading.push(at, change, cap);
+        if let Some(at) = at {
+            self.unseen.push(at, change, cap);
+            if self.unseen.wants_fence(cap) {
+                self.forget_seen(latest);
+            }
         }
         outcome
     }
 
-    /// Adopt a read's answer, then apply every kept change its snapshot
-    /// missed.
+    /// Drop the kept changes the engine's latest fence holds, when that is
+    /// safe for the read outstanding here.
+    pub fn forget_seen(&mut self, latest: &LatestFence<C>) {
+        if let Some(fence) = latest.trims(self.asked) {
+            self.unseen.forget_held(fence);
+        }
+    }
+
+    /// Whether the kept changes are near their cap and a fence-only read
+    /// should trim them.
+    pub const fn wants_fence(&self, cap: usize) -> bool {
+        self.unseen.wants_fence(cap)
+    }
+
+    /// Adopt a read's answer, then apply every kept change its snapshot did
+    /// not hold. `asked` stamps a read asked again.
     ///
     /// Without a fence nothing kept can be judged, so the answer is taken as
-    /// it is. A missed change that removes the answer asks for another read,
-    /// which keeps every change for that read to judge in turn.
-    pub fn install(&mut self, value: Value<B>, fence: Option<C::Fence>) -> ScalarInstallOutcome<B> {
-        let reading = self.reading.take().unwrap_or_else(ReadBuffer::new);
+    /// it is. A change the read held leaves the log. One it missed stays,
+    /// since the next read may miss it too. A missed change that removes the
+    /// answer asks for another read.
+    pub fn install(
+        &mut self,
+        value: Value<B>,
+        fence: Option<C::Fence>,
+        asked: u64,
+    ) -> ScalarInstallOutcome<B> {
         self.current = Some(value);
-        if fence.is_none() {
+        let Some(fence) = fence else {
+            self.unseen = UnseenLog::new();
+            self.asked = None;
             self.fence = ReadFence::none();
             return ScalarInstallOutcome::Value(self.current.clone().expect("just set"));
-        }
-        if reading.overflowed {
+        };
+        if self.unseen.overflowed {
             self.current = None;
-            self.reading = Some(ReadBuffer::new());
+            self.unseen = UnseenLog::new();
+            self.asked = Some(asked);
             return ScalarInstallOutcome::ReadAgain;
         }
-        self.fence = ReadFence::new(fence);
-        let removed = reading.changes.iter().any(|(at, change)| {
-            self.fence.admits(Some(at))
-                && matches!(self.apply(change), Maintenance::NeedsReexecution)
+        let mut unseen = core::mem::take(&mut self.unseen);
+        let mut removed = false;
+        unseen.entries.retain(|(at, change)| {
+            if at.seen_by(&fence) == Seen::Held {
+                return false;
+            }
+            removed = removed || matches!(self.apply(change), Maintenance::NeedsReexecution);
+            true
         });
+        self.unseen = unseen;
+        self.fence = ReadFence::new(Some(fence));
         if removed {
-            self.reading = Some(reading);
+            self.asked = Some(asked);
             return ScalarInstallOutcome::ReadAgain;
         }
+        self.asked = None;
         ScalarInstallOutcome::Value(self.current.clone().expect("the install set the extreme"))
     }
 
@@ -415,42 +535,17 @@ impl<B: Backend> GroupedRowChange<B> {
     }
 }
 
-/// One change to a group kept while a scoped read of it is outstanding.
-enum GroupEntry<B: Backend> {
-    Row(GroupedRowChange<B>),
+/// One change a scoped read's answer may lack, in stream order.
+enum GroupEntry<'a, B: Backend> {
+    Row(&'a GroupedRowChange<B>),
     Emptied,
 }
 
-/// A scoped read asked for one group, with every positioned change to the
-/// group since, so the ones its snapshot missed can be applied on top of its
-/// answer.
-struct GroupRead<B: Backend, C: Checkpoint> {
+/// A scoped read asked for one group.
+struct GroupRead<B: Backend> {
     values: Vec<Value<B>>,
-    changes: Vec<(C, GroupEntry<B>)>,
-    overflowed: bool,
-}
-
-impl<B: Backend, C: Checkpoint> GroupRead<B, C> {
-    const fn new(values: Vec<Value<B>>) -> Self {
-        Self {
-            values,
-            changes: Vec::new(),
-            overflowed: false,
-        }
-    }
-
-    /// An unpositioned change can never be judged against a fence, so it is
-    /// not kept.
-    fn record(&mut self, at: Option<&C>, entry: GroupEntry<B>, cap: usize) {
-        let Some(at) = at else {
-            return;
-        };
-        if self.changes.len() >= cap {
-            self.overflowed = true;
-            return;
-        }
-        self.changes.push((at.clone(), entry));
-    }
+    /// When it was asked, per [`LatestFence::now`].
+    asked: u64,
 }
 
 #[derive(Clone)]
@@ -521,7 +616,14 @@ pub struct GroupedMinMaxQuery<B: Backend, C: Checkpoint> {
     pending: Option<PendingGrouped<B, C>>,
     /// The seed read's fence, judging every group no scoped read has set.
     fence: ReadFence<C>,
-    pending_reads: HashMap<Vec<u8>, GroupRead<B, C>>,
+    pending_reads: HashMap<Vec<u8>, GroupRead<B>>,
+    /// Each group's changes no read of it has shown held, kept apart from the
+    /// group so they outlive its removal.
+    unseen: HashMap<Vec<u8>, UnseenLog<C, GroupedRowChange<B>>>,
+    /// Truncates no fence has shown held, which every group's read replays.
+    unseen_truncates: UnseenLog<C, ()>,
+    /// A log crossed half its cap since the last fence-only read.
+    wants_fence: bool,
     database_reads_per_consumer: bool,
 }
 
@@ -536,6 +638,9 @@ impl<B: Backend + SqlLiteralParse, C: Checkpoint> GroupedMinMaxQuery<B, C> {
             pending: Some(PendingGrouped::new()),
             fence: ReadFence::none(),
             pending_reads: HashMap::new(),
+            unseen: HashMap::new(),
+            unseen_truncates: UnseenLog::new(),
+            wants_fence: false,
             database_reads_per_consumer,
         }
     }
@@ -702,12 +807,13 @@ impl<B: Backend + SqlLiteralParse, C: Checkpoint> GroupedMinMaxQuery<B, C> {
         key: Vec<u8>,
         values: Vec<Value<B>>,
         checkpoint: Option<&C>,
+        asked: u64,
         output: &mut GroupedMaintenance<B, C>,
     ) -> Result<(), crate::RegisterError> {
         let query = crate::reexec::plan::render_grouped_scalar_read(&self.plan, &values)?;
         self.pending_reads
             .entry(key.clone())
-            .or_insert_with(|| GroupRead::new(values));
+            .or_insert(GroupRead { values, asked });
         output.reads.push(GroupedRead {
             group: key,
             query,
@@ -715,6 +821,67 @@ impl<B: Backend + SqlLiteralParse, C: Checkpoint> GroupedMinMaxQuery<B, C> {
             checkpoint: checkpoint.cloned(),
         });
         Ok(())
+    }
+
+    /// When the oldest outstanding group read was asked, which bounds what a
+    /// shared fence may trim from the truncates every group read replays.
+    fn oldest_ask(&self) -> Option<u64> {
+        self.pending_reads.values().map(|read| read.asked).min()
+    }
+
+    /// Keep `change` to the group `key` until a fence shows it held.
+    fn remember(
+        &mut self,
+        key: &[u8],
+        at: &C,
+        change: &GroupedRowChange<B>,
+        cap: usize,
+        latest: &LatestFence<C>,
+    ) {
+        let asked = self.pending_reads.get(key).map(|read| read.asked);
+        let log = self.unseen.entry(key.to_vec()).or_default();
+        log.push(at.clone(), change.clone(), cap);
+        if log.wants_fence(cap) {
+            if let Some(fence) = latest.trims(asked) {
+                log.forget_held(fence);
+            }
+            self.wants_fence |= log.wants_fence(cap);
+        }
+    }
+
+    fn remember_truncate(&mut self, at: &C, cap: usize, latest: &LatestFence<C>) {
+        // Truncates are rare and cost a position each, and forgetting one
+        // would lose it for every group, so this log has no ceiling.
+        self.unseen_truncates.push(at.clone(), (), usize::MAX);
+        if self.unseen_truncates.wants_fence(cap) {
+            if let Some(fence) = latest.trims(self.oldest_ask()) {
+                self.unseen_truncates.forget_held(fence);
+            }
+            self.wants_fence |= self.unseen_truncates.wants_fence(cap);
+        }
+    }
+
+    /// Drop every kept change the engine's latest fence holds, where that is
+    /// safe for the reads outstanding.
+    pub fn forget_seen(&mut self, latest: &LatestFence<C>, cap: usize) {
+        let pending_reads = &self.pending_reads;
+        self.unseen.retain(|key, log| {
+            if let Some(fence) = latest.trims(pending_reads.get(key).map(|read| read.asked)) {
+                log.forget_held(fence);
+            }
+            !log.is_empty()
+        });
+        if let Some(fence) = latest.trims(self.oldest_ask()) {
+            self.unseen_truncates.forget_held(fence);
+        }
+        self.wants_fence = self.unseen_truncates.wants_fence(cap)
+            || self.unseen.values().any(|log| log.wants_fence(cap));
+    }
+
+    /// Whether a kept log crossed half its cap and a fence-only read should
+    /// trim it.
+    pub const fn wants_fence(&self) -> bool {
+        self.wants_fence
     }
 
     #[allow(
@@ -727,11 +894,12 @@ impl<B: Backend + SqlLiteralParse, C: Checkpoint> GroupedMinMaxQuery<B, C> {
         group_limit: usize,
         checkpoint: Option<&C>,
         pending_cap: usize,
+        latest: &LatestFence<C>,
     ) -> Result<GroupedMaintenance<B, C>, crate::RegisterError> {
         let mut output = GroupedMaintenance::empty();
         let PendingGroupedEvent::Rows(changes) = event else {
-            for read in self.pending_reads.values_mut() {
-                read.record(checkpoint, GroupEntry::Emptied, pending_cap);
+            if let Some(at) = checkpoint {
+                self.remember_truncate(at, pending_cap, latest);
             }
             let mut removed = Vec::new();
             self.groups.retain(|key, group| {
@@ -764,8 +932,8 @@ impl<B: Backend + SqlLiteralParse, C: Checkpoint> GroupedMinMaxQuery<B, C> {
                 if held {
                     continue;
                 }
-                if let Some(read) = self.pending_reads.get_mut(key) {
-                    read.record(checkpoint, GroupEntry::Row(change.clone()), pending_cap);
+                if let Some(at) = checkpoint {
+                    self.remember(key, at, change, pending_cap, latest);
                 }
             }
             match change {
@@ -825,18 +993,7 @@ impl<B: Backend + SqlLiteralParse, C: Checkpoint> GroupedMinMaxQuery<B, C> {
                 .groups
                 .get(&key)
                 .map_or(values, |group| group.values.clone());
-            let opened = !self.pending_reads.contains_key(&key);
-            self.request_read(key.clone(), values, checkpoint, &mut output)?;
-            if opened {
-                // A held change among these is harmless, the read holds it too.
-                let read = self
-                    .pending_reads
-                    .get_mut(&key)
-                    .expect("the read was just requested");
-                for change in changes.iter().filter(|change| change.key() == Some(&key)) {
-                    read.record(checkpoint, GroupEntry::Row(change.clone()), pending_cap);
-                }
-            }
+            self.request_read(key, values, checkpoint, latest.now(), &mut output)?;
         }
         // Phase two announces each settled group's difference from what the
         // consumer last saw.
@@ -910,6 +1067,7 @@ impl<B: Backend + SqlLiteralParse, C: Checkpoint> GroupedMinMaxQuery<B, C> {
         db: &DB,
         pending_cap: usize,
         group_limit: usize,
+        latest: &LatestFence<C>,
     ) -> Result<GroupedMaintenance<B, C>, crate::DispatchError>
     where
         E: CdcEvent<Backend = B, Checkpoint = C>,
@@ -935,7 +1093,7 @@ impl<B: Backend + SqlLiteralParse, C: Checkpoint> GroupedMinMaxQuery<B, C> {
             return Ok(GroupedMaintenance::empty());
         }
         let change = self.event_changes(event, vm, db)?;
-        self.apply_event(&change, group_limit, at.as_ref(), pending_cap)
+        self.apply_event(&change, group_limit, at.as_ref(), pending_cap, latest)
             .map_err(|error| crate::DispatchError::TierTransition {
                 subscription: 0,
                 message: error.to_string(),
@@ -953,6 +1111,7 @@ impl<B: Backend + SqlLiteralParse, C: Checkpoint> GroupedMinMaxQuery<B, C> {
         fence: Option<C::Fence>,
         pending_cap: usize,
         group_limit: usize,
+        latest: &LatestFence<C>,
     ) -> Result<GroupedMaintenance<B, C>, crate::AggregateInstallError> {
         let Some(pending) = self.pending.take() else {
             return Err(crate::AggregateInstallError::AlreadySeeded(subscription));
@@ -1027,7 +1186,7 @@ impl<B: Backend + SqlLiteralParse, C: Checkpoint> GroupedMinMaxQuery<B, C> {
                 continue;
             }
             let replayed = self
-                .apply_event(event, group_limit, at.as_ref(), pending_cap)
+                .apply_event(event, group_limit, at.as_ref(), pending_cap, latest)
                 .map_err(|error| crate::AggregateInstallError::TierTransition {
                     subscription,
                     message: error.to_string(),
@@ -1067,9 +1226,18 @@ impl<B: Backend + SqlLiteralParse, C: Checkpoint> GroupedMinMaxQuery<B, C> {
         Ok(output)
     }
 
-    /// Install one scoped read's result, then apply every change to the group
-    /// its snapshot missed. The read's fence then judges the group's later
-    /// changes until one passes it.
+    /// Install one scoped read's result, then apply every kept change to the
+    /// group, and every kept truncate, its snapshot did not hold. `asked`
+    /// stamps a read asked again.
+    ///
+    /// A change the read held leaves the group's log. One it missed stays,
+    /// since the next read may miss it too. The read's fence then judges the
+    /// group's later changes until one passes it.
+    #[allow(
+        clippy::too_many_arguments,
+        clippy::too_many_lines,
+        reason = "the read's answer, its fence, its trigger and the engine's two ceilings"
+    )]
     pub fn install_group(
         &mut self,
         subscription: crate::SubscriptionId,
@@ -1078,6 +1246,7 @@ impl<B: Backend + SqlLiteralParse, C: Checkpoint> GroupedMinMaxQuery<B, C> {
         fence: Option<C::Fence>,
         checkpoint: Option<&C>,
         group_limit: usize,
+        asked: u64,
     ) -> Result<GroupedMaintenance<B, C>, crate::AggregateInstallError> {
         if row.len() != 2 {
             return Err(crate::AggregateInstallError::GroupedRowArity {
@@ -1095,9 +1264,9 @@ impl<B: Backend + SqlLiteralParse, C: Checkpoint> GroupedMinMaxQuery<B, C> {
         let read = self.pending_reads.remove(key);
         let existing = self.groups.remove(key);
         let was_present = existing.is_some();
-        let (values, announced) = match (existing, &read) {
+        let (values, announced) = match (existing, read) {
             (Some(group), _) => (group.values, group.announced),
-            (None, Some(read)) => (read.values.clone(), None),
+            (None, Some(read)) => (read.values, None),
             (None, None) if count <= 0 => return Ok(output),
             (None, None) => {
                 return Err(crate::AggregateInstallError::UnexpectedGroupRead(
@@ -1112,17 +1281,25 @@ impl<B: Backend + SqlLiteralParse, C: Checkpoint> GroupedMinMaxQuery<B, C> {
             announced,
             fence: ReadFence::none(),
         };
-        let replays = fence.is_some();
-        let mut group_fence = ReadFence::new(fence);
-        let reread = match &read {
-            Some(read) if replays && read.overflowed => true,
-            Some(read) if replays => read
-                .changes
-                .iter()
-                .any(|(at, entry)| group_fence.admits(Some(at)) && self.replay(&mut group, entry)),
-            _ => false,
+        let mut log = self.unseen.remove(key).unwrap_or_default();
+        let reread = match fence {
+            None => {
+                log = UnseenLog::new();
+                false
+            }
+            Some(_) if log.overflowed => {
+                log = UnseenLog::new();
+                true
+            }
+            Some(fence) => {
+                let reread = self.replay_unseen(&mut group, &mut log, &fence);
+                group.fence = ReadFence::new(Some(fence));
+                reread
+            }
         };
-        group.fence = group_fence;
+        if !log.is_empty() {
+            self.unseen.insert(key.to_vec(), log);
+        }
         if !was_present && (reread || group.rows > 0) && self.groups.len() >= group_limit {
             return Err(crate::AggregateInstallError::GroupLimit {
                 subscription,
@@ -1130,22 +1307,13 @@ impl<B: Backend + SqlLiteralParse, C: Checkpoint> GroupedMinMaxQuery<B, C> {
             });
         }
         if reread {
-            // Every kept change stays for the next read to judge, except
-            // after an overflow, when none of them can be trusted.
-            let kept = read
-                .filter(|read| !read.overflowed)
-                .map_or_else(Vec::new, |read| read.changes);
             let values = group.values.clone();
             self.groups.insert(key.to_vec(), group);
-            self.request_read(key.to_vec(), values, checkpoint, &mut output)
+            self.request_read(key.to_vec(), values, checkpoint, asked, &mut output)
                 .map_err(|error| crate::AggregateInstallError::TierTransition {
                     subscription,
                     message: error.to_string(),
                 })?;
-            self.pending_reads
-                .get_mut(key)
-                .expect("the read was just requested")
-                .changes = kept;
             return Ok(output);
         }
         if group.rows <= 0 {
@@ -1164,9 +1332,46 @@ impl<B: Backend + SqlLiteralParse, C: Checkpoint> GroupedMinMaxQuery<B, C> {
         Ok(output)
     }
 
+    /// Apply to `group`, in stream order, every entry of its log and every
+    /// kept truncate that `fence` does not hold, dropping the log entries it
+    /// holds. `true` when only another read can say what the group holds, from
+    /// which point entries are kept without being applied.
+    fn replay_unseen(
+        &self,
+        group: &mut GroupedExtreme<B, C>,
+        log: &mut UnseenLog<C, GroupedRowChange<B>>,
+        fence: &C::Fence,
+    ) -> bool {
+        let mut reread = false;
+        let mut truncates = self
+            .unseen_truncates
+            .entries
+            .iter()
+            .map(|(at, ())| at)
+            .filter(|at| at.seen_by(fence) != Seen::Held)
+            .peekable();
+        let mut replay = |group: &mut GroupedExtreme<B, C>, entry: GroupEntry<'_, B>| {
+            reread = reread || self.replay(group, &entry);
+        };
+        log.entries.retain(|(at, change)| {
+            while truncates.next_if(|truncate| *truncate < at).is_some() {
+                replay(group, GroupEntry::Emptied);
+            }
+            if at.seen_by(fence) == Seen::Held {
+                return false;
+            }
+            replay(group, GroupEntry::Row(change));
+            true
+        });
+        for _ in truncates {
+            replay(group, GroupEntry::Emptied);
+        }
+        reread
+    }
+
     /// Apply one kept change on top of a scoped read's answer. `true` when
     /// only another read can say what the group holds.
-    fn replay(&self, group: &mut GroupedExtreme<B, C>, entry: &GroupEntry<B>) -> bool {
+    fn replay(&self, group: &mut GroupedExtreme<B, C>, entry: &GroupEntry<'_, B>) -> bool {
         match entry {
             GroupEntry::Emptied => {
                 group.rows = 0;
@@ -1225,13 +1430,14 @@ impl<B: Backend + SqlLiteralParse, C: Checkpoint> QueryRuntime<B, C> {
         vm: &mut Vm<B>,
         db: &DB,
         cap: usize,
+        latest: &LatestFence<C>,
     ) -> Maintenance<B>
     where
         E: CdcEvent<Backend = B, Checkpoint = C>,
         DB: DatabaseLike,
     {
         match self {
-            Self::Partial(query) => query.on_event(event, vm, db, cap),
+            Self::Partial(query) => query.on_event(event, vm, db, cap, latest),
             Self::Grouped(_) => {
                 unreachable!("grouped maintenance uses its multi-group output")
             }
@@ -1240,14 +1446,38 @@ impl<B: Backend + SqlLiteralParse, C: Checkpoint> QueryRuntime<B, C> {
         }
     }
 
-    pub fn install(&mut self, value: Value<B>, fence: Option<C::Fence>) -> ScalarInstallOutcome<B> {
+    pub fn install(
+        &mut self,
+        value: Value<B>,
+        fence: Option<C::Fence>,
+        asked: u64,
+    ) -> ScalarInstallOutcome<B> {
         match self {
-            Self::Partial(query) => query.install(value, fence),
+            Self::Partial(query) => query.install(value, fence, asked),
             Self::Grouped(_) => {
                 unreachable!("a grouped result uses its concrete install input")
             }
             // Neither tier holds an answer, so the read goes to the consumer.
             Self::Total(_) | Self::Keyed(_) => ScalarInstallOutcome::Value(value),
+        }
+    }
+
+    /// Whether this value keeps enough unseen changes that a fence-only read
+    /// should trim them.
+    pub fn wants_fence(&self, cap: usize) -> bool {
+        match self {
+            Self::Partial(query) => query.wants_fence(cap),
+            Self::Grouped(query) => query.wants_fence(),
+            Self::Total(_) | Self::Keyed(_) => false,
+        }
+    }
+
+    /// Drop the unseen changes `latest` shows held, where that is safe.
+    pub fn forget_seen(&mut self, latest: &LatestFence<C>, cap: usize) {
+        match self {
+            Self::Partial(query) => query.forget_seen(latest),
+            Self::Grouped(query) => query.forget_seen(latest, cap),
+            Self::Total(_) | Self::Keyed(_) => {}
         }
     }
 

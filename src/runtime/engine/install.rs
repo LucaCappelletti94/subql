@@ -7,6 +7,53 @@ use super::{
 };
 use alloc::string::String;
 
+impl<E, I, DB> SubscriptionEngine<E, I, DB>
+where
+    E: CdcEvent,
+    E::Backend: SqlLiteralParse,
+    I: IdTypes,
+    DB: DatabaseLike + 'static,
+{
+    /// Remember the fence an install brings as the engine's latest, and
+    /// answer the stamp a read asked from this install on carries.
+    fn record_fence(&mut self, fence: Option<&<E::Checkpoint as crate::Checkpoint>::Fence>) -> u64 {
+        match fence {
+            Some(fence) => self.latest_fence.record(fence),
+            None => self.latest_fence.now(),
+        }
+    }
+}
+
+impl<E, I, DB> crate::Install<crate::FenceInstall<E::Checkpoint>> for SubscriptionEngine<E, I, DB>
+where
+    E: CdcEvent,
+    E::Backend: SqlLiteralParse,
+    I: IdTypes,
+    DB: DatabaseLike + 'static,
+{
+    type Output = ();
+    type Error = crate::InstallError;
+
+    /// Adopt the database's current fence and drop from every re-read answer
+    /// the unseen changes it holds, where no older read is outstanding.
+    fn install(
+        &mut self,
+        _subscription_id: SubscriptionId,
+        input: crate::FenceInstall<E::Checkpoint>,
+    ) -> Result<(), Self::Error> {
+        self.latest_fence.probing = false;
+        let Some(fence) = input.fence else {
+            return Ok(());
+        };
+        self.latest_fence.record(&fence);
+        let cap = self.max_changes_during_aggregate_read;
+        for entry in self.reexec.values_mut() {
+            entry.runtime.forget_seen(&self.latest_fence, cap);
+        }
+        Ok(())
+    }
+}
+
 impl<E, I, DB> crate::Install<crate::ScalarInstall<E::Backend, E::Checkpoint>>
     for SubscriptionEngine<E, I, DB>
 where
@@ -23,34 +70,42 @@ where
         subscription_id: SubscriptionId,
         input: crate::ScalarInstall<E::Backend, E::Checkpoint>,
     ) -> Result<Self::Output, Self::Error> {
-        let entry = self
+        let tier = self
             .reexec
-            .get_mut(&subscription_id)
-            .ok_or(crate::InstallError::UnknownSubscription(subscription_id))?;
-        if entry.tier != crate::ReadTier::Scalar {
+            .get(&subscription_id)
+            .ok_or(crate::InstallError::UnknownSubscription(subscription_id))?
+            .tier;
+        if tier != crate::ReadTier::Scalar {
             return Err(crate::InstallError::WrongTier {
                 subscription: subscription_id,
                 input: "ScalarInstall",
             });
         }
-        Ok(match entry.runtime.install(input.value, input.fence) {
-            crate::reexec::maintain::ScalarInstallOutcome::Value(value) => {
-                crate::reexec::ScalarInstalled::Value(crate::reexec::ScalarUpdate {
-                    subscription_id,
-                    consumer_id: entry.consumer_id,
-                    value,
-                    checkpoint: input.checkpoint,
-                })
-            }
-            crate::reexec::maintain::ScalarInstallOutcome::ReadAgain => {
-                crate::reexec::ScalarInstalled::ReadAgain(crate::reexec::ReExecutionTrigger {
-                    subscription_id,
-                    consumer_id: entry.consumer_id,
-                    read: crate::reexec::ReExecutionRead::Subscription,
-                    checkpoint: input.checkpoint,
-                })
-            }
-        })
+        let asked = self.record_fence(input.fence.as_ref());
+        let entry = self
+            .reexec
+            .get_mut(&subscription_id)
+            .expect("looked up just above");
+        Ok(
+            match entry.runtime.install(input.value, input.fence, asked) {
+                crate::reexec::maintain::ScalarInstallOutcome::Value(value) => {
+                    crate::reexec::ScalarInstalled::Value(crate::reexec::ScalarUpdate {
+                        subscription_id,
+                        consumer_id: entry.consumer_id,
+                        value,
+                        checkpoint: input.checkpoint,
+                    })
+                }
+                crate::reexec::maintain::ScalarInstallOutcome::ReadAgain => {
+                    crate::reexec::ScalarInstalled::ReadAgain(crate::reexec::ReExecutionTrigger {
+                        subscription_id,
+                        consumer_id: entry.consumer_id,
+                        read: crate::reexec::ReExecutionRead::Subscription,
+                        checkpoint: input.checkpoint,
+                    })
+                }
+            },
+        )
     }
 }
 impl<E, I, DB> crate::Install<crate::GroupedScalarSeedInstall<E::Backend, E::Checkpoint>>
@@ -71,6 +126,7 @@ where
     ) -> Result<Self::Output, Self::Error> {
         let group_limit = self.max_groups_per_aggregate;
         let pending_cap = self.max_changes_during_aggregate_read;
+        self.record_fence(input.fence.as_ref());
         let (consumer, table_id, installed) = {
             let entry = self.reexec.get_mut(&subscription_id).ok_or(
                 crate::AggregateInstallError::UnknownAggregate(subscription_id),
@@ -89,6 +145,7 @@ where
                     input.fence,
                     pending_cap,
                     group_limit,
+                    &self.latest_fence,
                 ),
             )
         };
@@ -168,6 +225,7 @@ where
         input: crate::GroupedScalarInstall<E::Backend, E::Checkpoint>,
     ) -> Result<Self::Output, Self::Error> {
         let group_limit = self.max_groups_per_aggregate;
+        let asked = self.record_fence(input.fence.as_ref());
         let (consumer, installed) = {
             let entry = self.reexec.get_mut(&subscription_id).ok_or(
                 crate::AggregateInstallError::UnknownAggregate(subscription_id),
@@ -186,6 +244,7 @@ where
                     input.fence,
                     input.checkpoint.as_ref(),
                     group_limit,
+                    asked,
                 ),
             )
         };
@@ -343,6 +402,7 @@ where
         subscription_id: SubscriptionId,
         input: crate::AggregateSeedInstall<E::Backend, E::Checkpoint>,
     ) -> Result<Self::Output, Self::Error> {
+        self.record_fence(input.fence.as_ref());
         if self.grouped_aggregates.contains_key(&subscription_id) {
             let installed = {
                 let total = self

@@ -1,6 +1,7 @@
 //! Per-subscription resolve state and the queue of pending reads.
 
 use super::{Backend, IdTypes, ScalarFamily, SubscriptionId, Vec};
+use crate::reexec::engine::ReadSlot;
 
 /// Per-query state needed to drive an automatic re-execution.
 ///
@@ -70,7 +71,7 @@ pub enum InProcessKind {
     StreamServedFilter,
 }
 
-/// Queued reads in arrival order, indexed by `(subscription, group)`.
+/// Queued reads in arrival order, indexed by `(subscription, slot)`.
 ///
 /// The order lives in a `VecDeque` whose entries can be tombstoned in
 /// place, and the index maps each live key to a monotonically assigned
@@ -79,7 +80,7 @@ pub enum InProcessKind {
 pub struct ReadQueue<I: IdTypes, C: crate::Checkpoint, B: Backend> {
     entries: alloc::collections::VecDeque<Option<crate::reexec::ReExecutionTrigger<I, C, B>>>,
     /// Live keys to the sequence number of their entry.
-    queued: hashbrown::HashMap<(SubscriptionId, Option<Vec<u8>>), u64>,
+    queued: hashbrown::HashMap<(SubscriptionId, ReadSlot), u64>,
     /// Sequence number of the front entry of `entries`.
     head_seq: u64,
     /// Tombstoned entries still holding a slot, compacted away as soon as
@@ -99,11 +100,8 @@ impl<I: IdTypes, C: crate::Checkpoint, B: Backend> ReadQueue<I, C, B> {
     }
     pub fn key_of(
         trigger: &crate::reexec::ReExecutionTrigger<I, C, B>,
-    ) -> (SubscriptionId, Option<Vec<u8>>) {
-        (
-            trigger.subscription_id,
-            trigger.read.group_key().map(<[u8]>::to_vec),
-        )
+    ) -> (SubscriptionId, ReadSlot) {
+        (trigger.subscription_id, trigger.read.slot())
     }
 
     pub fn index_of(&self, seq: u64) -> usize {
@@ -119,7 +117,7 @@ impl<I: IdTypes, C: crate::Checkpoint, B: Backend> ReadQueue<I, C, B> {
     }
 
     /// Queue `trigger`, replacing a queued read of the same subscription and
-    /// group in place, so a burst keeps one read at its original position.
+    /// slot in place, so a burst keeps one read at its original position.
     pub fn enqueue(&mut self, trigger: crate::reexec::ReExecutionTrigger<I, C, B>) {
         let key = Self::key_of(&trigger);
         if let Some(&seq) = self.queued.get(&key) {
@@ -132,11 +130,11 @@ impl<I: IdTypes, C: crate::Checkpoint, B: Backend> ReadQueue<I, C, B> {
         self.queued.insert(key, seq);
     }
 
-    /// Drop the queued read of `(subscription_id, group_key)`, tombstoning
+    /// Drop the queued read of `(subscription_id, slot)`, tombstoning
     /// its entry so no position shifts, and compacting once tombstones
     /// outnumber live reads.
-    pub fn remove(&mut self, subscription_id: SubscriptionId, group_key: Option<&[u8]>) {
-        let key = (subscription_id, group_key.map(<[u8]>::to_vec));
+    pub fn remove(&mut self, subscription_id: SubscriptionId, slot: ReadSlot) {
+        let key = (subscription_id, slot);
         if let Some(seq) = self.queued.remove(&key) {
             let index = self.index_of(seq);
             self.entries[index] = None;

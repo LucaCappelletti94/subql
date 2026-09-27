@@ -21,8 +21,9 @@ use subql::reexec::{
 use subql::testing::TestEvent;
 use subql::{
     catalog_helpers, AggValue, AggregateResultValue, AggregateSeedInstall, AggregateValueChange,
-    DefaultIds, GroupedScalarInstall, GroupedScalarSeedInstall, Install, PgCommitPosition, PgLsn,
-    PgSnapshotFence, PgXid, ScalarInstall, SubscriptionEngine, SubscriptionRequest, TableId,
+    DefaultIds, FenceInstall, GroupedScalarInstall, GroupedScalarSeedInstall, Install,
+    PgCommitPosition, PgLsn, PgSnapshotFence, PgXid, ScalarInstall, SubscriptionEngine,
+    SubscriptionRequest, TableId,
 };
 
 const DDL: &str = "CREATE TABLE orders (id INT PRIMARY KEY, region TEXT, amount INT, status TEXT);";
@@ -551,6 +552,7 @@ fn a_scalar_read_whose_kept_changes_overflowed_asks_again() {
 struct FencedReads {
     answers: std::sync::Mutex<Vec<(Value<Postgres>, PgSnapshotFence)>>,
     calls: std::sync::atomic::AtomicUsize,
+    fence_reads: std::sync::atomic::AtomicUsize,
 }
 
 impl FencedReads {
@@ -559,7 +561,19 @@ impl FencedReads {
         Self {
             answers: std::sync::Mutex::new(answers.into_iter().rev().collect()),
             calls: std::sync::atomic::AtomicUsize::new(0),
+            fence_reads: std::sync::atomic::AtomicUsize::new(0),
         }
+    }
+
+    fn fence_reads(&self) -> usize {
+        self.fence_reads.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// The database now, after every transaction the tests commit.
+    fn current_fence(&self) -> PgSnapshotFence {
+        self.fence_reads
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        PgSnapshotFence::parse("760:760:", PgLsn(3000)).unwrap()
     }
 
     fn calls(&self) -> usize {
@@ -609,6 +623,10 @@ impl Connector for FencedReads {
     ) -> Result<Snapshot<RowPage<Postgres>, PgCommitPosition>, FencedReadError> {
         Err(FencedReadError::NoRows)
     }
+
+    fn read_fence(&self, _auth: &()) -> Result<Option<PgSnapshotFence>, FencedReadError> {
+        Ok(Some(self.current_fence()))
+    }
 }
 
 #[allow(clippy::manual_async_fn)]
@@ -639,6 +657,15 @@ impl AsyncConnector for FencedReads {
         Output = Result<Snapshot<RowPage<Postgres>, PgCommitPosition>, FencedReadError>,
     > + Send {
         async move { Err(FencedReadError::NoRows) }
+    }
+
+    fn read_fence(
+        &self,
+        _auth: &(),
+    ) -> impl core::future::Future<Output = Result<Option<PgSnapshotFence>, FencedReadError>> + Send
+    {
+        let fence = self.current_fence();
+        async move { Ok(Some(fence)) }
     }
 }
 
@@ -817,4 +844,406 @@ fn a_missed_delete_whose_row_image_lacks_a_filtered_column_asks_again() {
         matches!(installed, ScalarInstalled::ReadAgain(_)),
         "got {installed:?}"
     );
+}
+
+/// A row the stream delivered before a read was asked for, whose
+/// transaction the read's snapshot does not see yet.
+fn unseen_insert(orders: TableId) -> Event {
+    insert(orders, 20, "north", 2, at(1200, 742))
+}
+
+/// A delete whose row image lacks the filtered column, so only a read can say
+/// what it removed.
+fn sparse_delete(orders: TableId) -> Event {
+    Event::delete(
+        orders,
+        vec![
+            Value::Int(21),
+            Value::String("north".into()),
+            Value::Int(9),
+            Value::Missing,
+        ],
+    )
+    .with_pk_columns([0u16])
+    .with_checkpoint(at(1300, 741))
+}
+
+#[test]
+fn a_scalar_read_keeps_a_change_it_missed_that_arrived_before_it_was_asked_for() {
+    let (mut engine, orders) = engine();
+    let sub = register(&mut engine, MIN_PAID);
+    Install::install(
+        &mut engine,
+        sub,
+        ScalarInstall {
+            value: Value::Int(4),
+            checkpoint: None,
+            fence: Some(early_fence()),
+        },
+    )
+    .unwrap();
+    engine.dispatch(&unseen_insert(orders)).unwrap();
+    let asked = engine.dispatch(&sparse_delete(orders)).unwrap();
+    assert_eq!(asked.triggers().len(), 1);
+
+    // The read saw 4 as the smallest and not the 742 row worth 2.
+    let installed = Install::install(
+        &mut engine,
+        sub,
+        ScalarInstall {
+            value: Value::Int(4),
+            checkpoint: Some(at(1300, 741)),
+            fence: Some(read_fence()),
+        },
+    )
+    .unwrap();
+    assert_eq!(scalar_value(installed), Value::Int(2));
+}
+
+#[test]
+fn a_scoped_group_read_keeps_a_change_it_missed_that_arrived_before_it_was_asked_for() {
+    let (mut engine, orders) = engine();
+    let sub = register(
+        &mut engine,
+        "SELECT region, MIN(amount) FROM orders WHERE status = 'paid' GROUP BY region",
+    );
+    let opening = Install::install(
+        &mut engine,
+        sub,
+        GroupedScalarSeedInstall {
+            rows: vec![vec![
+                Value::String("north".into()),
+                Value::Int(5),
+                Value::Int(2),
+            ]],
+            fence: Some(early_fence()),
+        },
+    )
+    .unwrap();
+    let north = opening.updates[0].group.clone().unwrap();
+    let seen = engine.dispatch(&unseen_insert(orders)).unwrap();
+    assert_eq!(seen.aggregate_updates()[0].change, scalar(2));
+    let asked = engine.dispatch(&sparse_delete(orders)).unwrap();
+    assert_eq!(asked.triggers().len(), 1);
+
+    // The read saw 5 as the smallest of two rows, and not the 742 row worth 2.
+    let installed = Install::install(
+        &mut engine,
+        sub,
+        GroupedScalarInstall {
+            group: north.key,
+            row: vec![Value::Int(5), Value::Int(2)],
+            checkpoint: Some(at(1300, 741)),
+            fence: Some(read_fence()),
+        },
+    )
+    .unwrap();
+    assert!(
+        installed.updates.is_empty() && installed.triggers.is_empty(),
+        "north still holds 2, got {:?}",
+        installed.updates
+    );
+}
+
+/// A scalar extreme whose unseen changes are logged from its first install,
+/// under a cap of four so half of it is two changes.
+fn small_cap_engine() -> (Engine, TableId, u64) {
+    let catalog = ParserDB::parse::<PostgreSqlDialect>(DDL).unwrap();
+    let orders = catalog_helpers::table_id::<Postgres, _>(&catalog, "orders").unwrap();
+    let mut engine: Engine = SubscriptionEngine::new(catalog, PostgreSqlDialect {})
+        .with_max_changes_during_aggregate_read(4);
+    let sub = register(&mut engine, MIN_PAID);
+    Install::install(
+        &mut engine,
+        sub,
+        ScalarInstall {
+            value: Value::Int(4),
+            checkpoint: None,
+            fence: Some(early_fence()),
+        },
+    )
+    .unwrap();
+    (engine, orders, sub)
+}
+
+fn fence_reads(output: &subql::DispatchOutput<DefaultIds, PgCommitPosition, Postgres>) -> usize {
+    output
+        .triggers()
+        .iter()
+        .filter(|trigger| matches!(trigger.read, ReExecutionRead::Fence))
+        .count()
+}
+
+#[test]
+fn a_filling_unseen_log_asks_for_one_fence_read_which_trims_it() {
+    let (mut engine, orders, sub) = small_cap_engine();
+    let first = engine
+        .dispatch(&insert(orders, 30, "north", 9, at(2100, 750)))
+        .unwrap();
+    assert_eq!(fence_reads(&first), 0);
+    let second = engine
+        .dispatch(&insert(orders, 31, "north", 9, at(2200, 751)))
+        .unwrap();
+    assert_eq!(fence_reads(&second), 1, "half the cap asks for a fence");
+    let third = engine
+        .dispatch(&insert(orders, 32, "north", 9, at(2300, 752)))
+        .unwrap();
+    assert_eq!(fence_reads(&third), 0, "one fence read at a time");
+
+    Install::install(
+        &mut engine,
+        sub,
+        FenceInstall {
+            fence: Some(PgSnapshotFence::parse("760:760:", PgLsn(3000)).unwrap()),
+        },
+    )
+    .unwrap();
+    let after = engine
+        .dispatch(&insert(orders, 33, "north", 9, at(3100, 770)))
+        .unwrap();
+    assert_eq!(fence_reads(&after), 0, "the fence emptied the log");
+}
+
+/// A fence installed while a read of a value is outstanding may be newer than
+/// that read's snapshot, so it must not drop what that read has to replay.
+#[test]
+fn a_shared_fence_leaves_a_value_with_an_older_read_outstanding_alone() {
+    let (mut engine, orders) = engine();
+    let sub = register(&mut engine, MIN_PAID);
+    Install::install(
+        &mut engine,
+        sub,
+        ScalarInstall {
+            value: Value::Int(4),
+            checkpoint: None,
+            fence: Some(early_fence()),
+        },
+    )
+    .unwrap();
+    engine.dispatch(&unseen_insert(orders)).unwrap();
+    engine.dispatch(&sparse_delete(orders)).unwrap();
+
+    // Newer than the read below, and it sees the 742 row.
+    Install::install(
+        &mut engine,
+        sub,
+        FenceInstall {
+            fence: Some(PgSnapshotFence::parse("760:760:", PgLsn(3000)).unwrap()),
+        },
+    )
+    .unwrap();
+
+    assert_eq!(
+        scalar_value(install_min(&mut engine, sub, 4)),
+        Value::Int(2)
+    );
+}
+
+#[test]
+fn the_auto_resolving_engine_serves_a_fence_read_through_its_connector() {
+    let catalog = ParserDB::parse::<PostgreSqlDialect>(DDL).unwrap();
+    let orders = catalog_helpers::table_id::<Postgres, _>(&catalog, "orders").unwrap();
+    let mut engine = AutoResolvingEngine::new(
+        SubscriptionEngine::<Event, DefaultIds, ParserDB>::new(catalog, PostgreSqlDialect {})
+            .with_max_changes_during_aggregate_read(2),
+        SyncMode(FencedReads::new(Vec::new())),
+    );
+    let sub = engine
+        .register(SubscriptionRequest::new(7u64, MIN_PAID), ())
+        .unwrap()
+        .subscription_id;
+    Install::install(
+        &mut engine,
+        sub,
+        ScalarInstall {
+            value: Value::Int(4),
+            checkpoint: None,
+            fence: Some(early_fence()),
+        },
+    )
+    .unwrap();
+    let settled = engine
+        .apply(&insert(orders, 30, "north", 9, at(2100, 750)))
+        .unwrap()
+        .resolve_collect();
+    settled.reads.unwrap();
+
+    assert_eq!(engine.connector().fence_reads(), 1);
+    assert_eq!(engine.connector().calls(), 0, "no query ran");
+    assert_eq!(engine.pending_read_count(), 0);
+}
+
+const GROUPED_MIN: &str =
+    "SELECT region, MIN(amount) FROM orders WHERE status = 'paid' GROUP BY region";
+
+/// A grouped extreme seeded with north holding `rows` rows, the smallest
+/// worth `min`, under `cap`.
+fn grouped_engine(cap: usize, min: i64, rows: i64) -> (Engine, TableId, u64, Vec<u8>) {
+    let catalog = ParserDB::parse::<PostgreSqlDialect>(DDL).unwrap();
+    let orders = catalog_helpers::table_id::<Postgres, _>(&catalog, "orders").unwrap();
+    let mut engine: Engine = SubscriptionEngine::new(catalog, PostgreSqlDialect {})
+        .with_max_changes_during_aggregate_read(cap);
+    let sub = register(&mut engine, GROUPED_MIN);
+    let opening = Install::install(
+        &mut engine,
+        sub,
+        GroupedScalarSeedInstall {
+            rows: vec![vec![
+                Value::String("north".into()),
+                Value::Int(min),
+                Value::Int(rows),
+            ]],
+            fence: Some(early_fence()),
+        },
+    )
+    .unwrap();
+    let north = opening.updates[0].group.clone().unwrap().key;
+    (engine, orders, sub, north)
+}
+
+#[test]
+fn a_filling_group_log_asks_for_a_fence_read_which_trims_it_and_the_truncates() {
+    let (mut engine, orders, sub, _) = grouped_engine(4, 1, 1);
+    let first = engine
+        .dispatch(&insert(orders, 30, "north", 9, at(2100, 750)))
+        .unwrap();
+    assert_eq!(fence_reads(&first), 0);
+    let second = engine
+        .dispatch(&insert(orders, 31, "north", 9, at(2200, 751)))
+        .unwrap();
+    assert_eq!(fence_reads(&second), 1, "half the cap asks for a fence");
+    for (lsn, xid) in [(2300, 752), (2400, 753)] {
+        engine
+            .dispatch(&Event::truncate(orders).with_checkpoint(at(lsn, xid)))
+            .unwrap();
+    }
+
+    Install::install(
+        &mut engine,
+        sub,
+        FenceInstall {
+            fence: Some(PgSnapshotFence::parse("760:760:", PgLsn(3000)).unwrap()),
+        },
+    )
+    .unwrap();
+    let after = engine
+        .dispatch(&insert(orders, 33, "north", 9, at(3100, 770)))
+        .unwrap();
+    assert_eq!(fence_reads(&after), 0, "the fence emptied both logs");
+}
+
+#[test]
+fn a_scoped_group_read_after_its_log_overflowed_asks_again() {
+    let (mut engine, orders, sub, north) = grouped_engine(2, 5, 2);
+    for (id, lsn, xid) in [(30, 2100, 750), (31, 2200, 751), (32, 2300, 752)] {
+        engine
+            .dispatch(&insert(orders, id, "north", 9, at(lsn, xid)))
+            .unwrap();
+    }
+    engine.dispatch(&sparse_delete_at(orders, 2400)).unwrap();
+
+    let installed = Install::install(
+        &mut engine,
+        sub,
+        GroupedScalarInstall {
+            group: north.clone(),
+            row: vec![Value::Int(5), Value::Int(4)],
+            checkpoint: Some(at(2400, 754)),
+            fence: Some(PgSnapshotFence::parse("760:760:", PgLsn(3000)).unwrap()),
+        },
+    )
+    .unwrap();
+    assert!(matches!(
+        &installed.triggers[..],
+        [trigger] if matches!(&trigger.read, ReExecutionRead::GroupedScalar { group, .. } if *group == north)
+    ));
+}
+
+/// A kept truncate lands between the kept changes around it, so a row the
+/// read missed that came after the truncate survives the replay.
+#[test]
+fn a_scoped_group_read_replays_kept_truncates_in_stream_order() {
+    let (mut engine, orders, sub, north) = grouped_engine(4096, 5, 2);
+    engine.dispatch(&sparse_delete_at(orders, 1100)).unwrap();
+    engine
+        .dispatch(&insert(orders, 20, "north", 3, at(1200, 742)))
+        .unwrap();
+    engine
+        .dispatch(&Event::truncate(orders).with_checkpoint(at(2100, 750)))
+        .unwrap();
+    engine
+        .dispatch(&insert(orders, 21, "north", 8, at(2200, 751)))
+        .unwrap();
+
+    // The read saw neither 742's row, nor the truncate, nor the row after it.
+    let installed = Install::install(
+        &mut engine,
+        sub,
+        GroupedScalarInstall {
+            group: north,
+            row: vec![Value::Int(5), Value::Int(1)],
+            checkpoint: Some(at(1100, 720)),
+            fence: Some(read_fence()),
+        },
+    )
+    .unwrap();
+    assert!(
+        installed.updates.is_empty() && installed.triggers.is_empty(),
+        "north holds the 8 inserted after the truncate, got {:?}",
+        installed.updates
+    );
+}
+
+fn sparse_delete_at(orders: TableId, lsn: u64) -> Event {
+    Event::delete(
+        orders,
+        vec![
+            Value::Int(21),
+            Value::String("north".into()),
+            Value::Int(9),
+            Value::Missing,
+        ],
+    )
+    .with_pk_columns([0u16])
+    .with_checkpoint(at(lsn, if lsn < 2000 { 720 } else { 754 }))
+}
+
+#[test]
+fn the_async_engine_serves_a_fence_read_through_its_connector() {
+    let catalog = ParserDB::parse::<PostgreSqlDialect>(DDL).unwrap();
+    let orders = catalog_helpers::table_id::<Postgres, _>(&catalog, "orders").unwrap();
+    let mut engine = AutoResolvingEngine::new(
+        SubscriptionEngine::<Event, DefaultIds, ParserDB>::new(catalog, PostgreSqlDialect {})
+            .with_max_changes_during_aggregate_read(2),
+        AsyncMode::new(FencedReads::new(Vec::new())),
+    );
+    let sub = engine
+        .register(SubscriptionRequest::new(7u64, MIN_PAID), ())
+        .unwrap()
+        .subscription_id;
+    Install::install(
+        &mut engine,
+        sub,
+        ScalarInstall {
+            value: Value::Int(4),
+            checkpoint: None,
+            fence: Some(early_fence()),
+        },
+    )
+    .unwrap();
+    drop(
+        engine
+            .apply(&insert(orders, 30, "north", 9, at(2100, 750)))
+            .unwrap(),
+    );
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(engine.resolve_collect())
+        .unwrap();
+
+    assert_eq!(engine.connector().fence_reads(), 1);
+    assert_eq!(engine.connector().calls(), 0, "no query ran");
+    assert_eq!(engine.pending_read_count(), 0);
 }

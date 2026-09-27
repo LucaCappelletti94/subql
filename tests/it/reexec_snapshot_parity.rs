@@ -172,3 +172,12 @@ fn async_snapshot_of_a_stream_served_filter_reads_nothing() {
         "the same answer as its twin, which is the whole point of this file"
     );
 }
+
+#[test]
+fn the_async_default_read_fence_reports_none() {
+    let fence = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("a current-thread runtime builds")
+        .block_on(AsyncConnector::read_fence(&Refusing, &()));
+    assert!(matches!(fence, Ok(None)));
+}

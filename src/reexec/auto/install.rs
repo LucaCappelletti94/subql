@@ -31,6 +31,8 @@ impl<I: IdTypes, B: crate::backend::Backend, C: crate::Checkpoint> InstallOutput
 {
 }
 
+impl<B: crate::backend::Backend> InstallOutputTransitions<B> for () {}
+
 impl<I: IdTypes, B: crate::backend::Backend, C: crate::Checkpoint> InstallOutputTransitions<B>
     for alloc::vec::Vec<crate::reexec::RowsUpdate<I, B, C>>
 {

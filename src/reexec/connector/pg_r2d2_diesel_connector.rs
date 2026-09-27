@@ -342,6 +342,14 @@ impl<S: SessionSetup> Connector for PgR2D2DieselConnector<S> {
             }
         }
     }
+
+    fn read_fence(&self, _auth: &S) -> Result<Option<crate::PgSnapshotFence>, Self::Error> {
+        let mut conn = self.pool.get().map_err(PgR2D2Error::Pool)?;
+        // One statement takes its snapshot at its start and reads the insert
+        // position after it, so no transaction is needed. The statement
+        // touches no table, so no setup statements run.
+        Ok(Some(read_fence(&mut conn)?))
+    }
 }
 
 /// Fill one page from an open cursor, buffering whatever a `FETCH` overshot.

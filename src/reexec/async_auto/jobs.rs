@@ -54,6 +54,8 @@ pub enum ResolveJob<B: Backend> {
         query: crate::reexec::BoundQuery<B>,
         generation: u64,
     },
+    /// The database's current fence, read with no query behind it.
+    Fence,
 }
 
 /// The keyed tier's read, as planned.
@@ -87,6 +89,9 @@ pub enum Resolved<B: Backend, C: crate::Checkpoint> {
     /// A whole re-read whose pages already streamed to the sink from the
     /// concurrent phase. Nothing is installed for it.
     WholeStreamed,
+    /// A fence read's answer, ready to install with
+    /// [`FenceInstall`](crate::FenceInstall). Nothing is delivered for it.
+    Fence { fence: Option<C::Fence> },
 }
 /// One page of a whole re-read buffered for a snapshot answer, which returns
 /// the whole result by contract.

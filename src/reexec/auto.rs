@@ -10,7 +10,7 @@
 //! [`ReExecutionTrigger`]: super::ReExecutionTrigger
 
 use super::connector::{Connector, ReExecError};
-use super::engine::{ReExecNotifications, RowDelta, RowsUpdate};
+use super::engine::{ReExecNotifications, ReadSlot, RowDelta, RowsUpdate};
 use crate::backend::{Backend, CdcEvent, ScalarFamily, Value};
 use crate::clock::{duration_between, ClockHandle};
 use crate::compiler::literals::SqlLiteralParse;
@@ -133,10 +133,10 @@ where
     pub(super) clock: Option<ClockHandle>,
     /// Minimum interval between two re-executions of the same query.
     pub(super) debounce: Option<Duration>,
-    /// Last execution time per subscription and optional group.
-    pub(super) last_reexec_at: HashMap<(SubscriptionId, Option<Vec<u8>>), u64>,
+    /// Last execution time per subscription and read slot.
+    pub(super) last_reexec_at: HashMap<(SubscriptionId, ReadSlot), u64>,
     /// Reads discovered by [`apply`](Self::apply) and not yet delivered by
-    /// `resolve`, deduplicated by subscription and group. A failed or
+    /// `resolve`, deduplicated by subscription and read slot. A failed or
     /// abandoned resolve leaves them here, so retrying costs a read and
     /// never a second application of the event.
     pub(super) pending_reads: ReadQueue<I, E::Checkpoint, E::Backend>,
@@ -406,10 +406,15 @@ where
         subscription_id: SubscriptionId,
         read: &super::ReExecutionRead<E::Backend>,
     ) -> bool {
+        // A fence read is the cheap trim, so it never sits out a debounce
+        // window.
+        if matches!(read, super::ReExecutionRead::Fence) {
+            return false;
+        }
         let (Some(clock), Some(window)) = (self.clock.as_ref(), self.debounce) else {
             return false;
         };
-        let key = (subscription_id, read.group_key().map(<[u8]>::to_vec));
+        let key = (subscription_id, read.slot());
         let Some(last_micros) = self.last_reexec_at.get(&key).copied() else {
             return false;
         };
@@ -422,16 +427,14 @@ where
         read: &super::ReExecutionRead<E::Backend>,
     ) {
         if let Some(clock) = self.clock.as_ref() {
-            self.last_reexec_at.insert(
-                (subscription_id, read.group_key().map(<[u8]>::to_vec)),
-                clock.now_micros(),
-            );
+            self.last_reexec_at
+                .insert((subscription_id, read.slot()), clock.now_micros());
         }
     }
 
     /// Queue one discovered read, replacing a queued read of the same
-    /// subscription and group so a burst costs one read. A read inside its
-    /// debounce window is dropped, exactly as the fused path dropped it.
+    /// subscription and read slot so a burst costs one read. A read inside
+    /// its debounce window is dropped, exactly as the fused path dropped it.
     ///
     /// `false` when the debounce window discarded the trigger.
     pub(super) fn enqueue_read(
@@ -453,7 +456,7 @@ where
         followup: super::ReExecutionTrigger<I, E::Checkpoint, E::Backend>,
     ) {
         if followup.subscription_id == resolved.subscription_id
-            && followup.read.group_key() == resolved.read.group_key()
+            && followup.read.same_slot(&resolved.read)
         {
             self.deferred_reads.push(followup);
         } else {
@@ -474,7 +477,7 @@ where
         trigger: &super::ReExecutionTrigger<I, E::Checkpoint, E::Backend>,
     ) {
         self.pending_reads
-            .remove(trigger.subscription_id, trigger.read.group_key());
+            .remove(trigger.subscription_id, trigger.read.slot());
     }
 
     /// Reads waiting for the next `resolve`.
