@@ -1209,16 +1209,34 @@ enum PendingChange {
     Emptied,
 }
 
+/// A buffered change that can take the next change at the same position
+/// into itself, so a transaction's many rows cost one slot.
+trait Absorb {
+    fn absorb(&mut self, next: &Self) -> bool;
+}
+
+impl Absorb for PendingChange {
+    fn absorb(&mut self, next: &Self) -> bool {
+        match (self, next) {
+            (Self::Fold(held), Self::Fold(delta)) => {
+                held.merge(delta);
+                true
+            }
+            _ => false,
+        }
+    }
+}
+
 /// Changes seen while waiting for the starting numbers.
-struct Pending<C: Checkpoint> {
+struct Pending<C: Checkpoint, T> {
     /// In arrival order, which is non-decreasing in position.
-    changes: Vec<(Option<C>, PendingChange)>,
+    changes: Vec<(Option<C>, T)>,
     /// Set once the list hit its ceiling, at which point the changes the read
     /// already saw can no longer be identified and the seed must be refused.
     overflowed: bool,
 }
 
-impl<C: Checkpoint> Pending<C> {
+impl<C: Checkpoint, T: Absorb> Pending<C, T> {
     const fn new() -> Self {
         Self {
             changes: Vec::new(),
@@ -1227,13 +1245,10 @@ impl<C: Checkpoint> Pending<C> {
     }
 
     /// Record `change` at `at`, merging into the last entry when the position
-    /// repeats so several changes inside one transaction cost one slot.
-    fn push(&mut self, at: Option<&C>, change: PendingChange, cap: usize) {
-        if let (Some((last_at, PendingChange::Fold(held))), PendingChange::Fold(delta)) =
-            (self.changes.last_mut(), &change)
-        {
-            if last_at.is_some() && last_at.as_ref() == at {
-                held.merge(delta);
+    /// repeats and the change allows it.
+    fn push(&mut self, at: Option<&C>, change: T, cap: usize) {
+        if let Some((last_at, held)) = self.changes.last_mut() {
+            if last_at.is_some() && last_at.as_ref() == at && held.absorb(&change) {
                 return;
             }
         }
@@ -1317,6 +1332,111 @@ impl<C: Checkpoint, T> Unseen<C, T> {
     }
 }
 
+/// Where a total stands against its seed reads, shared by the ungrouped and
+/// the grouped total.
+struct SeedState<C: Checkpoint, T> {
+    /// `None` once the starting numbers have landed.
+    pending: Option<Pending<C, T>>,
+    fence: ReadFence<C>,
+    unseen: Unseen<C, T>,
+}
+
+/// What a seeded total does with one change.
+enum Admit<T> {
+    /// Buffered for the seed, or already held by the last seed read.
+    Absorbed,
+    /// Apply it, then hand it back through [`SeedState::applied`].
+    Apply(T),
+}
+
+impl<C: Checkpoint, T: Absorb> SeedState<C, T> {
+    const fn new() -> Self {
+        Self {
+            pending: Some(Pending::new()),
+            fence: ReadFence::none(),
+            unseen: Unseen::new(),
+        }
+    }
+
+    const fn is_seeded(&self) -> bool {
+        self.pending.is_none()
+    }
+
+    /// Buffer `change` while unseeded, drop it when the last seed read holds
+    /// it, and otherwise hand it back to apply.
+    fn admit(&mut self, at: Option<&C>, change: T, cap: usize) -> Admit<T> {
+        if let Some(pending) = &mut self.pending {
+            pending.push(at, change, cap);
+            return Admit::Absorbed;
+        }
+        if self.fence.admits(at) {
+            Admit::Apply(change)
+        } else {
+            Admit::Absorbed
+        }
+    }
+
+    /// Keep an applied change until a fence shows it held.
+    fn applied(&mut self, at: Option<&C>, change: T, cap: usize, latest: &LatestFence<C>) {
+        self.unseen.record(at, change, cap, latest);
+    }
+
+    /// Mark the total unseeded, with a seed read asked at `asked`, buffering
+    /// the changes no seed read has shown held, which the new one may miss
+    /// too.
+    fn reset(&mut self, asked: u64) {
+        self.pending = Some(Pending {
+            changes: self.unseen.reopen(asked),
+            overflowed: false,
+        });
+        self.fence = ReadFence::none();
+    }
+
+    const fn wants_fence(&self, cap: usize) -> bool {
+        self.unseen.log.wants_fence(cap)
+    }
+
+    fn forget_seen(&mut self, latest: &LatestFence<C>) {
+        self.unseen.forget_seen(
+            latest,
+            self.pending.as_mut().map(|pending| &mut pending.changes),
+        );
+    }
+
+    /// The buffered changes a seed read behind `fence` can be lined up
+    /// against, or why it cannot.
+    fn to_install(
+        &self,
+        subscription: SubscriptionId,
+        fence: Option<&C::Fence>,
+        cap: usize,
+    ) -> Result<&[(Option<C>, T)], AggregateInstallError> {
+        let Some(pending) = self.pending.as_ref() else {
+            return Err(AggregateInstallError::AlreadySeeded(subscription));
+        };
+        if pending.overflowed {
+            return Err(AggregateInstallError::TooManyChangesDuringRead { subscription, cap });
+        }
+        if !pending.changes.is_empty()
+            && (fence.is_none() || pending.changes.iter().any(|(at, _)| at.is_none()))
+        {
+            return Err(AggregateInstallError::PositionUnknown(subscription));
+        }
+        Ok(&pending.changes)
+    }
+
+    /// Mark the seed installed behind `fence`, `judge` being the fence as the
+    /// replay left it. The buffered changes it did not hold stay kept.
+    fn installed(&mut self, fence: Option<&C::Fence>, judge: ReadFence<C>) {
+        let pending = self
+            .pending
+            .take()
+            .expect("an install follows `to_install`");
+        self.unseen = Unseen::after_install(pending.changes, fence);
+        self.fence = judge;
+    }
+}
+
 /// One aggregate subscription's running value.
 pub struct AggregateTotal<I: IdTypes, C: Checkpoint> {
     /// The consumer the registration belongs to, reported alongside the value.
@@ -1327,10 +1447,7 @@ pub struct AggregateTotal<I: IdTypes, C: Checkpoint> {
     /// How this subscription's fold answers, resolved at registration.
     rule: FoldRule,
     accumulator: AggAccumulator,
-    /// `None` once the starting numbers have landed.
-    pending: Option<Pending<C>>,
-    fence: ReadFence<C>,
-    unseen: Unseen<C, PendingChange>,
+    seed: SeedState<C, PendingChange>,
 }
 
 impl<I: IdTypes, C: Checkpoint> AggregateTotal<I, C> {
@@ -1340,9 +1457,7 @@ impl<I: IdTypes, C: Checkpoint> AggregateTotal<I, C> {
             accumulator: AggAccumulator::from_spec(&spec, rule),
             spec,
             rule,
-            pending: Some(Pending::new()),
-            fence: ReadFence::none(),
-            unseen: Unseen::new(),
+            seed: SeedState::new(),
         }
     }
 
@@ -1353,7 +1468,7 @@ impl<I: IdTypes, C: Checkpoint> AggregateTotal<I, C> {
     /// The value held right now, or `None` while the starting numbers are
     /// still missing.
     pub fn value(&self) -> Option<AggValue> {
-        self.pending.is_none().then(|| self.accumulator.value())
+        self.seed.is_seeded().then(|| self.accumulator.value())
     }
 
     /// Fold one change. Answers with the new value when the total is seeded
@@ -1365,16 +1480,13 @@ impl<I: IdTypes, C: Checkpoint> AggregateTotal<I, C> {
         cap: usize,
         latest: &LatestFence<C>,
     ) -> Result<Option<AggValue>, SumOutOfRange> {
-        if let Some(pending) = &mut self.pending {
-            pending.push(at, PendingChange::Fold(delta), cap);
+        let Admit::Apply(change) = self.seed.admit(at, PendingChange::Fold(delta), cap) else {
             return Ok(None);
+        };
+        if let PendingChange::Fold(delta) = &change {
+            self.accumulator.apply(delta)?;
         }
-        if !self.fence.admits(at) {
-            return Ok(None);
-        }
-        self.accumulator.apply(&delta)?;
-        self.unseen
-            .record(at, PendingChange::Fold(delta), cap, latest);
+        self.seed.applied(at, change, cap, latest);
         Ok(Some(self.accumulator.value()))
     }
 
@@ -1387,14 +1499,10 @@ impl<I: IdTypes, C: Checkpoint> AggregateTotal<I, C> {
         cap: usize,
         latest: &LatestFence<C>,
     ) -> Option<AggValue> {
-        if let Some(pending) = &mut self.pending {
-            pending.push(at, PendingChange::Emptied, cap);
+        let Admit::Apply(change) = self.seed.admit(at, PendingChange::Emptied, cap) else {
             return None;
-        }
-        if !self.fence.admits(at) {
-            return None;
-        }
-        self.unseen.record(at, PendingChange::Emptied, cap, latest);
+        };
+        self.seed.applied(at, change, cap, latest);
         let before = self.accumulator.value();
         self.accumulator.clear();
         let after = self.accumulator.value();
@@ -1403,30 +1511,20 @@ impl<I: IdTypes, C: Checkpoint> AggregateTotal<I, C> {
 
     /// Empty the total and mark it unseeded again, for a permission change the
     /// engine cannot see, with a seed read asked at `asked`.
-    ///
-    /// The changes no read of the total has shown held are buffered for the
-    /// new seed, which may miss them too.
     pub fn reset(&mut self, asked: u64) {
         self.accumulator.clear();
-        self.pending = Some(Pending {
-            changes: self.unseen.reopen(asked),
-            overflowed: false,
-        });
-        self.fence = ReadFence::none();
+        self.seed.reset(asked);
     }
 
     /// Whether the kept changes are near their cap and a fence-only read
     /// should trim them.
     pub const fn wants_fence(&self, cap: usize) -> bool {
-        self.unseen.log.wants_fence(cap)
+        self.seed.wants_fence(cap)
     }
 
     /// Drop the kept and buffered changes the engine's latest fence holds.
     pub fn forget_seen(&mut self, latest: &LatestFence<C>) {
-        self.unseen.forget_seen(
-            latest,
-            self.pending.as_mut().map(|pending| &mut pending.changes),
-        );
+        self.seed.forget_seen(latest);
     }
 
     /// Adopt `row` as the starting numbers, read behind `fence`.
@@ -1442,22 +1540,11 @@ impl<I: IdTypes, C: Checkpoint> AggregateTotal<I, C> {
         fence: Option<C::Fence>,
         cap: usize,
     ) -> Result<AggValue, AggregateInstallError> {
-        let Some(pending) = self.pending.as_ref() else {
-            return Err(AggregateInstallError::AlreadySeeded(subscription));
-        };
-        if pending.overflowed {
-            return Err(AggregateInstallError::TooManyChangesDuringRead { subscription, cap });
-        }
-        if !pending.changes.is_empty()
-            && (fence.is_none() || pending.changes.iter().any(|(at, _)| at.is_none()))
-        {
-            return Err(AggregateInstallError::PositionUnknown(subscription));
-        }
-
         let kept_by = fence.clone();
+        let pending = self.seed.to_install(subscription, kept_by.as_ref(), cap)?;
         let mut judge = ReadFence::new(fence);
         let mut accumulator = AggAccumulator::seed_from_row(&self.spec, self.rule, row);
-        for (at, change) in &pending.changes {
+        for (at, change) in pending {
             if !judge.admits(at.as_ref()) {
                 continue;
             }
@@ -1472,11 +1559,8 @@ impl<I: IdTypes, C: Checkpoint> AggregateTotal<I, C> {
                 PendingChange::Emptied => accumulator.clear(),
             }
         }
-
-        let pending = self.pending.take().expect("checked above");
-        self.unseen = Unseen::after_install(pending.changes, kept_by.as_ref());
+        self.seed.installed(kept_by.as_ref(), judge);
         self.accumulator = accumulator;
-        self.fence = judge;
         Ok(self.accumulator.value())
     }
 }
@@ -1561,57 +1645,34 @@ enum PendingGroupChange<B: Backend> {
     Emptied,
 }
 
-/// Grouped changes seen while the database seed read is in flight.
-struct PendingGroups<B: Backend, C: Checkpoint> {
-    changes: Vec<(Option<C>, PendingGroupChange<B>)>,
-    overflowed: bool,
-}
-
-impl<B: Backend, C: Checkpoint> PendingGroups<B, C> {
-    const fn new() -> Self {
-        Self {
-            changes: Vec::new(),
-            overflowed: false,
-        }
-    }
-
-    /// Record `change` at `at`, merging into the last entry when both the
-    /// position and the group repeat, so a transaction's many rows into one
-    /// group cost one slot, mirroring the ungrouped buffer.
-    fn push(&mut self, at: Option<&C>, change: PendingGroupChange<B>, cap: usize) {
-        if let (
-            Some((
-                last_at,
-                PendingGroupChange::Fold {
-                    key: held_key,
-                    values: _,
-                    delta: held_delta,
-                    rows: held_rows,
-                },
-            )),
-            PendingGroupChange::Fold {
-                key,
-                values: _,
-                delta,
-                rows,
+/// Merges only into a fold of the same group, so a transaction's many rows
+/// into one group cost one slot.
+impl<B: Backend> Absorb for PendingGroupChange<B> {
+    fn absorb(&mut self, next: &Self) -> bool {
+        let (
+            Self::Fold {
+                key: held_key,
+                delta: held_delta,
+                rows: held_rows,
+                ..
             },
-        ) = (self.changes.last_mut(), &change)
-        {
-            if last_at.is_some() && last_at.as_ref() == at && held_key == key {
-                match (held_delta, delta) {
-                    (Some(held), Some(delta)) => held.merge(delta),
-                    (held @ None, delta) => held.clone_from(delta),
-                    (_, None) => {}
-                }
-                *held_rows += rows;
-                return;
-            }
+            Self::Fold {
+                key, delta, rows, ..
+            },
+        ) = (self, next)
+        else {
+            return false;
+        };
+        if held_key != key {
+            return false;
         }
-        if self.changes.len() >= cap {
-            self.overflowed = true;
-            return;
+        match (held_delta, delta) {
+            (Some(held), Some(delta)) => held.merge(delta),
+            (held @ None, delta) => held.clone_from(delta),
+            (_, None) => {}
         }
-        self.changes.push((at.cloned(), change));
+        *held_rows += rows;
+        true
     }
 }
 
@@ -1646,9 +1707,7 @@ pub struct GroupedAggregateTotal<I: IdTypes, B: Backend, C: Checkpoint> {
     group_columns: usize,
     group_key_encoder: crate::backend::GroupKeyEncoder<B>,
     groups: HashMap<Vec<u8>, GroupValue<B>>,
-    pending: Option<PendingGroups<B, C>>,
-    fence: ReadFence<C>,
-    unseen: Unseen<C, PendingGroupChange<B>>,
+    seed: SeedState<C, PendingGroupChange<B>>,
     having: Option<GroupHaving>,
     /// Whether the seed carries components needed only by `HAVING`.
     widened: bool,
@@ -1684,9 +1743,7 @@ impl<I: IdTypes, B: Backend, C: Checkpoint> GroupedAggregateTotal<I, B, C> {
             group_columns,
             group_key_encoder,
             groups: HashMap::new(),
-            pending: Some(PendingGroups::new()),
-            fence: ReadFence::none(),
-            unseen: Unseen::new(),
+            seed: SeedState::new(),
             having,
             widened,
         }
@@ -1697,7 +1754,7 @@ impl<I: IdTypes, B: Backend, C: Checkpoint> GroupedAggregateTotal<I, B, C> {
     }
 
     pub const fn is_seeded(&self) -> bool {
-        self.pending.is_none()
+        self.seed.is_seeded()
     }
 
     pub const fn group_columns(&self) -> usize {
@@ -1720,24 +1777,25 @@ impl<I: IdTypes, B: Backend, C: Checkpoint> GroupedAggregateTotal<I, B, C> {
         group_limit: usize,
         latest: &LatestFence<C>,
     ) -> GroupedFoldOutcome<B> {
-        let crate::GroupIdentity { key, values } = group;
-        if let Some(pending) = &mut self.pending {
-            pending.push(
-                at,
-                PendingGroupChange::Fold {
-                    key,
-                    values,
-                    delta,
-                    rows,
-                },
-                cap,
-            );
+        let change = PendingGroupChange::Fold {
+            key: group.key,
+            values: group.values,
+            delta,
+            rows,
+        };
+        let Admit::Apply(change) = self.seed.admit(at, change, cap) else {
             return GroupedFoldOutcome::Unchanged;
-        }
-        if !self.fence.admits(at) {
-            return GroupedFoldOutcome::Unchanged;
-        }
-        if !self.groups.contains_key(&key) && rows > 0 && self.groups.len() >= group_limit {
+        };
+        let PendingGroupChange::Fold {
+            key,
+            values,
+            delta,
+            rows,
+        } = &change
+        else {
+            unreachable!("a fold was admitted")
+        };
+        if !self.groups.contains_key(key) && *rows > 0 && self.groups.len() >= group_limit {
             return GroupedFoldOutcome::GroupLimit;
         }
         let outcome = Self::apply_change(
@@ -1747,27 +1805,17 @@ impl<I: IdTypes, B: Backend, C: Checkpoint> GroupedAggregateTotal<I, B, C> {
                 having: self.having.as_ref(),
             },
             &mut self.groups,
-            &key,
-            &values,
+            key,
+            values,
             delta.as_ref(),
-            rows,
+            *rows,
         )
         .map_or(GroupedFoldOutcome::SumOutOfRange, |change| {
             change.map_or(GroupedFoldOutcome::Unchanged, |(identity, change)| {
                 GroupedFoldOutcome::Change(identity, change)
             })
         });
-        self.unseen.record(
-            at,
-            PendingGroupChange::Fold {
-                key,
-                values,
-                delta,
-                rows,
-            },
-            cap,
-            latest,
-        );
+        self.seed.applied(at, change, cap, latest);
         outcome
     }
 
@@ -1820,15 +1868,10 @@ impl<I: IdTypes, B: Backend, C: Checkpoint> GroupedAggregateTotal<I, B, C> {
         cap: usize,
         latest: &LatestFence<C>,
     ) -> GroupedValueChanges<B> {
-        if let Some(pending) = &mut self.pending {
-            pending.push(at, PendingGroupChange::Emptied, cap);
+        let Admit::Apply(change) = self.seed.admit(at, PendingGroupChange::Emptied, cap) else {
             return Vec::new();
-        }
-        if !self.fence.admits(at) {
-            return Vec::new();
-        }
-        self.unseen
-            .record(at, PendingGroupChange::Emptied, cap, latest);
+        };
+        self.seed.applied(at, change, cap, latest);
         let mut removed: Vec<_> = self
             .groups
             .iter()
@@ -1844,25 +1887,18 @@ impl<I: IdTypes, B: Backend, C: Checkpoint> GroupedAggregateTotal<I, B, C> {
     /// asked at `asked`, buffering the changes no read of it has shown held.
     pub fn reset(&mut self, asked: u64) {
         self.groups.clear();
-        self.pending = Some(PendingGroups {
-            changes: self.unseen.reopen(asked),
-            overflowed: false,
-        });
-        self.fence = ReadFence::none();
+        self.seed.reset(asked);
     }
 
     /// Whether the kept changes are near their cap and a fence-only read
     /// should trim them.
     pub const fn wants_fence(&self, cap: usize) -> bool {
-        self.unseen.log.wants_fence(cap)
+        self.seed.wants_fence(cap)
     }
 
     /// Drop the kept and buffered changes the engine's latest fence holds.
     pub fn forget_seen(&mut self, latest: &LatestFence<C>) {
-        self.unseen.forget_seen(
-            latest,
-            self.pending.as_mut().map(|pending| &mut pending.changes),
-        );
+        self.seed.forget_seen(latest);
     }
 
     fn seed_group(
@@ -1918,17 +1954,8 @@ impl<I: IdTypes, B: Backend, C: Checkpoint> GroupedAggregateTotal<I, B, C> {
         cap: usize,
         group_limit: usize,
     ) -> Result<GroupedValueChanges<B>, AggregateInstallError> {
-        let Some(pending) = self.pending.as_ref() else {
-            return Err(AggregateInstallError::AlreadySeeded(subscription));
-        };
-        if pending.overflowed {
-            return Err(AggregateInstallError::TooManyChangesDuringRead { subscription, cap });
-        }
-        if !pending.changes.is_empty()
-            && (fence.is_none() || pending.changes.iter().any(|(at, _)| at.is_none()))
-        {
-            return Err(AggregateInstallError::PositionUnknown(subscription));
-        }
+        let kept_by = fence.clone();
+        let pending = self.seed.to_install(subscription, kept_by.as_ref(), cap)?;
 
         // A short row would silently seed zeroed components (a widened seed
         // missing its count column would hide the group forever), so the
@@ -1952,9 +1979,8 @@ impl<I: IdTypes, B: Backend, C: Checkpoint> GroupedAggregateTotal<I, B, C> {
             }
         }
 
-        let kept_by = fence.clone();
         let mut judge = ReadFence::new(fence);
-        for (at, change) in &pending.changes {
+        for (at, change) in pending {
             if !judge.admits(at.as_ref()) {
                 continue;
             }
@@ -2010,9 +2036,7 @@ impl<I: IdTypes, B: Backend, C: Checkpoint> GroupedAggregateTotal<I, B, C> {
             .collect();
         opening.sort_unstable_by(|a, b| a.0.key.cmp(&b.0.key));
         self.groups = groups;
-        let pending = self.pending.take().expect("checked above");
-        self.unseen = Unseen::after_install(pending.changes, kept_by.as_ref());
-        self.fence = judge;
+        self.seed.installed(kept_by.as_ref(), judge);
         Ok(opening)
     }
 }
