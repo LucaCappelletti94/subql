@@ -87,7 +87,8 @@ fn scaffold_registers_both_and_executes_scalar() {
                 subscription_id,
                 subql::ScalarInstall {
                     value: Value::Float(5.0),
-                    checkpoint: None::<subql::NoCheckpoint>
+                    checkpoint: None::<subql::NoCheckpoint>,
+                    fence: None,
                 }
             )
             .is_ok());
@@ -162,7 +163,8 @@ fn delete_displacing_extreme_resolves_via_mysql_connector() {
         captured_qid,
         subql::ScalarInstall {
             value: Value::Float(5.0),
-            checkpoint: None::<subql::NoCheckpoint>
+            checkpoint: None::<subql::NoCheckpoint>,
+            fence: None,
         }
     )
     .is_ok());
@@ -326,7 +328,7 @@ fn every_read_reports_a_position_taken_before_its_snapshot() {
         "the page's snapshot holds two rows"
     );
     assert!(
-        page.checkpoint
+        page.fence
             .expect("binary logging is on, so a coordinate is reported")
             < after_commit,
         "the page read's position must sit behind the commit at {after_commit:?}"

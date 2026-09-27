@@ -91,8 +91,15 @@ impl AsyncConnector for ConcurrencyProbingConnector {
         _query: &subql::reexec::ReadQuery<'_, Postgres>,
         _kind: ScalarFamily,
         _auth: &(),
-    ) -> impl Future<Output = Result<(Value<Postgres>, Option<Self::Checkpoint>), Self::Error>> + Send
-    {
+    ) -> impl Future<
+        Output = Result<
+            (
+                Value<Postgres>,
+                Option<<Self::Checkpoint as subql::Checkpoint>::Fence>,
+            ),
+            Self::Error,
+        >,
+    > + Send {
         async move {
             let now = self.inflight.fetch_add(1, Ordering::AcqRel) + 1;
             self.peak.fetch_max(now, Ordering::AcqRel);
@@ -197,7 +204,8 @@ pub fn engine_with_first_n_queries(n: usize, cap: usize, delay: Duration) -> (En
             qid,
             subql::ScalarInstall {
                 value: install_value(),
-                checkpoint: None::<subql::NoCheckpoint>
+                checkpoint: None::<subql::NoCheckpoint>,
+                fence: None,
             }
         )
         .is_ok());

@@ -230,6 +230,13 @@ mod engine_trait_surface;
 mod engine_unknown_tables;
 mod in_process_persistence;
 mod merge_jobs;
+mod read_fence;
+
+// Docker-backed check that a Postgres read's fence holds exactly what its
+// snapshot saw. Tests are #[ignore]d; run with --ignored.
+#[cfg(feature = "executor-diesel-postgres")]
+mod read_fence_postgres;
+
 mod reads_persist;
 
 #[cfg(all(feature = "executor-diesel", feature = "diesel-typed-sqlite"))]

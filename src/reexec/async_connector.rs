@@ -44,7 +44,7 @@ pub trait AsyncConnector: Send + Sync {
     type AuthContext: Send + Sync;
     /// Connector-specific error returned by the futures below.
     type Error: Send;
-    /// Position token the connector tags reads with. See
+    /// The change-stream domain the read's fence lives in. See
     /// [`Connector::Checkpoint`](super::Connector::Checkpoint) for the
     /// sync analogue.
     type Checkpoint: Checkpoint;
@@ -52,8 +52,8 @@ pub trait AsyncConnector: Send + Sync {
     type Backend: Backend;
 
     /// Run the re-execution SQL and decode a single scalar value with the
-    /// expected [`ScalarFamily`](crate::backend::ScalarFamily), optionally reporting the position at
-    /// which the read was taken.
+    /// expected [`ScalarFamily`](crate::backend::ScalarFamily), reporting the
+    /// fence of the snapshot the read took.
     ///
     /// See [`Connector::execute_scalar`](super::Connector::execute_scalar)
     /// for the contract. The async surface is identical other than
@@ -64,7 +64,13 @@ pub trait AsyncConnector: Send + Sync {
         kind: ScalarFamily,
         auth: &Self::AuthContext,
     ) -> impl core::future::Future<
-        Output = Result<(Value<Self::Backend>, Option<Self::Checkpoint>), Self::Error>,
+        Output = Result<
+            (
+                Value<Self::Backend>,
+                Option<<Self::Checkpoint as Checkpoint>::Fence>,
+            ),
+            Self::Error,
+        >,
     > + Send;
 
     /// Async peer of [`Connector::read_page`](super::Connector::read_page).
@@ -148,7 +154,7 @@ pub trait AsyncConnector: Send + Sync {
         Output = Result<
             (
                 alloc::vec::Vec<Value<Self::Backend>>,
-                Option<Self::Checkpoint>,
+                Option<<Self::Checkpoint as Checkpoint>::Fence>,
             ),
             ScalarRowError<Self::Error>,
         >,

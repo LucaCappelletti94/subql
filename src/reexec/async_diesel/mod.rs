@@ -187,18 +187,19 @@ pub(super) async fn load_scalar_row_mysql_async<C: crate::backend::MySqlTableNam
     seed_row_values(row, kinds)
 }
 
-/// Async binlog-position-aware [`AsyncConnector`] for MySQL, the async peer
-/// of [`MysqlDieselConnector`](super::connector::MysqlDieselConnector).
+/// Async [`AsyncConnector`] for MySQL, the async peer of
+/// [`MysqlDieselConnector`](super::connector::MysqlDieselConnector), reporting
+/// the fence of each read, the binlog position the read ran under.
 ///
 /// Wraps a `bb8` pool over
 /// [`AsyncMysqlConnection`](diesel_async::AsyncMysqlConnection). Each
-/// `execute_scalar` runs the user's SQL and reads
-/// `performance_schema.log_status` in one transaction, returning the
+/// `execute_scalar` reads `performance_schema.log_status` before the read's
+/// transaction and runs the user's SQL, returning the
 /// [`Value<MySql>`](crate::backend::MySql) with the parsed
 /// [`MysqlBinlogPos`](crate::MysqlBinlogPos). `log_status` is used rather
 /// than `SHOW MASTER STATUS` because diesel's prepared-statement protocol
 /// cannot read `SHOW` result metadata. The coordinate is the server's
-/// current binlog position (best-effort "at or after the read"), so it
+/// current binlog position (best-effort "at or before the read"), so it
 /// degrades to `None` when binary logging is off or unreadable.
 ///
 /// # Errors
@@ -240,7 +241,7 @@ impl<S: SessionSetup + Send + Sync, C: crate::backend::MySqlTableNameCase>
     }
 }
 
-/// Read the current binlog coordinate from `performance_schema.log_status`.
+/// Read the current binlog fence from `performance_schema.log_status`.
 /// Best-effort: any read failure (missing privilege, binary logging off,
 /// unsupported server) degrades to `None` rather than failing the
 /// re-execution. Mirrors the sync `read_binlog_pos`.
@@ -290,10 +291,9 @@ impl<S: SessionSetup + Send + Sync, C: crate::backend::MySqlTableNameCase> Async
         async move {
             let mut pooled = self.pool.get().await.map_err(DieselAsyncError::Pool)?;
             let conn: &mut diesel_async::AsyncMysqlConnection = &mut pooled;
-            // Position before snapshot, per `Connector::Checkpoint`: the
-            // coordinate is the server's current one, so taken after the read
-            // it can sit ahead of the snapshot and a replay from there loses a
-            // commit.
+            // The fence is read before the snapshot: it is the server's current
+            // coordinate, so taken after the read it can sit ahead of the
+            // snapshot and a replay from there loses a commit.
             let pos = read_binlog_pos_async(conn).await;
             conn.transaction::<(Value<Self::Backend>, Option<crate::MysqlBinlogPos>), diesel::result::Error, _>(
                 async move |c| {
@@ -340,10 +340,7 @@ impl<S: SessionSetup + Send + Sync, C: crate::backend::MySqlTableNameCase> Async
                 .await
                 .map_err(DieselAsyncError::Diesel)?
             };
-            Ok(Snapshot {
-                value,
-                checkpoint: None,
-            })
+            Ok(Snapshot { value, fence: None })
         }
     }
 
@@ -367,7 +364,7 @@ impl<S: SessionSetup + Send + Sync, C: crate::backend::MySqlTableNameCase> Async
                 .await
                 .map_err(|e| ScalarRowError::Connector(DieselAsyncError::Pool(e)))?;
             let conn: &mut diesel_async::AsyncMysqlConnection = &mut pooled;
-            // Position before snapshot, per `Connector::Checkpoint`.
+            // The fence is read before the snapshot, for the reason on `execute_scalar`.
             let pos = read_binlog_pos_async(conn).await;
             conn.transaction::<(Vec<Value<Self::Backend>>, Option<crate::MysqlBinlogPos>), diesel::result::Error, _>(
                 async move |c| {

@@ -200,7 +200,7 @@ fn install<B: Summing>(
         subscription,
         subql::AggregateSeedInstall {
             rows: vec![row],
-            read_at: Some(PgLsn(5)),
+            fence: Some(PgLsn(5)),
         },
     )
     .expect("the seed lands")

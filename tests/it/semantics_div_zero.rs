@@ -296,7 +296,7 @@ fn an_aggregate_refused_on_both_images_reports_the_first_refusal() {
         subscription,
         subql::AggregateSeedInstall {
             rows: vec![vec![Value::Int(0)]],
-            read_at: None,
+            fence: None,
         },
     )
     .expect("the count seeds");
@@ -337,7 +337,7 @@ fn dispatch_reports_a_refused_aggregate() {
         subscription,
         subql::AggregateSeedInstall {
             rows: vec![vec![Value::Int(0)]],
-            read_at: None,
+            fence: None,
         },
     )
     .expect("the count seeds");

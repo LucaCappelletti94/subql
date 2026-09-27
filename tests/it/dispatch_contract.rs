@@ -40,7 +40,7 @@ fn dispatching_through_the_trait_folds_an_aggregate() {
         counted.subscription_id,
         AggregateSeedInstall {
             rows: vec![vec![Value::Int(0)]],
-            read_at: None,
+            fence: None,
         },
     )
     .expect("the starting number lands");

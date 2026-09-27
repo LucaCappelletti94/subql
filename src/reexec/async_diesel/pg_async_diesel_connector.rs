@@ -1,11 +1,12 @@
 #![allow(clippy::manual_async_fn)]
 #![allow(clippy::type_complexity)]
-//! LSN-aware async [`AsyncConnector`] for PostgreSQL.
+//! Async [`AsyncConnector`](super::super::async_connector::AsyncConnector) for PostgreSQL, reporting the read's own snapshot fence.
 
 use super::super::async_connector::AsyncConnector;
 use super::super::connector::{
-    boxed_postgres_read_query_owned, drain_cursor_buffer, CursorError, CursorId, PgLsnRow,
-    ReadQuery, RowPage, ScalarRowError, SessionSetup, Snapshot, PG_READ_SNAPSHOT,
+    boxed_postgres_read_query_owned, drain_cursor_buffer, CursorError, CursorId,
+    PgSnapshotFenceRow, ReadQuery, RowPage, ScalarRowError, SessionSetup, Snapshot,
+    PG_READ_SNAPSHOT,
 };
 use super::{
     load_page_postgres_async, load_scalar_postgres_async, load_scalar_row_postgres_async,
@@ -18,15 +19,16 @@ use diesel::sql_query;
 use diesel_async::pooled_connection::bb8::Pool;
 use diesel_async::{AsyncConnection, RunQueryDsl as _};
 
-/// Async LSN-aware [`AsyncConnector`] for PostgreSQL, the async peer of
+/// Async [`AsyncConnector`] for PostgreSQL, the async peer of
 /// [`PgDieselConnector`](crate::reexec::connector::PgDieselConnector).
 ///
 /// Wraps a `bb8` pool over
 /// [`AsyncPgConnection`](diesel_async::AsyncPgConnection). Each
-/// `execute_scalar` reads `pg_current_wal_lsn()`, opens a `READ ONLY
-/// REPEATABLE READ` transaction for the user's SQL, and returns the
+/// `execute_scalar` opens a `READ ONLY REPEATABLE READ` transaction for the
+/// user's SQL, reads that transaction's own snapshot and the WAL insert
+/// position after it, and returns the
 /// [`Value<Postgres>`](crate::backend::Postgres) with the read's
-/// [`PgCommitPosition`](crate::PgCommitPosition). Pure Rust: `diesel-async` speaks the PG wire
+/// [`PgSnapshotFence`](crate::PgSnapshotFence). Pure Rust: `diesel-async` speaks the PG wire
 /// protocol through `tokio-postgres`, no libpq.
 ///
 /// # Errors
@@ -61,8 +63,8 @@ use diesel_async::TransactionManager as _;
 type PgAsyncTxn =
     <diesel_async::AsyncPgConnection as diesel_async::AsyncConnection>::TransactionManager;
 
-/// One open async cursor: the pooled connection it pins, the position its
-/// snapshot sits at, and rows fetched but not yet delivered.
+/// One open async cursor: the pooled connection it pins, the fence of the
+/// snapshot its pages report, and rows fetched but not yet delivered.
 ///
 /// The leftover buffer keeps the byte budget exact, since `FETCH` cannot be
 /// undone: a batch that overshoots carries into the next page rather than
@@ -114,7 +116,7 @@ struct PgAsyncCursor {
         diesel_async::AsyncPgConnection,
     >,
     name: alloc::string::String,
-    checkpoint: Option<crate::PgCommitPosition>,
+    fence: Option<crate::PgSnapshotFence>,
     columns: alloc::vec::Vec<alloc::string::String>,
     leftover: alloc::collections::VecDeque<alloc::vec::Vec<Value<crate::backend::Postgres>>>,
 }
@@ -202,7 +204,7 @@ impl<S> PgAsyncDieselConnector<S> {
                         rows,
                         more: true,
                     },
-                    checkpoint: held.checkpoint,
+                    fence: held.fence.clone(),
                 });
             }
             // `FETCH FORWARD` is a cursor command with no typed DSL equivalent.
@@ -231,39 +233,35 @@ impl<S> PgAsyncDieselConnector<S> {
                         rows,
                         more: false,
                     },
-                    checkpoint: held.checkpoint,
+                    fence: held.fence.clone(),
                 });
             }
         }
     }
 }
 
-/// Read the current WAL LSN before opening the snapshot transaction.
-///
-/// `pg_current_wal_lsn()` is a Postgres-specific function with no typed DSL
-/// equivalent, so `sql_query` is required here.
+/// The fence of the snapshot the current repeatable-read transaction took.
 #[cfg(feature = "executor-diesel-async-postgres")]
-async fn read_current_lsn_async(
+async fn read_fence(
     conn: &mut diesel_async::AsyncPgConnection,
-) -> diesel::QueryResult<Option<crate::PgCommitPosition>> {
-    let row: PgLsnRow = sql_query("SELECT pg_current_wal_lsn()::text AS lsn")
-        .get_result(conn)
-        .await?;
-    Ok(crate::PgLsn::parse(&row.lsn).map(crate::PgCommitPosition::before_commit))
+) -> diesel::QueryResult<crate::PgSnapshotFence> {
+    sql_query(PgSnapshotFenceRow::SQL)
+        .get_result::<PgSnapshotFenceRow>(conn)
+        .await?
+        .into_fence()
 }
 
-/// Put the open transaction on the read snapshot, then run `setup`.
-///
-/// The async peer of the prelude
-/// [`read_at_lsn`](crate::reexec::connector::PgDieselConnector) runs, sharing
-/// its [`PG_READ_SNAPSHOT`] statement.
+/// Put the open transaction on the read snapshot, read its fence, then run
+/// `setup`.
 #[cfg(feature = "executor-diesel-async-postgres")]
 async fn begin_read_snapshot(
     conn: &mut diesel_async::AsyncPgConnection,
     setup: &[alloc::string::String],
-) -> diesel::QueryResult<()> {
+) -> diesel::QueryResult<crate::PgSnapshotFence> {
     sql_query(PG_READ_SNAPSHOT).execute(&mut *conn).await?;
-    run_setup_statements_async(conn, setup).await
+    let fence = read_fence(conn).await?;
+    run_setup_statements_async(conn, setup).await?;
+    Ok(fence)
 }
 
 #[cfg(feature = "executor-diesel-async-postgres")]
@@ -278,25 +276,22 @@ impl<S: SessionSetup + Send + Sync> AsyncConnector for PgAsyncDieselConnector<S>
         query: &ReadQuery<'_, Self::Backend>,
         kind: ScalarFamily,
         auth: &S,
-    ) -> impl Future<Output = Result<(Value<Self::Backend>, Option<Self::Checkpoint>), Self::Error>> + Send
-    {
+    ) -> impl Future<
+        Output = Result<(Value<Self::Backend>, Option<crate::PgSnapshotFence>), Self::Error>,
+    > + Send {
         let query = query.clone().into_owned();
         async move {
             let mut pooled = self.pool.get().await.map_err(DieselAsyncError::Pool)?;
             let conn: &mut diesel_async::AsyncPgConnection = &mut pooled;
-            // The position is read before the snapshot exists, because
-            // `pg_current_wal_lsn()` is not snapshot-bound: a position taken
-            // after the query can sit ahead of the snapshot, and a replay
-            // starting there skips a transaction that committed before it yet
-            // was invisible to the snapshot. Behind is safe, ahead loses data.
-            let lsn = read_current_lsn_async(conn)
-                .await
-                .map_err(DieselAsyncError::Diesel)?;
-            conn.transaction::<(Value<Self::Backend>, Option<crate::PgCommitPosition>), diesel::result::Error, _>(
+            conn.transaction::<
+                (Value<Self::Backend>, Option<crate::PgSnapshotFence>),
+                diesel::result::Error,
+                _,
+            >(
                 async move |c| {
-                    begin_read_snapshot(c, auth.setup_statements()).await?;
+                    let fence = begin_read_snapshot(c, auth.setup_statements()).await?;
                     let value = load_scalar_postgres_async(c, &query, kind).await?;
-                    Ok((value, lsn))
+                    Ok((value, Some(fence)))
                 },
             )
             .await
@@ -315,21 +310,17 @@ impl<S: SessionSetup + Send + Sync> AsyncConnector for PgAsyncDieselConnector<S>
         async move {
             let mut pooled = self.pool.get().await.map_err(DieselAsyncError::Pool)?;
             let conn: &mut diesel_async::AsyncPgConnection = &mut pooled;
-            // The position is read before the snapshot exists, because
-            // `pg_current_wal_lsn()` is not snapshot-bound: a position taken
-            // after the query can sit ahead of the snapshot, and a replay
-            // starting there skips a transaction that committed before it yet
-            // was invisible to the snapshot. Behind is safe, ahead loses data.
-            let lsn = read_current_lsn_async(conn)
-                .await
-                .map_err(DieselAsyncError::Diesel)?;
-            conn.transaction::<Snapshot<RowPage<Self::Backend>, crate::PgCommitPosition>, diesel::result::Error, _>(
+            conn.transaction::<
+                Snapshot<RowPage<Self::Backend>, crate::PgCommitPosition>,
+                diesel::result::Error,
+                _,
+            >(
                 async move |c| {
-                    begin_read_snapshot(c, auth.setup_statements()).await?;
+                    let fence = begin_read_snapshot(c, auth.setup_statements()).await?;
                     let value = load_page_postgres_async(c, &query, max_bytes).await?;
                     Ok(Snapshot {
                         value,
-                        checkpoint: lsn,
+                        fence: Some(fence),
                     })
                 },
             )
@@ -359,13 +350,6 @@ impl<S: SessionSetup + Send + Sync> AsyncConnector for PgAsyncDieselConnector<S>
             let name = alloc::format!("subql_cursor_{}", id.0);
 
             let opened = async {
-                // The position is read BEFORE the snapshot exists, on purpose.
-                // A caller replays the change stream from it, so it must sit at
-                // or behind the snapshot: behind re-delivers a few changes the
-                // snapshot already holds, which keyed application absorbs,
-                // while ahead silently drops a transaction that committed after
-                // the position and was invisible to the snapshot.
-                let lsn = read_current_lsn_async(&mut conn).await?;
                 // Through diesel's transaction manager, never a raw `BEGIN`.
                 // The manager's depth counter is what tells the pool this
                 // connection is inside a transaction, and a cancelled read
@@ -374,7 +358,9 @@ impl<S: SessionSetup + Send + Sync> AsyncConnector for PgAsyncDieselConnector<S>
                 // connection is clean, and the next caller inherits an open
                 // transaction: measured to swallow that caller's write whole.
                 PgAsyncTxn::begin_transaction(&mut *conn).await?;
-                begin_read_snapshot(&mut conn, auth.setup_statements()).await?;
+                // The snapshot is fixed by its first statement, so the fence
+                // is read here to report it.
+                let fence = begin_read_snapshot(&mut conn, auth.setup_statements()).await?;
                 let declaration = ReadQuery::owned(
                     alloc::format!("DECLARE {name} NO SCROLL CURSOR FOR {}", query.sql()),
                     query.binds().to_vec(),
@@ -382,12 +368,12 @@ impl<S: SessionSetup + Send + Sync> AsyncConnector for PgAsyncDieselConnector<S>
                 boxed_postgres_read_query_owned(&declaration)?
                     .execute(&mut *conn)
                     .await?;
-                Ok::<_, diesel::result::Error>(lsn)
+                Ok::<_, diesel::result::Error>(fence)
             }
             .await;
 
-            let checkpoint = match opened {
-                Ok(lsn) => lsn,
+            let fence = match opened {
+                Ok(fence) => Some(fence),
                 Err(e) => {
                     // Leave no transaction behind on a failed open. Dropping
                     // `conn` here would also do it, by discarding the
@@ -402,7 +388,7 @@ impl<S: SessionSetup + Send + Sync> AsyncConnector for PgAsyncDieselConnector<S>
                 CursorSlot::Idle(alloc::boxed::Box::new(PgAsyncCursor {
                     conn,
                     name,
-                    checkpoint,
+                    fence,
                     columns: alloc::vec::Vec::new(),
                     leftover: alloc::collections::VecDeque::new(),
                 })),
@@ -526,7 +512,7 @@ impl<S: SessionSetup + Send + Sync> AsyncConnector for PgAsyncDieselConnector<S>
         auth: &S,
     ) -> impl Future<
         Output = Result<
-            (Vec<Value<Self::Backend>>, Option<Self::Checkpoint>),
+            (Vec<Value<Self::Backend>>, Option<crate::PgSnapshotFence>),
             ScalarRowError<Self::Error>,
         >,
     > + Send {
@@ -539,17 +525,15 @@ impl<S: SessionSetup + Send + Sync> AsyncConnector for PgAsyncDieselConnector<S>
                 .await
                 .map_err(|e| ScalarRowError::Connector(DieselAsyncError::Pool(e)))?;
             let conn: &mut diesel_async::AsyncPgConnection = &mut pooled;
-            // Position before snapshot, for the reason spelled out on
-            // `execute_scalar`: a position taken after can sit ahead of the
-            // snapshot and a replay from there loses data.
-            let lsn = read_current_lsn_async(conn)
-                .await
-                .map_err(|e| ScalarRowError::Connector(DieselAsyncError::Diesel(e)))?;
-            conn.transaction::<(Vec<Value<Self::Backend>>, Option<crate::PgCommitPosition>), diesel::result::Error, _>(
+            conn.transaction::<
+                (Vec<Value<Self::Backend>>, Option<crate::PgSnapshotFence>),
+                diesel::result::Error,
+                _,
+            >(
                 async move |c| {
-                    begin_read_snapshot(c, auth.setup_statements()).await?;
+                    let fence = begin_read_snapshot(c, auth.setup_statements()).await?;
                     let values = load_scalar_row_postgres_async(c, &query, &kinds).await?;
-                    Ok((values, lsn))
+                    Ok((values, Some(fence)))
                 },
             )
             .await

@@ -159,7 +159,7 @@ where
         registered.subscription_id,
         subql::AggregateSeedInstall {
             rows: vec![components],
-            read_at: Some(PgLsn(5)),
+            fence: Some(PgLsn(5)),
         },
     )
     .expect("the seed lands");

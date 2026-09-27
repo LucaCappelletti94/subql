@@ -29,6 +29,8 @@ use crate::backend::{Postgres, RowKind, Value};
 use crate::catalog_helpers;
 use crate::types::{ColumnId, EventKind, TableId};
 use crate::wal::wire_event::{wire_cdc_event, WireEvent};
+#[cfg(any(feature = "pg-streaming", feature = "pg-sqlite-emu"))]
+use crate::PgXid;
 use crate::{PgCommitPosition, PgLsn};
 
 /// A pgoutput row change and where it falls in commit order.
@@ -177,7 +179,7 @@ impl ReleaseQueue {
 /// without either.
 #[cfg(any(feature = "pg-streaming", feature = "pg-sqlite-emu"))]
 pub struct PgOutputOrder {
-    order: TransactionOrder<PgLsn>,
+    order: TransactionOrder<(PgLsn, PgXid)>,
 }
 
 #[cfg(any(feature = "pg-streaming", feature = "pg-sqlite-emu"))]
@@ -197,10 +199,10 @@ impl PgOutputOrder {
     ) -> Result<Option<PgCommit>, TransactionOrderError> {
         match &change.event_type {
             EventType::Insert { .. } | EventType::Update { .. } | EventType::Delete { .. } => {
-                let (commit, ordinal) = self.order.next_row()?;
+                let ((commit, xid), ordinal) = self.order.next_row()?;
                 rows.extend([PgChangeEvent::new(
                     change,
-                    PgCommitPosition::new(commit, ordinal),
+                    PgCommitPosition::new(commit, xid, ordinal),
                 )]);
             }
             EventType::Truncate {
@@ -209,7 +211,7 @@ impl PgOutputOrder {
                 restart_identity,
             } => {
                 for table in tables {
-                    let (commit, ordinal) = self.order.next_row()?;
+                    let ((commit, xid), ordinal) = self.order.next_row()?;
                     let single = ChangeEvent {
                         event_type: EventType::Truncate {
                             tables: vec![Arc::clone(table)],
@@ -221,12 +223,17 @@ impl PgOutputOrder {
                     };
                     rows.extend([PgChangeEvent::new(
                         single,
-                        PgCommitPosition::new(commit, ordinal),
+                        PgCommitPosition::new(commit, xid, ordinal),
                     )]);
                 }
             }
-            EventType::Begin { final_lsn, .. } => {
-                self.order.begin(PgLsn(final_lsn.value()))?;
+            EventType::Begin {
+                transaction_id,
+                final_lsn,
+                ..
+            } => {
+                self.order
+                    .begin((PgLsn(final_lsn.value()), PgXid(*transaction_id)))?;
             }
             EventType::Commit {
                 commit_lsn,
@@ -234,12 +241,19 @@ impl PgOutputOrder {
                 ..
             } => {
                 let (began, placed) = self.order.commit()?;
+                let (commit, xid) = began;
                 let committed = PgLsn(commit_lsn.value());
-                if committed != began {
-                    return Err(TransactionOrderError::CommitMismatch { began, committed });
+                if committed != commit {
+                    return Err(TransactionOrderError::CommitMismatch {
+                        began: commit,
+                        committed,
+                    });
                 }
                 return Ok((placed > 0).then(|| {
-                    PgCommit::new(PgCommitPosition::at_commit(began), PgLsn(end_lsn.value()))
+                    PgCommit::new(
+                        PgCommitPosition::at_commit(commit, xid),
+                        PgLsn(end_lsn.value()),
+                    )
                 }));
             }
             EventType::Relation { .. }
@@ -405,7 +419,7 @@ impl WireEvent for PgChangeEvent {
 mod tests {
     use super::*;
     use crate::backend::CdcEvent;
-    use crate::PgLsn;
+    use crate::{PgLsn, PgXid};
     use pg_walstream::{Lsn, ReplicaIdentity};
     use sql_traits::structs::ParserDB;
     use sqlparser::dialect::PostgreSqlDialect;
@@ -421,9 +435,9 @@ mod tests {
         RowData::from_pairs(pairs)
     }
 
-    /// `change` as the first row of a transaction committing at `0x10`.
+    /// `change` as the first row of transaction 3, committing at `0x10`.
     fn at(change: ChangeEvent) -> PgChangeEvent {
-        PgChangeEvent::new(change, PgCommitPosition::new(PgLsn(0x10), 1))
+        PgChangeEvent::new(change, PgCommitPosition::new(PgLsn(0x10), PgXid(3), 1))
     }
 
     #[test]
@@ -452,7 +466,7 @@ mod tests {
         );
         assert_eq!(
             ev.checkpoint(),
-            Some(PgCommitPosition::new(PgLsn(0x10), 1)),
+            Some(PgCommitPosition::new(PgLsn(0x10), PgXid(3), 1)),
             "the checkpoint is the commit position, whatever the record position"
         );
         assert_eq!(ev.value_at(&db, RowKind::New, 0).unwrap(), Value::Int(7));
@@ -585,14 +599,14 @@ mod tests {
     mod order {
         use super::super::{PgChangeEvent, PgCommit, PgOutputOrder};
         use crate::wal::TransactionOrderError;
-        use crate::{PgCommitPosition, PgLsn};
+        use crate::{PgCommitPosition, PgLsn, PgXid};
         use alloc::sync::Arc;
         use bytes::Bytes;
         use pg_walstream::{ChangeEvent, ColumnValue, Lsn, RowData};
 
-        fn begin(commit: u64) -> ChangeEvent {
+        fn begin(xid: u32, commit: u64) -> ChangeEvent {
             ChangeEvent::begin(
-                1,
+                xid,
                 Lsn::new(commit),
                 chrono::DateTime::UNIX_EPOCH,
                 Lsn::new(0),
@@ -630,18 +644,18 @@ mod tests {
             rows.iter().map(PgChangeEvent::position).collect()
         }
 
-        /// T1 writes at 1000 and commits at 1500, and T2 writes at 1200 and
-        /// commits at 1300, so T2 arrives first.
+        /// T1, xid 3, writes at 1000 and commits at 1500, and T2, xid 4,
+        /// writes at 1200 and commits at 1300, so T2 arrives first.
         #[test]
         fn an_older_transaction_committing_later_orders_later() {
             let mut order = PgOutputOrder::new();
             let placed = positions(
                 &mut order,
                 vec![
-                    begin(1300),
+                    begin(4, 1300),
                     insert(1200),
                     commit(1300, 1310),
-                    begin(1500),
+                    begin(3, 1500),
                     insert(1000),
                     insert(1100),
                     commit(1500, 1510),
@@ -650,9 +664,9 @@ mod tests {
             assert_eq!(
                 placed,
                 vec![
-                    PgCommitPosition::new(PgLsn(1300), 1),
-                    PgCommitPosition::new(PgLsn(1500), 1),
-                    PgCommitPosition::new(PgLsn(1500), 2),
+                    PgCommitPosition::new(PgLsn(1300), PgXid(4), 1),
+                    PgCommitPosition::new(PgLsn(1500), PgXid(3), 1),
+                    PgCommitPosition::new(PgLsn(1500), PgXid(3), 2),
                 ]
             );
         }
@@ -661,7 +675,7 @@ mod tests {
         fn a_commit_reports_its_position_after_its_rows_and_where_it_ends() {
             let mut order = PgOutputOrder::new();
             let mut rows = Vec::new();
-            for change in [begin(1500), insert(1000), insert(1100)] {
+            for change in [begin(3, 1500), insert(1000), insert(1100)] {
                 assert_eq!(order.apply(change, &mut rows), Ok(None));
             }
             let commit = order
@@ -670,7 +684,10 @@ mod tests {
                 .expect("a transaction with rows reports its commit");
             assert_eq!(
                 commit,
-                PgCommit::new(PgCommitPosition::at_commit(PgLsn(1500)), PgLsn(1510))
+                PgCommit::new(
+                    PgCommitPosition::at_commit(PgLsn(1500), PgXid(3)),
+                    PgLsn(1510)
+                )
             );
             assert!(rows.iter().all(|row| row.position() < commit.position()));
         }
@@ -679,7 +696,7 @@ mod tests {
         fn a_transaction_without_rows_reports_no_commit() {
             let mut order = PgOutputOrder::new();
             let mut rows = Vec::new();
-            order.apply(begin(1600), &mut rows).unwrap();
+            order.apply(begin(5, 1600), &mut rows).unwrap();
             assert_eq!(order.apply(commit(1600, 1610), &mut rows), Ok(None));
         }
 
@@ -688,7 +705,7 @@ mod tests {
             let mut order = PgOutputOrder::new();
             let mut rows = Vec::new();
             for change in [
-                begin(1500),
+                begin(5, 1500),
                 ChangeEvent::truncate(
                     vec!["public.orders".into(), "public.items".into()],
                     true,
@@ -732,7 +749,7 @@ mod tests {
                 &mut order,
                 vec![
                     message(),
-                    begin(1500),
+                    begin(6, 1500),
                     origin(),
                     insert(1000),
                     message(),
@@ -740,7 +757,10 @@ mod tests {
                     origin(),
                 ],
             );
-            assert_eq!(placed, vec![PgCommitPosition::new(PgLsn(1500), 1)]);
+            assert_eq!(
+                placed,
+                vec![PgCommitPosition::new(PgLsn(1500), PgXid(6), 1)]
+            );
         }
 
         #[test]
@@ -755,13 +775,13 @@ mod tests {
                 Err(TransactionOrderError::CommitOutsideTransaction)
             );
             let mut nested = PgOutputOrder::new();
-            nested.apply(begin(1500), &mut rows).unwrap();
+            nested.apply(begin(7, 1500), &mut rows).unwrap();
             assert_eq!(
-                nested.apply(begin(1600), &mut rows),
+                nested.apply(begin(8, 1600), &mut rows),
                 Err(TransactionOrderError::NestedBegin)
             );
             let mut mismatched = PgOutputOrder::new();
-            mismatched.apply(begin(1500), &mut rows).unwrap();
+            mismatched.apply(begin(9, 1500), &mut rows).unwrap();
             assert_eq!(
                 mismatched.apply(commit(1600, 1610), &mut rows),
                 Err(TransactionOrderError::CommitMismatch {
@@ -800,12 +820,12 @@ mod tests {
     #[cfg(feature = "pg-streaming")]
     mod release {
         use super::super::{PgCommit, ReleaseQueue};
-        use crate::{PgCommitPosition, PgLsn};
+        use crate::{PgCommitPosition, PgLsn, PgXid};
 
-        /// The commit of a transaction committing at `commit`, ending ten past it.
-        fn commit(commit: u64) -> PgCommit {
+        /// The commit of transaction `xid` committing at `commit`, ending ten past it.
+        fn commit(xid: u32, commit: u64) -> PgCommit {
             PgCommit::new(
-                PgCommitPosition::at_commit(PgLsn(commit)),
+                PgCommitPosition::at_commit(PgLsn(commit), PgXid(xid)),
                 PgLsn(commit + 10),
             )
         }
@@ -813,48 +833,48 @@ mod tests {
         #[test]
         fn acknowledging_every_row_without_the_commit_releases_nothing() {
             let mut queue = ReleaseQueue::new();
-            queue.committed(commit(1300));
-            queue.acknowledge(PgCommitPosition::new(PgLsn(1300), 2));
+            queue.committed(commit(3, 1300));
+            queue.acknowledge(PgCommitPosition::new(PgLsn(1300), PgXid(3), 2));
             assert_eq!(queue.release(), None);
-            queue.acknowledge(PgCommitPosition::at_commit(PgLsn(1300)));
+            queue.acknowledge(PgCommitPosition::at_commit(PgLsn(1300), PgXid(3)));
             assert_eq!(queue.release(), Some(PgLsn(1310)));
         }
 
         #[test]
         fn a_commit_is_released_with_every_commit_before_it_and_none_after() {
             let mut queue = ReleaseQueue::new();
-            queue.committed(commit(1300));
-            queue.committed(commit(1500));
-            queue.committed(commit(1700));
-            queue.acknowledge(PgCommitPosition::new(PgLsn(1700), 1));
+            queue.committed(commit(3, 1300));
+            queue.committed(commit(4, 1500));
+            queue.committed(commit(5, 1700));
+            queue.acknowledge(PgCommitPosition::new(PgLsn(1700), PgXid(5), 1));
             assert_eq!(queue.release(), Some(PgLsn(1510)), "T1 and T2 are whole");
             assert_eq!(queue.release(), None, "T3's commit is unacknowledged");
-            queue.acknowledge(PgCommitPosition::at_commit(PgLsn(1700)));
+            queue.acknowledge(PgCommitPosition::at_commit(PgLsn(1700), PgXid(5)));
             assert_eq!(queue.release(), Some(PgLsn(1710)));
         }
 
         #[test]
         fn an_acknowledgement_ahead_of_the_commit_releases_it_when_it_arrives() {
             let mut queue = ReleaseQueue::new();
-            queue.acknowledge(PgCommitPosition::at_commit(PgLsn(1500)));
+            queue.acknowledge(PgCommitPosition::at_commit(PgLsn(1500), PgXid(4)));
             assert_eq!(queue.release(), None);
-            queue.committed(commit(1500));
+            queue.committed(commit(4, 1500));
             assert_eq!(queue.release(), Some(PgLsn(1510)));
         }
 
         #[test]
         fn an_older_acknowledgement_never_takes_the_position_back() {
             let mut queue = ReleaseQueue::new();
-            queue.acknowledge(PgCommitPosition::at_commit(PgLsn(1500)));
-            queue.acknowledge(PgCommitPosition::at_commit(PgLsn(1300)));
-            queue.committed(commit(1500));
+            queue.acknowledge(PgCommitPosition::at_commit(PgLsn(1500), PgXid(4)));
+            queue.acknowledge(PgCommitPosition::at_commit(PgLsn(1300), PgXid(3)));
+            queue.committed(commit(4, 1500));
             assert_eq!(queue.release(), Some(PgLsn(1510)));
         }
 
         #[test]
         fn nothing_is_released_before_any_acknowledgement() {
             let mut queue = ReleaseQueue::new();
-            queue.committed(commit(1300));
+            queue.committed(commit(3, 1300));
             assert_eq!(queue.release(), None);
         }
     }

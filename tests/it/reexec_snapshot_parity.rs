@@ -56,7 +56,13 @@ impl Connector for Refusing {
         _query: &ReadQuery<'_, Postgres>,
         _kind: ScalarFamily,
         _auth: &(),
-    ) -> Result<(Value<Postgres>, Option<NoCheckpoint>), RefusingError> {
+    ) -> Result<
+        (
+            Value<Postgres>,
+            Option<<NoCheckpoint as subql::Checkpoint>::Fence>,
+        ),
+        RefusingError,
+    > {
         Err(RefusingError::ReadIssued)
     }
 
@@ -82,8 +88,15 @@ impl AsyncConnector for Refusing {
         _query: &ReadQuery<'_, Postgres>,
         _kind: ScalarFamily,
         _auth: &(),
-    ) -> impl Future<Output = Result<(Value<Postgres>, Option<NoCheckpoint>), RefusingError>> + Send
-    {
+    ) -> impl Future<
+        Output = Result<
+            (
+                Value<Postgres>,
+                Option<<NoCheckpoint as subql::Checkpoint>::Fence>,
+            ),
+            RefusingError,
+        >,
+    > + Send {
         async move { Err(RefusingError::ReadIssued) }
     }
 

@@ -100,7 +100,8 @@ fn scaffold_registers_both_subscription_kinds() {
                 subscription_id,
                 subql::ScalarInstall {
                     value: Value::Float(5.0),
-                    checkpoint: None::<subql::NoCheckpoint>
+                    checkpoint: None,
+                    fence: None,
                 }
             )
             .is_ok());
@@ -170,7 +171,8 @@ fn engine_and_captured_paths_coexist_through_pg_connector() {
         captured_qid,
         subql::ScalarInstall {
             value: Value::Float(5.0),
-            checkpoint: None::<subql::NoCheckpoint>
+            checkpoint: None,
+            fence: None,
         }
     )
     .is_ok());
@@ -274,7 +276,8 @@ fn update_displacing_extreme_resolves_via_pg_connector() {
         captured_qid,
         subql::ScalarInstall {
             value: Value::Float(5.0),
-            checkpoint: None::<subql::NoCheckpoint>
+            checkpoint: None,
+            fence: None,
         }
     )
     .is_ok());
@@ -298,14 +301,14 @@ fn update_displacing_extreme_resolves_via_pg_connector() {
     assert_eq!(engine.pending_read_count(), 0, "no pending reads");
 }
 
-/// Test 3 - PgDieselConnector::snapshot returns a real commit position.
+/// Test 3 - PgDieselConnector::snapshot returns a real read fence.
 ///
 /// Seeds the table with `(1, 5.0), (2, 9.0)`, registers `MIN(price)`, then
 /// calls `engine.snapshot(qid)` BEFORE any CDC events. The result should be
-/// `SnapshotResult::Scalar(Value::Float(5.0), Some(position))` where the
-/// LSN is non-zero (PG always has a position). Subsequent dispatches then
-/// see 5.0 as the current MIN without any further connector calls because
-/// `snapshot` already installed the value.
+/// `SnapshotResult::Scalar(Value::Float(5.0), Some(fence))` where the
+/// fence's insert LSN is non-zero (PG always has one). Subsequent
+/// dispatches then see 5.0 as the current MIN without any further connector
+/// calls because `snapshot` already installed the value.
 #[test]
 #[ignore = "requires Docker; run with --ignored"]
 fn snapshot_reads_value_and_lsn_from_pg() {
@@ -321,21 +324,21 @@ fn snapshot_reads_value_and_lsn_from_pg() {
     let captured_qid =
         common::reexec::register_captured(&mut engine, 1u64, "SELECT MIN(price) FROM orders");
 
-    // Snapshot reads value + LSN inside a single transaction.
+    // Snapshot reads the value and the fence inside one transaction.
     let snap = engine
         .snapshot(captured_qid)
         .expect("snapshot")
         .expect("subscription_id exists");
-    let (value, checkpoint) = match snap {
-        SnapshotResult::Scalar(value, checkpoint) => (value, checkpoint),
+    let (value, fence) = match snap {
+        SnapshotResult::Scalar(value, fence) => (value, fence),
         other => panic!("unexpected snapshot variant: {other:?}"),
     };
     assert_eq!(value, Value::Float(5.0), "MIN(price) snapshot value");
 
-    let lsn = checkpoint.expect("PgDieselConnector must report a checkpoint");
+    let fence = fence.expect("PgDieselConnector must report a fence");
     assert!(
-        lsn.commit_lsn() > subql::PgLsn(0),
-        "pg_current_wal_lsn() should be non-zero on a live server, got {lsn:?}"
+        fence.insert_lsn() > subql::PgLsn(0),
+        "the fence's insert LSN should be non-zero on a live server, got {fence:?}"
     );
 }
 
@@ -463,21 +466,20 @@ fn a_key_column_needing_quotes_is_still_readable() {
     );
 }
 
-/// Every read reports a position taken before its own snapshot opened.
+/// Every read reports the fence of its own snapshot.
 ///
-/// The contract a caller replays from: a position at or behind the snapshot
-/// re-delivers changes the snapshot already holds, which keyed application
-/// absorbs, while a position ahead of it silently drops a transaction the
-/// snapshot never saw. An advisory lock parks each read inside its own
-/// snapshot, a commit lands while it waits, and the returned position has to
-/// sit behind that commit. The row count is asserted too, because a read that
-/// somehow saw the commit would make the position comparison meaningless.
+/// The contract a caller judges changes against: a change the snapshot
+/// holds is dropped, one it missed is applied. An advisory lock parks each
+/// read inside its own snapshot, a commit lands while it waits, and the
+/// fence read inside that parked transaction has to sit behind that
+/// commit. The row count is asserted too, because a read that somehow saw
+/// the commit would make the LSN comparison meaningless.
 ///
 /// A connector each, because this one owns its connection outright and a
 /// parked read holds it for the length of the park.
 #[test]
 #[ignore = "requires Docker; run with --ignored"]
-fn every_read_reports_a_position_taken_before_its_snapshot() {
+fn every_read_reports_the_fence_of_its_own_snapshot() {
     common::assert_docker_available();
     let db = common::pg_database();
     let slot = db.slot(SLOT);
@@ -486,7 +488,7 @@ fn every_read_reports_a_position_taken_before_its_snapshot() {
 
     let sql = format!("SELECT count(*)::bigint AS v FROM orders {}", common::PARK);
     let url = db.url();
-    let ((value, position), after_commit) =
+    let ((value, fence), after_commit) =
         common::park_a_read(&db, &common::pg::orders_insert(2), move || {
             PgDieselConnector::new(PgConnection::establish(&url).expect("pg connection"))
                 .execute_scalar(
@@ -502,11 +504,8 @@ fn every_read_reports_a_position_taken_before_its_snapshot() {
         "the scalar read's snapshot holds one row"
     );
     assert!(
-        position
-            .expect("a PG connector reports a position")
-            .commit_lsn()
-            < after_commit,
-        "the scalar read's position must sit behind the commit at {after_commit:?}"
+        fence.expect("a PG connector reports a fence").insert_lsn() < after_commit,
+        "the scalar read's fence must sit behind the commit at {after_commit:?}"
     );
 
     let sql = format!("SELECT id FROM orders {} ORDER BY id", common::PARK);
@@ -522,16 +521,16 @@ fn every_read_reports_a_position_taken_before_its_snapshot() {
         "the page's snapshot holds two rows"
     );
     assert!(
-        page.checkpoint
-            .expect("a PG connector reports a position")
-            .commit_lsn()
+        page.fence
+            .expect("a PG connector reports a fence")
+            .insert_lsn()
             < after_commit,
-        "the page read's position must sit behind the commit at {after_commit:?}"
+        "the page read's fence must sit behind the commit at {after_commit:?}"
     );
 
     let sql = format!("SELECT count(*)::bigint AS c0 FROM orders {}", common::PARK);
     let url = db.url();
-    let ((values, position), after_commit) =
+    let ((values, fence), after_commit) =
         common::park_a_read(&db, &common::pg::orders_insert(4), move || {
             PgDieselConnector::new(PgConnection::establish(&url).expect("pg connection"))
                 .execute_scalar_row(
@@ -547,11 +546,8 @@ fn every_read_reports_a_position_taken_before_its_snapshot() {
         "the seed read's snapshot holds three rows"
     );
     assert!(
-        position
-            .expect("a PG connector reports a position")
-            .commit_lsn()
-            < after_commit,
-        "the seed read's position must sit behind the commit at {after_commit:?}"
+        fence.expect("a PG connector reports a fence").insert_lsn() < after_commit,
+        "the seed read's fence must sit behind the commit at {after_commit:?}"
     );
 }
 

@@ -7,22 +7,21 @@ use super::{
 };
 use alloc::string::String;
 
-impl<E, I, DB, C> crate::Install<crate::ScalarInstall<E::Backend, C>>
+impl<E, I, DB> crate::Install<crate::ScalarInstall<E::Backend, E::Checkpoint>>
     for SubscriptionEngine<E, I, DB>
 where
     E: CdcEvent,
     E::Backend: SqlLiteralParse,
     I: IdTypes,
-    C: crate::Checkpoint,
     DB: DatabaseLike + 'static,
 {
-    type Output = crate::reexec::ScalarUpdate<I, E::Backend, C>;
+    type Output = crate::reexec::ScalarInstalled<I, E::Backend, E::Checkpoint>;
     type Error = crate::InstallError;
 
     fn install(
         &mut self,
         subscription_id: SubscriptionId,
-        input: crate::ScalarInstall<E::Backend, C>,
+        input: crate::ScalarInstall<E::Backend, E::Checkpoint>,
     ) -> Result<Self::Output, Self::Error> {
         let entry = self
             .reexec
@@ -34,12 +33,23 @@ where
                 input: "ScalarInstall",
             });
         }
-        entry.runtime.install(input.value.clone());
-        Ok(crate::reexec::ScalarUpdate {
-            subscription_id,
-            consumer_id: entry.consumer_id,
-            value: input.value,
-            checkpoint: input.checkpoint,
+        Ok(match entry.runtime.install(input.value, input.fence) {
+            crate::reexec::maintain::ScalarInstallOutcome::Value(value) => {
+                crate::reexec::ScalarInstalled::Value(crate::reexec::ScalarUpdate {
+                    subscription_id,
+                    consumer_id: entry.consumer_id,
+                    value,
+                    checkpoint: input.checkpoint,
+                })
+            }
+            crate::reexec::maintain::ScalarInstallOutcome::ReadAgain => {
+                crate::reexec::ScalarInstalled::ReadAgain(crate::reexec::ReExecutionTrigger {
+                    subscription_id,
+                    consumer_id: entry.consumer_id,
+                    read: crate::reexec::ReExecutionRead::Subscription,
+                    checkpoint: input.checkpoint,
+                })
+            }
         })
     }
 }
@@ -76,7 +86,7 @@ where
                 query.install_seed(
                     subscription_id,
                     &input.rows,
-                    input.read_at.as_ref(),
+                    input.fence,
                     pending_cap,
                     group_limit,
                 ),
@@ -90,7 +100,7 @@ where
                     super::GroupedStopTier::GroupedScalar,
                     error,
                     group_limit,
-                    input.read_at.as_ref(),
+                    None,
                     Some(table_id),
                 );
             }
@@ -107,7 +117,7 @@ where
                 subscription_id,
                 super::GroupedStopTier::GroupedScalar,
                 reason,
-                input.read_at.as_ref(),
+                None,
             );
         }
         Ok(crate::AggregateMaintenanceOutput {
@@ -169,11 +179,18 @@ where
             };
             (
                 entry.consumer_id,
-                query.install_group(subscription_id, &input.group, &input.row, group_limit),
+                query.install_group(
+                    subscription_id,
+                    &input.group,
+                    &input.row,
+                    input.fence,
+                    input.checkpoint.as_ref(),
+                    group_limit,
+                ),
             )
         };
-        let change = match installed {
-            Ok(change) => change,
+        let grouped = match installed {
+            Ok(grouped) => grouped,
             Err(crate::AggregateInstallError::GroupLimit { .. }) => {
                 return self.stopped_for_reason(
                     subscription_id,
@@ -185,16 +202,30 @@ where
             Err(error) => return Err(error),
         };
         Ok(crate::AggregateMaintenanceOutput {
-            updates: change
+            updates: grouped
+                .changes
+                .into_iter()
                 .map(|(group, change)| crate::AggregateValueUpdate {
                     subscription: subscription_id,
                     consumer,
                     group: Some(group),
                     change,
                 })
-                .into_iter()
                 .collect(),
-            triggers: Vec::new(),
+            triggers: grouped
+                .reads
+                .into_iter()
+                .map(|read| crate::reexec::ReExecutionTrigger {
+                    subscription_id,
+                    consumer_id: consumer,
+                    read: crate::reexec::ReExecutionRead::GroupedScalar {
+                        group: read.group,
+                        query: read.query,
+                        column_kinds: read.column_kinds,
+                    },
+                    checkpoint: read.checkpoint,
+                })
+                .collect(),
             transitions: Vec::new(),
             evaluation_failures: Vec::new(),
         })
@@ -313,7 +344,6 @@ where
         input: crate::AggregateSeedInstall<E::Backend, E::Checkpoint>,
     ) -> Result<Self::Output, Self::Error> {
         if self.grouped_aggregates.contains_key(&subscription_id) {
-            let read_at = input.read_at.clone();
             let installed = {
                 let total = self
                     .grouped_aggregates
@@ -324,7 +354,7 @@ where
                     subscription_id,
                     total.group_columns(),
                     &input.rows,
-                    input.read_at.as_ref(),
+                    input.fence,
                     self.max_changes_during_aggregate_read,
                     self.max_groups_per_aggregate,
                 );
@@ -347,7 +377,7 @@ where
                         super::GroupedStopTier::Aggregate,
                         error,
                         self.max_groups_per_aggregate,
-                        read_at.as_ref(),
+                        None,
                         table_id,
                     );
                 }
@@ -374,7 +404,7 @@ where
             });
         }
         let value =
-            self.install_aggregate_rows_inner(subscription_id, &input.rows[0], input.read_at)?;
+            self.install_aggregate_rows_inner(subscription_id, &input.rows[0], input.fence)?;
         let consumer = self
             .aggregates
             .get(&subscription_id)

@@ -171,7 +171,8 @@ fn engine_and_captured_paths_coexist_through_pg_async_connector() {
             captured_qid,
             subql::ScalarInstall {
                 value: Value::Float(5.0),
-                checkpoint: None::<subql::NoCheckpoint>
+                checkpoint: None,
+                fence: None,
             }
         )
         .is_ok());
@@ -229,7 +230,7 @@ fn engine_and_captured_paths_coexist_through_pg_async_connector() {
     });
 }
 
-/// `PgAsyncDieselConnector` snapshot reads value plus a non-zero commit position
+/// `PgAsyncDieselConnector` snapshot reads the value plus the read's fence
 /// inside one transaction, mirroring the sync snapshot test.
 #[test]
 #[ignore = "requires Docker; run with --ignored"]
@@ -253,16 +254,16 @@ fn snapshot_reads_value_and_lsn_from_pg_async() {
             .await
             .expect("snapshot")
             .expect("subscription_id exists");
-        let (value, checkpoint) = match snap {
-            SnapshotResult::Scalar(value, checkpoint) => (value, checkpoint),
+        let (value, fence) = match snap {
+            SnapshotResult::Scalar(value, fence) => (value, fence),
             other => panic!("unexpected snapshot variant: {other:?}"),
         };
         assert_eq!(value, Value::Float(5.0), "MIN(price) snapshot value");
 
-        let lsn = checkpoint.expect("PgAsyncDieselConnector must report a checkpoint");
+        let fence = fence.expect("PgAsyncDieselConnector must report a fence");
         assert!(
-            lsn.commit_lsn() > subql::PgLsn(0),
-            "pg_current_wal_lsn() should be non-zero on a live server, got {lsn:?}"
+            fence.insert_lsn() > subql::PgLsn(0),
+            "the fence's insert LSN should be non-zero on a live server, got {fence:?}"
         );
     });
 }
@@ -1012,7 +1013,7 @@ fn a_captured_query_snapshots_its_rows_on_either_tier_async() {
                 SnapshotResult::Rows {
                     columns,
                     rows,
-                    checkpoint,
+                    fence,
                 } => {
                     assert_eq!(columns, vec!["id", "price", "quantity", "status"]);
                     let mut ids: Vec<i64> = rows
@@ -1028,9 +1029,9 @@ fn a_captured_query_snapshots_its_rows_on_either_tier_async() {
                         "the {tier} tier must snapshot every matching row and only those"
                     );
                     assert!(
-                        checkpoint.is_some(),
-                        "the {tier} tier's starting rows are anchored to a position in the \
-                         change stream, which is what lets a consumer replay from there"
+                        fence.is_some(),
+                        "the {tier} tier's starting rows are anchored to a fence, \
+                         which is what lets a consumer judge changes against the read"
                     );
                 }
                 other => panic!("the {tier} tier must snapshot as rows, got {other:?}"),
@@ -1062,21 +1063,20 @@ fn register_captured(engine: &mut Engine, consumer: u64, sql: &str, keyed: bool)
     }
 }
 
-/// Every read reports a position taken before its own snapshot opened.
+/// Every read reports the fence of its own snapshot.
 ///
-/// The contract a caller replays from: a position at or behind the snapshot
-/// re-delivers changes the snapshot already holds, which keyed application
-/// absorbs, while a position ahead of it silently drops a transaction the
-/// snapshot never saw. An advisory lock parks each read inside its own
-/// snapshot, a commit lands while it waits, and the returned position has to
-/// sit behind that commit. The row count is asserted too, because a read that
-/// somehow saw the commit would make the position comparison meaningless.
+/// The contract a caller judges changes against: a change the snapshot
+/// holds is dropped, one it missed is applied. An advisory lock parks each
+/// read inside its own snapshot, a commit lands while it waits, and the
+/// fence read inside that parked transaction has to sit behind that
+/// commit. The row count is asserted too, because a read that somehow saw
+/// the commit would make the LSN comparison meaningless.
 ///
 /// The park blocks a thread, so each read is driven from the runtime's handle
 /// off the test thread rather than by entering the runtime here.
 #[test]
 #[ignore = "requires Docker; run with --ignored"]
-fn every_read_reports_a_position_taken_before_its_snapshot() {
+fn every_read_reports_the_fence_of_its_own_snapshot() {
     common::assert_docker_available();
     let db = common::pg_database();
     let url = db.url();
@@ -1092,7 +1092,7 @@ fn every_read_reports_a_position_taken_before_its_snapshot() {
     let held = Arc::clone(&connector);
     let on = rt.handle().clone();
     let sql = format!("SELECT count(*)::bigint AS v FROM orders {}", common::PARK);
-    let ((value, position), after_commit) =
+    let ((value, fence), after_commit) =
         common::park_a_read(&db, &common::pg::orders_insert(2), move || {
             on.block_on(async move {
                 held.execute_scalar(
@@ -1110,11 +1110,8 @@ fn every_read_reports_a_position_taken_before_its_snapshot() {
         "the scalar read's snapshot holds one row"
     );
     assert!(
-        position
-            .expect("a PG connector reports a position")
-            .commit_lsn()
-            < after_commit,
-        "the scalar read's position must sit behind the commit at {after_commit:?}"
+        fence.expect("a PG connector reports a fence").insert_lsn() < after_commit,
+        "the scalar read's fence must sit behind the commit at {after_commit:?}"
     );
 
     let held = Arc::clone(&connector);
@@ -1133,17 +1130,17 @@ fn every_read_reports_a_position_taken_before_its_snapshot() {
         "the page's snapshot holds two rows"
     );
     assert!(
-        page.checkpoint
-            .expect("a PG connector reports a position")
-            .commit_lsn()
+        page.fence
+            .expect("a PG connector reports a fence")
+            .insert_lsn()
             < after_commit,
-        "the page read's position must sit behind the commit at {after_commit:?}"
+        "the page read's fence must sit behind the commit at {after_commit:?}"
     );
 
     let held = Arc::clone(&connector);
     let on = rt.handle().clone();
     let sql = format!("SELECT count(*)::bigint AS c0 FROM orders {}", common::PARK);
-    let ((values, position), after_commit) =
+    let ((values, fence), after_commit) =
         common::park_a_read(&db, &common::pg::orders_insert(4), move || {
             on.block_on(async move {
                 held.execute_scalar_row(
@@ -1161,11 +1158,8 @@ fn every_read_reports_a_position_taken_before_its_snapshot() {
         "the seed read's snapshot holds three rows"
     );
     assert!(
-        position
-            .expect("a PG connector reports a position")
-            .commit_lsn()
-            < after_commit,
-        "the seed read's position must sit behind the commit at {after_commit:?}"
+        fence.expect("a PG connector reports a fence").insert_lsn() < after_commit,
+        "the seed read's fence must sit behind the commit at {after_commit:?}"
     );
 }
 

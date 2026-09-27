@@ -215,7 +215,7 @@ fn acknowledging_a_commit_moves_the_slot_to_the_end_it_named() {
         let commit = next_commit(&mut source).await;
         assert_eq!(
             commit.position(),
-            PgCommitPosition::at_commit(row.position().commit_lsn()),
+            PgCommitPosition::at_commit(row.position().commit_lsn(), row.position().xid()),
             "the commit follows its row"
         );
         assert!(commit.end_lsn() > row.position().commit_lsn());

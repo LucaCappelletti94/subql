@@ -41,6 +41,7 @@ pub use wal::{
 // fingerprint and its envelope error, and the parser-backed default DB impl.
 pub use checkpoint::{
     Checkpoint, MysqlBinlogPos, NoCheckpoint, OpaqueCheckpoint, PgCommitPosition, PgLsn,
+    PgSnapshotFence, PgXid, Seen,
 };
 #[cfg(feature = "std")]
 pub use clock::StdClock;

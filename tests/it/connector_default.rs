@@ -25,7 +25,13 @@ impl Connector for MinimalConnector {
         _query: &ReadQuery<'_, Postgres>,
         _kind: ScalarFamily,
         _auth: &(),
-    ) -> Result<(Value<Postgres>, Option<NoCheckpoint>), String> {
+    ) -> Result<
+        (
+            Value<Postgres>,
+            Option<<NoCheckpoint as subql::Checkpoint>::Fence>,
+        ),
+        String,
+    > {
         Ok((Value::Int(0), None))
     }
 

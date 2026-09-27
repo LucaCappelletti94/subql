@@ -171,7 +171,7 @@ where
                 registered.subscription_id,
                 AggregateSeedInstall::<E::Backend, E::Checkpoint> {
                     rows: vec![Vec::new()],
-                    read_at: None,
+                    fence: None,
                 },
             )
             .expect("the empty seed lands");

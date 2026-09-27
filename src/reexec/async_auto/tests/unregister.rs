@@ -22,6 +22,7 @@ fn unregister_subscription_drops_the_queued_read() {
         crate::ScalarInstall {
             value: Value::Float(5.0),
             checkpoint: None::<crate::NoCheckpoint>,
+            fence: None,
         },
     )
     .unwrap();
@@ -110,6 +111,7 @@ fn async_unregister_subscription_drops_the_resolve_context() {
         crate::ScalarInstall {
             value: Value::Float(5.0),
             checkpoint: None::<NoCheckpoint>,
+            fence: None,
         },
     )
     .unwrap();

@@ -27,7 +27,7 @@ fn ungrouped_aggregate_folds_through_the_wrapper() {
         count_id,
         crate::AggregateSeedInstall {
             rows: alloc::vec![alloc::vec![Value::Int(5)]],
-            read_at: None::<crate::NoCheckpoint>,
+            fence: None,
         },
     )
     .unwrap();
@@ -74,7 +74,7 @@ fn ungrouped_aggregate_folds_across_an_applied_burst() {
         count_id,
         crate::AggregateSeedInstall {
             rows: alloc::vec![alloc::vec![Value::Int(5)]],
-            read_at: None::<crate::NoCheckpoint>,
+            fence: None,
         },
     )
     .unwrap();
@@ -117,7 +117,7 @@ fn ungrouped_aggregate_demotion_resolves_through_the_wrapper() {
         count_id,
         crate::AggregateSeedInstall {
             rows: alloc::vec![alloc::vec![Value::Int(1)]],
-            read_at: None::<crate::NoCheckpoint>,
+            fence: None,
         },
     )
     .unwrap();
@@ -164,7 +164,7 @@ fn snapshot_of_a_folding_aggregate_is_none() {
         count_id,
         crate::AggregateSeedInstall {
             rows: alloc::vec![alloc::vec![Value::Int(5)]],
-            read_at: None::<crate::NoCheckpoint>,
+            fence: None,
         },
     )
     .unwrap();
@@ -216,7 +216,7 @@ fn a_seed_that_demotes_at_install_serves_the_whole_read() {
                 alloc::vec![Value::String("open".into()), Value::Int(2), Value::Int(2)],
                 alloc::vec![Value::String("done".into()), Value::Int(1), Value::Int(1)],
             ],
-            read_at: None::<crate::NoCheckpoint>,
+            fence: None,
         },
     )
     .unwrap();

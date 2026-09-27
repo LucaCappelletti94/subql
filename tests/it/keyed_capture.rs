@@ -80,7 +80,13 @@ impl subql::reexec::Connector for Counting {
         query: &subql::reexec::ReadQuery<'_, SQLite>,
         kind: subql::backend::ScalarFamily,
         auth: &(),
-    ) -> Result<(Value<SQLite>, Option<Self::Checkpoint>), Self::Error> {
+    ) -> Result<
+        (
+            Value<SQLite>,
+            Option<<Self::Checkpoint as subql::Checkpoint>::Fence>,
+        ),
+        Self::Error,
+    > {
         self.inner.execute_scalar(query, kind, auth)
     }
 
@@ -110,7 +116,10 @@ impl subql::reexec::Connector for Counting {
         kinds: &[subql::backend::ScalarFamily],
         auth: &(),
     ) -> Result<
-        (Vec<Value<SQLite>>, Option<Self::Checkpoint>),
+        (
+            Vec<Value<SQLite>>,
+            Option<<Self::Checkpoint as subql::Checkpoint>::Fence>,
+        ),
         subql::reexec::ScalarRowError<Self::Error>,
     > {
         self.inner.execute_scalar_row(query, kinds, auth)

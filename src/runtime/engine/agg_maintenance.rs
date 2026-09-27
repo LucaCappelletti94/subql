@@ -245,7 +245,7 @@ where
     ///     registered.subscription_id,
     ///     subql::AggregateSeedInstall {
     ///         rows: vec![vec![Value::Int(4)]],
-    ///         read_at: None,
+    ///         fence: None,
     ///     },
     /// )
     /// .expect("the starting numbers land");
@@ -398,14 +398,14 @@ where
         &mut self,
         subscription: SubscriptionId,
         row: &[Value<E::Backend>],
-        read_at: Option<E::Checkpoint>,
+        fence: Option<<E::Checkpoint as crate::Checkpoint>::Fence>,
     ) -> Result<crate::AggValue, crate::AggregateInstallError> {
         let cap = self.max_changes_during_aggregate_read;
         let total = self
             .aggregates
             .get_mut(&subscription)
             .ok_or(crate::AggregateInstallError::UnknownAggregate(subscription))?;
-        total.install(subscription, row, read_at.as_ref(), cap)
+        total.install(subscription, row, fence, cap)
     }
 
     /// Empty an aggregate value and require another database read.

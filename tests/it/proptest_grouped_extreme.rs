@@ -98,7 +98,7 @@ proptest! {
             subscription,
             GroupedScalarSeedInstall {
                 rows: Vec::new(),
-                read_at: None::<NoCheckpoint>,
+                fence: None,
             },
         )
         .expect("empty seed installs");
@@ -188,6 +188,7 @@ proptest! {
                             Value::Int(i64::try_from(count).expect("test group count fits i64")),
                         ],
                         checkpoint: None::<NoCheckpoint>,
+                        fence: None,
                     },
                 )
                 .expect("group read installs");
@@ -236,7 +237,7 @@ proptest! {
             subscription,
             GroupedScalarSeedInstall {
                 rows: Vec::new(),
-                read_at: None::<NoCheckpoint>,
+                fence: None,
             },
         )
         .expect("empty seed installs");
@@ -315,6 +316,7 @@ proptest! {
                             Value::Int(i64::try_from(count).expect("test group count fits i64")),
                         ],
                         checkpoint: None::<NoCheckpoint>,
+                        fence: None,
                     },
                 )
                 .expect("group read installs");

@@ -177,7 +177,7 @@ fn seeded_value(db: &ParserDB, sql: &str, row: &[Value<Postgres>]) -> AggValue {
         registered.subscription_id,
         subql::AggregateSeedInstall {
             rows: vec![row.to_vec()],
-            read_at: None,
+            fence: None,
         },
     )
     .expect("the starting numbers land");

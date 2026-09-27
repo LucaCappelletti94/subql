@@ -85,6 +85,7 @@ where
         crate::ScalarInstall {
             value: Value::Float(seed),
             checkpoint: None::<crate::NoCheckpoint>,
+            fence: None,
         },
     )
     .expect("the bootstrap seed installs");

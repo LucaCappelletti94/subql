@@ -1,15 +1,12 @@
 //! The running total the engine holds for one aggregate subscription.
 //!
-//! A total starts out unseeded, which is not the same as zero. The caller
-//! learns its seed query from the registration, so its read necessarily
-//! happens after the engine has begun folding changes, and a change committed
-//! inside that window is in both the read and the fold. Adding both would
-//! double count it, permanently. So an unseeded total folds nothing and
-//! instead records each change against the stream position it arrived at, and
-//! the install keeps only the changes the read could not have seen.
+//! A total starts out unseeded, which is not the same as zero. Until its read
+//! lands it records each change with its stream position, and from then on
+//! every change, buffered or late, is judged against the read's fence so a
+//! change the read already holds is never folded twice.
 
 use crate::backend::{Backend, Value};
-use crate::checkpoint::Checkpoint;
+use crate::checkpoint::{Checkpoint, ReadFence};
 use crate::compiler::AggSpec;
 use crate::{AggValue, AggregateInstallError, IdTypes, SubscriptionId};
 use alloc::string::ToString;
@@ -1259,6 +1256,7 @@ pub struct AggregateTotal<I: IdTypes, C: Checkpoint> {
     accumulator: AggAccumulator,
     /// `None` once the starting numbers have landed.
     pending: Option<Pending<C>>,
+    fence: ReadFence<C>,
 }
 
 impl<I: IdTypes, C: Checkpoint> AggregateTotal<I, C> {
@@ -1269,6 +1267,7 @@ impl<I: IdTypes, C: Checkpoint> AggregateTotal<I, C> {
             spec,
             rule,
             pending: Some(Pending::new()),
+            fence: ReadFence::none(),
         }
     }
 
@@ -1282,9 +1281,8 @@ impl<I: IdTypes, C: Checkpoint> AggregateTotal<I, C> {
         self.pending.is_none().then(|| self.accumulator.value())
     }
 
-    /// Fold one change. Answers with the new value when the total is seeded,
-    /// and with nothing while it is not, since a total covering only the last
-    /// few seconds is worse than silence.
+    /// Fold one change. Answers with the new value when the total is seeded
+    /// and the change moved it past its read, and with nothing otherwise.
     pub fn fold(
         &mut self,
         delta: AggDelta,
@@ -1295,19 +1293,22 @@ impl<I: IdTypes, C: Checkpoint> AggregateTotal<I, C> {
             pending.push(at, PendingChange::Fold(delta), cap);
             return Ok(None);
         }
+        if !self.fence.admits(at) {
+            return Ok(None);
+        }
         self.accumulator.apply(&delta)?;
         Ok(Some(self.accumulator.value()))
     }
 
     /// Empty the total because the table was truncated. Answers with the new
-    /// value when that moved it, and with nothing when it was already empty or
-    /// the total is unseeded.
-    ///
-    /// No re-read is needed: an emptied table's components are all zero, which
-    /// is what a seed over it would decode to.
+    /// value when that moved it, and with nothing when it was already empty,
+    /// the total is unseeded, or its read already saw the truncate.
     pub fn empty(&mut self, at: Option<&C>, cap: usize) -> Option<AggValue> {
         if let Some(pending) = &mut self.pending {
             pending.push(at, PendingChange::Emptied, cap);
+            return None;
+        }
+        if !self.fence.admits(at) {
             return None;
         }
         let before = self.accumulator.value();
@@ -1321,19 +1322,19 @@ impl<I: IdTypes, C: Checkpoint> AggregateTotal<I, C> {
     pub fn reset(&mut self) {
         self.accumulator.clear();
         self.pending = Some(Pending::new());
+        self.fence = ReadFence::none();
     }
 
-    /// Adopt `row` as the starting numbers, read at `read_at`.
+    /// Adopt `row` as the starting numbers, read behind `fence`.
     ///
-    /// Every change recorded at or before `read_at` is already inside `row`
-    /// and is dropped. `read_at` is taken before the read's snapshot opens, so
-    /// that direction is the safe one: it can only keep a change the numbers
-    /// already hold, which the position comparison then removes.
+    /// Every recorded change the read holds is dropped and every other one is
+    /// applied. The fence then stays until a change passes it, so a held
+    /// change the stream delivers late is dropped too.
     pub fn install<B: Backend>(
         &mut self,
         subscription: SubscriptionId,
         row: &[Value<B>],
-        read_at: Option<&C>,
+        fence: Option<C::Fence>,
         cap: usize,
     ) -> Result<AggValue, AggregateInstallError> {
         let Some(pending) = self.pending.as_ref() else {
@@ -1343,14 +1344,15 @@ impl<I: IdTypes, C: Checkpoint> AggregateTotal<I, C> {
             return Err(AggregateInstallError::TooManyChangesDuringRead { subscription, cap });
         }
         if !pending.changes.is_empty()
-            && (read_at.is_none() || pending.changes.iter().any(|(at, _)| at.is_none()))
+            && (fence.is_none() || pending.changes.iter().any(|(at, _)| at.is_none()))
         {
             return Err(AggregateInstallError::PositionUnknown(subscription));
         }
 
+        let mut fence = ReadFence::new(fence);
         let mut accumulator = AggAccumulator::seed_from_row(&self.spec, self.rule, row);
         for (at, change) in &pending.changes {
-            if at.as_ref() <= read_at {
+            if !fence.admits(at.as_ref()) {
                 continue;
             }
             match change {
@@ -1367,6 +1369,7 @@ impl<I: IdTypes, C: Checkpoint> AggregateTotal<I, C> {
 
         self.accumulator = accumulator;
         self.pending = None;
+        self.fence = fence;
         Ok(self.accumulator.value())
     }
 }
@@ -1537,6 +1540,7 @@ pub struct GroupedAggregateTotal<I: IdTypes, B: Backend, C: Checkpoint> {
     group_key_encoder: crate::backend::GroupKeyEncoder<B>,
     groups: HashMap<Vec<u8>, GroupValue<B>>,
     pending: Option<PendingGroups<B, C>>,
+    fence: ReadFence<C>,
     having: Option<GroupHaving>,
     /// Whether the seed carries components needed only by `HAVING`.
     widened: bool,
@@ -1573,6 +1577,7 @@ impl<I: IdTypes, B: Backend, C: Checkpoint> GroupedAggregateTotal<I, B, C> {
             group_key_encoder,
             groups: HashMap::new(),
             pending: Some(PendingGroups::new()),
+            fence: ReadFence::none(),
             having,
             widened,
         }
@@ -1613,6 +1618,9 @@ impl<I: IdTypes, B: Backend, C: Checkpoint> GroupedAggregateTotal<I, B, C> {
                 },
                 cap,
             );
+            return GroupedFoldOutcome::Unchanged;
+        }
+        if !self.fence.admits(at) {
             return GroupedFoldOutcome::Unchanged;
         }
         if !self.groups.contains_key(&key) && rows > 0 && self.groups.len() >= group_limit {
@@ -1679,10 +1687,13 @@ impl<I: IdTypes, B: Backend, C: Checkpoint> GroupedAggregateTotal<I, B, C> {
         Ok(change.map(|change| (group.identity(key), change)))
     }
 
-    /// Empty every group after `TRUNCATE`.
+    /// Empty every group after `TRUNCATE`, unless the read already saw it.
     pub fn empty(&mut self, at: Option<&C>, cap: usize) -> GroupedValueChanges<B> {
         if let Some(pending) = &mut self.pending {
             pending.push(at, PendingGroupChange::Emptied, cap);
+            return Vec::new();
+        }
+        if !self.fence.admits(at) {
             return Vec::new();
         }
         let mut removed: Vec<_> = self
@@ -1699,6 +1710,7 @@ impl<I: IdTypes, B: Backend, C: Checkpoint> GroupedAggregateTotal<I, B, C> {
     pub fn reset(&mut self) {
         self.groups.clear();
         self.pending = Some(PendingGroups::new());
+        self.fence = ReadFence::none();
     }
 
     fn seed_group(
@@ -1742,13 +1754,15 @@ impl<I: IdTypes, B: Backend, C: Checkpoint> GroupedAggregateTotal<I, B, C> {
         ))
     }
 
-    /// Install every grouped seed row as one atomic result.
+    /// Install every grouped seed row as one atomic result, read behind
+    /// `fence`, which then judges every later change as the ungrouped total's
+    /// does.
     pub fn install(
         &mut self,
         subscription: SubscriptionId,
         group_columns: usize,
         rows: &[Vec<Value<B>>],
-        read_at: Option<&C>,
+        fence: Option<C::Fence>,
         cap: usize,
         group_limit: usize,
     ) -> Result<GroupedValueChanges<B>, AggregateInstallError> {
@@ -1759,7 +1773,7 @@ impl<I: IdTypes, B: Backend, C: Checkpoint> GroupedAggregateTotal<I, B, C> {
             return Err(AggregateInstallError::TooManyChangesDuringRead { subscription, cap });
         }
         if !pending.changes.is_empty()
-            && (read_at.is_none() || pending.changes.iter().any(|(at, _)| at.is_none()))
+            && (fence.is_none() || pending.changes.iter().any(|(at, _)| at.is_none()))
         {
             return Err(AggregateInstallError::PositionUnknown(subscription));
         }
@@ -1786,8 +1800,9 @@ impl<I: IdTypes, B: Backend, C: Checkpoint> GroupedAggregateTotal<I, B, C> {
             }
         }
 
+        let mut fence = ReadFence::new(fence);
         for (at, change) in &pending.changes {
-            if at.as_ref() <= read_at {
+            if !fence.admits(at.as_ref()) {
                 continue;
             }
             match change {
@@ -1843,6 +1858,7 @@ impl<I: IdTypes, B: Backend, C: Checkpoint> GroupedAggregateTotal<I, B, C> {
         opening.sort_unstable_by(|a, b| a.0.key.cmp(&b.0.key));
         self.groups = groups;
         self.pending = None;
+        self.fence = fence;
         Ok(opening)
     }
 }

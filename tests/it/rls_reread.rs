@@ -40,7 +40,13 @@ impl Connector for Recording {
         _query: &subql::reexec::ReadQuery<'_, Postgres>,
         _kind: ScalarFamily,
         _auth: &Self::AuthContext,
-    ) -> Result<(Value<Postgres>, Option<NoCheckpoint>), Self::Error> {
+    ) -> Result<
+        (
+            Value<Postgres>,
+            Option<<NoCheckpoint as subql::Checkpoint>::Fence>,
+        ),
+        Self::Error,
+    > {
         unreachable!("the tests register row reads")
     }
 
@@ -57,7 +63,7 @@ impl Connector for Recording {
                 rows: Vec::new(),
                 more: false,
             },
-            checkpoint: None,
+            fence: None,
         })
     }
 }
@@ -229,7 +235,13 @@ impl Connector for AggregateRecording {
         query: &subql::reexec::ReadQuery<'_, Postgres>,
         _kind: ScalarFamily,
         auth: &Self::AuthContext,
-    ) -> Result<(Value<Postgres>, Option<NoCheckpoint>), Self::Error> {
+    ) -> Result<
+        (
+            Value<Postgres>,
+            Option<<NoCheckpoint as subql::Checkpoint>::Fence>,
+        ),
+        Self::Error,
+    > {
         Ok((self.state.lock().scalar_answer(query, auth), None))
     }
 
@@ -241,7 +253,7 @@ impl Connector for AggregateRecording {
     ) -> Result<Snapshot<RowPage<Postgres>, NoCheckpoint>, Self::Error> {
         Ok(Snapshot {
             value: self.state.lock().page_answer(query, auth),
-            checkpoint: None,
+            fence: None,
         })
     }
 
@@ -260,7 +272,7 @@ impl Connector for AggregateRecording {
     ) -> Result<Snapshot<RowPage<Postgres>, NoCheckpoint>, CursorError<Self::Error>> {
         Ok(Snapshot {
             value: self.state.lock().fetch_cursor(cursor)?,
-            checkpoint: None,
+            fence: None,
         })
     }
 
@@ -301,7 +313,13 @@ impl AsyncConnector for AsyncAggregateRecording {
         _kind: ScalarFamily,
         auth: &Self::AuthContext,
     ) -> impl core::future::Future<
-        Output = Result<(Value<Postgres>, Option<NoCheckpoint>), Self::Error>,
+        Output = Result<
+            (
+                Value<Postgres>,
+                Option<<NoCheckpoint as subql::Checkpoint>::Fence>,
+            ),
+            Self::Error,
+        >,
     > + Send {
         let answer = (self.state.lock().scalar_answer(query, auth), None);
         core::future::ready(Ok(answer))
@@ -317,7 +335,7 @@ impl AsyncConnector for AsyncAggregateRecording {
     > + Send {
         let answer = Snapshot {
             value: self.state.lock().page_answer(query, auth),
-            checkpoint: None,
+            fence: None,
         };
         core::future::ready(Ok(answer))
     }
@@ -342,10 +360,7 @@ impl AsyncConnector for AsyncAggregateRecording {
             .state
             .lock()
             .fetch_cursor(cursor)
-            .map(|value| Snapshot {
-                value,
-                checkpoint: None,
-            });
+            .map(|value| Snapshot { value, fence: None });
         core::future::ready(answer)
     }
 
@@ -912,6 +927,7 @@ fn per_consumer_scalar_extreme_insert_asks_before_revealing_value() {
         ScalarInstall {
             value: Value::Int(5),
             checkpoint: None::<NoCheckpoint>,
+            fence: None,
         },
     )
     .expect("scalar seed installs");
@@ -943,7 +959,7 @@ fn per_consumer_grouped_extreme_insert_asks_before_opening_group() {
                 Value::Int(5),
                 Value::Int(1),
             ]],
-            read_at: None::<NoCheckpoint>,
+            fence: None,
         },
     )
     .expect("grouped seed installs");
@@ -970,6 +986,7 @@ fn per_consumer_grouped_extreme_insert_asks_before_opening_group() {
             group: group.clone(),
             row: vec![Value::Int(3), Value::Int(1)],
             checkpoint: None::<NoCheckpoint>,
+            fence: None,
         },
     )
     .expect("scoped grouped value installs");
@@ -995,7 +1012,7 @@ fn delayed_group_read_recovers_identity_after_state_removal() {
         registered.subscription_id,
         GroupedScalarSeedInstall {
             rows: Vec::new(),
-            read_at: None::<NoCheckpoint>,
+            fence: None,
         },
     )
     .expect("empty grouped seed installs");
@@ -1037,6 +1054,7 @@ fn delayed_group_read_recovers_identity_after_state_removal() {
             group: group.clone(),
             row: vec![Value::Int(2), Value::Int(1)],
             checkpoint: None::<NoCheckpoint>,
+            fence: None,
         },
     )
     .expect("delayed grouped value installs");
@@ -1071,7 +1089,7 @@ fn zero_row_group_read_removes_original_identity() {
                 Value::Int(5),
                 Value::Int(1),
             ]],
-            read_at: None::<NoCheckpoint>,
+            fence: None,
         },
     )
     .expect("grouped seed installs");
@@ -1096,6 +1114,7 @@ fn zero_row_group_read_removes_original_identity() {
             group: group.clone(),
             row: vec![Value::Null, Value::Int(0)],
             checkpoint: None::<NoCheckpoint>,
+            fence: None,
         },
     )
     .expect("empty grouped value installs");

@@ -71,7 +71,13 @@ impl Connector for MockConnector {
         query: &crate::reexec::ReadQuery<'_, Postgres>,
         column_kind: ScalarFamily,
         _auth: &(),
-    ) -> Result<(Value<Postgres>, Option<Self::Checkpoint>), Self::Error> {
+    ) -> Result<
+        (
+            Value<Postgres>,
+            Option<<Self::Checkpoint as crate::Checkpoint>::Fence>,
+        ),
+        Self::Error,
+    > {
         self.calls
             .borrow_mut()
             .push((String::from(query.sql()), column_kind));
@@ -109,7 +115,7 @@ impl Connector for MockConnector {
         };
         Ok(crate::reexec::connector::Snapshot {
             value: page,
-            checkpoint: None,
+            fence: None,
         })
     }
 
@@ -148,7 +154,7 @@ impl Connector for MockConnector {
         let page = self.cursor_pages.borrow_mut().remove(0);
         Ok(crate::reexec::connector::Snapshot {
             value: page,
-            checkpoint: None,
+            fence: None,
         })
     }
 

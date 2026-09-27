@@ -88,6 +88,10 @@ pub trait CdcSource: Send {
     /// Position (checkpoint) is expressed through the event's own
     /// [`CdcEvent::Checkpoint`]. The Postgres sources yield
     /// [`crate::PgChangeEvent`], whose checkpoint is a [`crate::PgCommitPosition`].
+    /// The checkpoint is the stream's position, which the source resumes
+    /// and the consumer acknowledges. A database read reports a fence of
+    /// type `CdcEvent::Checkpoint::Fence` instead, and each change is
+    /// judged against it with `seen_by` on that fence type.
     type Event: CdcEvent + Send + Sync;
 
     /// The end of a transaction this source surfaces after its events.

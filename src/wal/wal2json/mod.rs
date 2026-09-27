@@ -8,8 +8,8 @@
 //!
 //! v2 is read through [`Wal2JsonV2Reader`], which follows the transaction
 //! boundaries to place each row at its [`PgCommitPosition`](crate::PgCommitPosition)
-//! (with `include-lsn=true`). v1 batches a transaction and has no per-change
-//! position, so it uses [`NoCheckpoint`](crate::NoCheckpoint).
+//! (with `include-lsn` and `include-xids` on). v1 batches a transaction and
+//! has no per-change position, so it uses [`NoCheckpoint`](crate::NoCheckpoint).
 
 mod decode_helpers;
 mod parse_helpers;
@@ -25,7 +25,7 @@ mod tests {
     use crate::backend::{CdcEvent, RowKind, Value};
     use crate::types::EventKind;
     use crate::wal::{TransactionOrderError, WalParseError};
-    use crate::{PgCommitPosition, PgLsn};
+    use crate::{PgCommitPosition, PgLsn, PgXid};
     use alloc::vec::Vec;
     use sql_traits::structs::ParserDB;
     use sqlparser::dialect::PostgreSqlDialect;
@@ -37,11 +37,11 @@ mod tests {
         .expect("parse DDL")
     }
 
-    /// The row `bytes` carries, read as the first row of a transaction
+    /// The row `bytes` carries, read as the first row of transaction 5,
     /// committing at `0/16B2300`.
     fn one_v2(bytes: &[u8]) -> Wal2JsonV2Event {
         let mut reader = Wal2JsonV2Reader::new();
-        let begin = reader.parse(br#"{"action":"B","lsn":"0/16B2300"}"#);
+        let begin = reader.parse(br#"{"action":"B","lsn":"0/16B2300","xid":5}"#);
         assert!(begin.expect("begin parses").is_none());
         reader
             .parse(bytes)
@@ -74,7 +74,7 @@ mod tests {
         assert_eq!(ev.pk_columns(&db), alloc::vec![0u16]);
         assert_eq!(
             ev.checkpoint(),
-            Some(PgCommitPosition::new(PgLsn(0x16B_2300), 1)),
+            Some(PgCommitPosition::new(PgLsn(0x16B_2300), PgXid(5), 1)),
             "the checkpoint is the commit position the begin named, not the row's own lsn"
         );
         assert_eq!(
@@ -148,26 +148,26 @@ mod tests {
         }
     }
 
-    /// T2, a row at 1200 committing at 1300, arrives before T1, rows at 1000
-    /// and 1100 committing at 1500.
+    /// T2, xid 4, a row at 1200 committing at 1300, arrives before T1, xid 3,
+    /// rows at 1000 and 1100 committing at 1500.
     #[test]
     fn v2_rows_order_by_commit_then_place_in_transaction() {
         let placed = checkpoints(&[
-            br#"{"action":"B","lsn":"0/514"}"#,
+            br#"{"action":"B","lsn":"0/514","xid":4}"#,
             br#"{"action":"I","schema":"public","table":"orders","lsn":"0/4B0","columns":[]}"#,
-            br#"{"action":"C","lsn":"0/514"}"#,
-            br#"{"action":"B","lsn":"0/5DC"}"#,
+            br#"{"action":"C","lsn":"0/514","xid":4}"#,
+            br#"{"action":"B","lsn":"0/5DC","xid":3}"#,
             br#"{"action":"M","transactional":true,"prefix":"p","content":"c"}"#,
             br#"{"action":"I","schema":"public","table":"orders","lsn":"0/3E8","columns":[]}"#,
             br#"{"action":"T","schema":"public","table":"orders","lsn":"0/44C"}"#,
-            br#"{"action":"C","lsn":"0/5DC"}"#,
+            br#"{"action":"C","lsn":"0/5DC","xid":3}"#,
         ]);
         assert_eq!(
             placed.expect("frames in place"),
             vec![
-                Some(PgCommitPosition::new(PgLsn(1300), 1)),
-                Some(PgCommitPosition::new(PgLsn(1500), 1)),
-                Some(PgCommitPosition::new(PgLsn(1500), 2)),
+                Some(PgCommitPosition::new(PgLsn(1300), PgXid(4), 1)),
+                Some(PgCommitPosition::new(PgLsn(1500), PgXid(3), 1)),
+                Some(PgCommitPosition::new(PgLsn(1500), PgXid(3), 2)),
             ]
         );
     }
@@ -180,6 +180,18 @@ mod tests {
             br#"{"action":"B"}"#,
             br#"{"action":"I","schema":"public","table":"orders","columns":[]}"#,
             br#"{"action":"C"}"#,
+        ]);
+        assert_eq!(placed.expect("frames in place"), vec![None]);
+    }
+
+    /// A begin with `include-lsn` but without `include-xids` names the commit
+    /// and not the transaction, so the rows carry no position.
+    #[test]
+    fn v2_with_lsns_but_without_xids_carries_none() {
+        let placed = checkpoints(&[
+            br#"{"action":"B","lsn":"0/5DC"}"#,
+            br#"{"action":"I","schema":"public","table":"orders","lsn":"0/44C","columns":[]}"#,
+            br#"{"action":"C","lsn":"0/5DC"}"#,
         ]);
         assert_eq!(placed.expect("frames in place"), vec![None]);
     }
@@ -207,8 +219,8 @@ mod tests {
         ));
         assert!(matches!(
             checkpoints(&[
-                br#"{"action":"B","lsn":"0/5DC"}"#,
-                br#"{"action":"C","lsn":"0/640"}"#
+                br#"{"action":"B","lsn":"0/5DC","xid":6}"#,
+                br#"{"action":"C","lsn":"0/640","xid":6}"#
             ]),
             Err(WalParseError::TransactionOrder(
                 TransactionOrderError::CommitMismatch { .. }

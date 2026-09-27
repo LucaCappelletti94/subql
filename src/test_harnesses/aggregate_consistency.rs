@@ -531,7 +531,7 @@ pub fn harness_aggregate_consistency(data: &[u8]) {
                 *subscription,
                 crate::AggregateSeedInstall {
                     rows: vec![seed_row(spec, &s0)],
-                    read_at: None,
+                    fence: None,
                 },
             )
             .expect("a seed with nothing folded against it lands");

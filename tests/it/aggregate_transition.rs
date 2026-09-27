@@ -57,7 +57,7 @@ fn seed_group(engine: &mut Engine, subscription: u64, region: &str) {
                 Value::Int(1),
                 Value::Int(1),
             ]],
-            read_at: None,
+            fence: None,
         },
     )
     .expect("seed group");
@@ -162,7 +162,7 @@ fn seed_rows_over_the_group_limit_transition_before_any_map_is_installed() {
                 vec![Value::String("north".into()), Value::Int(1), Value::Int(1)],
                 vec![Value::String("south".into()), Value::Int(1), Value::Int(1)],
             ],
-            read_at: None,
+            fence: None,
         },
     )
     .expect("the limit changes tier rather than failing installation");
@@ -197,7 +197,7 @@ fn missing_old_row_transitions_only_the_filtered_aggregate() {
         aggregate.subscription_id,
         AggregateSeedInstall {
             rows: vec![vec![Value::Int(1)]],
-            read_at: None,
+            fence: None,
         },
     )
     .expect("seed aggregate");
@@ -262,7 +262,7 @@ fn an_unanswerable_filter_cell_stops_maintenance_instead_of_half_folding() {
         aggregate.subscription_id,
         AggregateSeedInstall {
             rows: vec![vec![Value::Int(1)]],
-            read_at: None,
+            fence: None,
         },
     )
     .expect("seed aggregate");
@@ -331,7 +331,7 @@ fn unfiltered_count_needs_no_old_row_and_stays_in_process() {
         aggregate.subscription_id,
         AggregateSeedInstall {
             rows: vec![vec![Value::Int(1)]],
-            read_at: None,
+            fence: None,
         },
     )
     .expect("seed aggregate");

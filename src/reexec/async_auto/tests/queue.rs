@@ -31,7 +31,7 @@ fn a_failed_install_drops_the_read_instead_of_requeueing_it() {
                 Value::Float(5.0),
                 Value::Int(2),
             ]],
-            read_at: None::<crate::NoCheckpoint>,
+            fence: None,
         },
     )
     .expect("group map installs");
@@ -231,6 +231,7 @@ fn a_dropped_drain_parks_the_notifications_it_could_not_deliver() {
         crate::ScalarInstall {
             value: Value::Float(5.0),
             checkpoint: None::<NoCheckpoint>,
+            fence: None,
         },
     )
     .unwrap();
@@ -424,6 +425,7 @@ fn dropped_resolve_keeps_the_read_queued() {
         crate::ScalarInstall {
             value: Value::Float(5.0),
             checkpoint: None::<NoCheckpoint>,
+            fence: None,
         },
     )
     .unwrap();

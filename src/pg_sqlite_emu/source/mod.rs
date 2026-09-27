@@ -93,6 +93,9 @@ pub struct PgSqliteEmuSource {
     /// WAL position of the last frame, which the next transaction's
     /// positions follow.
     next_lsn: u64,
+    /// Transaction id the next transaction takes, from 3, Postgres' first
+    /// normal xid, so the positions name distinct transactions.
+    next_xid: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -181,6 +184,7 @@ impl PgSqliteEmuSource {
             announced: HashSet::new(),
             tables,
             next_lsn: 0,
+            next_xid: 3,
         })
     }
 
@@ -485,11 +489,13 @@ impl PgSqliteEmuSource {
         let rows = u64::try_from(messages.len()).expect("a message count fits in u64");
         // Laid out as a server writes them, the rows' records and then the commit record.
         let commit_lsn = self.next_lsn + rows + 2;
+        let xid = self.next_xid;
+        self.next_xid = self.next_xid.wrapping_add(1);
         let pushed = self
             .push_frame(&LogicalReplicationMessage::Begin {
                 final_lsn: commit_lsn,
                 timestamp: 0,
-                xid: 0,
+                xid,
             })
             .and_then(|()| messages.iter().try_for_each(|msg| self.push_frame(msg)))
             .and_then(|()| {
@@ -885,7 +891,8 @@ mod tests {
     }
 
     /// Every drain is one transaction, and its rows order after every row of
-    /// the drains before it and among themselves in their order.
+    /// the drains before it and among themselves in their order, and each drain
+    /// names a transaction id of its own, from 3 upward.
     #[test]
     fn events_carry_strictly_increasing_commit_positions() {
         let mut src = build_source();
@@ -913,6 +920,12 @@ mod tests {
         let ordinals: Vec<u64> = checkpoints.iter().map(|c| c.ordinal()).collect();
         assert_eq!(ordinals, [1, 2, 1], "ordinals count from 1 in each drain");
         assert_eq!(checkpoints[0].commit_lsn(), checkpoints[1].commit_lsn());
+        let xids: Vec<crate::PgXid> = checkpoints.iter().map(|c| c.xid()).collect();
+        assert_eq!(
+            xids,
+            [crate::PgXid(3), crate::PgXid(3), crate::PgXid(4)],
+            "each drain takes the next xid, from 3"
+        );
         assert!(
             checkpoints.windows(2).all(|w| w[1] > w[0]),
             "checkpoints must be strictly increasing, got {checkpoints:?}"

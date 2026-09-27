@@ -452,7 +452,7 @@ fn an_aggregate_update_refused_on_one_version_folds_nothing() {
             subscription,
             subql::AggregateSeedInstall {
                 rows: vec![vec![Value::Int(4)]],
-                read_at: None,
+                fence: None,
             },
         )
         .expect("the seed installs");

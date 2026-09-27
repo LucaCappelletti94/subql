@@ -246,10 +246,10 @@ where
 {
     type AuthContext = S;
     type Error = diesel::result::Error;
-    /// Backend-agnostic v1 default: this connector does not read the
-    /// underlying source's position. PG-aware variants
-    /// (`PgDieselConnector`) override this to `PgCommitPosition` and read
-    /// `pg_current_wal_lsn()` before the snapshot transaction.
+    /// Backend-agnostic v1 default: this connector does not report a read
+    /// fence, so its fence type has no values and every read reports
+    /// `None`. PG-aware variants (`PgDieselConnector`) override this to
+    /// `PgCommitPosition` and report the snapshot fence the read took.
     type Checkpoint = crate::NoCheckpoint;
     type Backend = B;
 
@@ -258,7 +258,13 @@ where
         query: &ReadQuery<'_, B>,
         kind: ScalarFamily,
         auth: &S,
-    ) -> Result<(Value<B>, Option<Self::Checkpoint>), Self::Error> {
+    ) -> Result<
+        (
+            Value<B>,
+            Option<<Self::Checkpoint as crate::Checkpoint>::Fence>,
+        ),
+        Self::Error,
+    > {
         let mut conn = self.conn.borrow_mut();
         let setup = auth.setup_statements();
         // Decision 5: this path opens no transaction today, so a caller
@@ -293,10 +299,7 @@ where
                 load_page::<_, B>(conn, query, max_bytes)
             })?
         };
-        Ok(Snapshot {
-            value,
-            checkpoint: None,
-        })
+        Ok(Snapshot { value, fence: None })
     }
 
     fn execute_scalar_row(
@@ -304,8 +307,13 @@ where
         query: &ReadQuery<'_, B>,
         kinds: &[ScalarFamily],
         auth: &S,
-    ) -> Result<(alloc::vec::Vec<Value<B>>, Option<Self::Checkpoint>), ScalarRowError<Self::Error>>
-    {
+    ) -> Result<
+        (
+            alloc::vec::Vec<Value<B>>,
+            Option<<Self::Checkpoint as crate::Checkpoint>::Fence>,
+        ),
+        ScalarRowError<Self::Error>,
+    > {
         let mut conn = self.conn.borrow_mut();
         // Read every component in one transaction so a variance seed's sum,
         // sum-of-squares, and count come from a single snapshot. This basic

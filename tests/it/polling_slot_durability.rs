@@ -462,7 +462,10 @@ fn every_row_of_a_copied_batch_is_delivered() {
             seen.windows(2).all(|pair| pair[0] < pair[1]),
             "each copied row has a position of its own, and the commit follows them: {seen:?}"
         );
-        assert_eq!(seen[3], PgCommitPosition::at_commit(seen[0].commit_lsn()));
+        assert_eq!(
+            seen[3],
+            PgCommitPosition::at_commit(seen[0].commit_lsn(), seen[0].xid())
+        );
     });
 
     common::drop_slot(&mut setup, &slot);

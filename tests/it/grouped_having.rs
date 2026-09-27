@@ -78,7 +78,7 @@ fn seed(
         subscription,
         AggregateSeedInstall {
             rows,
-            read_at: Some(PgLsn(5)),
+            fence: Some(PgLsn(5)),
         },
     )
     .expect("grouped seed rows install together")

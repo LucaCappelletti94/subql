@@ -8,6 +8,7 @@
 
 use crate::backend::ComparisonContext;
 use crate::backend::{Backend, CdcEvent, RowKind, ScalarText, Value};
+use crate::checkpoint::ReadFence;
 use crate::compiler::literals::SqlLiteralParse;
 use crate::compiler::sql_shape::ScalarAggKind;
 use crate::compiler::value_cmp::{compare_ordered_values, values_equal};
@@ -27,19 +28,18 @@ pub enum Maintenance<B: Backend> {
     Unchanged,
     /// The event produced a new result value in-process.
     Updated(Value<B>),
-    /// The maintenance state machine cannot decide in-process; the caller
-    /// must re-execute against the authoritative store and call
-    /// [`MaintainedQuery::install`] with the new value.
+    /// The maintenance state machine cannot decide in-process, so the caller
+    /// must re-execute against the authoritative store and install the new
+    /// value.
     NeedsReexecution,
 }
 
-/// A query maintained by the re-execution layer.
+/// A read tier that holds no answer, only which reads a change calls for.
 ///
 /// Implementors never touch the database. When they cannot decide
 /// in-process they return [`Maintenance::NeedsReexecution`]. The engine
 /// then surfaces a [`ReExecutionTrigger`](super::ReExecutionTrigger) for
-/// the Subscription Materializer, which re-runs the SQL and calls
-/// [`install`](Self::install) with the recomputed value.
+/// the Subscription Materializer, which re-runs the SQL.
 pub trait MaintainedQuery<B: Backend> {
     /// Feed a CDC event. `vm` is lent for WHERE-membership evaluation.
     fn on_event<E, DB>(&mut self, event: &E, vm: &mut Vm<B>, db: &DB) -> Maintenance<B>
@@ -47,11 +47,57 @@ pub trait MaintainedQuery<B: Backend> {
         E: CdcEvent<Backend = B>,
         DB: DatabaseLike;
 
-    /// Adopt a value produced by the materializer's re-execution.
-    fn install(&mut self, value: Value<B>);
-
     /// Columns whose change can affect the result.
     fn dependency_columns(&self) -> &[ColumnId];
+}
+
+/// What one change does to a scalar extreme, decided from the event once so
+/// it can be applied live and again on top of a later read.
+struct ExtremeChange<B: Backend> {
+    /// A matching row left, or `None` when no matching row did.
+    removed: Option<Removed<B>>,
+    /// The aggregated value of a matching row that arrived.
+    added: Option<Value<B>>,
+    emptied: bool,
+}
+
+enum Removed<B: Backend> {
+    /// A column the query depends on is missing from the old row.
+    Unknown,
+    Row(Value<B>),
+}
+
+/// Changes kept while a read of the value is outstanding, so the ones its
+/// snapshot missed can be applied on top of its answer.
+struct ReadBuffer<B: Backend, C: Checkpoint> {
+    changes: Vec<(C, ExtremeChange<B>)>,
+    overflowed: bool,
+}
+
+impl<B: Backend, C: Checkpoint> ReadBuffer<B, C> {
+    const fn new() -> Self {
+        Self {
+            changes: Vec::new(),
+            overflowed: false,
+        }
+    }
+
+    fn push(&mut self, at: C, change: ExtremeChange<B>, cap: usize) {
+        if self.changes.len() >= cap {
+            self.overflowed = true;
+            return;
+        }
+        self.changes.push((at, change));
+    }
+}
+
+/// What installing a read into a scalar extreme produced.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ScalarInstallOutcome<B: Backend> {
+    /// The value after the read and every change it missed.
+    Value(Value<B>),
+    /// Only another read can say what the value is.
+    ReadAgain,
 }
 
 /// Incrementally-maintained single-table scalar `MIN` / `MAX`.
@@ -60,7 +106,7 @@ pub trait MaintainedQuery<B: Backend> {
 /// re-query is required only when the current extreme value is removed
 /// or displaced (then we cannot know the next extreme without scanning),
 /// or when an event's row image is too incomplete to decide.
-pub struct MinMaxQuery<B: Backend> {
+pub struct MinMaxQuery<B: Backend, C: Checkpoint> {
     kind: ScalarAggKind,
     agg_column: ColumnId,
     where_program: Arc<BytecodeProgram<B>>,
@@ -69,9 +115,12 @@ pub struct MinMaxQuery<B: Backend> {
     /// The extreme, once known. `Some(Value::Null)` means the filtered set is
     /// empty, `None` means nobody has said yet, which no change can decide.
     current: Option<Value<B>>,
+    /// Open from registration and from each asked-for read until its install.
+    reading: Option<ReadBuffer<B, C>>,
+    fence: ReadFence<C>,
 }
 
-impl<B: Backend> MinMaxQuery<B> {
+impl<B: Backend, C: Checkpoint> MinMaxQuery<B, C> {
     pub const fn new(
         kind: ScalarAggKind,
         agg_column: ColumnId,
@@ -86,6 +135,8 @@ impl<B: Backend> MinMaxQuery<B> {
             dependency_columns,
             database_reads_per_consumer,
             current: None,
+            reading: Some(ReadBuffer::new()),
+            fence: ReadFence::none(),
         }
     }
 
@@ -125,6 +176,35 @@ impl<B: Backend> MinMaxQuery<B> {
         })
     }
 
+    fn change<E, DB>(&self, event: &E, vm: &mut Vm<B>, db: &DB) -> ExtremeChange<B>
+    where
+        E: CdcEvent<Backend = B>,
+        DB: DatabaseLike,
+    {
+        let kind = event.kind();
+        let removed = matches!(kind, EventKind::Delete | EventKind::Update)
+            .then(|| {
+                if self.any_dependency_missing(event, RowKind::Old, db) {
+                    Some(Removed::Unknown)
+                } else {
+                    self.matches(event, RowKind::Old, vm, db)
+                        .then(|| Removed::Row(self.agg_value(event, RowKind::Old, db)))
+                }
+            })
+            .flatten();
+        let added = matches!(kind, EventKind::Insert | EventKind::Update)
+            .then(|| {
+                self.matches(event, RowKind::New, vm, db)
+                    .then(|| self.agg_value(event, RowKind::New, db))
+            })
+            .flatten();
+        ExtremeChange {
+            removed,
+            added,
+            emptied: kind == EventKind::Truncate,
+        }
+    }
+
     /// Whether `candidate` would become the new extreme, or `None` when the
     /// current one is unknown and no comparison can be made.
     /// A non-present candidate (NULL / Missing) never participates. Into an
@@ -152,114 +232,114 @@ impl<B: Backend> MinMaxQuery<B> {
         ))
     }
 
-    /// Insert half: fold a (matching) new row into the extreme. Never
-    /// forces a re-query.
-    fn on_insert_row<E, DB>(
-        &mut self,
-        event: &E,
-        row: RowKind,
-        vm: &mut Vm<B>,
-        db: &DB,
-    ) -> Maintenance<B>
-    where
-        E: CdcEvent<Backend = B>,
-        DB: DatabaseLike,
-    {
-        if !self.matches(event, row, vm, db) {
-            return Maintenance::Unchanged;
+    fn apply(&mut self, change: &ExtremeChange<B>) -> Maintenance<B> {
+        if change.emptied {
+            // The table is empty afterwards, so this resolves an unknown
+            // extreme as well as replacing a known one.
+            if self.current.as_ref().is_some_and(Value::is_null) {
+                return Maintenance::Unchanged;
+            }
+            self.current = Some(Value::Null);
+            return Maintenance::Updated(Value::Null);
         }
-        let candidate = self.agg_value(event, row, db);
-        match self.is_more_extreme(&candidate) {
+        match &change.removed {
+            Some(Removed::Unknown) => return Maintenance::NeedsReexecution,
+            Some(Removed::Row(value)) => {
+                let Some(current) = self.current.as_ref() else {
+                    return Maintenance::NeedsReexecution;
+                };
+                // A refusal cannot say whether the extreme left, so the safe
+                // answer is the one that asks the database. A fresh scan also
+                // reflects the insert half of an update.
+                if !value.is_absent()
+                    && values_equal(ComparisonContext::none(), value, current).unwrap_or(true)
+                {
+                    return Maintenance::NeedsReexecution;
+                }
+            }
+            None => {}
+        }
+        let Some(candidate) = &change.added else {
+            return Maintenance::Unchanged;
+        };
+        match self.is_more_extreme(candidate) {
             // Nobody has said what the extreme is, so this row cannot be it:
             // the table may hold a more extreme one this engine never saw.
             None => Maintenance::NeedsReexecution,
+            Some(true) if self.database_reads_per_consumer => Maintenance::NeedsReexecution,
             Some(true) => {
-                if self.database_reads_per_consumer {
-                    return Maintenance::NeedsReexecution;
-                }
                 self.current = Some(candidate.clone());
-                Maintenance::Updated(candidate)
+                Maintenance::Updated(candidate.clone())
             }
             Some(false) => Maintenance::Unchanged,
         }
     }
 
-    /// Delete half: decide whether removing `row` displaces the extreme.
-    /// Does not mutate state. Returns only `Unchanged` or
-    /// `NeedsReexecution`.
-    fn on_delete_row<E, DB>(
-        &self,
+    /// Feed one change. A change the last read already holds is dropped, and
+    /// every other positioned one is kept while a read is outstanding.
+    pub fn on_event<E, DB>(
+        &mut self,
         event: &E,
-        row: RowKind,
         vm: &mut Vm<B>,
         db: &DB,
+        cap: usize,
     ) -> Maintenance<B>
     where
-        E: CdcEvent<Backend = B>,
+        E: CdcEvent<Backend = B, Checkpoint = C>,
         DB: DatabaseLike,
     {
-        if self.any_dependency_missing(event, row, db) {
-            return Maintenance::NeedsReexecution;
-        }
-        if !self.matches(event, row, vm, db) {
+        let at = event.checkpoint();
+        if !self.fence.admits(at.as_ref()) {
             return Maintenance::Unchanged;
         }
-        let Some(current) = self.current.as_ref() else {
-            return Maintenance::NeedsReexecution;
-        };
-        let value = self.agg_value(event, row, db);
-        // A refusal cannot say whether the extreme left, so the safe answer
-        // is the one that asks the database.
-        if !value.is_absent()
-            && values_equal(ComparisonContext::none(), &value, current).unwrap_or(true)
-        {
-            // The current extreme (or a tie of it) was removed, the next
-            // extreme is unknown without a scan.
-            Maintenance::NeedsReexecution
-        } else {
-            Maintenance::Unchanged
+        let change = self.change(event, vm, db);
+        let outcome = self.apply(&change);
+        if matches!(outcome, Maintenance::NeedsReexecution) && self.reading.is_none() {
+            self.reading = Some(ReadBuffer::new());
         }
-    }
-}
-
-impl<B: Backend> MaintainedQuery<B> for MinMaxQuery<B> {
-    fn on_event<E, DB>(&mut self, event: &E, vm: &mut Vm<B>, db: &DB) -> Maintenance<B>
-    where
-        E: CdcEvent<Backend = B>,
-        DB: DatabaseLike,
-    {
-        match event.kind() {
-            EventKind::Insert => self.on_insert_row(event, RowKind::New, vm, db),
-            EventKind::Delete => self.on_delete_row(event, RowKind::Old, vm, db),
-            EventKind::Update => match self.on_delete_row(event, RowKind::Old, vm, db) {
-                // The extreme was displaced: a fresh scan also reflects
-                // the insert half, so re-query covers both.
-                Maintenance::NeedsReexecution => Maintenance::NeedsReexecution,
-                _ => self.on_insert_row(event, RowKind::New, vm, db),
-            },
-            EventKind::Truncate => {
-                // The table is empty afterwards, so this resolves an unknown
-                // extreme as well as replacing a known one.
-                if self.current.as_ref().is_some_and(Value::is_null) {
-                    Maintenance::Unchanged
-                } else {
-                    self.current = Some(Value::Null);
-                    Maintenance::Updated(Value::Null)
-                }
-            }
+        // An unpositioned change can never be judged against a fence.
+        if let (Some(reading), Some(at)) = (&mut self.reading, at) {
+            reading.push(at, change, cap);
         }
+        outcome
     }
 
-    fn install(&mut self, value: Value<B>) {
+    /// Adopt a read's answer, then apply every kept change its snapshot
+    /// missed.
+    ///
+    /// Without a fence nothing kept can be judged, so the answer is taken as
+    /// it is. A missed change that removes the answer asks for another read,
+    /// which keeps every change for that read to judge in turn.
+    pub fn install(&mut self, value: Value<B>, fence: Option<C::Fence>) -> ScalarInstallOutcome<B> {
+        let reading = self.reading.take().unwrap_or_else(ReadBuffer::new);
         self.current = Some(value);
+        if fence.is_none() {
+            self.fence = ReadFence::none();
+            return ScalarInstallOutcome::Value(self.current.clone().expect("just set"));
+        }
+        if reading.overflowed {
+            self.current = None;
+            self.reading = Some(ReadBuffer::new());
+            return ScalarInstallOutcome::ReadAgain;
+        }
+        self.fence = ReadFence::new(fence);
+        let removed = reading.changes.iter().any(|(at, change)| {
+            self.fence.admits(Some(at))
+                && matches!(self.apply(change), Maintenance::NeedsReexecution)
+        });
+        if removed {
+            self.reading = Some(reading);
+            return ScalarInstallOutcome::ReadAgain;
+        }
+        ScalarInstallOutcome::Value(self.current.clone().expect("the install set the extreme"))
     }
 
-    fn dependency_columns(&self) -> &[ColumnId] {
+    pub fn dependency_columns(&self) -> &[ColumnId] {
         &self.dependency_columns
     }
 }
 
-struct GroupedExtreme<B: Backend> {
+struct GroupedExtreme<B: Backend, C: Checkpoint> {
     values: Vec<Value<B>>,
     current: Value<B>,
     rows: i64,
@@ -268,9 +348,11 @@ struct GroupedExtreme<B: Backend> {
     /// this, so a value that moved under a pending read is announced by the
     /// read's install rather than twice or never.
     announced: Option<Value<B>>,
+    /// The fence of the scoped read that last set the group.
+    fence: ReadFence<C>,
 }
 
-impl<B: Backend> GroupedExtreme<B> {
+impl<B: Backend, C: Checkpoint> GroupedExtreme<B, C> {
     fn identity(&self, key: &[u8]) -> crate::GroupIdentity<B> {
         crate::GroupIdentity {
             key: key.to_vec(),
@@ -286,19 +368,89 @@ impl<B: Backend> GroupedExtreme<B> {
     }
 }
 
-#[derive(Clone)]
 struct ExtremeRow<B: Backend> {
     key: Vec<u8>,
     values: Vec<Value<B>>,
     value: Value<B>,
 }
 
-#[derive(Clone)]
+impl<B: Backend> Clone for ExtremeRow<B> {
+    fn clone(&self) -> Self {
+        Self {
+            key: self.key.clone(),
+            values: self.values.clone(),
+            value: self.value.clone(),
+        }
+    }
+}
+
 enum GroupedRowChange<B: Backend> {
     Insert(ExtremeRow<B>),
     Delete(ExtremeRow<B>),
     Refresh { key: Vec<u8>, values: Vec<Value<B>> },
     MissingGroup,
+}
+
+impl<B: Backend> Clone for GroupedRowChange<B> {
+    fn clone(&self) -> Self {
+        match self {
+            Self::Insert(row) => Self::Insert(row.clone()),
+            Self::Delete(row) => Self::Delete(row.clone()),
+            Self::Refresh { key, values } => Self::Refresh {
+                key: key.clone(),
+                values: values.clone(),
+            },
+            Self::MissingGroup => Self::MissingGroup,
+        }
+    }
+}
+
+impl<B: Backend> GroupedRowChange<B> {
+    fn key(&self) -> Option<&[u8]> {
+        match self {
+            Self::Insert(row) | Self::Delete(row) => Some(&row.key),
+            Self::Refresh { key, .. } => Some(key),
+            Self::MissingGroup => None,
+        }
+    }
+}
+
+/// One change to a group kept while a scoped read of it is outstanding.
+enum GroupEntry<B: Backend> {
+    Row(GroupedRowChange<B>),
+    Emptied,
+}
+
+/// A scoped read asked for one group, with every positioned change to the
+/// group since, so the ones its snapshot missed can be applied on top of its
+/// answer.
+struct GroupRead<B: Backend, C: Checkpoint> {
+    values: Vec<Value<B>>,
+    changes: Vec<(C, GroupEntry<B>)>,
+    overflowed: bool,
+}
+
+impl<B: Backend, C: Checkpoint> GroupRead<B, C> {
+    const fn new(values: Vec<Value<B>>) -> Self {
+        Self {
+            values,
+            changes: Vec::new(),
+            overflowed: false,
+        }
+    }
+
+    /// An unpositioned change can never be judged against a fence, so it is
+    /// not kept.
+    fn record(&mut self, at: Option<&C>, entry: GroupEntry<B>, cap: usize) {
+        let Some(at) = at else {
+            return;
+        };
+        if self.changes.len() >= cap {
+            self.overflowed = true;
+            return;
+        }
+        self.changes.push((at.clone(), entry));
+    }
 }
 
 #[derive(Clone)]
@@ -365,9 +517,11 @@ impl<B: Backend, C: Checkpoint> GroupedMaintenance<B, C> {
 
 pub struct GroupedMinMaxQuery<B: Backend, C: Checkpoint> {
     plan: crate::reexec::plan::GroupedMinMaxPlan<B>,
-    groups: HashMap<Vec<u8>, GroupedExtreme<B>>,
+    groups: HashMap<Vec<u8>, GroupedExtreme<B, C>>,
     pending: Option<PendingGrouped<B, C>>,
-    pending_reads: HashMap<Vec<u8>, Vec<Value<B>>>,
+    /// The seed read's fence, judging every group no scoped read has set.
+    fence: ReadFence<C>,
+    pending_reads: HashMap<Vec<u8>, GroupRead<B, C>>,
     database_reads_per_consumer: bool,
 }
 
@@ -380,6 +534,7 @@ impl<B: Backend + SqlLiteralParse, C: Checkpoint> GroupedMinMaxQuery<B, C> {
             plan,
             groups: HashMap::new(),
             pending: Some(PendingGrouped::new()),
+            fence: ReadFence::none(),
             pending_reads: HashMap::new(),
             database_reads_per_consumer,
         }
@@ -521,7 +676,7 @@ impl<B: Backend + SqlLiteralParse, C: Checkpoint> GroupedMinMaxQuery<B, C> {
     /// install speaks.
     fn crossing(
         having: Option<&crate::reexec::plan::GroupedHavingCheck<B>>,
-        group: &mut GroupedExtreme<B>,
+        group: &mut GroupedExtreme<B, C>,
     ) -> Option<crate::AggregateValueChange<B>> {
         if Self::passes(having, &group.current, group.rows) {
             let repeat = group.announced.as_ref().is_some_and(|seen| {
@@ -540,22 +695,54 @@ impl<B: Backend + SqlLiteralParse, C: Checkpoint> GroupedMinMaxQuery<B, C> {
             .map(|_| crate::AggregateValueChange::Remove)
     }
 
+    /// Ask for a scoped read of `key`, keeping the group's changes from here
+    /// until it lands.
+    fn request_read(
+        &mut self,
+        key: Vec<u8>,
+        values: Vec<Value<B>>,
+        checkpoint: Option<&C>,
+        output: &mut GroupedMaintenance<B, C>,
+    ) -> Result<(), crate::RegisterError> {
+        let query = crate::reexec::plan::render_grouped_scalar_read(&self.plan, &values)?;
+        self.pending_reads
+            .entry(key.clone())
+            .or_insert_with(|| GroupRead::new(values));
+        output.reads.push(GroupedRead {
+            group: key,
+            query,
+            column_kinds: [self.plan.agg_kind, crate::backend::ScalarFamily::Int],
+            checkpoint: checkpoint.cloned(),
+        });
+        Ok(())
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one pass judges, records and applies each group's changes in event order"
+    )]
     fn apply_event(
         &mut self,
         event: &PendingGroupedEvent<B>,
         group_limit: usize,
         checkpoint: Option<&C>,
+        pending_cap: usize,
     ) -> Result<GroupedMaintenance<B, C>, crate::RegisterError> {
         let mut output = GroupedMaintenance::empty();
         let PendingGroupedEvent::Rows(changes) = event else {
-            output.changes.extend(
-                self.groups
-                    .iter()
-                    .filter(|(_, group)| group.announced.is_some())
-                    .map(|(key, group)| (group.identity(key), crate::AggregateValueChange::Remove)),
-            );
-            self.groups.clear();
-            self.pending_reads.clear();
+            for read in self.pending_reads.values_mut() {
+                read.record(checkpoint, GroupEntry::Emptied, pending_cap);
+            }
+            let mut removed = Vec::new();
+            self.groups.retain(|key, group| {
+                // A group a later read set keeps what that read saw after the truncate.
+                let kept = !group.fence.admits(checkpoint);
+                if !kept && group.announced.is_some() {
+                    removed.push((group.identity(key), crate::AggregateValueChange::Remove));
+                }
+                kept
+            });
+            output.changes.extend(removed);
             return Ok(output);
         };
         // Phase one applies the row changes and remembers which groups
@@ -569,6 +756,18 @@ impl<B: Backend + SqlLiteralParse, C: Checkpoint> GroupedMinMaxQuery<B, C> {
             }
         };
         for change in changes {
+            if let Some(key) = change.key() {
+                let held = self
+                    .groups
+                    .get_mut(key)
+                    .is_some_and(|group| !group.fence.admits(checkpoint));
+                if held {
+                    continue;
+                }
+                if let Some(read) = self.pending_reads.get_mut(key) {
+                    read.record(checkpoint, GroupEntry::Row(change.clone()), pending_cap);
+                }
+            }
             match change {
                 GroupedRowChange::MissingGroup => output.missing_group = true,
                 GroupedRowChange::Refresh { key, values } => {
@@ -578,25 +777,23 @@ impl<B: Backend + SqlLiteralParse, C: Checkpoint> GroupedMinMaxQuery<B, C> {
                     let Some(group) = self.groups.get_mut(&row.key) else {
                         continue;
                     };
-                    group.rows -= 1;
-                    if group.rows <= 0 {
-                        // The removal is final, so it does not wait for
-                        // phase two: an announced group says goodbye now.
-                        if let Some(group) = self.groups.remove(&row.key) {
-                            if group.announced.is_some() {
-                                output.changes.push((
-                                    group.into_identity(row.key.clone()),
-                                    crate::AggregateValueChange::Remove,
-                                ));
+                    match Self::delete_row(group, row) {
+                        RowEffect::Emptied => {
+                            // The removal is final, so it does not wait for
+                            // phase two: an announced group says goodbye now.
+                            if let Some(group) = self.groups.remove(&row.key) {
+                                if group.announced.is_some() {
+                                    output.changes.push((
+                                        group.into_identity(row.key.clone()),
+                                        crate::AggregateValueChange::Remove,
+                                    ));
+                                }
                             }
                         }
-                    } else if !row.value.is_absent()
-                        && values_equal(ComparisonContext::none(), &row.value, &group.current)
-                            .unwrap_or(true)
-                    {
-                        refresh.insert(row.key.clone(), row.values.clone());
-                    } else {
-                        touch(&mut touched, &row.key);
+                        RowEffect::Reread => {
+                            refresh.insert(row.key.clone(), row.values.clone());
+                        }
+                        RowEffect::Moved => touch(&mut touched, &row.key),
                     }
                 }
                 GroupedRowChange::Insert(row) => {
@@ -620,6 +817,7 @@ impl<B: Backend + SqlLiteralParse, C: Checkpoint> GroupedMinMaxQuery<B, C> {
                         current: Value::Null,
                         rows: 0,
                         announced: None,
+                        fence: ReadFence::none(),
                     },
                 );
             }
@@ -627,16 +825,18 @@ impl<B: Backend + SqlLiteralParse, C: Checkpoint> GroupedMinMaxQuery<B, C> {
                 .groups
                 .get(&key)
                 .map_or(values, |group| group.values.clone());
-            // Rendered before the read is recorded, so `values` moves into the
-            // map rather than being copied for both.
-            let query = crate::reexec::plan::render_grouped_scalar_read(&self.plan, &values)?;
-            self.pending_reads.insert(key.clone(), values);
-            output.reads.push(GroupedRead {
-                group: key,
-                query,
-                column_kinds: [self.plan.agg_kind, crate::backend::ScalarFamily::Int],
-                checkpoint: checkpoint.cloned(),
-            });
+            let opened = !self.pending_reads.contains_key(&key);
+            self.request_read(key.clone(), values, checkpoint, &mut output)?;
+            if opened {
+                // A held change among these is harmless, the read holds it too.
+                let read = self
+                    .pending_reads
+                    .get_mut(&key)
+                    .expect("the read was just requested");
+                for change in changes.iter().filter(|change| change.key() == Some(&key)) {
+                    read.record(checkpoint, GroupEntry::Row(change.clone()), pending_cap);
+                }
+            }
         }
         // Phase two announces each settled group's difference from what the
         // consumer last saw.
@@ -650,6 +850,20 @@ impl<B: Backend + SqlLiteralParse, C: Checkpoint> GroupedMinMaxQuery<B, C> {
             }
         }
         Ok(output)
+    }
+
+    /// Take one matching row out of `group`.
+    fn delete_row(group: &mut GroupedExtreme<B, C>, row: &ExtremeRow<B>) -> RowEffect {
+        group.rows -= 1;
+        if group.rows <= 0 {
+            RowEffect::Emptied
+        } else if !row.value.is_absent()
+            && values_equal(ComparisonContext::none(), &row.value, &group.current).unwrap_or(true)
+        {
+            RowEffect::Reread
+        } else {
+            RowEffect::Moved
+        }
     }
 
     /// Fold one observed insert or force a scoped read when event data cannot
@@ -682,6 +896,7 @@ impl<B: Backend + SqlLiteralParse, C: Checkpoint> GroupedMinMaxQuery<B, C> {
                     current: row.value.clone(),
                     rows: 1,
                     announced: None,
+                    fence: ReadFence::none(),
                 },
             );
         }
@@ -700,19 +915,27 @@ impl<B: Backend + SqlLiteralParse, C: Checkpoint> GroupedMinMaxQuery<B, C> {
         E: CdcEvent<Backend = B, Checkpoint = C>,
         DB: DatabaseLike,
     {
-        let change = self.event_changes(event, vm, db)?;
-        if let Some(pending) = &mut self.pending {
+        let at = event.checkpoint();
+        if self.pending.is_some() {
+            let change = self.event_changes(event, vm, db)?;
             let missing_group = matches!(
                 &change,
                 PendingGroupedEvent::Rows(changes)
                     if changes.iter().any(|change| matches!(change, GroupedRowChange::MissingGroup))
             );
-            pending.push(event.checkpoint().as_ref(), change, pending_cap);
+            if let Some(pending) = &mut self.pending {
+                pending.push(at.as_ref(), change, pending_cap);
+            }
             let mut output = GroupedMaintenance::empty();
             output.missing_group = missing_group;
             return Ok(output);
         }
-        self.apply_event(&change, group_limit, event.checkpoint().as_ref())
+        // What the seed read holds, every later read holds too.
+        if !self.fence.admits(at.as_ref()) {
+            return Ok(GroupedMaintenance::empty());
+        }
+        let change = self.event_changes(event, vm, db)?;
+        self.apply_event(&change, group_limit, at.as_ref(), pending_cap)
             .map_err(|error| crate::DispatchError::TierTransition {
                 subscription: 0,
                 message: error.to_string(),
@@ -727,7 +950,7 @@ impl<B: Backend + SqlLiteralParse, C: Checkpoint> GroupedMinMaxQuery<B, C> {
         &mut self,
         subscription: crate::SubscriptionId,
         rows: &[Vec<Value<B>>],
-        read_at: Option<&C>,
+        fence: Option<C::Fence>,
         pending_cap: usize,
         group_limit: usize,
     ) -> Result<GroupedMaintenance<B, C>, crate::AggregateInstallError> {
@@ -742,7 +965,7 @@ impl<B: Backend + SqlLiteralParse, C: Checkpoint> GroupedMinMaxQuery<B, C> {
             });
         }
         if !pending.events.is_empty()
-            && (read_at.is_none() || pending.events.iter().any(|(at, _)| at.is_none()))
+            && (fence.is_none() || pending.events.iter().any(|(at, _)| at.is_none()))
         {
             self.pending = Some(pending);
             return Err(crate::AggregateInstallError::PositionUnknown(subscription));
@@ -787,6 +1010,7 @@ impl<B: Backend + SqlLiteralParse, C: Checkpoint> GroupedMinMaxQuery<B, C> {
                         current: row[group_columns].clone(),
                         rows: count,
                         announced: None,
+                        fence: ReadFence::none(),
                     },
                 )
                 .is_some()
@@ -796,13 +1020,14 @@ impl<B: Backend + SqlLiteralParse, C: Checkpoint> GroupedMinMaxQuery<B, C> {
             }
         }
         self.groups = groups;
+        self.fence = ReadFence::new(fence);
         let mut output = GroupedMaintenance::empty();
         for (at, event) in &pending.events {
-            if at.as_ref() <= read_at {
+            if !self.fence.admits(at.as_ref()) {
                 continue;
             }
             let replayed = self
-                .apply_event(event, group_limit, at.as_ref())
+                .apply_event(event, group_limit, at.as_ref(), pending_cap)
                 .map_err(|error| crate::AggregateInstallError::TierTransition {
                     subscription,
                     message: error.to_string(),
@@ -842,14 +1067,18 @@ impl<B: Backend + SqlLiteralParse, C: Checkpoint> GroupedMinMaxQuery<B, C> {
         Ok(output)
     }
 
-    /// Install one scoped read's result.
+    /// Install one scoped read's result, then apply every change to the group
+    /// its snapshot missed. The read's fence then judges the group's later
+    /// changes until one passes it.
     pub fn install_group(
         &mut self,
         subscription: crate::SubscriptionId,
         key: &[u8],
         row: &[Value<B>],
+        fence: Option<C::Fence>,
+        checkpoint: Option<&C>,
         group_limit: usize,
-    ) -> Result<Option<GroupedValueChange<B>>, crate::AggregateInstallError> {
+    ) -> Result<GroupedMaintenance<B, C>, crate::AggregateInstallError> {
         if row.len() != 2 {
             return Err(crate::AggregateInstallError::GroupedRowArity {
                 subscription,
@@ -862,60 +1091,125 @@ impl<B: Backend + SqlLiteralParse, C: Checkpoint> GroupedMinMaxQuery<B, C> {
         };
         let count = sql_scalar_text::parse_i64(&count.scalar_text())
             .ok_or(crate::AggregateInstallError::GroupedRowCount(subscription))?;
-        if count <= 0 {
-            self.pending_reads.remove(key);
-            let change = self.groups.remove(key).and_then(|group| {
-                group.announced.is_some().then(|| {
-                    (
-                        group.into_identity(key.to_vec()),
-                        crate::AggregateValueChange::Remove,
-                    )
-                })
-            });
-            return Ok(change);
-        }
-        if !self.groups.contains_key(key) && self.groups.len() >= group_limit {
+        let mut output = GroupedMaintenance::empty();
+        let read = self.pending_reads.remove(key);
+        let existing = self.groups.remove(key);
+        let was_present = existing.is_some();
+        let (values, announced) = match (existing, &read) {
+            (Some(group), _) => (group.values, group.announced),
+            (None, Some(read)) => (read.values.clone(), None),
+            (None, None) if count <= 0 => return Ok(output),
+            (None, None) => {
+                return Err(crate::AggregateInstallError::UnexpectedGroupRead(
+                    subscription,
+                ))
+            }
+        };
+        let mut group = GroupedExtreme {
+            values,
+            current: row[0].clone(),
+            rows: count.max(0),
+            announced,
+            fence: ReadFence::none(),
+        };
+        let replays = fence.is_some();
+        let mut group_fence = ReadFence::new(fence);
+        let reread = match &read {
+            Some(read) if replays && read.overflowed => true,
+            Some(read) if replays => read
+                .changes
+                .iter()
+                .any(|(at, entry)| group_fence.admits(Some(at)) && self.replay(&mut group, entry)),
+            _ => false,
+        };
+        group.fence = group_fence;
+        if !was_present && (reread || group.rows > 0) && self.groups.len() >= group_limit {
             return Err(crate::AggregateInstallError::GroupLimit {
                 subscription,
                 limit: group_limit,
             });
         }
-        let having = self.plan.having.as_ref();
-        let (values, change) = if let Some(group) = self.groups.get_mut(key) {
-            group.current.clone_from(&row[0]);
-            group.rows = count;
-            let change = Self::crossing(having, group);
-            (group.values.clone(), change)
-        } else {
-            let values = self.pending_reads.get(key).cloned().ok_or(
-                crate::AggregateInstallError::UnexpectedGroupRead(subscription),
-            )?;
-            let mut group = GroupedExtreme {
-                values: values.clone(),
-                current: row[0].clone(),
-                rows: count,
-                announced: None,
-            };
-            let change = Self::crossing(having, &mut group);
+        if reread {
+            // Every kept change stays for the next read to judge, except
+            // after an overflow, when none of them can be trusted.
+            let kept = read
+                .filter(|read| !read.overflowed)
+                .map_or_else(Vec::new, |read| read.changes);
+            let values = group.values.clone();
             self.groups.insert(key.to_vec(), group);
-            (values, change)
-        };
-        self.pending_reads.remove(key);
-        Ok(change.map(|change| {
-            (
-                crate::GroupIdentity {
-                    key: key.to_vec(),
-                    values,
-                },
-                change,
-            )
-        }))
+            self.request_read(key.to_vec(), values, checkpoint, &mut output)
+                .map_err(|error| crate::AggregateInstallError::TierTransition {
+                    subscription,
+                    message: error.to_string(),
+                })?;
+            self.pending_reads
+                .get_mut(key)
+                .expect("the read was just requested")
+                .changes = kept;
+            return Ok(output);
+        }
+        if group.rows <= 0 {
+            if group.announced.is_some() {
+                output.changes.push((
+                    group.into_identity(key.to_vec()),
+                    crate::AggregateValueChange::Remove,
+                ));
+            }
+            return Ok(output);
+        }
+        if let Some(change) = Self::crossing(self.plan.having.as_ref(), &mut group) {
+            output.changes.push((group.identity(key), change));
+        }
+        self.groups.insert(key.to_vec(), group);
+        Ok(output)
     }
+
+    /// Apply one kept change on top of a scoped read's answer. `true` when
+    /// only another read can say what the group holds.
+    fn replay(&self, group: &mut GroupedExtreme<B, C>, entry: &GroupEntry<B>) -> bool {
+        match entry {
+            GroupEntry::Emptied => {
+                group.rows = 0;
+                group.current = Value::Null;
+                false
+            }
+            GroupEntry::Row(GroupedRowChange::Insert(row)) => {
+                if self.database_reads_per_consumer {
+                    return true;
+                }
+                group.rows += 1;
+                if Self::candidate_wins(self.plan.kind, &row.value, &group.current) {
+                    group.current.clone_from(&row.value);
+                }
+                false
+            }
+            GroupEntry::Row(GroupedRowChange::Delete(row)) => match Self::delete_row(group, row) {
+                RowEffect::Emptied => {
+                    group.rows = 0;
+                    group.current = Value::Null;
+                    false
+                }
+                RowEffect::Reread => true,
+                RowEffect::Moved => false,
+            },
+            GroupEntry::Row(GroupedRowChange::Refresh { .. }) => true,
+            GroupEntry::Row(GroupedRowChange::MissingGroup) => false,
+        }
+    }
+}
+
+/// What taking one row out of a group did to it.
+enum RowEffect {
+    /// No row is left.
+    Emptied,
+    /// The extreme left and only a read can name the next one.
+    Reread,
+    Moved,
 }
 
 /// Enum-dispatch wrapper holding any maintained query.
 pub enum QueryRuntime<B: Backend, C: Checkpoint = crate::NoCheckpoint> {
-    Partial(MinMaxQuery<B>),
+    Partial(MinMaxQuery<B, C>),
     /// Grouped extrema with a checkpoint-aware seed window.
     Grouped(alloc::boxed::Box<GroupedMinMaxQuery<B, C>>),
     /// Re-read in full on any relevant change, holding nothing.
@@ -925,13 +1219,19 @@ pub enum QueryRuntime<B: Backend, C: Checkpoint = crate::NoCheckpoint> {
 }
 
 impl<B: Backend + SqlLiteralParse, C: Checkpoint> QueryRuntime<B, C> {
-    pub fn on_event<E, DB>(&mut self, event: &E, vm: &mut Vm<B>, db: &DB) -> Maintenance<B>
+    pub fn on_event<E, DB>(
+        &mut self,
+        event: &E,
+        vm: &mut Vm<B>,
+        db: &DB,
+        cap: usize,
+    ) -> Maintenance<B>
     where
-        E: CdcEvent<Backend = B>,
+        E: CdcEvent<Backend = B, Checkpoint = C>,
         DB: DatabaseLike,
     {
         match self {
-            Self::Partial(query) => query.on_event(event, vm, db),
+            Self::Partial(query) => query.on_event(event, vm, db, cap),
             Self::Grouped(_) => {
                 unreachable!("grouped maintenance uses its multi-group output")
             }
@@ -940,14 +1240,14 @@ impl<B: Backend + SqlLiteralParse, C: Checkpoint> QueryRuntime<B, C> {
         }
     }
 
-    pub fn install(&mut self, value: Value<B>) {
+    pub fn install(&mut self, value: Value<B>, fence: Option<C::Fence>) -> ScalarInstallOutcome<B> {
         match self {
-            Self::Partial(query) => query.install(value),
+            Self::Partial(query) => query.install(value, fence),
             Self::Grouped(_) => {
                 unreachable!("a grouped result uses its concrete install input")
             }
-            Self::Total(query) => MaintainedQuery::<B>::install(query, value),
-            Self::Keyed(query) => MaintainedQuery::<B>::install(query, value),
+            // Neither tier holds an answer, so the read goes to the consumer.
+            Self::Total(_) | Self::Keyed(_) => ScalarInstallOutcome::Value(value),
         }
     }
 
@@ -999,11 +1299,6 @@ impl<B: Backend> MaintainedQuery<B> for TotalQuery {
         _database: &DB,
     ) -> Maintenance<B> {
         Maintenance::NeedsReexecution
-    }
-
-    fn install(&mut self, _value: Value<B>) {
-        // Nothing to install: the tier holds no answer, so a re-read is
-        // delivered to the consumer rather than stored here.
     }
 
     fn dependency_columns(&self) -> &[crate::ColumnId] {
@@ -1129,10 +1424,6 @@ impl<B: Backend> MaintainedQuery<B> for KeyedQuery<B> {
         };
         self.record(key);
         Maintenance::NeedsReexecution
-    }
-
-    fn install(&mut self, _value: Value<B>) {
-        // Nothing to install: this tier holds no answer.
     }
 
     fn dependency_columns(&self) -> &[crate::ColumnId] {
