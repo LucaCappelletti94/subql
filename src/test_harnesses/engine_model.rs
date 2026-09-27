@@ -863,43 +863,19 @@ impl Run {
                 unknown.push(subscription.id);
                 continue;
             }
-            if let View::Stream(rows) = &mut subscription.view {
-                let listed = |ids: &[u64]| ids.contains(&consumer);
-                let remove = |rows: &mut Answer, row: &[Cell]| {
-                    let projected = project(&subscription.statement, row);
-                    if let Some(at) = rows.iter().position(|held| {
-                        held.len() == projected.len()
-                            && held.iter().zip(&projected).all(|(a, b)| a.same(b))
-                    }) {
-                        rows.remove(at);
-                    }
-                };
-                if truncate && listed(notifications.deleted()) {
-                    rows.clear();
-                }
-                if listed(notifications.deleted()) || listed(notifications.updated()) {
-                    if let Some(old) = &old {
-                        remove(rows, old);
-                    }
-                }
-                if listed(notifications.inserted()) || listed(notifications.updated()) {
-                    if let Some(new) = &new {
-                        rows.push(project(&subscription.statement, new));
-                    }
-                }
-            }
+            fold_rows(
+                subscription,
+                notifications,
+                truncate,
+                old.as_deref(),
+                new.as_deref(),
+            );
             apply_aggregates(
                 &mut subscription.view,
                 subscription.id,
                 &settled.dispatched.aggregate_updates,
             );
-            for update in &settled.dispatched.scalar_updates {
-                if update.subscription_id == subscription.id {
-                    let mut groups = BTreeMap::new();
-                    groups.insert(Vec::new(), (Vec::new(), Cell::of(&update.value)));
-                    subscription.view = View::Groups(groups);
-                }
-            }
+            apply_scalars(subscription, &settled.dispatched.scalar_updates);
             if let Some(reads) = &reads {
                 absorb_reads(subscription, reads);
             }
@@ -963,6 +939,52 @@ fn changed_columns(old: &[Value<SQLite>], new: &[Value<SQLite>]) -> Vec<u16> {
         .collect()
 }
 
+/// Fold an in-process row notification into `subscription`'s held rows,
+/// the old image leaving and the new one arriving as the lists name it.
+fn fold_rows(
+    subscription: &mut Subscription,
+    notifications: &crate::ConsumerNotifications<DefaultIds, crate::NoCheckpoint, SQLite>,
+    truncate: bool,
+    old: Option<&[Cell]>,
+    new: Option<&[Cell]>,
+) {
+    let View::Stream(rows) = &mut subscription.view else {
+        return;
+    };
+    let consumer = subscription.consumer;
+    let listed = |ids: &[u64]| ids.contains(&consumer);
+    let deleted = listed(notifications.deleted());
+    let updated = listed(notifications.updated());
+    if truncate && deleted {
+        rows.clear();
+    }
+    if let Some(old) = old.filter(|_| deleted || updated) {
+        let projected = project(&subscription.statement, old);
+        if let Some(at) = rows.iter().position(|held| {
+            held.len() == projected.len() && held.iter().zip(&projected).all(|(a, b)| a.same(b))
+        }) {
+            rows.remove(at);
+        }
+    }
+    if let Some(new) = new.filter(|_| listed(notifications.inserted()) || updated) {
+        rows.push(project(&subscription.statement, new));
+    }
+}
+
+/// Replace `subscription`'s view with the scalar value an update names.
+fn apply_scalars(
+    subscription: &mut Subscription,
+    updates: &[crate::reexec::ScalarUpdate<DefaultIds, SQLite, crate::NoCheckpoint>],
+) {
+    for update in updates {
+        if update.subscription_id == subscription.id {
+            let mut groups = BTreeMap::new();
+            groups.insert(Vec::new(), (Vec::new(), Cell::of(&update.value)));
+            subscription.view = View::Groups(groups);
+        }
+    }
+}
+
 /// Fold what the re-execution reads delivered into `subscription`.
 fn absorb_reads(
     subscription: &mut Subscription,
@@ -973,13 +995,7 @@ fn absorb_reads(
         subscription.id,
         &reads.aggregate_updates,
     );
-    for update in &reads.scalar_updates {
-        if update.subscription_id == subscription.id {
-            let mut groups = BTreeMap::new();
-            groups.insert(Vec::new(), (Vec::new(), Cell::of(&update.value)));
-            subscription.view = View::Groups(groups);
-        }
-    }
+    apply_scalars(subscription, &reads.scalar_updates);
     for update in &reads.rows_updates {
         if update.subscription_id == subscription.id {
             subscription.view = View::Whole(
