@@ -85,6 +85,10 @@ jobs:
             args: "--all-targets --features apply-patchset-postgres-async"
           - name: apply-patchset-mysql-async
             args: "--all-targets --features apply-patchset-mysql-async"
+          # The feature the documented `pg_streaming_e2e` and `polling_smoke`
+          # run commands enable alone.
+          - name: pg-streaming
+            args: "--all-targets --features pg-streaming"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: sudo apt-get update && sudo apt-get install -y libpq-dev default-libmysqlclient-dev
