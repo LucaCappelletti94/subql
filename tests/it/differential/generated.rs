@@ -18,7 +18,7 @@ use subql::test_harnesses::predicate_grammar::{self, subql_selects, t, Case, Eng
 /// file so neither replays the other's seeds.
 const REGRESSIONS: &str = "tests/it/differential/generated.proptest-regressions";
 
-/// Cases per run: `SUBQL_SWEEP_ROWS` times fifty, so the pull-request depth
+/// `SUBQL_SWEEP_ROWS` times fifty cases per run, so the pull-request depth
 /// is 2400 and the weekly one 30000.
 fn cases() -> u32 {
     std::env::var("SUBQL_SWEEP_ROWS")

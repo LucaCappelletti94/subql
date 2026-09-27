@@ -1100,8 +1100,8 @@ where
     Ok(())
 }
 
-/// Whether a pattern match reads `operand` as text on every engine: a text
-/// column, a string, a bound parameter or `NULL`. MySQL and SQLite match a
+/// Whether `operand` is a text column, a string, a bound parameter or
+/// `NULL`, which every engine matches as text. MySQL and SQLite match a
 /// number or a boolean by its text rendering and PostgreSQL refuses it, a
 /// rendering subql does not reproduce.
 fn is_text_operand<B: Backend, DB: DatabaseLike>(
@@ -1178,8 +1178,8 @@ fn refuse_mixed_arithmetic<B: Backend, DB: DatabaseLike>(
     Ok(())
 }
 
-/// Whether `operand` is a number on every engine: a numeric column or
-/// literal, a bound parameter, `NULL`, or arithmetic over those.
+/// Whether `operand` is a numeric column or literal, a bound parameter,
+/// `NULL`, or arithmetic over those, which every engine reads as a number.
 fn is_numeric_operand<B: Backend, DB: DatabaseLike>(
     operand: &Expr,
     table_id: TableId,

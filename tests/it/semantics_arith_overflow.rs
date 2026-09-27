@@ -128,9 +128,9 @@ fn sqlite_overflow_promotes_to_float() {
     );
 }
 
-/// The promoted real keeps computing as SQLite computes it: a real beside an
-/// integer is a real, so `qty * qty + qty` over the largest integer is about
-/// `8.5e37`, and above `qty`.
+/// The promoted real keeps computing as SQLite computes it. A real beside
+/// an integer is a real, so `qty * qty + qty` over the largest integer is
+/// about `8.5e37`, and above `qty`.
 #[test]
 fn sqlite_arithmetic_continues_on_the_promoted_real() {
     let notifications = dispatch!(

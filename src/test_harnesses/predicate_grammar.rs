@@ -2,7 +2,7 @@
 //!
 //! Every choice is drawn from [`Unstructured`], so one byte string names one
 //! case in the libFuzzer target and in the Docker sweep alike. The grammar
-//! draws expressions in every position subql compiles: the condition itself,
+//! draws expressions in every position subql compiles, which are the condition itself,
 //! comparison operands, `IN` lists, `BETWEEN` bounds, `LIKE` patterns with
 //! and without `ESCAPE`, `COALESCE` arguments, truth tests, null-safe
 //! equality and arithmetic. Nothing restricts a value to where a boolean is
@@ -383,7 +383,7 @@ impl Expr {
     }
 }
 
-/// One generated case: a row of `t` and a filter over it.
+/// One generated case, a row of `t` and a filter over it.
 #[derive(Clone, Debug)]
 pub struct Case {
     /// The row stored in `t`.
@@ -486,9 +486,9 @@ pub fn catalog<D: sqlparser::dialect::Dialect + Default>(engine: Engine) -> Pars
 
 /// Whether subql, serving the filter in process, delivers the row.
 ///
-/// `None` when subql does not answer in process: the statement is routed to
-/// a read, refused, or the row leaves the answer to the engine. Only a served
-/// answer can diverge.
+/// `None` when the statement is routed to a read, refused, or the row
+/// leaves the answer to the engine, so subql does not answer in process.
+/// Only a served answer can diverge.
 ///
 /// `database` is [`catalog`] for `engine`, taken by value so a caller judging
 /// many cases parses it once and clones it.
