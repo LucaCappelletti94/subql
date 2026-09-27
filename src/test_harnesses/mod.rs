@@ -30,7 +30,7 @@ pub(crate) mod snapshot_restore;
 
 pub use aggregate_consistency::harness_aggregate_consistency;
 #[cfg(all(feature = "pg-sqlite-emu", feature = "executor-diesel"))]
-pub use engine_model::harness_engine_model_sqlite;
+pub use engine_model::{engine_model_sqlite, harness_engine_model_sqlite, EngineModelCoverage};
 pub use harness_functions::{
     fuzz_catalog, harness_canonicalize, harness_codec_decode, harness_deserialize_shard,
     harness_parse_sql, harness_vm_eval, harness_wal_json_postparse,

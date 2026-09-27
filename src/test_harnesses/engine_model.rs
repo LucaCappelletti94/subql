@@ -431,7 +431,33 @@ impl Drop for Store {
     }
 }
 
+/// What one sequence compared, so a run that compares nothing is visible.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct EngineModelCoverage {
+    /// Comparisons of rows or columns maintained in process.
+    pub rows: usize,
+    /// Comparisons of aggregates folded in process.
+    pub aggregates: usize,
+    /// Comparisons of answers a database read keeps.
+    pub reads: usize,
+    /// Tier changes the engine reported for a compared subscription.
+    pub transitions: usize,
+    /// Restarts every live subscription came back from.
+    pub restarts: usize,
+}
+
+impl core::ops::AddAssign for EngineModelCoverage {
+    fn add_assign(&mut self, other: Self) {
+        self.rows += other.rows;
+        self.aggregates += other.aggregates;
+        self.reads += other.reads;
+        self.transitions += other.transitions;
+        self.restarts += other.restarts;
+    }
+}
+
 struct Run {
+    coverage: EngineModelCoverage,
     engine: Model,
     store: Store,
     url: String,
@@ -477,6 +503,7 @@ impl Run {
         // is the durability a restart can be held to.
         inner.set_rotation_threshold(0);
         Self {
+            coverage: EngineModelCoverage::default(),
             engine: AutoResolvingEngine::new(inner, SyncMode(DieselConnector::new(reads))),
             store,
             url,
@@ -663,6 +690,19 @@ impl Run {
                 self.engine.unregister_subscription(id);
             }
         }
+        // The model connection is held across the restart, so the shared
+        // in-memory database, and every row in it, is still there.
+        let stored: i64 = t::table
+            .count()
+            .get_result(&mut self.model)
+            .expect("the model table counts");
+        assert_eq!(
+            usize::try_from(stored).ok(),
+            Some(self.rows.len()),
+            "the model table lost rows across a restart\n{}",
+            self.script.join("\n")
+        );
+        self.coverage.restarts += 1;
     }
 
     fn unregister(&mut self, index: usize) {
@@ -870,6 +910,7 @@ impl Run {
                 .chain(reads.iter().flat_map(|reads| &reads.transitions))
             {
                 if transition.subscription_id == subscription.id {
+                    self.coverage.transitions += 1;
                     subscription.tier = transition.to.kind();
                 }
             }
@@ -884,12 +925,18 @@ impl Run {
             model,
             subscriptions,
             script,
+            coverage,
             ..
         } = self;
         for subscription in subscriptions.iter() {
             let Some(expected) = sqlite_answers(model, &subscription.statement) else {
                 continue;
             };
+            match (subscription.tier, &subscription.view) {
+                (TierKind::InProcess, View::Groups(_)) => coverage.aggregates += 1,
+                (TierKind::InProcess, _) => coverage.rows += 1,
+                _ => coverage.reads += 1,
+            }
             let held = subscription.view.answer();
             assert!(
                 same_answer(&held, &expected),
@@ -1022,14 +1069,24 @@ fn apply_aggregates(
 /// Contract: a panic is a subscription whose answer, as its subscriber
 /// would hold it, differs from SQLite's for the same statement.
 pub fn harness_engine_model_sqlite(data: &[u8]) {
+    let _ = engine_model_sqlite(data);
+}
+
+/// [`harness_engine_model_sqlite`], reporting what the sequence compared.
+///
+/// # Panics
+///
+/// As [`harness_engine_model_sqlite`].
+#[must_use]
+pub fn engine_model_sqlite(data: &[u8]) -> EngineModelCoverage {
     let mut u = Unstructured::new(data);
     let Ok(len) = u.int_in_range(1usize..=24) else {
-        return;
+        return EngineModelCoverage::default();
     };
     let mut run = Run::new();
     for _ in 0..len {
         let Ok(step) = Step::arbitrary(&mut u) else {
-            return;
+            break;
         };
         match step {
             Step::Register(statement) => run.register(statement),
@@ -1038,4 +1095,5 @@ pub fn harness_engine_model_sqlite(data: &[u8]) {
             write => run.write(&write),
         }
     }
+    run.coverage
 }
