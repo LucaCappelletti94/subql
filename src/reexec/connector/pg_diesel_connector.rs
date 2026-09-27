@@ -298,8 +298,8 @@ impl<S: SessionSetup> Connector for PgDieselConnector<S> {
 }
 
 /// End the transaction the cursors held, committing when they closed cleanly.
-/// Best-effort on the way out of a failure: the transaction is read only, so
-/// failing to end it politely loses nothing.
+/// Best-effort on the way out of a failure, since the transaction is read
+/// only and failing to end it politely loses nothing.
 #[cfg(feature = "executor-diesel-postgres")]
 fn end_cursor_transaction(conn: &mut diesel::PgConnection, commit: bool) {
     use diesel::connection::TransactionManager as _;
@@ -315,9 +315,9 @@ fn end_cursor_transaction(conn: &mut diesel::PgConnection, commit: bool) {
 #[cfg(feature = "executor-diesel-postgres")]
 pub(super) const CURSOR_BATCH: usize = 64;
 
-/// One `DECLARE`d cursor apart from the connection it lives on: its name, the
-/// fence of the snapshot its pages report, and rows already fetched but not
-/// yet delivered.
+/// One `DECLARE`d cursor apart from the connection it lives on, with its
+/// name, the fence of the snapshot its pages report, and rows already
+/// fetched but not yet delivered.
 ///
 /// The leftover buffer is what keeps the byte budget exact. `FETCH` cannot be
 /// undone, so a batch that overshoots the budget would otherwise have to be
@@ -348,8 +348,9 @@ impl PgCursorState {
 /// Fill one page from an open cursor, buffering whatever a `FETCH` overshot.
 ///
 /// The sync twin of `PgAsyncDieselConnector::fetch_from`, shared by the r2d2
-/// and the single-connection connectors, and split out for the same reason: the caller decides what a failure means for the cursor's
-/// registration, and that decision does not belong inside the read loop.
+/// and the single-connection connectors, and split out for the same reason.
+/// The caller decides what a failure means for the cursor's registration,
+/// and that decision does not belong inside the read loop.
 #[cfg(feature = "executor-diesel-postgres")]
 pub(super) fn fetch_page_from(
     conn: &mut diesel::PgConnection,

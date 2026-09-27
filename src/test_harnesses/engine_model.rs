@@ -418,8 +418,6 @@ fn sqlite_answers(connection: &mut SqliteConnection, statement: &Statement) -> O
     }
 }
 
-/// One sequence run: the engine, the model database and every live
-/// subscription.
 /// A directory for the engine's store, removed when the run ends.
 struct Store {
     path: std::path::PathBuf,
@@ -456,6 +454,8 @@ impl core::ops::AddAssign for EngineModelCoverage {
     }
 }
 
+/// One sequence run, holding the engine, the model database and every live
+/// subscription.
 struct Run {
     coverage: EngineModelCoverage,
     engine: Model,
@@ -607,8 +607,8 @@ impl Run {
     /// Drop the engine, reopen it from its store and adopt what came back,
     /// then prime every answer a restart leaves unprimed.
     ///
-    /// Every subscription has to come back: the catalog did not change, so
-    /// nothing justifies dropping one.
+    /// Every subscription has to come back, since the catalog did not change
+    /// and nothing justifies dropping one.
     fn restart(&mut self) {
         self.script.push(String::from("-- restart"));
         let reads = SqliteConnection::establish(&self.url).expect("the read connection opens");

@@ -16,7 +16,7 @@ use subql::test_harnesses::{engine_model_sqlite, EngineModelCoverage};
 /// Where a failing byte string is recorded.
 const REGRESSIONS: &str = "tests/it/engine_model.proptest-regressions";
 
-/// Sequences per run: `SUBQL_SWEEP_ROWS` times two, so the pull-request depth
+/// `SUBQL_SWEEP_ROWS` times two sequences per run, so the pull-request depth
 /// is 96 and the weekly one 1200. A sequence opens a store and restarts, so
 /// it costs about as much as fifty generated filters.
 fn cases() -> u32 {

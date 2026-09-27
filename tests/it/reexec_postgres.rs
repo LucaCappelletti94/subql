@@ -664,10 +664,11 @@ fn each_read_runs_read_only_at_repeatable_read() {
     );
 }
 
-/// The sync connector's cursor streams one snapshot: every row once across
-/// pages under the byte budget, the last page says so, and a row committed
-/// after the cursor opened is not in it. Closing ends the transaction, so
-/// the connector reads again afterwards, and a closed cursor is unknown.
+/// The sync connector's cursor streams one snapshot. Every row comes once
+/// across pages under the byte budget, the last page says so, and a row
+/// committed after the cursor opened is not in it. Closing ends the
+/// transaction, so the connector reads again afterwards, and a closed
+/// cursor is unknown.
 #[test]
 #[ignore = "requires Docker; run with --ignored"]
 fn a_sync_cursor_pages_one_snapshot_of_a_keyless_result() {

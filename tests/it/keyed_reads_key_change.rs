@@ -1,9 +1,9 @@
 //! Keyed re-reads through the sync SQLite connector.
 //!
 //! A keyed read asks the database only about the keys that changed, so an
-//! update from key 4 to key 6 has to ask about both: key 6 now holds the row
-//! and key 4 no longer does. Asking about key 6 alone left a subscriber
-//! holding the row under key 4 forever.
+//! update from key 4 to key 6 has to ask about both, since key 6 now holds
+//! the row and key 4 no longer does. Asking about key 6 alone left a
+//! subscriber holding the row under key 4 forever.
 //!
 //! A change with no key, a truncate among them, moves a keyed read to a whole
 //! re-read, and the store has to follow it there, or a restart drops it.
