@@ -20,9 +20,9 @@ use subql::reexec::{
 };
 use subql::testing::TestEvent;
 use subql::{
-    catalog_helpers, AggValue, AggregateResultValue, AggregateSeedInstall, AggregateValueChange,
-    DefaultIds, FenceInstall, GroupedScalarInstall, GroupedScalarSeedInstall, Install,
-    PgCommitPosition, PgLsn, PgSnapshotFence, PgXid, ScalarInstall, SubscriptionEngine,
+    catalog_helpers, AggValue, AggregateInstallError, AggregateResultValue, AggregateSeedInstall,
+    AggregateValueChange, DefaultIds, FenceInstall, GroupedScalarInstall, GroupedScalarSeedInstall,
+    Install, PgCommitPosition, PgLsn, PgSnapshotFence, PgXid, ScalarInstall, SubscriptionEngine,
     SubscriptionRequest, TableId,
 };
 
@@ -1396,5 +1396,108 @@ fn a_reset_after_its_kept_changes_overflowed_starts_over() {
     assert_eq!(
         reseed(&mut engine, sub, 3, later),
         vec![AggValue::CountStar(3)]
+    );
+}
+
+/// Rows of one transaction share a slot of the seed buffer, so a cap of one
+/// holds a whole transaction.
+#[test]
+fn a_seed_buffers_one_transaction_in_one_slot() {
+    let catalog = ParserDB::parse::<PostgreSqlDialect>(DDL).unwrap();
+    let orders = catalog_helpers::table_id::<Postgres, _>(&catalog, "orders").unwrap();
+    let mut engine: Engine = SubscriptionEngine::new(catalog, PostgreSqlDialect {})
+        .with_max_changes_during_aggregate_read(1);
+    let sub = register(
+        &mut engine,
+        "SELECT COUNT(*) FROM orders WHERE status = 'paid'",
+    );
+    for id in [30, 31] {
+        engine
+            .aggregate_updates(&insert(orders, id, "north", 9, at(2100, 750)))
+            .unwrap();
+    }
+    let installed = Install::install(
+        &mut engine,
+        sub,
+        AggregateSeedInstall {
+            rows: vec![vec![Value::Int(1)]],
+            fence: Some(read_fence()),
+        },
+    )
+    .unwrap();
+    assert_eq!(folded(&installed), vec![AggValue::CountStar(3)]);
+}
+
+fn grouped_count_engine(cap: usize) -> (Engine, TableId, u64) {
+    let catalog = ParserDB::parse::<PostgreSqlDialect>(DDL).unwrap();
+    let orders = catalog_helpers::table_id::<Postgres, _>(&catalog, "orders").unwrap();
+    let mut engine: Engine = SubscriptionEngine::new(catalog, PostgreSqlDialect {})
+        .with_max_changes_during_aggregate_read(cap);
+    let sub = register(
+        &mut engine,
+        "SELECT region, COUNT(*) FROM orders WHERE status = 'paid' GROUP BY region",
+    );
+    (engine, orders, sub)
+}
+
+fn grouped_seed(fence: PgSnapshotFence) -> AggregateSeedInstall<Postgres, PgCommitPosition> {
+    AggregateSeedInstall {
+        rows: vec![vec![
+            Value::String("north".into()),
+            Value::Int(1),
+            Value::Int(1),
+        ]],
+        fence: Some(fence),
+    }
+}
+
+/// Rows of one transaction into one group share a slot of the seed buffer,
+/// while rows into another group take their own.
+#[test]
+fn a_grouped_seed_buffers_one_slot_per_group_of_a_transaction() {
+    let (mut engine, orders, sub) = grouped_count_engine(1);
+    for id in [30, 31] {
+        engine
+            .aggregate_updates(&insert(orders, id, "north", 9, at(2100, 750)))
+            .unwrap();
+    }
+    let installed = Install::install(&mut engine, sub, grouped_seed(read_fence())).unwrap();
+    assert_eq!(folded(&installed), vec![AggValue::CountStar(3)]);
+
+    let (mut engine, orders, sub) = grouped_count_engine(1);
+    for (id, region) in [(30, "north"), (31, "south")] {
+        engine
+            .aggregate_updates(&insert(orders, id, region, 9, at(2100, 750)))
+            .unwrap();
+    }
+    assert_eq!(
+        Install::install(&mut engine, sub, grouped_seed(read_fence())).unwrap_err(),
+        AggregateInstallError::TooManyChangesDuringRead {
+            subscription: sub,
+            cap: 1,
+        },
+    );
+}
+
+#[test]
+fn a_fence_read_drops_the_kept_changes_a_grouped_total_holds() {
+    let (mut engine, orders, sub) = grouped_count_engine(4);
+    Install::install(&mut engine, sub, grouped_seed(early_fence())).unwrap();
+    engine.aggregate_updates(&unseen_insert(orders)).unwrap();
+    Install::install(
+        &mut engine,
+        sub,
+        FenceInstall {
+            fence: Some(PgSnapshotFence::parse("760:760:", PgLsn(3000)).unwrap()),
+        },
+    )
+    .unwrap();
+
+    let next = engine
+        .aggregate_updates(&insert(orders, 30, "north", 9, at(3100, 770)))
+        .unwrap();
+    assert!(
+        next.triggers.is_empty(),
+        "one kept change is under half the cap"
     );
 }
