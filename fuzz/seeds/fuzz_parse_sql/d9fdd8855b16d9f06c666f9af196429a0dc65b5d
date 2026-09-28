@@ -1,0 +1,1 @@
+SELECT region, SUM(amount) FROM orders GROUP BY region HAVING SUM(amount) > NULL

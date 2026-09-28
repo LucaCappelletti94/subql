@@ -1,0 +1,1 @@
+SELECT SUM(amount) AS c0, COUNT(amount) AS c1 FROM t

@@ -1,0 +1,1 @@
+SELECT o.note FROM orders o WHERE amount > 3

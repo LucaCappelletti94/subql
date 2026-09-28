@@ -1,0 +1,1 @@
+SELECT status, id, COUNT(*) FROM g GROUP BY status, id

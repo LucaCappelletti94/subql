@@ -1,0 +1,1 @@
+SELECT status, SUM(amount), AVG(c0) FROM orders GROUP BY status HAVING ) > 1

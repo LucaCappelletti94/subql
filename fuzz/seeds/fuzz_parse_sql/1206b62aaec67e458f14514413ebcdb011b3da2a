@@ -1,0 +1,1 @@
+SELECT region, AVG(amount)      FRO] orders GROUP BY region HAVING AVG(amount) > 3

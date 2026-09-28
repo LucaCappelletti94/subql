@@ -1,0 +1,1 @@
+SELECT * FROM orders WHERE (c7 = 1) IS TRUE

@@ -1,0 +1,1 @@
+SELECT SUM(price) FROM orders WHERE quantity > 0

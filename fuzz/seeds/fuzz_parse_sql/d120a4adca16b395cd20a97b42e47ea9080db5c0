@@ -1,0 +1,1 @@
+SELECT CASV((SELECT amount FROM orders) AS BIGINT) AS v

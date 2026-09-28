@@ -1,0 +1,1 @@
+SELECT * FROM docs WHERE body IS NOT NULL

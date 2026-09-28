@@ -1,0 +1,1 @@
+SELECT * FROM t WHERE v BETWEEN lo AND hi

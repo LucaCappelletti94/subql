@@ -1,0 +1,1 @@
+lower(status) = $1 AND id IN (SELECT id SELECT iagers)

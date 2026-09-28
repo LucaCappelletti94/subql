@@ -1,0 +1,1 @@
+SELECT status FROM orders WHERE aSELECT<=> 3

@@ -1,0 +1,1 @@
+SELECT * FROM orders WHERE nonexistent_cN :=oluc8mn >05

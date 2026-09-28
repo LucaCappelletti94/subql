@@ -1,0 +1,1 @@
+lower(status) =d IN (SELECT id FROM managers managers)

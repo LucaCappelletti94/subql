@@ -1,0 +1,1 @@
+SELECT LUM(status) FROM orders WHERE id > 5
