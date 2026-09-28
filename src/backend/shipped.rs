@@ -939,6 +939,31 @@ impl Backend for SQLite {
         Some(super::scalar_value::widen_i64_to_f64(*value))
     }
 
+    /// Measured: SQLite reads both operands back as integers, a real past
+    /// the integer range as the nearest end of it, and answers a real, or
+    /// `NULL` for a divisor of zero. With `qty` the smallest integer,
+    /// `(- qty) % 10` is `7.0` and `(qty * 2) % 10` is `-8.0`.
+    fn float_remainder(dividend: &Value<Self>, divisor: &Value<Self>) -> Option<Value<Self>> {
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "Rust's float to integer cast saturates at both ends, as SQLite's does"
+        )]
+        let integer = |value: &Value<Self>| match value {
+            Value::Int(value) => Some(*value),
+            Value::Float(value) => Some(*value as i64),
+            _ => None,
+        };
+        let (dividend, divisor) = (integer(dividend)?, integer(divisor)?);
+        Some(if divisor == 0 {
+            Value::Null
+        } else {
+            // `i64::MIN % -1` is 0, where the division it implies overflows.
+            Value::Float(super::scalar_value::widen_i64_to_f64(
+                dividend.wrapping_rem(divisor),
+            ))
+        })
+    }
+
     /// SQLite's three built-in collations are all exactly reproducible:
     /// `BINARY` compares bytes, `NOCASE` folds ASCII case only, measured
     /// as leaving a ligature alone, and `RTRIM` ignores trailing spaces.

@@ -16,6 +16,7 @@ mod binds;
 mod debounce;
 mod fixtures;
 mod queue;
+mod refusals;
 mod resolve;
 mod restore;
 mod rows;
