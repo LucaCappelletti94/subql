@@ -191,6 +191,8 @@ impl Backend for Custom {
 
     const READS_IS_UNKNOWN: bool = true;
 
+    const RANGE_WITH_NULL_BOUND_COMPARES_DOUBLES: bool = false;
+
     fn decimal_quotient(
         dividend: bigdecimal::BigDecimal,
         divisor: bigdecimal::BigDecimal,

@@ -491,6 +491,16 @@ pub trait Backend: 'static {
     /// reads the word as a column name instead.
     const READS_IS_UNKNOWN: bool;
 
+    /// Whether a `BETWEEN` whose bound has the type `NULL`, a bare `NULL` or
+    /// arithmetic over one, compares all three operands as doubles.
+    ///
+    /// Required, and per backend, because one engine types the range by
+    /// every operand: measured with `b` a `BIGINT` holding 9007199254740993,
+    /// `b BETWEEN NULL AND (b - 1)` is `NULL` on MySQL, which rounds both to
+    /// the same double, and false on PostgreSQL and SQLite. Such a range is
+    /// routed to a database read where this is true.
+    const RANGE_WITH_NULL_BOUND_COMPARES_DOUBLES: bool;
+
     /// What this engine answers when a floating total leaves its range.
     ///
     /// Required, and per backend, because no two agree: measured,

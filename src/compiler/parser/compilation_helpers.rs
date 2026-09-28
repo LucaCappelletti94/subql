@@ -874,6 +874,15 @@ where
             for operand in [expr, low, high] {
                 refuse_condition_operand(operand)?;
             }
+            if B::RANGE_WITH_NULL_BOUND_COMPARES_DOUBLES
+                && [low, high]
+                    .into_iter()
+                    .any(|bound| null_typed(bound, depth))
+            {
+                return Err(RegisterError::UnsupportedSql(
+                    "BETWEEN with a NULL bound compares in doubles on this engine".to_string(),
+                ));
+            }
             let range_target =
                 tested_side_kind::<B, DB>(expr, table_id, database, depth, "BETWEEN")?;
             for bound in [low, high] {
@@ -1324,6 +1333,36 @@ fn is_numeric_operand<B: Backend, DB: DatabaseLike>(
                 Some(ScalarFamily::Int | ScalarFamily::Float | ScalarFamily::Decimal)
             )
         }),
+    }
+}
+
+/// Whether `operand` has the type `NULL`: a bare `NULL`, or a sign or
+/// arithmetic over one, which answers `NULL` whatever the other side holds.
+fn null_typed(operand: &Expr, depth: usize) -> bool {
+    if depth >= sql_shape::MAX_EXPR_DEPTH {
+        return false;
+    }
+    match operand {
+        Expr::Value(ValueWithSpan {
+            value: SqlValue::Null,
+            ..
+        }) => true,
+        Expr::Nested(inner)
+        | Expr::UnaryOp {
+            op: UnaryOperator::Minus | UnaryOperator::Plus,
+            expr: inner,
+        } => null_typed(inner, depth + 1),
+        Expr::BinaryOp {
+            left,
+            op:
+                BinaryOperator::Plus
+                | BinaryOperator::Minus
+                | BinaryOperator::Multiply
+                | BinaryOperator::Divide
+                | BinaryOperator::Modulo,
+            right,
+        } => null_typed(left, depth + 1) || null_typed(right, depth + 1),
+        _ => false,
     }
 }
 
