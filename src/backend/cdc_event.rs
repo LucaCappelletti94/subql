@@ -108,12 +108,14 @@ pub trait CdcEvent {
 
     /// Column ids whose cells changed on an Update event.
     ///
-    /// For non-Update events the result is empty. For Update events
-    /// sources vary in whether they populate this: sources that only
-    /// carry the changed columns (wal2json v2 with `add-tables`) list
-    /// only those. Sources that carry the full row image list every
-    /// column whose value differs. Consumers should treat the result as
-    /// a hint for optimisation, not as an authoritative diff. `db`
+    /// For non-Update events the result is empty. An Update event either
+    /// lists none, saying nothing about which columns moved, or lists every
+    /// column whose value differs: sources that only carry the changed
+    /// columns (wal2json v2 with `add-tables`, Maxwell) list those, and
+    /// sources that carry the full row image list the ones that differ.
+    /// Listing a column that did not change is harmless. Leaving out one
+    /// that did is a wrong answer, because an old cell the event does not
+    /// carry, for a column not listed, is read as its new value. `db`
     /// resolves wire names to subql column ordinals.
     fn changed_columns<DB: DatabaseLike>(&self, db: &DB) -> Vec<ColumnId>;
 
@@ -289,6 +291,33 @@ impl<'a, E: CdcEvent> ResolvedEvent<'a, E> {
             .get_or_init(|| self.event.changed_columns_resolved(database, self.table_id))
             .as_slice()
     }
+
+    /// Whether the event names the columns that changed and `col` is not one.
+    /// An event naming none says nothing about any column.
+    fn unchanged<DB: DatabaseLike>(&self, database: &DB, col: ColumnId) -> bool {
+        let changed = self.changed_columns(database);
+        !changed.is_empty() && !changed.contains(&col)
+    }
+
+    /// The cell as the event carries it, decoded once per row image.
+    fn carried_cell<DB: DatabaseLike>(
+        &self,
+        db: &DB,
+        row: RowKind,
+        col: ColumnId,
+    ) -> Result<Cow<'_, Value<E::Backend>>, crate::ValueError> {
+        if E::LENDS_CELLS {
+            return self.event.cell_at(db, row, col);
+        }
+        let decode = || self.event.value_at_resolved(db, self.table_id, row, col);
+        let Some(slot) = self.cell_slot(db, row, col) else {
+            return decode().map(Cow::Owned);
+        };
+        match slot.get_or_init(decode) {
+            Ok(value) => Ok(Cow::Borrowed(value)),
+            Err(error) => Err(error.clone()),
+        }
+    }
 }
 
 impl<E: CdcEvent> CdcEvent for ResolvedEvent<'_, E> {
@@ -340,23 +369,25 @@ impl<E: CdcEvent> CdcEvent for ResolvedEvent<'_, E> {
         self.cell_at(db, row, col).map(Cow::into_owned)
     }
 
+    /// An update's old cell the event does not carry, for a column the event
+    /// lists as unchanged, is its new cell: the value did not move. Maxwell
+    /// sends the old values of the changed columns alone, so reading the rest
+    /// this way answers an update to other columns without a read.
     fn cell_at<DB: DatabaseLike>(
         &self,
         db: &DB,
         row: RowKind,
         col: ColumnId,
     ) -> Result<Cow<'_, Value<Self::Backend>>, crate::ValueError> {
-        if E::LENDS_CELLS {
-            return self.event.cell_at(db, row, col);
+        let cell = self.carried_cell(db, row, col)?;
+        if row == RowKind::Old
+            && cell.is_missing()
+            && self.event.kind() == EventKind::Update
+            && self.unchanged(db, col)
+        {
+            return self.carried_cell(db, RowKind::New, col);
         }
-        let decode = || self.event.value_at_resolved(db, self.table_id, row, col);
-        let Some(slot) = self.cell_slot(db, row, col) else {
-            return decode().map(Cow::Owned);
-        };
-        match slot.get_or_init(decode) {
-            Ok(value) => Ok(Cow::Borrowed(value)),
-            Err(error) => Err(error.clone()),
-        }
+        Ok(cell)
     }
 
     fn value_at_known_pk<DB: DatabaseLike>(
