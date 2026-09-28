@@ -1,0 +1,1 @@
+SELECT SUM(amount) .current_settipgp(n'u.aser_id') c2 FROM t

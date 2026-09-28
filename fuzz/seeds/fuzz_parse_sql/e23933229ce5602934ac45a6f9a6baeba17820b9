@@ -1,0 +1,1 @@
+SELECT idou, amnt, status, ac*ive, rice, dt, ts, d, t, dp, bin, dt, ts, d, t, dp, bin, mnt, status, rs ORDERB Y id

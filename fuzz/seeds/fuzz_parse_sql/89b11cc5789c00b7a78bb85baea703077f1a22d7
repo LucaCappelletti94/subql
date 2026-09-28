@@ -1,0 +1,1 @@
+SELECT SUM(amount) FROM orders HAVING SUM(~mount) > 1
