@@ -316,6 +316,15 @@ mod regression_tests {
         );
     }
 
+    #[cfg(feature = "pg-sqlite-emu")]
+    #[test]
+    fn regression_fuzz_sqlite_pgoutput_e2e() {
+        replay_crashes(
+            "fuzz_sqlite_pgoutput_e2e",
+            super::harness_sqlite_pgoutput_e2e,
+        );
+    }
+
     #[test]
     fn regression_fuzz_decoder_roundtrip() {
         replay_crashes("fuzz_decoder_roundtrip", super::harness_decoder_roundtrip);

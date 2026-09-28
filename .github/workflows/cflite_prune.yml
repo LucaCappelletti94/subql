@@ -27,5 +27,6 @@ jobs:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           fuzz-seconds: 600
           mode: prune
-          storage-repo: ${{ github.server_url }}/${{ github.repository }}.git
+          # The corpus store is this repository, so the job token can push to it.
+          storage-repo: https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git
           storage-repo-branch: clusterfuzzlite
