@@ -124,8 +124,10 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Postgres emits an update's or a delete's old image in full only under
 /// `REPLICA IDENTITY FULL`. Under the default it sends the key alone, and
 /// then a row that leaves a subscriber's reach cannot be distinguished
-/// from one that was never reachable, so the subscriber silently keeps a
-/// row it may no longer see.
+/// from one that was never reachable. The engine reports every such
+/// subscriber through
+/// [`ConsumerNotifications::unanswered`](crate::ConsumerNotifications::unanswered),
+/// so on such a table nearly every update costs its subscribers a read.
 ///
 /// One round trip for the whole database, and each row names a table to
 /// fix. Ordinary and partitioned tables in user schemas only, since

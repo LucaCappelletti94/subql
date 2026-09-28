@@ -443,6 +443,8 @@ mod unseeded_extreme;
 
 mod update_non_predicate_column;
 
+mod update_without_old_row;
+
 mod uuid_id_types;
 
 // The delegated half against a real OpenFGA server, which is the one criterion

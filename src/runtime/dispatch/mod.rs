@@ -181,6 +181,39 @@ fn split_transition(
     }
 }
 
+/// Report the subscribers an update's cells cannot answer, and add them to
+/// `refused` so no transition is computed for them.
+///
+/// A cell the new version lacks is the case that produces one in
+/// production: an unchanged TOASTed column is omitted from an update's
+/// message whatever the replica identity says.
+///
+/// An old cell the event did not carry, for a column that changed or that
+/// the event does not say is unchanged, leaves open whether the subscriber
+/// held the row and in which version. One the new version no longer reaches
+/// may keep the old row forever, and one it reaches would be handed the new
+/// row beside an old one it cannot remove, so either way it is told the
+/// event could not answer it. An unchanged column reads its new value (see
+/// `ResolvedEvent::cell_at`), so this costs nothing on an update to other
+/// columns.
+fn report_absent_cells<I: IdTypes, B: Backend>(
+    (predicates, pred_id): (&PredicateStore<I, B>, PredicateId),
+    new: Option<(RoaringBitmap, crate::ColumnId)>,
+    old: Option<(RoaringBitmap, crate::ColumnId)>,
+    refused: &mut RoaringBitmap,
+    out: &mut Vec<(ConsumerOrdinal, SubscriptionId, crate::ColumnId)>,
+) {
+    if let Some((consumers, column)) = new {
+        collect_bound_subscriptions(predicates, pred_id, &consumers, column, out);
+        *refused |= consumers;
+    }
+    if let Some((consumers, column)) = old {
+        let left = &consumers - &*refused;
+        collect_bound_subscriptions(predicates, pred_id, &left, column, out);
+        *refused |= left;
+    }
+}
+
 /// What one membership term says about one row version.
 enum TermFacts<'a> {
     /// The term admits exactly these subscribers, and none when [`None`]: the
@@ -898,26 +931,13 @@ where
             refused_here |= consumers;
         }
 
-        // The same rule for a cell the event did not carry, which is the
-        // case that produces one in production: an unchanged TOASTed column
-        // is omitted from an update's message whatever the replica identity
-        // says.
-        //
-        // The new version only. An absent cell in the old image is the
-        // replica-identity story, which `REPLICA_IDENTITY_AUDIT_SQL` covers
-        // and the transition rules already account for: under the default
-        // identity the old image is the key alone, so treating that as
-        // unanswerable would report every update on such a table.
-        if let Some((consumers, column)) = new_matched.unanswered {
-            collect_bound_subscriptions(
-                &snapshot.predicates,
-                pred_id,
-                &consumers,
-                column,
-                &mut reports.unanswered,
-            );
-            refused_here |= consumers;
-        }
+        report_absent_cells(
+            (&snapshot.predicates, pred_id),
+            new_matched.unanswered,
+            old_matched.unanswered,
+            &mut refused_here,
+            &mut reports.unanswered,
+        );
 
         let new_served = new_matched.matched.without(&refused_here);
         let old_served = old_matched.matched.without(&refused_here);
