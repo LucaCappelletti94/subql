@@ -131,19 +131,30 @@ impl SqlLiteralParse for Unconverting {
     }
 }
 
-/// `- n` promotes to a float, and the integer beside it cannot be read as
-/// one, so the sum is refused rather than answered `NULL`.
+/// `- n` promotes to a float, and the integer beside it, on either side of
+/// any operator, cannot be read as one, so the result is refused rather than
+/// answered `NULL`.
 #[test]
 fn a_promoted_integer_the_backend_cannot_widen_beside_is_refused() {
-    let notifications = dispatch::<Unconverting>(
-        "((- n) + 1) IS NULL",
-        vec![Value::Int(1), Value::Int(i64::MIN), Value::Null],
-    );
-    assert_eq!(
-        refused(&notifications),
-        vec![EvaluationRefusal::OperandKinds {
-            operation: ArithmeticOp::Add
-        }]
-    );
-    assert!(notifications.inserted().is_empty());
+    for (predicate, operation) in [
+        ("((- n) + 1) IS NULL", ArithmeticOp::Add),
+        ("(1 + (- n)) IS NULL", ArithmeticOp::Add),
+        ("((- n) - 1) IS NULL", ArithmeticOp::Subtract),
+        ("(1 - (- n)) IS NULL", ArithmeticOp::Subtract),
+        ("((- n) * 2) IS NULL", ArithmeticOp::Multiply),
+        ("(2 * (- n)) IS NULL", ArithmeticOp::Multiply),
+        ("((- n) / 2) IS NULL", ArithmeticOp::Divide),
+        ("(2 / (- n)) IS NULL", ArithmeticOp::Divide),
+    ] {
+        let notifications = dispatch::<Unconverting>(
+            predicate,
+            vec![Value::Int(1), Value::Int(i64::MIN), Value::Null],
+        );
+        assert_eq!(
+            refused(&notifications),
+            vec![EvaluationRefusal::OperandKinds { operation }],
+            "{predicate}"
+        );
+        assert!(notifications.inserted().is_empty(), "{predicate}");
+    }
 }
