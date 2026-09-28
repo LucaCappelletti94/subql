@@ -454,6 +454,19 @@ pub trait Backend: 'static {
         None
     }
 
+    /// `%` with an operand this backend carries as a float, or `None` when
+    /// the engine raises for it.
+    ///
+    /// Only SQLite reaches this, through its promotion of an overflowed
+    /// integer to a real, since `%` over a fractional operand is not served.
+    /// Defaults to `None`, which reports the overflow the operand came from.
+    fn float_remainder(_dividend: &Value<Self>, _divisor: &Value<Self>) -> Option<Value<Self>>
+    where
+        Self: Sized,
+    {
+        None
+    }
+
     /// What this backend answers when a divisor is zero.
     ///
     /// Required, and per backend, because the engines disagree: measured,

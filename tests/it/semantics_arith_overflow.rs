@@ -144,6 +144,37 @@ fn sqlite_arithmetic_continues_on_the_promoted_real() {
     assert_eq!(notifications.inserted(), &[1], "8.5e37 is above qty");
 }
 
+/// `%` over the promoted real is SQLite's too. It reads both operands back
+/// as integers, a real past the integer range as the nearest end of it, and
+/// answers a real, or `NULL` for a divisor of zero. Measured on SQLite 3.51.1
+/// with `qty` an `INTEGER` holding the smallest integer:
+///
+/// ```text
+/// (- qty) % 10           7.0    the largest integer, 9223372036854775807
+/// (qty * 2) % 10         -8.0   the smallest, -9223372036854775808
+/// ((- qty) % 10) = 7     1
+/// (- qty) % 0            NULL
+/// (- qty) % (-1)         0.0
+/// ```
+#[test]
+fn sqlite_remainder_continues_on_the_promoted_real() {
+    for (predicate, selected) in [
+        ("SELECT * FROM t WHERE ((- qty) % 10) = 7", true),
+        ("SELECT * FROM t WHERE ((qty * 2) % 10) = (-8)", true),
+        ("SELECT * FROM t WHERE ((- qty) % 10) = 6", false),
+        ("SELECT * FROM t WHERE (((- qty) % 0) IS NULL)", true),
+        ("SELECT * FROM t WHERE ((- qty) % (-1)) = 0", true),
+    ] {
+        let notifications = dispatch!(SQLite, SQLiteDialect, SQLITE_DDL, predicate, i64::MIN);
+        assert_eq!(
+            notifications.evaluation_failures(),
+            [],
+            "SQLite answers {predicate}"
+        );
+        assert_eq!(notifications.inserted() == [1], selected, "{predicate}");
+    }
+}
+
 /// A failure is per subscription: another subscription reading the same
 /// event still gets its answer.
 #[test]

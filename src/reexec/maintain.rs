@@ -55,15 +55,18 @@ pub trait MaintainedQuery<B: Backend> {
 /// it can be applied live and again on top of a later read.
 struct ExtremeChange<B: Backend> {
     /// A matching row left, or `None` when no matching row did.
-    removed: Option<Removed<B>>,
-    /// The aggregated value of a matching row that arrived.
-    added: Option<Value<B>>,
+    removed: Option<Membership<B>>,
+    /// A matching row arrived, or `None` when no matching row did.
+    added: Option<Membership<B>>,
     emptied: bool,
 }
 
-enum Removed<B: Backend> {
-    /// A column the query depends on is missing from the old row.
+/// A row the query may hold.
+enum Membership<B: Backend> {
+    /// Whether the row matches is not known: a column the query depends on
+    /// is missing from it, or the engine refuses to evaluate the filter.
     Unknown,
+    /// The row matches, with its aggregated value.
     Row(Value<B>),
 }
 
@@ -172,15 +175,26 @@ impl<B: Backend, C: Checkpoint> MinMaxQuery<B, C> {
         }
     }
 
-    /// Whether the `row` view of `event` satisfies the query's WHERE
-    /// clause (only `Tri::True` counts. NULL / Unknown excludes the row,
-    /// per SQL).
-    fn matches<E, DB>(&self, event: &E, row: RowKind, vm: &mut Vm<B>, db: &DB) -> bool
+    /// The `row` view of `event` as the query may hold it, `None` when the
+    /// filter excludes it. Only `Tri::True` matches, so NULL excludes the row
+    /// as SQL does. A refused evaluation is unknown, since the refusal cannot
+    /// say whether the row belongs.
+    fn membership<E, DB>(
+        &self,
+        event: &E,
+        row: RowKind,
+        vm: &mut Vm<B>,
+        db: &DB,
+    ) -> Option<Membership<B>>
     where
         E: CdcEvent<Backend = B>,
         DB: DatabaseLike,
     {
-        matches!(vm.eval(&self.where_program, event, row, db), Ok(Tri::True))
+        match vm.eval(&self.where_program, event, row, db) {
+            Ok(Tri::True) => Some(Membership::Row(self.agg_value(event, row, db))),
+            Ok(_) => None,
+            Err(_) => Some(Membership::Unknown),
+        }
     }
 
     /// The aggregated column's value from the `row` view of `event`.
@@ -217,18 +231,14 @@ impl<B: Backend, C: Checkpoint> MinMaxQuery<B, C> {
         let removed = matches!(kind, EventKind::Delete | EventKind::Update)
             .then(|| {
                 if self.any_dependency_missing(event, RowKind::Old, db) {
-                    Some(Removed::Unknown)
+                    Some(Membership::Unknown)
                 } else {
-                    self.matches(event, RowKind::Old, vm, db)
-                        .then(|| Removed::Row(self.agg_value(event, RowKind::Old, db)))
+                    self.membership(event, RowKind::Old, vm, db)
                 }
             })
             .flatten();
         let added = matches!(kind, EventKind::Insert | EventKind::Update)
-            .then(|| {
-                self.matches(event, RowKind::New, vm, db)
-                    .then(|| self.agg_value(event, RowKind::New, db))
-            })
+            .then(|| self.membership(event, RowKind::New, vm, db))
             .flatten();
         ExtremeChange {
             removed,
@@ -275,8 +285,8 @@ impl<B: Backend, C: Checkpoint> MinMaxQuery<B, C> {
             return Maintenance::Updated(Value::Null);
         }
         match &change.removed {
-            Some(Removed::Unknown) => return Maintenance::NeedsReexecution,
-            Some(Removed::Row(value)) => {
+            Some(Membership::Unknown) => return Maintenance::NeedsReexecution,
+            Some(Membership::Row(value)) => {
                 let Some(current) = self.current.as_ref() else {
                     return Maintenance::NeedsReexecution;
                 };
@@ -291,8 +301,10 @@ impl<B: Backend, C: Checkpoint> MinMaxQuery<B, C> {
             }
             None => {}
         }
-        let Some(candidate) = &change.added else {
-            return Maintenance::Unchanged;
+        let candidate = match &change.added {
+            None => return Maintenance::Unchanged,
+            Some(Membership::Unknown) => return Maintenance::NeedsReexecution,
+            Some(Membership::Row(candidate)) => candidate,
         };
         match self.is_more_extreme(candidate) {
             // Nobody has said what the extreme is, so this row cannot be it:
@@ -624,11 +636,12 @@ impl<B: Backend + SqlLiteralParse, C: Checkpoint> GroupedMinMaxQuery<B, C> {
         }) {
             return Ok(ObservedRow::Refresh { key, values });
         }
-        if !matches!(
-            vm.eval(&self.plan.where_program, event, row, db),
-            Ok(Tri::True)
-        ) {
-            return Ok(ObservedRow::Excluded);
+        match vm.eval(&self.plan.where_program, event, row, db) {
+            Ok(Tri::True) => {}
+            Ok(_) => return Ok(ObservedRow::Excluded),
+            // The refusal cannot say whether the row belongs, so the group
+            // is read.
+            Err(_) => return Ok(ObservedRow::Refresh { key, values }),
         }
         let value = event.value_at(db, row, self.plan.agg_column)?;
         if value.is_missing() {

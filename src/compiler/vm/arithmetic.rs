@@ -230,11 +230,13 @@ pub(crate) fn arithmetic_divide<B: Backend>(
     })
 }
 
-/// Modulo: `Int % Int` only, same zero rule as division.
+/// Modulo: `Int % Int`, same zero rule as division, and a float operand as
+/// [`Backend::float_remainder`] answers it.
 ///
 /// # Errors
 ///
-/// As [`arithmetic_divide`].
+/// As [`arithmetic_divide`], and an integer overflow for a float operand the
+/// backend does not answer.
 pub(crate) fn arithmetic_modulo<B: Backend>(
     a: Value<B>,
     b: Value<B>,
@@ -242,20 +244,18 @@ pub(crate) fn arithmetic_modulo<B: Backend>(
     if let Some(null) = null_propagate_binary(&a, &b) {
         return Ok(null);
     }
+    // Only SQLite's promotion of an overflowed integer reaches a float here.
+    if matches!(a, Value::Float(_)) || matches!(b, Value::Float(_)) {
+        return B::float_remainder(&a, &b).ok_or(EvaluationRefusal::IntegerOverflow {
+            operation: ArithmeticOp::Modulo,
+        });
+    }
     Ok(match (a, b) {
         (Value::Int(x), Value::Int(y)) => {
             if let Some(null) = zero_divisor::<B, _>(&y, ArithmeticOp::Modulo)? {
                 return Ok(null);
             }
             return B::integer_binary(ArithmeticOp::Modulo, x, y);
-        }
-        // Only SQLite's promotion of an overflowed integer reaches here, and
-        // SQLite truncates both operands back to integers, which is undefined
-        // past the integer range, so the overflow it continues is reported.
-        (Value::Float(_), _) | (_, Value::Float(_)) => {
-            return Err(EvaluationRefusal::IntegerOverflow {
-                operation: ArithmeticOp::Modulo,
-            })
         }
         _ => Value::Null,
     })
