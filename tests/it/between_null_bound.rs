@@ -18,8 +18,8 @@
 //! b BETWEEN 0 AND (b - 1)             f               0              0
 //! ```
 //!
-//! So MySQL routes such a range to a database read, and the other engines
-//! serve it.
+//! So MySQL routes such a range to a database read. PostgreSQL and SQLite
+//! type a bare `NULL` bound by the tested side and serve it.
 use crate::common::semantics::served;
 use subql::backend::{Backend, MySql, Postgres, SQLite, Value};
 
