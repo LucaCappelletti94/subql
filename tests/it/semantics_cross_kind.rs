@@ -256,6 +256,44 @@ fn an_expression_against_a_column_of_another_kind_is_not_served() {
     );
 }
 
+/// Unary `+` over a non-number is refused as `-` is. PostgreSQL has no
+/// `+ boolean` operator, and MySQL and SQLite read a condition under `+` as
+/// its integer, so no engine answers these with the condition itself.
+#[test]
+fn unary_plus_over_a_non_number_is_not_served() {
+    const SQLITE_WITH_LABEL: &str =
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, qty INTEGER, price REAL, label TEXT)";
+    for predicate in [
+        "qty = +(label IS NULL)",
+        "qty = +(qty > 1)",
+        "+(qty > 1)",
+        "qty = -(label IS NULL)",
+    ] {
+        let sql = format!("SELECT * FROM t WHERE {predicate}");
+        assert!(
+            crate::common::semantics::register::<Postgres>(PG_DDL, &sql)
+                .served()
+                .is_none(),
+            "PostgreSQL does not serve {predicate}"
+        );
+        assert!(
+            crate::common::semantics::register::<SQLite>(SQLITE_WITH_LABEL, &sql)
+                .served()
+                .is_none(),
+            "SQLite does not serve {predicate}"
+        );
+    }
+    assert!(
+        crate::common::semantics::notifies::<Postgres>(
+            PG_DDL,
+            "t",
+            "SELECT * FROM t WHERE qty = +qty",
+            row(5, 0.0, "0", "")
+        ),
+        "unary plus over a number stays served"
+    );
+}
+
 /// The control: a same-kind comparison is untouched by any of this.
 #[test]
 fn same_kind_comparison_still_folds_in_process() {
