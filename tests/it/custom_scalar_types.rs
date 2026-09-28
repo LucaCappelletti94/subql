@@ -8,19 +8,15 @@
 //! conversion, and each refusal is reported as itself rather than as silence.
 #![allow(clippy::unwrap_used)]
 
+use crate::common::postgres_like::postgres_like_backend;
 use sql_traits::structs::ParserDB;
 use sqlparser::ast::Value as SqlValue;
 use sqlparser::dialect::PostgreSqlDialect;
 use subql::backend::Pg18;
 use subql::backend::Postgres;
-use subql::backend::{
-    Backend, Carried, CustomScalars, ScalarFamily, ScalarKind, ScalarKindOf, Value,
-};
-use subql::backend::{NumericWidening, TextOperation, TextRule, ValueKind, ValueKindOf};
-use subql::compiler::vm::arithmetic::{checked_integer_binary, checked_integer_negate};
-use subql::compiler::vm::refusal::{
-    ArithmeticOp, DanglingEscape, DivisionByZero, EvaluationRefusal, IntegerOverflow,
-};
+use subql::backend::{Carried, CustomScalars, ScalarFamily, ScalarKind, ScalarKindOf, Value};
+use subql::backend::{ValueKind, ValueKindOf};
+use subql::compiler::vm::refusal::IntegerOverflow;
 use subql::compiler::SqlLiteralParse;
 use subql::testing::TestEvent;
 use subql::{
@@ -105,165 +101,13 @@ impl CustomScalars for MyScalars {
 #[derive(Debug)]
 struct Custom;
 
-impl Backend for Custom {
-    /// The embedder's own engine here is PostgreSQL's, whose delimited
-    /// identifiers keep their case.
-    const COLUMN_NAME_CASE: sql_traits::structs::IdentifierCase =
-        sql_traits::structs::IdentifierCase::AsWritten;
-
-    const WRITTEN_TABLE_NAME_CASE: sql_traits::structs::IdentifierCase =
-        sql_traits::structs::IdentifierCase::AsWritten;
-
-    const WIRE_TABLE_NAME_CASE: sql_traits::structs::IdentifierCase =
-        sql_traits::structs::IdentifierCase::Exact;
-
-    /// This backend speaks the PostgreSQL dialect, so it takes
-    /// PostgreSQL's `LIKE` escape rule with it.
-    const LIKE_DEFAULT_ESCAPE: Option<char> = Some('\\');
-
-    const LIKE_DANGLING_ESCAPE: DanglingEscape = DanglingEscape::Fails;
-
-    fn like_escape_clause(written: &str) -> Result<Option<char>, &'static str> {
-        <subql::backend::Postgres as Backend>::like_escape_clause(written)
-    }
-
-    /// PostgreSQL's dialect, so PostgreSQL's rule.
-    const DIVISION_BY_ZERO: DivisionByZero = DivisionByZero::Fails;
-
-    /// PostgreSQL's dialect again: it raises rather than promoting.
-    const INTEGER_OVERFLOW: IntegerOverflow = IntegerOverflow::Fails;
-
-    /// This backend carries its integers in `i64`, so it takes the checked
-    /// arithmetic.
-    fn integer_binary(
-        operation: ArithmeticOp,
-        left: i64,
-        right: i64,
-    ) -> Result<Value<Self>, EvaluationRefusal> {
-        checked_integer_binary(Self::INTEGER_OVERFLOW, operation, left, right)
-    }
-
-    fn integer_negate(value: i64) -> Result<Value<Self>, EvaluationRefusal> {
-        checked_integer_negate(Self::INTEGER_OVERFLOW, value)
-    }
-
-    /// No cross-kind numeric comparison: this backend's fixtures compare
-    /// same-kind values only.
-    fn numeric_widening(_left: ScalarFamily, _right: ScalarFamily) -> Option<NumericWidening> {
-        None
-    }
-
-    /// And raises when a floating total leaves range, as PostgreSQL does.
-    const FLOAT_SUM_OVERFLOW: subql::backend::FloatSumOverflow =
-        subql::backend::FloatSumOverflow::Raises;
-
-    /// This fixture stands in for PostgreSQL, so it orders floats the way
-    /// PostgreSQL does.
-    const FLOAT_ORDER: subql::backend::FloatOrder = subql::backend::FloatOrder::NanIsGreatest;
-
-    /// And read a variance back the way it does, from its own answer.
-    const VARIANCE_SEED: subql::backend::VarianceSeed = subql::backend::VarianceSeed::EnginesOwn;
-
-    /// And average like it: an exact total's mean is an exact decimal.
-    const MEAN: subql::backend::MeanRule = subql::backend::MeanRule::Exact;
-
-    /// The fixtures sum like PostgreSQL: a narrow integer column totals
-    /// into a 64-bit integer and everything exact totals into a decimal.
-    fn sum_rule(column: subql::backend::DeclaredType) -> subql::backend::SumRule {
-        match column {
-            subql::backend::DeclaredType::Int(subql::backend::IntWidth::UpToThirtyTwo) => {
-                subql::backend::SumRule::Integer
-            }
-            subql::backend::DeclaredType::Int(subql::backend::IntWidth::SixtyFour)
-            | subql::backend::DeclaredType::Decimal => subql::backend::SumRule::Decimal {
-                integer_digits: Some(131_072),
-            },
-            _ => subql::backend::SumRule::Double,
-        }
-    }
-
-    /// The fixtures divide like PostgreSQL: two integers truncate, and a
-    /// decimal quotient takes the significant-digit scale.
-    const DIVISION: subql::backend::DivisionRule = subql::backend::DivisionRule::IntegersTruncate;
-
-    const NULL_SAFE_EQUALITY: subql::backend::NullSafeEquality =
-        subql::backend::NullSafeEquality::DistinctFrom;
-
-    const READS_IS_UNKNOWN: bool = true;
-
-    const RANGE_WITH_NULL_BOUND_COMPARES_DOUBLES: bool = false;
-
-    fn decimal_quotient(
-        dividend: bigdecimal::BigDecimal,
-        divisor: bigdecimal::BigDecimal,
-        quotient: subql::compiler::bytecode::Quotient,
-    ) -> bigdecimal::BigDecimal {
-        subql::compiler::vm::arithmetic::quotient_by_rule(&dividend, &divisor, quotient)
-    }
-
-    /// Never called: this backend's `/` truncates two integers.
-    fn integer_quotient(
-        dividend: i64,
-        divisor: i64,
-        increment: subql::backend::DivisionPrecisionIncrement,
-    ) -> bigdecimal::BigDecimal {
-        subql::compiler::vm::arithmetic::integer_quotient_in_words(dividend, divisor, increment)
-    }
-
-    /// On the standard carrier, so the shared narrowing serves even though
-    /// this backend never resolves a single-width result.
-    fn hold_float_at_single(value: f64) -> f64 {
-        subql::backend::at_float4(value)
-    }
-
-    /// The fixtures declare no single-width column, so no result is held at
-    /// float4 and this backend narrows nothing.
-    fn float_arithmetic_width(
-        left: Option<subql::backend::FloatWidth>,
-        right: Option<subql::backend::FloatWidth>,
-    ) -> Option<subql::backend::FloatWidth> {
-        left.or(right).map(|_| subql::backend::FloatWidth::Double)
-    }
-
-    /// The fixtures declare no fixed-width or single-width column, so the
-    /// common refinements serve.
-    fn refine_declared_type(
-        family: subql::backend::ScalarFamily,
-        declared_type: &str,
-    ) -> subql::backend::DeclaredType {
-        subql::backend::declared_type_of(
-            family,
-            subql::backend::declares_sixty_four_bit_int(declared_type),
-            subql::backend::FloatWidth::Double,
-            subql::backend::TextWidth::Varying,
-        )
-    }
-
-    /// Byte comparison, which is all this backend's fixtures need.
-    fn text_rule(
-        _comparison: &subql::backend::ComparisonContext<'_, Self>,
-        _operation: TextOperation,
-    ) -> subql::backend::TextResolution {
-        subql::backend::TextResolution::Rule(TextRule::EXACT)
-    }
-
-    type Dialect = PostgreSqlDialect;
-    type Custom = MyScalars;
-    type Bool = bool;
-    type Int = i64;
-    type Float = f64;
-    type String = String;
-    type Bytes = Vec<u8>;
-    type Uuid = uuid::Uuid;
-    type Timestamp = chrono::NaiveDateTime;
-    type TimestampTz = chrono::DateTime<chrono::Utc>;
-    type Date = chrono::NaiveDate;
-    type Time = chrono::NaiveTime;
-    type Decimal = bigdecimal::BigDecimal;
-    type Json = serde_json::Value;
-    type Jsonb = serde_json::Value;
-    type JsonbVersion = Pg18;
-}
+// PostgreSQL's dialect again, so an overflow raises rather than promoting.
+postgres_like_backend!(
+    Custom,
+    custom = MyScalars,
+    overflow = IntegerOverflow::Fails,
+    {}
+);
 
 impl SqlLiteralParse for Custom {
     fn parse_literal(
@@ -277,33 +121,10 @@ impl SqlLiteralParse for Custom {
             return subql::compiler::parse_custom_literal::<Self>(sql, custom);
         }
         let builtin = target.family().expect("not custom, so builtin");
-        Ok(widen(Postgres::<Pg18>::parse_literal(
+        Ok(Self::from_postgres(Postgres::<Pg18>::parse_literal(
             sql,
             ValueKind::from(builtin),
         )?))
-    }
-}
-
-/// This backend's scalar shapes are Postgres', so a builtin literal parsed
-/// there transfers unchanged. Only the custom position differs.
-fn widen(value: Value<Postgres>) -> Value<Custom> {
-    match value {
-        Value::Missing => Value::Missing,
-        Value::Null => Value::Null,
-        Value::Bool(v) => Value::Bool(v),
-        Value::Int(v) => Value::Int(v),
-        Value::Float(v) => Value::Float(v),
-        Value::String(v) => Value::String(v),
-        Value::Bytes(v) => Value::Bytes(v),
-        Value::Uuid(v) => Value::Uuid(v),
-        Value::Timestamp(v) => Value::Timestamp(v),
-        Value::TimestampTz(v) => Value::TimestampTz(v),
-        Value::Date(v) => Value::Date(v),
-        Value::Time(v) => Value::Time(v),
-        Value::Decimal(v) => Value::Decimal(v),
-        Value::Json(v) => Value::Json(v),
-        Value::Jsonb(v) => Value::Jsonb(v),
-        Value::Custom(none) => match none {},
     }
 }
 

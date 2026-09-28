@@ -94,6 +94,8 @@ mod connector_default;
 
 mod custom_scalar_types;
 
+mod float_remainder_default;
+
 #[cfg(feature = "testing")]
 mod decoder_roundtrip;
 
