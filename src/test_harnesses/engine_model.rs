@@ -121,7 +121,7 @@ impl Statement {
         let filter = if u.ratio(1u8, 4u8)? {
             None
         } else {
-            Some(Expr::arbitrary(u, 3)?)
+            Some(Expr::filter(u, 3)?)
         };
         Ok(Self { shape, filter })
     }

@@ -5,8 +5,11 @@
 //! draws expressions in every position subql compiles, which are the condition itself,
 //! comparison operands, `IN` lists, `BETWEEN` bounds, `LIKE` patterns with
 //! and without `ESCAPE`, `COALESCE` arguments, truth tests, null-safe
-//! equality and arithmetic. Nothing restricts a value to where a boolean is
-//! expected, because a shape nobody wrote down is what this is for.
+//! equality and arithmetic. Seven filters in eight are drawn typed, every
+//! operand of the kind its operator reads, so most of them are served and
+//! compared. The eighth puts anything anywhere, a value where a condition
+//! belongs or two kinds side by side, because a shape nobody wrote down is
+//! what this is for.
 
 use alloc::boxed::Box;
 use alloc::format;
@@ -182,6 +185,22 @@ pub enum TruthValue {
     Unknown,
 }
 
+/// The kind of value a typed draw builds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Kind {
+    /// A condition, as a filter reads it.
+    Condition,
+    /// An integer, as `a` and `b` hold.
+    Int,
+    /// A float, as `r` holds.
+    Float,
+    /// Text, as `s` holds.
+    Text,
+}
+
+/// The comparison operators, which read two values of one kind.
+const COMPARISONS: [Op; 6] = [Op::Eq, Op::Ne, Op::Lt, Op::Le, Op::Gt, Op::Ge];
+
 /// An expression tree, rendered fully parenthesised.
 #[derive(Clone, Debug)]
 pub enum Expr {
@@ -220,6 +239,197 @@ pub enum Expr {
 }
 
 impl Expr {
+    /// A filter, typed seven times in eight so that most draws are ones
+    /// subql serves and compares, and untyped otherwise, which keeps a value
+    /// where a condition belongs and two kinds side by side in the mix.
+    pub(crate) fn filter(u: &mut Unstructured<'_>, depth: u8) -> arbitrary::Result<Self> {
+        if u.ratio(1u8, 8u8)? {
+            Self::arbitrary(u, depth)
+        } else {
+            Self::typed(u, depth, Kind::Condition)
+        }
+    }
+
+    /// An expression of `kind` whose every operand has the kind its
+    /// operator reads.
+    fn typed(u: &mut Unstructured<'_>, depth: u8, kind: Kind) -> arbitrary::Result<Self> {
+        let leaf = depth == 0 || u.ratio(1u8, 4u8)?;
+        let below = depth.saturating_sub(1);
+        match kind {
+            Kind::Condition if leaf => Self::condition_leaf(u),
+            Kind::Condition => Self::condition(u, below),
+            value if leaf => Self::value_leaf(u, value),
+            value => Self::value(u, below, value),
+        }
+    }
+
+    /// A value kind a comparison can read on both sides.
+    fn comparable(u: &mut Unstructured<'_>) -> arbitrary::Result<Kind> {
+        pick(u, &[Kind::Int, Kind::Int, Kind::Float, Kind::Text])
+    }
+
+    fn condition_leaf(u: &mut Unstructured<'_>) -> arbitrary::Result<Self> {
+        Ok(match u.int_in_range(0u8..=5)? {
+            0 => Self::Column(Column::F),
+            1 => Self::Bool(u.arbitrary()?),
+            _ => {
+                let kind = Self::comparable(u)?;
+                Self::Binary(
+                    pick(u, &COMPARISONS)?,
+                    Box::new(Self::value_leaf(u, kind)?),
+                    Box::new(Self::value_leaf(u, kind)?),
+                )
+            }
+        })
+    }
+
+    fn condition(u: &mut Unstructured<'_>, depth: u8) -> arbitrary::Result<Self> {
+        let condition =
+            |u: &mut Unstructured<'_>| Self::typed(u, depth, Kind::Condition).map(Box::new);
+        let value = |u: &mut Unstructured<'_>, kind| Self::typed(u, depth, kind).map(Box::new);
+        Ok(match u.int_in_range(0u8..=11)? {
+            0 => Self::Not(condition(u)?),
+            1 | 2 => Self::Binary(pick(u, &[Op::And, Op::Or])?, condition(u)?, condition(u)?),
+            3..=5 => {
+                let kind = Self::comparable(u)?;
+                Self::Binary(pick(u, &COMPARISONS)?, value(u, kind)?, value(u, kind)?)
+            }
+            6 => {
+                let kind = pick(u, &[Kind::Condition, Kind::Int, Kind::Float, Kind::Text])?;
+                Self::IsNull(value(u, kind)?, u.arbitrary()?)
+            }
+            7 => Self::IsTruth(
+                condition(u)?,
+                pick(
+                    u,
+                    &[TruthValue::True, TruthValue::False, TruthValue::Unknown],
+                )?,
+                u.arbitrary()?,
+            ),
+            8 => {
+                let kind = Self::comparable(u)?;
+                Self::NullSafe(value(u, kind)?, value(u, kind)?, u.arbitrary()?)
+            }
+            9 => {
+                let kind = Self::comparable(u)?;
+                let len = u.int_in_range(1usize..=4)?;
+                let list = (0..len)
+                    .map(|_| Self::literal(u, kind))
+                    .collect::<arbitrary::Result<_>>()?;
+                Self::In(
+                    Box::new(Self::reading(u, depth, kind)?),
+                    list,
+                    u.arbitrary()?,
+                )
+            }
+            10 => {
+                let kind = Self::comparable(u)?;
+                Self::Between(
+                    Box::new(Self::reading(u, depth, kind)?),
+                    value(u, kind)?,
+                    value(u, kind)?,
+                    u.arbitrary()?,
+                )
+            }
+            _ => Self::Like(
+                value(u, Kind::Text)?,
+                value(u, Kind::Text)?,
+                pick(u, &[None, Some('!'), Some('\\')])?,
+                u.arbitrary()?,
+            ),
+        })
+    }
+
+    /// The column of `kind` two times in three, otherwise a literal of it or
+    /// now and then `NULL`.
+    fn value_leaf(u: &mut Unstructured<'_>, kind: Kind) -> arbitrary::Result<Self> {
+        if u.ratio(1u8, 12u8)? {
+            return Ok(Self::Null);
+        }
+        if u.ratio(1u8, 3u8)? {
+            Self::literal(u, kind)
+        } else {
+            Self::column(u, kind)
+        }
+    }
+
+    /// A column holding `kind`.
+    fn column(u: &mut Unstructured<'_>, kind: Kind) -> arbitrary::Result<Self> {
+        Ok(Self::Column(match kind {
+            Kind::Int => pick(u, &[Column::A, Column::B])?,
+            Kind::Float => Column::R,
+            Kind::Text => Column::S,
+            Kind::Condition => Column::F,
+        }))
+    }
+
+    /// A value of `kind` that reads a column, as the tested side of `IN` and
+    /// `BETWEEN` has to.
+    fn reading(u: &mut Unstructured<'_>, depth: u8, kind: Kind) -> arbitrary::Result<Self> {
+        let value = Self::typed(u, depth, kind)?;
+        if value.reads_column() {
+            Ok(value)
+        } else {
+            Self::column(u, kind)
+        }
+    }
+
+    /// Whether a column appears anywhere in the expression.
+    fn reads_column(&self) -> bool {
+        match self {
+            Self::Column(_) => true,
+            Self::Int(_) | Self::Float(_) | Self::Str(_) | Self::Bool(_) | Self::Null => false,
+            Self::Not(inner)
+            | Self::Neg(inner)
+            | Self::IsNull(inner, _)
+            | Self::IsTruth(inner, ..) => inner.reads_column(),
+            Self::Binary(_, left, right)
+            | Self::NullSafe(left, right, _)
+            | Self::Like(left, right, ..) => left.reads_column() || right.reads_column(),
+            Self::In(tested, list, _) => {
+                tested.reads_column() || list.iter().any(Self::reads_column)
+            }
+            Self::Between(tested, low, high, _) => {
+                tested.reads_column() || low.reads_column() || high.reads_column()
+            }
+            Self::Coalesce(arguments) => arguments.iter().any(Self::reads_column),
+        }
+    }
+
+    /// A literal written in `kind`'s own form.
+    fn literal(u: &mut Unstructured<'_>, kind: Kind) -> arbitrary::Result<Self> {
+        Ok(match kind {
+            Kind::Int => Self::Int(pick(u, &INTS)?),
+            Kind::Float => Self::Float(pick(u, &FLOATS)?),
+            Kind::Text => Self::Str(pick(u, &STRINGS)?),
+            Kind::Condition => Self::Bool(u.arbitrary()?),
+        })
+    }
+
+    fn value(u: &mut Unstructured<'_>, depth: u8, kind: Kind) -> arbitrary::Result<Self> {
+        let operand = |u: &mut Unstructured<'_>| Self::typed(u, depth, kind).map(Box::new);
+        let arithmetic: &[Op] = match kind {
+            Kind::Int => &[Op::Add, Op::Sub, Op::Mul, Op::Div, Op::Mod],
+            Kind::Float => &[Op::Add, Op::Sub, Op::Mul, Op::Div],
+            Kind::Text | Kind::Condition => &[],
+        };
+        Ok(match u.int_in_range(0u8..=3)? {
+            0 | 1 if !arithmetic.is_empty() => {
+                Self::Binary(pick(u, arithmetic)?, operand(u)?, operand(u)?)
+            }
+            2 if !arithmetic.is_empty() => Self::Neg(operand(u)?),
+            _ => {
+                // One column and literals in its own form, which is the
+                // `COALESCE` every engine types alike.
+                let mut arguments = vec![Self::column(u, kind)?];
+                for _ in 0..u.int_in_range(1usize..=2)? {
+                    arguments.push(Self::literal(u, kind)?);
+                }
+                Self::Coalesce(arguments)
+            }
+        })
+    }
+
     pub(crate) fn arbitrary(u: &mut Unstructured<'_>, depth: u8) -> arbitrary::Result<Self> {
         if depth == 0 || u.ratio(1u8, 4u8)? {
             return Self::leaf(u);
@@ -417,7 +627,7 @@ impl Case {
     pub fn arbitrary(u: &mut Unstructured<'_>) -> arbitrary::Result<Self> {
         Ok(Self {
             row: Row::arbitrary(u)?,
-            filter: Expr::arbitrary(u, 4)?,
+            filter: Expr::filter(u, 4)?,
         })
     }
 

@@ -20,6 +20,11 @@ const REGRESSIONS: &str = "tests/it/differential/generated.proptest-regressions"
 
 /// `SUBQL_SWEEP_ROWS` times fifty cases per run, so the pull-request depth
 /// is 2400 and the weekly one 30000.
+///
+/// Most draws are typed, so at least one case in five is served and compared
+/// on every engine, which is the floor each test holds. MySQL compares the
+/// fewest, since its default text collation folds case and routes text
+/// comparisons.
 fn cases() -> u32 {
     std::env::var("SUBQL_SWEEP_ROWS")
         .ok()
@@ -112,7 +117,11 @@ fn generated_filters_agree_with_sqlite() {
         subql::backend::SQLite,
         sqlparser::dialect::SQLiteDialect
     );
-    assert!(compared > 0, "no generated filter was served and compared");
+    assert!(
+        compared.saturating_mul(5) >= cases(),
+        "{compared} of {} generated filters were served and compared",
+        cases()
+    );
 }
 
 /// PostgreSQL, which refuses most coercions MySQL and SQLite perform.
@@ -127,7 +136,11 @@ fn generated_filters_agree_with_postgres() {
         subql::backend::Postgres,
         sqlparser::dialect::PostgreSqlDialect
     );
-    assert!(compared > 0, "no generated filter was served and compared");
+    assert!(
+        compared.saturating_mul(5) >= cases(),
+        "{compared} of {} generated filters were served and compared",
+        cases()
+    );
 }
 
 /// MySQL, whose coercions and default collation no other engine shares.
@@ -152,5 +165,9 @@ fn generated_filters_agree_with_mysql() {
         subql::backend::MySql,
         sqlparser::dialect::MySqlDialect
     );
-    assert!(compared > 0, "no generated filter was served and compared");
+    assert!(
+        compared.saturating_mul(5) >= cases(),
+        "{compared} of {} generated filters were served and compared",
+        cases()
+    );
 }
