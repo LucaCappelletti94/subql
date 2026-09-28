@@ -158,6 +158,7 @@ toml = { version = "1", optional = true }
 tracing = { version = "0.1", default-features = false, optional = true }
 dhat = { version = "0.3", optional = true }
 arbitrary = { version = "1", features = ["derive"], optional = true }
+tempfile = { version = "3", optional = true }
 
 # PostgreSQL logical-replication decoder plus low-level parser. Carries the
 # connection-independent `PgOutputDecoder` (pgoutput bytes to `ChangeEvent`)
@@ -371,7 +372,7 @@ std = [
     "rls2fga?/std",
 ]
 # `std` because the harnesses replay persisted shards, which is std-only I/O.
-testing = ["std", "dep:arbitrary"]
+testing = ["std", "dep:arbitrary", "dep:tempfile"]
 observability = ["dep:tracing", "tracing/std"]
 # Opt-in: ship `DieselConnector` plus the auto-resolving engine's diesel
 # bindings. Does NOT imply `std`: diesel's core is `no_std` and carries no

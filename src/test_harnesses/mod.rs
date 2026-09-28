@@ -43,6 +43,20 @@ pub use predicate_grammar::harness_predicate_verdict_sqlite;
 pub use snapshot_restore::harness_sqlite_pgoutput_e2e;
 pub use snapshot_restore::{harness_pgoutput, harness_snapshot_restore_roundtrip};
 
+/// A fresh directory for a harness's store, removed when dropped.
+///
+/// A store syncs every write it makes, so the directory goes on `/dev/shm`
+/// when the host has that memory filesystem, where a sync costs nothing, and
+/// in the platform's temporary directory otherwise.
+pub(crate) fn store_dir() -> std::io::Result<tempfile::TempDir> {
+    let root = Some(std::path::Path::new("/dev/shm"))
+        .filter(|shm| shm.is_dir())
+        .map_or_else(std::env::temp_dir, std::path::Path::to_path_buf);
+    tempfile::Builder::new()
+        .prefix("subql-harness-")
+        .tempdir_in(root)
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {

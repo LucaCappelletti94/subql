@@ -58,31 +58,6 @@ enum SnapEvent {
     },
 }
 
-/// Per-process working directory for the snapshot/restore harness.
-/// libFuzzer spawns one worker process per parallel run. Pinning the
-/// path to `pid` keeps separate workers from clobbering each other's
-/// shard files, and a per-iteration `remove_dir_all` + `create_dir_all`
-/// starts each round-trip from a clean slate.
-///
-/// Prefers `/dev/shm` (Linux tmpfs / RAM) over `std::env::temp_dir()`
-/// (often a btrfs / ext4 mount), because the harness's bottleneck is
-/// the snapshot write's `fsync` and the restore's directory scan. On
-/// systems without `/dev/shm` the fallback to the platform temp dir
-/// keeps the harness working with slower iteration speed.
-fn snapshot_workdir() -> std::path::PathBuf {
-    let shm = std::path::Path::new("/dev/shm");
-    let mut p = if shm.is_dir() {
-        shm.to_path_buf()
-    } else {
-        std::env::temp_dir()
-    };
-    p.push(format!(
-        "subql-fuzz-snapshot-restore-{}",
-        std::process::id()
-    ));
-    p
-}
-
 fn snap_event_to_event(
     op: SnapEvent,
     table_id: crate::TableId,
@@ -178,11 +153,10 @@ pub fn harness_snapshot_restore_roundtrip(data: &[u8]) {
         return;
     };
 
-    let workdir = snapshot_workdir();
-    let _ = std::fs::remove_dir_all(&workdir);
-    if std::fs::create_dir_all(&workdir).is_err() {
+    let Ok(store) = super::store_dir() else {
         return;
-    }
+    };
+    let workdir = store.path().to_path_buf();
 
     let database = agg_catalog();
     let Some(table_id) = catalog_helpers::table_id::<Postgres, _>(&database, "orders") else {
