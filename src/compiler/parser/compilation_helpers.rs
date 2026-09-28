@@ -67,6 +67,113 @@ pub(super) fn nested_column_scalar_of<B: Backend, DB: DatabaseLike>(
     }
 }
 
+/// The kind a comparison's literals are read at.
+///
+/// A side reading a column names it, as [`nested_column_scalar_of`] finds it.
+/// With no column on either side the literals name it, through the same
+/// arithmetic and the same `/` rule, so `1 = 7` reads its integers as
+/// integers. Two sides naming different kinds, as in `1 < 2.5`, are typed by
+/// each engine's own rules, so that comparison is refused to a read. With no
+/// literal naming a kind either, as in `NULL = NULL`, it is text.
+fn comparison_target<B: Backend, DB: DatabaseLike>(
+    left: &Expr,
+    right: &Expr,
+    table_id: TableId,
+    database: &DB,
+    depth: usize,
+) -> Result<ValueKindOf<B>, RegisterError> {
+    if let Some(kind) = nested_column_scalar_of::<B, DB>(left, table_id, database, depth)
+        .or_else(|| nested_column_scalar_of::<B, DB>(right, table_id, database, depth))
+    {
+        return Ok(kind);
+    }
+    let left = literal_kind::<B>(left, depth)?;
+    let right = literal_kind::<B>(right, depth)?;
+    Ok(agreeing_kind::<B>(left, right)?.unwrap_or_else(|| ScalarFamily::String.into()))
+}
+
+/// The kind an arithmetic operation's literals are read at.
+///
+/// An operand reading a column names it, as for a comparison. With no column
+/// the literals name it, and the result has to be the kind the enclosing
+/// comparison reads, `inherited`. A result of another kind is refused to a
+/// read, since `r > (1 / 2)` divides integers to `0` where reading them at the
+/// float column's kind gives `0.5`. With no literal naming a kind either, the
+/// operands are read at `inherited`.
+fn arithmetic_target<B: Backend, DB: DatabaseLike>(
+    op: &BinaryOperator,
+    left: &Expr,
+    right: &Expr,
+    inherited: ValueKindOf<B>,
+    table_id: TableId,
+    database: &DB,
+    depth: usize,
+) -> Result<ValueKindOf<B>, RegisterError> {
+    if let Some(kind) = nested_column_scalar_of::<B, DB>(left, table_id, database, depth)
+        .or_else(|| nested_column_scalar_of::<B, DB>(right, table_id, database, depth))
+    {
+        return Ok(kind);
+    }
+    let operands = agreeing_kind::<B>(
+        literal_kind::<B>(left, depth)?,
+        literal_kind::<B>(right, depth)?,
+    )?;
+    match operands {
+        Some(kind) if quotient_kind::<B>(op, Some(kind)) == Some(inherited) => Ok(kind),
+        Some(_) => Err(RegisterError::UnsupportedSql(
+            "arithmetic over literals is served where it answers the kind it is compared with"
+                .to_string(),
+        )),
+        None => Ok(inherited),
+    }
+}
+
+/// The kind the literals in `expr` name, looking through arithmetic and
+/// grouping, or `None` when none does.
+fn literal_kind<B: Backend>(
+    expr: &Expr,
+    depth: usize,
+) -> Result<Option<ValueKindOf<B>>, RegisterError> {
+    if depth >= sql_shape::MAX_EXPR_DEPTH {
+        return Ok(None);
+    }
+    Ok(match expr {
+        Expr::Value(ValueWithSpan { value, .. }) => match value {
+            SqlValue::Number(digits, _) if digits.contains(['.', 'e', 'E']) => {
+                Some(ScalarFamily::Float.into())
+            }
+            SqlValue::Number(..) => Some(ScalarFamily::Int.into()),
+            SqlValue::SingleQuotedString(_) => Some(ScalarFamily::String.into()),
+            SqlValue::Boolean(_) => Some(ScalarFamily::Bool.into()),
+            _ => None,
+        },
+        Expr::BinaryOp { left, op, right } => {
+            let operand = agreeing_kind::<B>(
+                literal_kind::<B>(left, depth + 1)?,
+                literal_kind::<B>(right, depth + 1)?,
+            )?;
+            quotient_kind::<B>(op, operand)
+        }
+        Expr::UnaryOp { expr, .. } | Expr::Nested(expr) => literal_kind::<B>(expr, depth + 1)?,
+        _ => None,
+    })
+}
+
+/// The one kind two literal kinds name, refusing two different ones.
+fn agreeing_kind<B: Backend>(
+    left: Option<ValueKindOf<B>>,
+    right: Option<ValueKindOf<B>>,
+) -> Result<Option<ValueKindOf<B>>, RegisterError> {
+    match (left, right) {
+        (Some(left), Some(right)) if left != right => Err(RegisterError::UnsupportedSql(
+            "literals of two kinds with no column beside them are typed by each engine's own rules"
+                .to_string(),
+        )),
+        (Some(kind), _) | (None, Some(kind)) => Ok(Some(kind)),
+        (None, None) => Ok(None),
+    }
+}
+
 /// The kind the literals beside `tested` are read at: the kind of the column it
 /// reads, through the arithmetic around it, as `=` reads it.
 ///
@@ -471,12 +578,26 @@ where
                     // then emit the op. Target-typed literal inference
                     // picks whichever sibling is a column reference and
                     // uses its ScalarKind for the other side's literal.
-                    let child_target =
-                        nested_column_scalar_of::<B, DB>(left, table_id, database, depth)
-                            .or_else(|| {
-                                nested_column_scalar_of::<B, DB>(right, table_id, database, depth)
-                            })
-                            .unwrap_or_else(|| ScalarFamily::String.into());
+                    let child_target = if matches!(
+                        op,
+                        BinaryOperator::Plus
+                            | BinaryOperator::Minus
+                            | BinaryOperator::Multiply
+                            | BinaryOperator::Divide
+                            | BinaryOperator::Modulo
+                    ) {
+                        arithmetic_target::<B, DB>(
+                            op,
+                            left,
+                            right,
+                            target_kind,
+                            table_id,
+                            database,
+                            depth,
+                        )?
+                    } else {
+                        comparison_target::<B, DB>(left, right, table_id, database, depth)?
+                    };
                     compile_expr_recursive::<B, DB>(
                         left,
                         table_id,
@@ -1540,9 +1661,7 @@ where
     refuse_condition_operand(left)?;
     refuse_condition_operand(right)?;
     refuse_literal_foreign_to_coalesce::<B, DB>(left, right, table_id, database)?;
-    let target = nested_column_scalar_of::<B, DB>(left, table_id, database, depth)
-        .or_else(|| nested_column_scalar_of::<B, DB>(right, table_id, database, depth))
-        .unwrap_or_else(|| ScalarFamily::String.into());
+    let target = comparison_target::<B, DB>(left, right, table_id, database, depth)?;
     for operand in [left, right] {
         compile_expr_recursive::<B, DB>(operand, table_id, database, out, depth + 1, target)?;
     }

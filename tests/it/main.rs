@@ -406,6 +406,8 @@ mod operand_kinds;
 
 mod literal_text_comparison;
 
+mod constant_comparison;
+
 mod float_range_bounds;
 
 mod null_test_of_condition;
