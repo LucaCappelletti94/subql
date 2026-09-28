@@ -211,6 +211,62 @@ fn a_not_null_test_on_a_missing_cell_is_unanswered() {
     assert_eq!(notifications.inserted(), &[] as &[u64]);
 }
 
+/// Arithmetic over an absent cell is absent too, since the cell may hold
+/// any value, so a null test over it is unanswered as over the bare cell.
+/// Arithmetic with a `NULL` operand is `NULL` whatever the cell holds, and
+/// answers.
+#[test]
+fn arithmetic_over_a_missing_cell_leaves_a_null_test_unanswered() {
+    for (predicate, answered) in [
+        ("(n + 0) IS NULL", None),
+        ("(- n) IS NOT NULL", None),
+        ("(n * 2) IS DISTINCT FROM NULL", None),
+        ("(n / 0) IS NULL", None),
+        ("(n % 3) IS NOT NULL", None),
+        ("(NULL + n) IS NULL", Some(true)),
+        ("(- (n - NULL)) IS NOT NULL", Some(false)),
+    ] {
+        let db =
+            ParserDB::parse::<PostgreSqlDialect>("CREATE TABLE nums (id INT PRIMARY KEY, n INT)")
+                .expect("DDL parses");
+        let table = catalog_helpers::table_id::<subql::backend::Postgres, _>(&db, "nums")
+            .expect("nums is in the catalog");
+        let mut engine: Engine = SubscriptionEngine::new(db, PostgreSqlDialect {});
+        let registered = engine
+            .register(SubscriptionRequest::new(
+                1u64,
+                format!("SELECT * FROM nums WHERE {predicate}"),
+            ))
+            .expect("the predicate registers");
+        assert_eq!(registered.not_served_because, None, "{predicate} is served");
+        let notifications = engine
+            .consumers(&TestEvent::insert(
+                table,
+                vec![Value::Int(1), Value::Missing],
+            ))
+            .expect("dispatch succeeds");
+        let unanswered = notifications
+            .unanswered()
+            .iter()
+            .map(|entry| entry.column)
+            .collect::<Vec<_>>();
+        match answered {
+            None => {
+                assert_eq!(unanswered, vec![1], "{predicate} names the absent cell");
+                assert!(notifications.inserted().is_empty(), "{predicate}");
+            }
+            Some(selected) => {
+                assert!(unanswered.is_empty(), "{predicate} answers");
+                assert_eq!(
+                    !notifications.inserted().is_empty(),
+                    selected,
+                    "{predicate}"
+                );
+            }
+        }
+    }
+}
+
 /// A null test over a cell the event carried as SQL `NULL` still
 /// answers, in both directions.
 ///

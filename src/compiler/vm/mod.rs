@@ -16,8 +16,10 @@
 //!   `StackValue::Value` carrying `Value::Null` / `Value::Missing` (both
 //!   lift to `Tri::Unknown`). Any other final shape is a compiler bug and
 //!   surfaces as [`VmError::MalformedProgram`].
-//! * Same-scalar arithmetic only. Cross-scalar operands, or `Missing` /
-//!   `Null` operands, collapse to `Value::Null`.
+//! * Same-scalar arithmetic only. Cross-scalar operands collapse to
+//!   `Value::Null`. A `Null` operand answers `Null`, and otherwise a
+//!   `Missing` one answers `Missing`, so a null test over the result stays
+//!   unanswered.
 //! * A `LoadColumn` instruction reads its cell through
 //!   [`CdcEvent::cell_at`], which lends the decoded [`Value`] when the event
 //!   caches it and hands an owned one over otherwise. Boolean predicates on a bare column

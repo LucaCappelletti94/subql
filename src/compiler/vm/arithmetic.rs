@@ -8,14 +8,15 @@ use bigdecimal::{
     BigDecimal,
 };
 
-/// `Value::Missing` / `Value::Null` on either side propagates to
-/// `Value::Null` (SQL NULL propagation).
-pub(crate) const fn null_propagate_binary<B: Backend>(
-    a: &Value<B>,
-    b: &Value<B>,
-) -> Option<Value<B>> {
-    if a.is_absent() || b.is_absent() {
+/// The answer of arithmetic over an absent operand, `None` when both are
+/// present. A `Value::Null` operand answers `Value::Null` whatever the other
+/// holds. Otherwise a `Value::Missing` one answers `Value::Missing`, since
+/// the cell the event did not carry may hold any value.
+pub(crate) const fn absent_binary<B: Backend>(a: &Value<B>, b: &Value<B>) -> Option<Value<B>> {
+    if a.is_null() || b.is_null() {
         Some(Value::Null)
+    } else if a.is_missing() || b.is_missing() {
+        Some(Value::Missing)
     } else {
         None
     }
@@ -104,8 +105,8 @@ pub(crate) fn arithmetic_add<B: Backend>(
     a: Value<B>,
     b: Value<B>,
 ) -> Result<Value<B>, EvaluationRefusal> {
-    if let Some(null) = null_propagate_binary(&a, &b) {
-        return Ok(null);
+    if let Some(absent) = absent_binary(&a, &b) {
+        return Ok(absent);
     }
     Ok(match (a, b) {
         (Value::Int(x), Value::Int(y)) => return B::integer_binary(ArithmeticOp::Add, x, y),
@@ -126,8 +127,8 @@ pub(crate) fn arithmetic_subtract<B: Backend>(
     a: Value<B>,
     b: Value<B>,
 ) -> Result<Value<B>, EvaluationRefusal> {
-    if let Some(null) = null_propagate_binary(&a, &b) {
-        return Ok(null);
+    if let Some(absent) = absent_binary(&a, &b) {
+        return Ok(absent);
     }
     Ok(match (a, b) {
         (Value::Int(x), Value::Int(y)) => return B::integer_binary(ArithmeticOp::Subtract, x, y),
@@ -148,8 +149,8 @@ pub(crate) fn arithmetic_multiply<B: Backend>(
     a: Value<B>,
     b: Value<B>,
 ) -> Result<Value<B>, EvaluationRefusal> {
-    if let Some(null) = null_propagate_binary(&a, &b) {
-        return Ok(null);
+    if let Some(absent) = absent_binary(&a, &b) {
+        return Ok(absent);
     }
     Ok(match (a, b) {
         (Value::Int(x), Value::Int(y)) => return B::integer_binary(ArithmeticOp::Multiply, x, y),
@@ -185,8 +186,8 @@ pub(crate) fn arithmetic_divide<B: Backend>(
     b: Value<B>,
     quotient: crate::compiler::bytecode::Quotient,
 ) -> Result<Value<B>, EvaluationRefusal> {
-    if let Some(null) = null_propagate_binary(&a, &b) {
-        return Ok(null);
+    if let Some(absent) = absent_binary(&a, &b) {
+        return Ok(absent);
     }
     Ok(match (a, b) {
         (Value::Int(x), Value::Int(y)) => {
@@ -241,8 +242,8 @@ pub(crate) fn arithmetic_modulo<B: Backend>(
     a: Value<B>,
     b: Value<B>,
 ) -> Result<Value<B>, EvaluationRefusal> {
-    if let Some(null) = null_propagate_binary(&a, &b) {
-        return Ok(null);
+    if let Some(absent) = absent_binary(&a, &b) {
+        return Ok(absent);
     }
     // Only SQLite's promotion of an overflowed integer reaches a float here.
     if matches!(a, Value::Float(_)) || matches!(b, Value::Float(_)) {
@@ -287,7 +288,7 @@ where
 /// Negate: same-scalar only.
 pub(crate) fn arithmetic_negate<B: Backend>(a: Value<B>) -> Result<Value<B>, EvaluationRefusal> {
     if a.is_absent() {
-        return Ok(Value::Null);
+        return Ok(a);
     }
     Ok(match a {
         Value::Int(x) => return B::integer_negate(x),
