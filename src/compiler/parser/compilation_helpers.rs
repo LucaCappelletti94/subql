@@ -854,7 +854,8 @@ where
                     out.push(Instruction::Not);
                 }
                 UnaryOperator::Plus => {
-                    // Unary + is no-op.
+                    refuse_non_numeric_operand::<B, DB>(inner, table_id, database, depth)?;
+                    // Unary + emits nothing over a number.
                 }
                 UnaryOperator::Minus => {
                     refuse_non_numeric_operand::<B, DB>(inner, table_id, database, depth)?;
