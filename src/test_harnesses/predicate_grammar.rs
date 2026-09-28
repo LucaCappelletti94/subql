@@ -190,6 +190,13 @@ pub enum TruthValue {
 enum Kind {
     /// A condition, as a filter reads it.
     Condition,
+    /// A scalar, as a comparison or arithmetic reads it.
+    Scalar(Scalar),
+}
+
+/// The kind of scalar a typed draw builds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Scalar {
     /// An integer, as `a` and `b` hold.
     Int,
     /// A float, as `r` holds.
@@ -258,14 +265,14 @@ impl Expr {
         match kind {
             Kind::Condition if leaf => Self::condition_leaf(u),
             Kind::Condition => Self::condition(u, below),
-            value if leaf => Self::value_leaf(u, value),
-            value => Self::value(u, below, value),
+            Kind::Scalar(scalar) if leaf => Self::value_leaf(u, scalar),
+            Kind::Scalar(scalar) => Self::value(u, below, scalar),
         }
     }
 
     /// A value kind a comparison can read on both sides.
-    fn comparable(u: &mut Unstructured<'_>) -> arbitrary::Result<Kind> {
-        pick(u, &[Kind::Int, Kind::Int, Kind::Float, Kind::Text])
+    fn comparable(u: &mut Unstructured<'_>) -> arbitrary::Result<Scalar> {
+        pick(u, &[Scalar::Int, Scalar::Int, Scalar::Float, Scalar::Text])
     }
 
     fn condition_leaf(u: &mut Unstructured<'_>) -> arbitrary::Result<Self> {
@@ -286,7 +293,9 @@ impl Expr {
     fn condition(u: &mut Unstructured<'_>, depth: u8) -> arbitrary::Result<Self> {
         let condition =
             |u: &mut Unstructured<'_>| Self::typed(u, depth, Kind::Condition).map(Box::new);
-        let value = |u: &mut Unstructured<'_>, kind| Self::typed(u, depth, kind).map(Box::new);
+        let value = |u: &mut Unstructured<'_>, scalar| {
+            Self::typed(u, depth, Kind::Scalar(scalar)).map(Box::new)
+        };
         Ok(match u.int_in_range(0u8..=11)? {
             0 => Self::Not(condition(u)?),
             1 | 2 => Self::Binary(pick(u, &[Op::And, Op::Or])?, condition(u)?, condition(u)?),
@@ -295,8 +304,19 @@ impl Expr {
                 Self::Binary(pick(u, &COMPARISONS)?, value(u, kind)?, value(u, kind)?)
             }
             6 => {
-                let kind = pick(u, &[Kind::Condition, Kind::Int, Kind::Float, Kind::Text])?;
-                Self::IsNull(value(u, kind)?, u.arbitrary()?)
+                let tested = match pick(
+                    u,
+                    &[
+                        None,
+                        Some(Scalar::Int),
+                        Some(Scalar::Float),
+                        Some(Scalar::Text),
+                    ],
+                )? {
+                    None => condition(u)?,
+                    Some(scalar) => value(u, scalar)?,
+                };
+                Self::IsNull(tested, u.arbitrary()?)
             }
             7 => Self::IsTruth(
                 condition(u)?,
@@ -332,8 +352,8 @@ impl Expr {
                 )
             }
             _ => Self::Like(
-                value(u, Kind::Text)?,
-                value(u, Kind::Text)?,
+                value(u, Scalar::Text)?,
+                value(u, Scalar::Text)?,
                 pick(u, &[None, Some('!'), Some('\\')])?,
                 u.arbitrary()?,
             ),
@@ -342,7 +362,7 @@ impl Expr {
 
     /// The column of `kind` two times in three, otherwise a literal of it or
     /// now and then `NULL`.
-    fn value_leaf(u: &mut Unstructured<'_>, kind: Kind) -> arbitrary::Result<Self> {
+    fn value_leaf(u: &mut Unstructured<'_>, kind: Scalar) -> arbitrary::Result<Self> {
         if u.ratio(1u8, 12u8)? {
             return Ok(Self::Null);
         }
@@ -354,19 +374,18 @@ impl Expr {
     }
 
     /// A column holding `kind`.
-    fn column(u: &mut Unstructured<'_>, kind: Kind) -> arbitrary::Result<Self> {
+    fn column(u: &mut Unstructured<'_>, kind: Scalar) -> arbitrary::Result<Self> {
         Ok(Self::Column(match kind {
-            Kind::Int => pick(u, &[Column::A, Column::B])?,
-            Kind::Float => Column::R,
-            Kind::Text => Column::S,
-            Kind::Condition => Column::F,
+            Scalar::Int => pick(u, &[Column::A, Column::B])?,
+            Scalar::Float => Column::R,
+            Scalar::Text => Column::S,
         }))
     }
 
     /// A value of `kind` that reads a column, as the tested side of `IN` and
     /// `BETWEEN` has to.
-    fn reading(u: &mut Unstructured<'_>, depth: u8, kind: Kind) -> arbitrary::Result<Self> {
-        let value = Self::typed(u, depth, kind)?;
+    fn reading(u: &mut Unstructured<'_>, depth: u8, kind: Scalar) -> arbitrary::Result<Self> {
+        let value = Self::typed(u, depth, Kind::Scalar(kind))?;
         if value.reads_column() {
             Ok(value)
         } else {
@@ -397,21 +416,21 @@ impl Expr {
     }
 
     /// A literal written in `kind`'s own form.
-    fn literal(u: &mut Unstructured<'_>, kind: Kind) -> arbitrary::Result<Self> {
+    fn literal(u: &mut Unstructured<'_>, kind: Scalar) -> arbitrary::Result<Self> {
         Ok(match kind {
-            Kind::Int => Self::Int(pick(u, &INTS)?),
-            Kind::Float => Self::Float(pick(u, &FLOATS)?),
-            Kind::Text => Self::Str(pick(u, &STRINGS)?),
-            Kind::Condition => Self::Bool(u.arbitrary()?),
+            Scalar::Int => Self::Int(pick(u, &INTS)?),
+            Scalar::Float => Self::Float(pick(u, &FLOATS)?),
+            Scalar::Text => Self::Str(pick(u, &STRINGS)?),
         })
     }
 
-    fn value(u: &mut Unstructured<'_>, depth: u8, kind: Kind) -> arbitrary::Result<Self> {
-        let operand = |u: &mut Unstructured<'_>| Self::typed(u, depth, kind).map(Box::new);
+    fn value(u: &mut Unstructured<'_>, depth: u8, kind: Scalar) -> arbitrary::Result<Self> {
+        let operand =
+            |u: &mut Unstructured<'_>| Self::typed(u, depth, Kind::Scalar(kind)).map(Box::new);
         let arithmetic: &[Op] = match kind {
-            Kind::Int => &[Op::Add, Op::Sub, Op::Mul, Op::Div, Op::Mod],
-            Kind::Float => &[Op::Add, Op::Sub, Op::Mul, Op::Div],
-            Kind::Text | Kind::Condition => &[],
+            Scalar::Int => &[Op::Add, Op::Sub, Op::Mul, Op::Div, Op::Mod],
+            Scalar::Float => &[Op::Add, Op::Sub, Op::Mul, Op::Div],
+            Scalar::Text => &[],
         };
         Ok(match u.int_in_range(0u8..=3)? {
             0 | 1 if !arithmetic.is_empty() => {
