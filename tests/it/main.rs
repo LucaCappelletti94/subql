@@ -96,6 +96,8 @@ mod custom_scalar_types;
 
 mod float_remainder_default;
 
+mod arithmetic_operand_kinds;
+
 #[cfg(feature = "testing")]
 mod decoder_roundtrip;
 

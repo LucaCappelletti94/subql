@@ -54,6 +54,16 @@ pub enum EvaluationRefusal {
     /// normally. PostgreSQL only, since MySQL's `DECIMAL` holds at most 65
     /// digits and SQLite compares through the exact rule instead.
     DecimalOutsideFloatRange,
+    /// The operands are kinds the operation is not computed over in process.
+    /// Registration refuses such a pair, so only a cell whose kind contradicts
+    /// its column's declared type reaches this, which a conforming event
+    /// reports as missing instead, or a promoted integer beside a float on a
+    /// backend with no [`Backend::int_as_float`](crate::backend::Backend::int_as_float).
+    /// No engine answers such a pair `NULL`, so no answer is given.
+    OperandKinds {
+        /// The operation over the operands.
+        operation: ArithmeticOp,
+    },
 }
 
 /// What a backend answers when a divisor is zero.
