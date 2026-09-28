@@ -100,7 +100,12 @@ fn promoted(operation: ArithmeticOp, a: i64, b: i64) -> f64 {
     }
 }
 
-/// Add: same-scalar only.
+/// Add: same-scalar only, and an integer beside a float read as a float.
+///
+/// # Errors
+///
+/// The backend's integer overflow, and [`EvaluationRefusal::OperandKinds`]
+/// for any other pair.
 pub(crate) fn arithmetic_add<B: Backend>(
     a: Value<B>,
     b: Value<B>,
@@ -111,18 +116,22 @@ pub(crate) fn arithmetic_add<B: Backend>(
     Ok(match (a, b) {
         (Value::Int(x), Value::Int(y)) => return B::integer_binary(ArithmeticOp::Add, x, y),
         (Value::Float(x), Value::Float(y)) => Value::Float(x + y),
-        (Value::Int(x), Value::Float(y)) => {
-            B::int_as_float(&x).map_or(Value::Null, |x| Value::Float(x + y))
-        }
-        (Value::Float(x), Value::Int(y)) => {
-            B::int_as_float(&y).map_or(Value::Null, |y| Value::Float(x + y))
-        }
+        (Value::Int(x), Value::Float(y)) => Value::Float(widened::<B>(&x, ArithmeticOp::Add)? + y),
+        (Value::Float(x), Value::Int(y)) => Value::Float(x + widened::<B>(&y, ArithmeticOp::Add)?),
         (Value::Decimal(x), Value::Decimal(y)) => Value::Decimal(x + y),
-        _ => Value::Null,
+        _ => {
+            return Err(EvaluationRefusal::OperandKinds {
+                operation: ArithmeticOp::Add,
+            })
+        }
     })
 }
 
-/// Subtract: same-scalar only.
+/// Subtract: as [`arithmetic_add`].
+///
+/// # Errors
+///
+/// As [`arithmetic_add`].
 pub(crate) fn arithmetic_subtract<B: Backend>(
     a: Value<B>,
     b: Value<B>,
@@ -134,17 +143,25 @@ pub(crate) fn arithmetic_subtract<B: Backend>(
         (Value::Int(x), Value::Int(y)) => return B::integer_binary(ArithmeticOp::Subtract, x, y),
         (Value::Float(x), Value::Float(y)) => Value::Float(x - y),
         (Value::Int(x), Value::Float(y)) => {
-            B::int_as_float(&x).map_or(Value::Null, |x| Value::Float(x - y))
+            Value::Float(widened::<B>(&x, ArithmeticOp::Subtract)? - y)
         }
         (Value::Float(x), Value::Int(y)) => {
-            B::int_as_float(&y).map_or(Value::Null, |y| Value::Float(x - y))
+            Value::Float(x - widened::<B>(&y, ArithmeticOp::Subtract)?)
         }
         (Value::Decimal(x), Value::Decimal(y)) => Value::Decimal(x - y),
-        _ => Value::Null,
+        _ => {
+            return Err(EvaluationRefusal::OperandKinds {
+                operation: ArithmeticOp::Subtract,
+            })
+        }
     })
 }
 
-/// Multiply: same-scalar only.
+/// Multiply: as [`arithmetic_add`].
+///
+/// # Errors
+///
+/// As [`arithmetic_add`].
 pub(crate) fn arithmetic_multiply<B: Backend>(
     a: Value<B>,
     b: Value<B>,
@@ -156,13 +173,17 @@ pub(crate) fn arithmetic_multiply<B: Backend>(
         (Value::Int(x), Value::Int(y)) => return B::integer_binary(ArithmeticOp::Multiply, x, y),
         (Value::Float(x), Value::Float(y)) => Value::Float(x * y),
         (Value::Int(x), Value::Float(y)) => {
-            B::int_as_float(&x).map_or(Value::Null, |x| Value::Float(x * y))
+            Value::Float(widened::<B>(&x, ArithmeticOp::Multiply)? * y)
         }
         (Value::Float(x), Value::Int(y)) => {
-            B::int_as_float(&y).map_or(Value::Null, |y| Value::Float(x * y))
+            Value::Float(x * widened::<B>(&y, ArithmeticOp::Multiply)?)
         }
         (Value::Decimal(x), Value::Decimal(y)) => Value::Decimal(x * y),
-        _ => Value::Null,
+        _ => {
+            return Err(EvaluationRefusal::OperandKinds {
+                operation: ArithmeticOp::Multiply,
+            })
+        }
     })
 }
 
@@ -179,8 +200,9 @@ pub(crate) fn arithmetic_multiply<B: Backend>(
 /// # Errors
 ///
 /// [`EvaluationRefusal::DivisionByZero`] on a zero divisor where this
-/// backend raises, and [`EvaluationRefusal::IntegerOverflow`] for the one
-/// quotient that does not fit, `i64::MIN / -1`.
+/// backend raises, [`EvaluationRefusal::IntegerOverflow`] for the one
+/// quotient that does not fit, `i64::MIN / -1`, and
+/// [`EvaluationRefusal::OperandKinds`] for a pair it is not computed over.
 pub(crate) fn arithmetic_divide<B: Backend>(
     a: Value<B>,
     b: Value<B>,
@@ -213,13 +235,13 @@ pub(crate) fn arithmetic_divide<B: Backend>(
             if let Some(null) = zero_divisor::<B, _>(&y, ArithmeticOp::Divide)? {
                 return Ok(null);
             }
-            B::int_as_float(&x).map_or(Value::Null, |x| Value::Float(x / y))
+            Value::Float(widened::<B>(&x, ArithmeticOp::Divide)? / y)
         }
         (Value::Float(x), Value::Int(y)) => {
             if let Some(null) = zero_divisor::<B, _>(&y, ArithmeticOp::Divide)? {
                 return Ok(null);
             }
-            B::int_as_float(&y).map_or(Value::Null, |y| Value::Float(x / y))
+            Value::Float(x / widened::<B>(&y, ArithmeticOp::Divide)?)
         }
         (Value::Decimal(x), Value::Decimal(y)) => {
             if let Some(null) = zero_divisor::<B, _>(&y, ArithmeticOp::Divide)? {
@@ -227,7 +249,11 @@ pub(crate) fn arithmetic_divide<B: Backend>(
             }
             Value::Decimal(B::decimal_quotient(x, y, quotient))
         }
-        _ => Value::Null,
+        _ => {
+            return Err(EvaluationRefusal::OperandKinds {
+                operation: ArithmeticOp::Divide,
+            })
+        }
     })
 }
 
@@ -245,21 +271,35 @@ pub(crate) fn arithmetic_modulo<B: Backend>(
     if let Some(absent) = absent_binary(&a, &b) {
         return Ok(absent);
     }
-    // Only SQLite's promotion of an overflowed integer reaches a float here.
-    if matches!(a, Value::Float(_)) || matches!(b, Value::Float(_)) {
-        return B::float_remainder(&a, &b).ok_or(EvaluationRefusal::IntegerOverflow {
-            operation: ArithmeticOp::Modulo,
-        });
-    }
-    Ok(match (a, b) {
+    match (a, b) {
         (Value::Int(x), Value::Int(y)) => {
             if let Some(null) = zero_divisor::<B, _>(&y, ArithmeticOp::Modulo)? {
                 return Ok(null);
             }
-            return B::integer_binary(ArithmeticOp::Modulo, x, y);
+            B::integer_binary(ArithmeticOp::Modulo, x, y)
         }
-        _ => Value::Null,
-    })
+        // Only SQLite's promotion of an overflowed integer reaches a float here.
+        (a @ (Value::Int(_) | Value::Float(_)), b @ (Value::Int(_) | Value::Float(_))) => {
+            B::float_remainder(&a, &b).ok_or(EvaluationRefusal::IntegerOverflow {
+                operation: ArithmeticOp::Modulo,
+            })
+        }
+        _ => Err(EvaluationRefusal::OperandKinds {
+            operation: ArithmeticOp::Modulo,
+        }),
+    }
+}
+
+/// An integer operand beside a float, read as this backend's float.
+///
+/// # Errors
+///
+/// [`EvaluationRefusal::OperandKinds`] where the backend has no such reading.
+fn widened<B: Backend>(
+    value: &B::Int,
+    operation: ArithmeticOp,
+) -> Result<B::Float, EvaluationRefusal> {
+    B::int_as_float(value).ok_or(EvaluationRefusal::OperandKinds { operation })
 }
 
 /// This backend's answer for a zero divisor: `None` when the divisor is not
@@ -285,7 +325,12 @@ where
     }
 }
 
-/// Negate: same-scalar only.
+/// Negate: a number only.
+///
+/// # Errors
+///
+/// The backend's integer overflow, and [`EvaluationRefusal::OperandKinds`]
+/// for anything but a number.
 pub(crate) fn arithmetic_negate<B: Backend>(a: Value<B>) -> Result<Value<B>, EvaluationRefusal> {
     if a.is_absent() {
         return Ok(a);
@@ -294,7 +339,11 @@ pub(crate) fn arithmetic_negate<B: Backend>(a: Value<B>) -> Result<Value<B>, Eva
         Value::Int(x) => return B::integer_negate(x),
         Value::Float(x) => Value::Float(-x),
         Value::Decimal(x) => Value::Decimal(-x),
-        _ => Value::Null,
+        _ => {
+            return Err(EvaluationRefusal::OperandKinds {
+                operation: ArithmeticOp::Negate,
+            })
+        }
     })
 }
 

@@ -445,8 +445,9 @@ pub trait Backend: 'static {
     ///
     /// Every shipped engine computes `1 + 2.5` as a double, and SQLite reaches
     /// the pair on its own when an overflowed integer is promoted to a real.
-    /// Defaults to `None`, which answers such arithmetic `NULL`, for a backend
-    /// whose carriers this crate cannot convert.
+    /// Defaults to `None`, which refuses such arithmetic as
+    /// [`EvaluationRefusal::OperandKinds`](crate::compiler::vm::refusal::EvaluationRefusal::OperandKinds),
+    /// for a backend whose carriers this crate cannot convert.
     fn int_as_float(_value: &Self::Int) -> Option<Self::Float>
     where
         Self: Sized,

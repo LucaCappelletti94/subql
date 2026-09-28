@@ -70,6 +70,7 @@ All notable changes to subql are recorded here. The format follows [Keep a Chang
 
 ### Fixed
 
+- Arithmetic over operands it is not computed over, a cell whose kind contradicts its column's declared type or a promoted integer beside a float on a backend with no `Backend::int_as_float`, reports the new `EvaluationRefusal::OperandKinds` for the subscription. It answered `NULL`, so `IS NULL` over the result selected a row no engine would.
 - A `MIN` or `MAX` subscription, grouped or not, reads the database when the engine refuses to evaluate its filter for a changed row. It took the row as excluded, so a grouped `MIN` over SQLite silently missed a group whose only row the filter could not evaluate.
 - On SQLite, `%` over an integer that overflowed to a real answers as SQLite does, reading both operands back as integers clamped to the integer range and answering a real, or `NULL` for a divisor of zero. It was refused as an overflow. Custom backends can answer it through the new `Backend::float_remainder`, which defaults to that refusal.
 - Arithmetic over a cell the event did not carry is unanswered too, so `(n + 0) IS NULL` reports the subscriber through `ConsumerNotifications::unanswered` where `n IS NULL` already did. The engine read such arithmetic as `NULL`, so an update without its old row, or with an unchanged TOASTed column left out, answered a null test over it as if the column were `NULL`. Arithmetic with a `NULL` operand still answers `NULL`.
