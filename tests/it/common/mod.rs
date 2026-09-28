@@ -244,6 +244,7 @@ pub mod mysql;
 ))]
 mod parked_reads;
 pub mod pg;
+pub mod postgres_like;
 
 pub use mysql::{maxwell_collect, mysql_database, start_maxwell};
 #[cfg(any(
