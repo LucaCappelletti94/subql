@@ -136,6 +136,22 @@ fn a_coalesce_the_engines_type_differently_is_routed() {
     }
 }
 
+/// A mixed `COALESCE` under `LIKE` is left to the engine too. Its first
+/// column alone reads as text, and a `NULL` there makes the value a number or
+/// a boolean, which MySQL and SQLite match by its text rendering and
+/// PostgreSQL refuses.
+#[test]
+fn a_coalesce_the_engines_type_differently_is_routed_under_like() {
+    for predicate in [
+        "COALESCE(label, 1) LIKE '1'",
+        "COALESCE(label, n) LIKE '1'",
+        "'1' LIKE COALESCE(label, n)",
+        "COALESCE(label, flag) NOT LIKE 't%'",
+    ] {
+        routed_everywhere(predicate);
+    }
+}
+
 /// A served `COALESCE` is classified as its column is, so a comparison the
 /// column's collation leaves to the database is left to it here too.
 #[test]
