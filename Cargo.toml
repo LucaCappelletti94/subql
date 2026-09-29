@@ -453,16 +453,18 @@ executor-diesel-postgres-r2d2 = [
 # Opt-in: ship the `patchset::PgAdapter` and the
 # `SubscriptionEngine::apply_patchset` entry point for executing a
 # client-uploaded SQLite session patchset against a Postgres target via
-# the diesel connection. Enables `sqlite-diff-rs`'s `diesel` feature,
-# pulls in diesel's `postgres` backend, turns on diesel's `uuid` feature
-# for native `UUID` binds, `numeric` for native `NUMERIC` / `DECIMAL`
+# the diesel connection. Only `diesel::pg::Pg`, the backend type: pulls in
+# `postgres_backend` (pure Rust, no libpq), not the sync `postgres` driver,
+# which stays behind `executor-diesel-postgres` for the sync connector.
+# `uuid` for native `UUID` binds, `numeric` for native `NUMERIC` / `DECIMAL`
 # binds through `bigdecimal`, `chrono` for native temporal binds
 # (`TIMESTAMP`, `TIMESTAMPTZ`, `DATE`, `TIME`), and `serde_json` for
 # native `JSON` / `JSONB` binds. Dispatches `BOOLEAN`, `UUID`, `NUMERIC` /
 # `DECIMAL`, the temporals, and `JSON` / `JSONB` today; other native PG
 # types land as follow-up work.
 apply-patchset-postgres = [
-    "executor-diesel-postgres",
+    "executor-diesel",
+    "diesel?/postgres_backend",
     "sqlite-diff-rs/diesel",
     "diesel?/uuid",
     "diesel?/numeric",
