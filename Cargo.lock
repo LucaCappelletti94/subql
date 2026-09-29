@@ -1310,7 +1310,7 @@ dependencies = [
 [[package]]
 name = "diesel-sqlite-session"
 version = "0.1.0"
-source = "git+https://github.com/LucaCappelletti94/diesel-sqlite-session#e5a5ce7f34dc7a41fd6350e32f19c7ea3593f43b"
+source = "git+https://github.com/LucaCappelletti94/diesel-sqlite-session#398c5e8399ca16e3a0c31fb3919907ece317e58b"
 dependencies = [
  "diesel",
  "libsqlite3-sys",
@@ -1876,7 +1876,7 @@ checksum = "ad5208a115eaba24916f7456929832e310a81518c641f93fee4f89aa93aa3675"
 dependencies = [
  "cfg-if",
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -2008,7 +2008,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -4347,7 +4347,7 @@ dependencies = [
  "once_cell",
  "socket2 0.5.10",
  "tracing",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -4710,7 +4710,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -5261,7 +5261,7 @@ dependencies = [
 [[package]]
 name = "sqlparser"
 version = "0.63.0"
-source = "git+https://github.com/apache/datafusion-sqlparser-rs?branch=main#560a13c32b6c3b9f1a202d6b9a9020c016bbf7be"
+source = "git+https://github.com/apache/datafusion-sqlparser-rs?branch=main#5cad9060d38229ebf22a3b8625c685d5ad8552db"
 dependencies = [
  "log",
  "recursive",
@@ -5291,7 +5291,7 @@ dependencies = [
 [[package]]
 name = "sqlparser_derive"
 version = "0.6.0"
-source = "git+https://github.com/apache/datafusion-sqlparser-rs?branch=main#560a13c32b6c3b9f1a202d6b9a9020c016bbf7be"
+source = "git+https://github.com/apache/datafusion-sqlparser-rs?branch=main#5cad9060d38229ebf22a3b8625c685d5ad8552db"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -5535,7 +5535,7 @@ dependencies = [
  "getrandom 0.3.4",
  "once_cell",
  "rustix",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -6439,7 +6439,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
