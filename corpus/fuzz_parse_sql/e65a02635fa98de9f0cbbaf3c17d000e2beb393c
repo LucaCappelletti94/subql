@@ -1,0 +1,1 @@
+SELECT * FROM orders WHERE st ?&s LIKE 'p%''' AND NOT (c1 = 3)

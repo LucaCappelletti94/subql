@@ -1,0 +1,1 @@
+SELECT doc::text!AS t F rich WH 1

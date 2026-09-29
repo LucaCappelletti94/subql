@@ -1,0 +1,1 @@
+SELECT orders.status AS s FROM orders WHERE amount > 3

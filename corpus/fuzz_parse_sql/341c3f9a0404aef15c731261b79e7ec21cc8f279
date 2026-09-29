@@ -1,0 +1,1 @@
+SELECT FROM orders WHERE GET_%ObK(CONCAT(DAT/BASE(), '_park_seed_', id), @0) = 1

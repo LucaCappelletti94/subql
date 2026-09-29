@@ -1,0 +1,1 @@
+SELECT id, amount FROM orders WHERE (a+ount + c3) * 2 >=  c3

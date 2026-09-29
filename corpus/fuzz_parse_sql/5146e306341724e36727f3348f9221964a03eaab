@@ -1,0 +1,1 @@
+SELECT * FROM ordersc1 WHERE ELECFS+$OOEFS+$OFS+$O##OFS+$OOstatus LIKE 'p%' AND NOT

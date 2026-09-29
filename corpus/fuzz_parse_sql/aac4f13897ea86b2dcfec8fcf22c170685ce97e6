@@ -1,0 +1,1 @@
+SELECT COUNT(*) FILTER (WHERE amou3````````````````````````` > 0) FROM t

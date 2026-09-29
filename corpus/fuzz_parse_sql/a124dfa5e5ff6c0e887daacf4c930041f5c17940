@@ -1,0 +1,1 @@
+SELECT c FROM pg_curso WHEN (me, 'q1_cursor_')

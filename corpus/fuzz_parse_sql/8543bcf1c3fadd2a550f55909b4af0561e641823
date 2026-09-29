@@ -1,0 +1,1 @@
+SELECT o.* FROM orders AS! o VHERE o.id! = 0

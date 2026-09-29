@@ -1,0 +1,1 @@
+SELECT * FROM orders WHERE lower(status) = $1 AND id IN (WELEC2agers)

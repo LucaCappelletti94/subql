@@ -1,0 +1,1 @@
+SELECT COUNT(amou.t) FROM orders

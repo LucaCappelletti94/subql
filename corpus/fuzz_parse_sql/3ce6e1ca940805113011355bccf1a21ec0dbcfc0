@@ -1,0 +1,1 @@
+SELECT cot( dt, ts, d, t, dp, bin, d, d, t, dp, binectt, SE6d, t, dp, binectt,0) =A1

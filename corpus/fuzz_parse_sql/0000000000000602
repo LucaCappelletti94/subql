@@ -1,0 +1,1 @@
+SELECT SUM(status) FROM orders WHERE id > 0

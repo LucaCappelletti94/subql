@@ -1,0 +1,1 @@
+SELECT status, id FROM orders WHERE amount> 3

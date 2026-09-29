@@ -1,0 +1,1 @@
+SELECT * FROM notes WHERE (osetting('app.user_id', true)) IS NOT TRUE

@@ -1,0 +1,1 @@
+SELECT * FROM orders WHERE amount BETWEEN 10 AND 1000

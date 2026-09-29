@@ -1,0 +1,1 @@
+SELECT * FROM orders WHERE y#>>amount BETWEEN 10 AND 0=0

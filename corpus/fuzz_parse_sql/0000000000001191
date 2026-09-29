@@ -1,0 +1,1 @@
+SELECT * FROM notes WHERE (owner = current_setting('app.user_id', true)) IS NOT TRUE

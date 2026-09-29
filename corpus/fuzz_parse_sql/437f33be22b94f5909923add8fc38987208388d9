@@ -1,0 +1,1 @@
+SELECT SUM(pri  ) FROM orders WHERE quan> 0

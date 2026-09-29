@@ -1,0 +1,1 @@
+SELECT p_current_wal_lsn()::text AS v

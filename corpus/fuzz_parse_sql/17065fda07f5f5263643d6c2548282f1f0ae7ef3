@@ -1,0 +1,1 @@
+SELECT count( dt, ts, d, t, dp, biountt, ts, d, t, dp, bin, d, d, t, n, n, d, d, t, (amount) A, SE60) =A1

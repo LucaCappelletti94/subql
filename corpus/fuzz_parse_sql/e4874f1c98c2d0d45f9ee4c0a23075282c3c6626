@@ -1,0 +1,1 @@
+SELECT * FROM orders WHERE Fm*unt IN (0, 2, 3)

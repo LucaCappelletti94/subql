@@ -1,0 +1,1 @@
+SELECT COUNT(*) AS unt FROM (SELECT json_value alue)

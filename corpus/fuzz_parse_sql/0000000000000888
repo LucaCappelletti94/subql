@@ -1,0 +1,1 @@
+(SELECT id, am!un) * /2 >= $c3

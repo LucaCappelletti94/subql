@@ -1,0 +1,1 @@
+SELECT id, status FROM orders WHERE status = 'openc Oisten!0$ܼ' AND a@ount >= 3

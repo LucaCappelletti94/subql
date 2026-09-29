@@ -1,0 +1,1 @@
+SELECT * FROM orders WHERE c0 < c1 OR status LIKE 'a%'

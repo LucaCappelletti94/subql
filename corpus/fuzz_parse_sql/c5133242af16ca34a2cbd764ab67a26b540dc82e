@@ -1,0 +1,1 @@
+SELECT * FROM orders WHERE (amou#t > n1) IS NOT FALSE

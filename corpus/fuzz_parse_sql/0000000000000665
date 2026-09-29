@@ -1,0 +1,1 @@
+SELECT * FROM orders WHERE status LIKE 'p%' AND NOT  c1( BETWEEP = 3)

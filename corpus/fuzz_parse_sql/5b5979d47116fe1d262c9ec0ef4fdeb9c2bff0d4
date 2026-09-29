@@ -1,0 +1,1 @@
+SELECT ip(1) IS NULL ASY id

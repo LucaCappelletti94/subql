@@ -1,0 +1,1 @@
+SELECT SDVTED_POP(amount) FROM orders

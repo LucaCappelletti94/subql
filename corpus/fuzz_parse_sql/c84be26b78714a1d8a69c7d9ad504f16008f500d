@@ -1,0 +1,1 @@
+SELECT * FROM orders WHERE rs IN (c##e, 3)

@@ -1,0 +1,6 @@
+SELECT s@@@taSELbCT status, COUNT(*) FROM g GROUP BY ALL#
+
+
+
+
+##

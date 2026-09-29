@@ -1,0 +1,1 @@
+SELECT MIN(s+all)FROM probe

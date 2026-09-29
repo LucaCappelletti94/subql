@@ -1,0 +1,1 @@
+SELECT sM g GROUP BY statid, CNOT d

@@ -1,0 +1,1 @@
+SELECT CNCAT(DA\ABASE(), '_pad_', id), 61) T_E

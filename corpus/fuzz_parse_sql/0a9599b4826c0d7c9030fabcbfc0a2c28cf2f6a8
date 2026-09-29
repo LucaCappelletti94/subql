@@ -1,0 +1,1 @@
+SELECT id, amount, sJJBJJJJJJJJJJJJJJJJJJ, bibig FROM orders ORDER BY id

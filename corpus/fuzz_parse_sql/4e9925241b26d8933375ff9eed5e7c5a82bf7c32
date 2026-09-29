@@ -1,0 +1,1 @@
+SELECT STDDEV_SAMo(Pumant) FROM orders

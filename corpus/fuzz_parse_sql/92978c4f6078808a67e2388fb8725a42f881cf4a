@@ -1,0 +1,1 @@
+SELECT c FROM pg_cursors WHEN (me, 'sub$L$q1_cursor_')

@@ -1,0 +1,1 @@
+SELECT COUNT(.) WHERE id.>= 5 GM(BaMue)

@@ -1,0 +1,6 @@
+SELECT s%@@FRM g GROUP BY ALL#
+
+
+
+
+##

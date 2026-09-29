@@ -1,0 +1,1 @@
+SELECT /*~+ ME(1),*/ * FROM  MAX_EXYt

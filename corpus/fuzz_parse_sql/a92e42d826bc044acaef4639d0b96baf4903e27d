@@ -1,0 +1,1 @@
+SELECT * FROM orders WHERE COALESE(c6, 0) <> 1

@@ -1,0 +1,1 @@
+SELECT FROM t WINDOW w AS (PARTITION B~Y status))

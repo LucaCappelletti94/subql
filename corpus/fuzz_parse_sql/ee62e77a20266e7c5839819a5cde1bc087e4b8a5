@@ -1,0 +1,1 @@
+SELECT id, amount FROM orders WHERE COADESCE( c3) =  c3
