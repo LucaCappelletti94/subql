@@ -1,0 +1,1 @@
+status LIKE 'p%' AND N NOT IN (3)

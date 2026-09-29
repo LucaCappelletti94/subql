@@ -1,0 +1,1 @@
+c14_LOCK(CONCAT(DATABASE(), '_parABASE()', id), 33) =_LOCK(CONCAT(DATABASE(), '_parABASE()', id), 33) = p

@@ -1,0 +1,1 @@
+GET_OC(LCKONCAT(DA\ABASE(), '_park_page_', id), 30) = 2
