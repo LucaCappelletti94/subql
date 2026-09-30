@@ -166,7 +166,7 @@ pub struct Vm<B: Backend> {
     /// absent cell records nothing, and so a `Null` cell, which is a value
     /// the database holds, is never mistaken for an absent one.
     absent_column: Option<crate::ColumnId>,
-    /// Buffers every `LIKE` walk reuses, so matching allocates nothing once warm.
+    /// Buffers every `LIKE` match reuses, so matching allocates nothing once warm.
     like: LikeScratch,
 }
 
@@ -957,7 +957,7 @@ impl<B: Backend> Default for Vm<B> {
 /// One step of a compiled `LIKE` pattern.
 ///
 /// Parsing the pattern before matching is what makes the escape rule a
-/// property of the pattern rather than of every step of the walk: once a
+/// property of the pattern rather than of every step of the match: once a
 /// character is escaped it is a [`Self::Literal`], indistinguishable from
 /// any other literal character.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -974,28 +974,28 @@ enum PatternAtom {
     DanglingEscape,
 }
 
-/// A `LIKE` pattern the walk reached but cannot answer.
+/// A `LIKE` pattern the matcher reached but cannot answer.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum PatternError {
-    /// The walk reached a [`PatternAtom::DanglingEscape`] with input still
-    /// to read.
+    /// PostgreSQL's matcher would reach a [`PatternAtom::DanglingEscape`]
+    /// with input still to read.
     ///
     /// PostgreSQL raises `LIKE pattern must not end with escape character`
     /// exactly here, and answers false when the input ran out before the
-    /// matcher arrived, which is why this is reported from the walk rather
+    /// matcher arrived, which is why this is reported from matching rather
     /// than from parsing. MySQL answers false either way. Keeping it
     /// distinct from a no-match is what lets a per-subscription evaluation
     /// failure report it once the engine carries one, without revisiting
-    /// the walk.
+    /// the match.
     TrailingEscape,
 }
 
-/// The buffers one `LIKE` walk needs, kept between walks.
+/// The buffers one `LIKE` match needs, kept between matches.
 #[derive(Default)]
 struct LikeScratch {
     atoms: Vec<PatternAtom>,
-    reached: Vec<bool>,
-    next: Vec<bool>,
+    text: Vec<char>,
+    finder: SegmentFinder,
 }
 
 impl LikeScratch {
@@ -1031,6 +1031,12 @@ impl LikeScratch {
     /// Supports `%` (zero or more characters), `_` (exactly one character) and
     /// the default escape. An explicit `ESCAPE` clause is refused before
     /// reaching here.
+    ///
+    /// The pattern splits at every `%` into segments of fixed length. The
+    /// first must sit at the start of the text, the last at its end, and each
+    /// one between is taken at its leftmost place after the one before, which
+    /// is never worse than a later place. Each search reads the text once, so
+    /// the cost is the text times the words a segment's positions fill.
     fn matches(
         &mut self,
         string: &str,
@@ -1039,58 +1045,180 @@ impl LikeScratch {
         case: crate::backend::TextCase,
     ) -> Result<bool, PatternError> {
         self.compile(pattern, escape);
-        let p = &self.atoms;
-        let pn = p.len();
+        self.text.clear();
+        self.text.extend(string.chars());
+        let Self {
+            atoms,
+            text,
+            finder,
+        } = self;
+        let Some(PatternAtom::DanglingEscape) = atoms.last() else {
+            return Ok(fits_pattern(atoms, text, case, finder));
+        };
+        // PostgreSQL's matcher reaches the escape with input left exactly when
+        // a proper prefix of the text matches everything before it, which is
+        // when the text less its last character matches that followed by `%`.
+        let Some(shorter) = text.len().checked_sub(1) else {
+            return Ok(false);
+        };
+        let last = atoms.len() - 1;
+        atoms[last] = PatternAtom::AnySequence;
+        if fits_pattern(atoms, &text[..shorter], case, finder) {
+            Err(PatternError::TrailingEscape)
+        } else {
+            Ok(false)
+        }
+    }
+}
 
-        // reached[j] = true when the input read so far matches p[0..j].
-        let reached = &mut self.reached;
-        let next = &mut self.next;
-        reached.clear();
-        reached.resize(pn + 1, false);
-        reached[0] = true;
+/// Whether `text` matches the compiled `atoms`, none of them a dangling escape.
+fn fits_pattern(
+    atoms: &[PatternAtom],
+    text: &[char],
+    case: crate::backend::TextCase,
+    finder: &mut SegmentFinder,
+) -> bool {
+    let any = |atom: &PatternAtom| *atom == PatternAtom::AnySequence;
+    let (Some(first_any), Some(last_any)) =
+        (atoms.iter().position(any), atoms.iter().rposition(any))
+    else {
+        return atoms.len() == text.len() && fits_segment(atoms, text, case);
+    };
+    let head = &atoms[..first_any];
+    let tail = &atoms[last_any + 1..];
+    let Some(until) = text
+        .len()
+        .checked_sub(tail.len())
+        .filter(|until| *until >= head.len())
+    else {
+        return false;
+    };
+    if !fits_segment(head, &text[..head.len()], case) || !fits_segment(tail, &text[until..], case) {
+        return false;
+    }
+    let mut from = head.len();
+    for segment in atoms[first_any..last_any]
+        .split(any)
+        .filter(|s| !s.is_empty())
+    {
+        match finder.find(segment, &text[from..until], case) {
+            Some(end) => from += end,
+            None => return false,
+        }
+    }
+    true
+}
 
-        // Leading '%' can match the empty string.
-        for (j, atom) in p.iter().enumerate() {
-            if *atom == PatternAtom::AnySequence {
-                reached[j + 1] = reached[j];
-            } else {
-                break;
+/// Whether `text` matches the `%`-free `segment` character for character.
+fn fits_segment(segment: &[PatternAtom], text: &[char], case: crate::backend::TextCase) -> bool {
+    segment.iter().zip(text).all(|(atom, sc)| match *atom {
+        PatternAtom::AnyChar => true,
+        PatternAtom::Literal(ch) => same_character(*sc, ch, case),
+        PatternAtom::AnySequence | PatternAtom::DanglingEscape => false,
+    })
+}
+
+/// A bit-parallel search for one `%`-free segment, one bit per segment position.
+///
+/// Bit `i` of the state is set when the segment's first `i + 1` positions
+/// match the text ending at the character just read, so reading a character
+/// shifts the state up and keeps the positions that character can fill.
+#[derive(Default)]
+struct SegmentFinder {
+    /// The segment's literal characters under the case rule, each with its position.
+    keys: Vec<(char, usize)>,
+    /// Where each ASCII character's mask starts in `masks`, 0 when the segment never names it.
+    ascii: Vec<usize>,
+    /// Where each other character's mask starts, sorted by character.
+    others: Vec<(char, usize)>,
+    /// Masks of `words` words each. The first holds the `_` positions, which
+    /// every character fills, and is the mask of any character the segment
+    /// never names.
+    masks: Vec<u64>,
+    state: Vec<u64>,
+}
+
+impl SegmentFinder {
+    /// How far into `text` the leftmost occurrence of the non-empty `segment` ends.
+    fn find(
+        &mut self,
+        segment: &[PatternAtom],
+        text: &[char],
+        case: crate::backend::TextCase,
+    ) -> Option<usize> {
+        let words = segment.len().div_ceil(64);
+        self.prepare(segment, words, case);
+        let top = (segment.len() - 1) / 64;
+        let top_bit = 1u64 << ((segment.len() - 1) % 64);
+        self.state.clear();
+        self.state.resize(words, 0);
+        for (read, &sc) in text.iter().enumerate() {
+            let mask = self.mask_of(fold(sc, case));
+            let mut carry = 1;
+            for (word, allowed) in self.state.iter_mut().zip(&self.masks[mask..mask + words]) {
+                let shifted = (*word << 1) | carry;
+                carry = *word >> 63;
+                *word = shifted & allowed;
+            }
+            if self.state[top] & top_bit != 0 {
+                return Some(read + 1);
             }
         }
+        None
+    }
 
-        for sc in string.chars() {
-            next.clear();
-            next.resize(pn + 1, false);
-            for j in 0..pn {
-                if !(reached[j] || (p[j] == PatternAtom::AnySequence && next[j])) {
-                    continue;
-                }
-                match p[j] {
-                    PatternAtom::AnySequence => {
-                        next[j] = true;
-                        next[j + 1] = true;
-                    }
-                    PatternAtom::AnyChar => {
-                        if reached[j] {
-                            next[j + 1] = true;
-                        }
-                    }
-                    PatternAtom::Literal(ch) => {
-                        if reached[j] && same_character(sc, ch, case) {
-                            next[j + 1] = true;
-                        }
-                    }
-                    // Reached with `sc` still to read, which is the exact
-                    // condition PostgreSQL refuses. Input that ran out before
-                    // this point never gets here, and the atom matches
-                    // nothing, so such a pattern answers no-match below.
-                    PatternAtom::DanglingEscape => return Err(PatternError::TrailingEscape),
+    fn prepare(&mut self, segment: &[PatternAtom], words: usize, case: crate::backend::TextCase) {
+        self.masks.clear();
+        self.masks.resize(words, 0);
+        self.keys.clear();
+        for (position, atom) in segment.iter().enumerate() {
+            match *atom {
+                PatternAtom::AnyChar => self.masks[position / 64] |= 1 << (position % 64),
+                PatternAtom::Literal(ch) => self.keys.push((fold(ch, case), position)),
+                PatternAtom::AnySequence | PatternAtom::DanglingEscape => {}
+            }
+        }
+        self.keys.sort_unstable();
+        self.ascii.clear();
+        self.ascii.resize(128, 0);
+        self.others.clear();
+        let mut previous = None;
+        for &(ch, position) in &self.keys {
+            if previous != Some(ch) {
+                previous = Some(ch);
+                let start = self.masks.len();
+                self.masks.extend_from_within(..words);
+                match ascii_code(ch) {
+                    Some(code) => self.ascii[code] = start,
+                    None => self.others.push((ch, start)),
                 }
             }
-            core::mem::swap(reached, next);
+            let start = self.masks.len() - words;
+            self.masks[start + position / 64] |= 1 << (position % 64);
         }
+    }
 
-        Ok(reached[pn])
+    fn mask_of(&self, ch: char) -> usize {
+        ascii_code(ch).map_or_else(
+            || {
+                self.others
+                    .binary_search_by_key(&ch, |(key, _)| *key)
+                    .map_or(0, |found| self.others[found].1)
+            },
+            |code| self.ascii[code],
+        )
+    }
+}
+
+fn ascii_code(ch: char) -> Option<usize> {
+    u8::try_from(ch).ok().filter(u8::is_ascii).map(usize::from)
+}
+
+/// A character as the case rule compares it.
+const fn fold(ch: char, case: crate::backend::TextCase) -> char {
+    match case {
+        crate::backend::TextCase::Exact => ch,
+        crate::backend::TextCase::AsciiNoCase => ch.to_ascii_lowercase(),
     }
 }
 
@@ -1604,5 +1732,148 @@ mod tests {
             ),
             Ok(false)
         );
+    }
+
+    /// The quadratic walk the matcher replaced, kept as the oracle it must agree with.
+    fn walk(
+        string: &str,
+        pattern: &str,
+        escape: Option<char>,
+        case: crate::backend::TextCase,
+    ) -> Result<bool, PatternError> {
+        #[derive(Clone, Copy, PartialEq)]
+        enum Atom {
+            Any,
+            One,
+            Char(char),
+            Dangling,
+        }
+        let mut atoms = Vec::new();
+        let mut chars = pattern.chars();
+        while let Some(ch) = chars.next() {
+            atoms.push(if Some(ch) == escape {
+                chars.next().map_or(Atom::Dangling, Atom::Char)
+            } else {
+                match ch {
+                    '%' => Atom::Any,
+                    '_' => Atom::One,
+                    other => Atom::Char(other),
+                }
+            });
+        }
+        let n = atoms.len();
+        let mut reached = alloc::vec![false; n + 1];
+        reached[0] = true;
+        for j in 0..n {
+            if atoms[j] != Atom::Any {
+                break;
+            }
+            reached[j + 1] = reached[j];
+        }
+        for sc in string.chars() {
+            let mut next = alloc::vec![false; n + 1];
+            for j in 0..n {
+                if !(reached[j] || (atoms[j] == Atom::Any && next[j])) {
+                    continue;
+                }
+                match atoms[j] {
+                    Atom::Any => {
+                        next[j] = true;
+                        next[j + 1] = true;
+                    }
+                    Atom::One => next[j + 1] |= reached[j],
+                    Atom::Char(ch) => {
+                        next[j + 1] |= reached[j] && super::same_character(sc, ch, case);
+                    }
+                    Atom::Dangling => return Err(PatternError::TrailingEscape),
+                }
+            }
+            reached = next;
+        }
+        Ok(reached[n])
+    }
+
+    fn every_word(alphabet: &[char], longest: usize) -> Vec<alloc::string::String> {
+        let mut words = alloc::vec![alloc::string::String::new()];
+        let mut last = alloc::vec![alloc::string::String::new()];
+        for _ in 0..longest {
+            last = last
+                .iter()
+                .flat_map(|word| alphabet.iter().map(move |ch| alloc::format!("{word}{ch}")))
+                .collect();
+            words.extend(last.iter().cloned());
+        }
+        words
+    }
+
+    #[test]
+    fn the_matcher_agrees_with_the_walk_on_every_short_pattern() {
+        let patterns = every_word(&['a', 'B', '%', '_', '\\'], 4);
+        let texts = every_word(&['a', 'A', 'b', 'é'], 5);
+        let mut like = LikeScratch::default();
+        for case in [
+            crate::backend::TextCase::Exact,
+            crate::backend::TextCase::AsciiNoCase,
+        ] {
+            for escape in [Some('\\'), None] {
+                for pattern in &patterns {
+                    for text in &texts {
+                        assert_eq!(
+                            like.matches(text, pattern, escape, case),
+                            walk(text, pattern, escape, case),
+                            "{text:?} LIKE {pattern:?} escape {escape:?} {case:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Segments longer than one machine word, over texts spelled from the
+    /// pattern itself so they match or miss by one character, from a fixed seed.
+    #[test]
+    fn the_matcher_agrees_with_the_walk_on_long_segments() {
+        let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut draw = |bound: u64| {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (state >> 33) % bound
+        };
+        let letter = |pick: u64| ['a', 'b', 'A', 'B'][usize::try_from(pick).unwrap()];
+        let mut like = LikeScratch::default();
+        for _ in 0..4_000 {
+            let pattern: alloc::string::String = (0..draw(300))
+                .map(|_| match draw(60) {
+                    0 => '%',
+                    1..=6 => '_',
+                    pick => letter(pick % 4),
+                })
+                .collect();
+            let mut text: Vec<char> = Vec::new();
+            for ch in pattern.chars() {
+                match ch {
+                    '%' => text.extend((0..draw(90)).map(|_| letter(draw(4)))),
+                    '_' => text.push(letter(draw(4))),
+                    literal if draw(2) == 0 => text.push(literal.to_ascii_uppercase()),
+                    literal => text.push(literal),
+                }
+            }
+            if !text.is_empty() && draw(2) == 0 {
+                let at = usize::try_from(draw(u64::try_from(text.len()).unwrap())).unwrap();
+                text[at] = letter(draw(4));
+            }
+            let text: alloc::string::String = text.into_iter().collect();
+            for case in [
+                crate::backend::TextCase::Exact,
+                crate::backend::TextCase::AsciiNoCase,
+            ] {
+                assert_eq!(
+                    like.matches(&text, &pattern, Some('\\'), case),
+                    walk(&text, &pattern, Some('\\'), case),
+                    "{text:?} LIKE {pattern:?} {case:?}"
+                );
+            }
+        }
     }
 }
