@@ -12,13 +12,14 @@ use std::sync::LazyLock;
 use arbitrary::{Arbitrary, Unstructured};
 use sql_traits::structs::ParserDB;
 use sqlparser::dialect::PostgreSqlDialect;
+use sqlparser::parser::Parser;
 
 use crate::backend::{DivisionPrecisionIncrement, FloatWidth, Postgres, RowKind, Value};
 use crate::compiler::bytecode::{
     BytecodeProgram, ComparisonRef, FloatResult, Instruction, Quotient,
 };
 use crate::compiler::canonicalize::normalize_sql;
-use crate::compiler::parser::parse_and_compile;
+use crate::compiler::parser::{compile_filter, parse_and_compile};
 use crate::compiler::vm::Vm;
 use crate::persistence::codec;
 use crate::persistence::shard::{deserialize_shard, ShardPayload};
@@ -253,6 +254,10 @@ pub fn harness_deserialize_shard(data: &[u8]) {
 /// answer every row alike. The input is the filter alone, so every input that
 /// parses reaches the compiler. PostgreSqlDialect only, see `harness_parse_sql`
 /// for the rationale.
+///
+/// The canonical form is read back as the canonicalizer checks it, as an
+/// expression, because a statement around it spends recursion depth the
+/// canonicalizer never reserved.
 pub fn harness_canonicalize(data: &[u8]) {
     let Ok(filter) = core::str::from_utf8(data) else {
         return;
@@ -266,14 +271,16 @@ pub fn harness_canonicalize(data: &[u8]) {
     else {
         return;
     };
-    let restated = format!("SELECT * FROM orders WHERE {canonical}");
-    let (restated_table, restated_program) =
-        parse_and_compile::<Postgres, _>(&restated, &dialect, fuzz_catalog())
-            .unwrap_or_else(|e| panic!("{restated} does not compile: {e}"));
-    assert_eq!(
-        table, restated_table,
-        "{sql} and {restated} read different tables"
-    );
+    let restated = Parser::new(&dialect)
+        .try_with_sql(&canonical)
+        .and_then(|mut parser| parser.parse_expr())
+        .unwrap_or_else(|e| {
+            panic!("{canonical}, the canonical form of {sql}, does not parse: {e}")
+        });
+    let restated_program =
+        compile_filter::<Postgres, _>(&restated, table, &dialect, fuzz_catalog()).unwrap_or_else(
+            |e| panic!("{canonical}, the canonical form of {sql}, does not compile: {e}"),
+        );
 
     let mut vm = Vm::<Postgres>::new();
     for cells in probe_rows(&written, table) {
@@ -298,7 +305,10 @@ pub fn harness_canonicalize(data: &[u8]) {
         let (Some(a), Some(b)) = (answer(&written), answer(&restated_program)) else {
             continue;
         };
-        assert_eq!(a, b, "{sql} and {restated} disagree on {event:?}");
+        assert_eq!(
+            a, b,
+            "{sql} and its canonical form {canonical} disagree on {event:?}"
+        );
     }
 }
 
