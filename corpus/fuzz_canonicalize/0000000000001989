@@ -1,1 +1,0 @@
-GET_LOCK(CONCAT(DATABASE(), '_park_page_', id), 60)$= 1

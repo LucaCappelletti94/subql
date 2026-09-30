@@ -1,1 +1,0 @@
-lower(status) = $1 AND id tIN (SELECT id FROM manNULs)

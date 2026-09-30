@@ -1,1 +1,0 @@
-lower(sts14s) = 'paid' HAVING COUNT(*)= 'paid' > 0
