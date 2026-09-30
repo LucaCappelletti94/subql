@@ -523,6 +523,23 @@ where
     })
 }
 
+/// Compile `filter` as the WHERE clause of a statement over `table_id`.
+#[cfg(feature = "testing")]
+pub(crate) fn compile_filter<B, DB>(
+    filter: &Expr,
+    table_id: TableId,
+    dialect: &B::Dialect,
+    database: &DB,
+) -> Result<BytecodeProgram<B>, RegisterError>
+where
+    B: Backend + SqlLiteralParse,
+    DB: DatabaseLike,
+{
+    let canonicalizer = Canonicalizer::new(dialect as &dyn Dialect);
+    compile_expression::<B, DB>(filter, table_id, database, &canonicalizer, None)
+        .map(|(program, _)| program)
+}
+
 /// Table identity and WHERE-clause column dependencies for a single-table
 /// SELECT, plus the parsed statement.
 ///
