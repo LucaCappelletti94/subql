@@ -3,8 +3,6 @@
 //! applies before parsing count only the structure, so a filter whose text
 //! holds an unmatched `(` is served like any other.
 
-#![allow(clippy::unwrap_used)]
-
 use sql_traits::structs::ParserDB;
 use sqlparser::dialect::{MySqlDialect, PostgreSqlDialect};
 use subql::backend::{MySql, Postgres};
@@ -14,7 +12,7 @@ use subql::{DefaultIds, RegisterError, Registered, SubscriptionEngine, Subscript
 const DDL: &str = "CREATE TABLE t (id INT PRIMARY KEY, status TEXT, \"a(b\" TEXT);";
 
 fn served_on_postgres(sql: &str) {
-    let db = ParserDB::parse::<PostgreSqlDialect>(DDL).unwrap();
+    let db = ParserDB::parse::<PostgreSqlDialect>(DDL).expect("the fixture DDL parses");
     let mut engine: SubscriptionEngine<TestEvent<Postgres>, DefaultIds, ParserDB> =
         SubscriptionEngine::new(db, PostgreSqlDialect {});
     match engine.register(SubscriptionRequest::new(1u64, sql)) {
@@ -57,7 +55,7 @@ fn an_unmatched_parenthesis_after_a_backslash_escaped_quote_is_served_on_mysql()
     let db = ParserDB::parse::<MySqlDialect>(
         "CREATE TABLE t (id INT PRIMARY KEY, status VARCHAR(8) COLLATE utf8mb4_bin);",
     )
-    .unwrap();
+    .expect("the fixture DDL parses");
     let mut engine: SubscriptionEngine<TestEvent<MySql>, DefaultIds, ParserDB> =
         SubscriptionEngine::new(db, MySqlDialect {});
     match engine.register(SubscriptionRequest::new(1u64, sql)) {
@@ -82,7 +80,7 @@ fn a_long_run_of_operator_characters_inside_a_literal_is_served() {
 #[test]
 fn a_parenthesis_closed_only_inside_a_comment_is_refused() {
     let sql = "SELECT * FROM t WHERE (status = 'x' -- )";
-    let db = ParserDB::parse::<PostgreSqlDialect>(DDL).unwrap();
+    let db = ParserDB::parse::<PostgreSqlDialect>(DDL).expect("the fixture DDL parses");
     let mut engine: SubscriptionEngine<TestEvent<Postgres>, DefaultIds, ParserDB> =
         SubscriptionEngine::new(db, PostgreSqlDialect {});
     match engine.register(SubscriptionRequest::new(1u64, sql)) {
