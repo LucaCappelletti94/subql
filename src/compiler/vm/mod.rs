@@ -1136,6 +1136,9 @@ struct SegmentFinder {
     /// never names.
     masks: Vec<u64>,
     state: Vec<u64>,
+    /// State words updated so far, which is what the cost bound counts.
+    #[cfg(test)]
+    words_read: usize,
 }
 
 impl SegmentFinder {
@@ -1154,6 +1157,10 @@ impl SegmentFinder {
         self.state.resize(words, 0);
         for (read, &sc) in text.iter().enumerate() {
             let mask = self.mask_of(fold(sc, case));
+            #[cfg(test)]
+            {
+                self.words_read += words;
+            }
             let mut carry = 1;
             for (word, allowed) in self.state.iter_mut().zip(&self.masks[mask..mask + words]) {
                 let shifted = (*word << 1) | carry;
@@ -1875,5 +1882,54 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// State words one match updates. The walk this matcher replaced paired
+    /// every pattern position with every text character, 6,000 by 1,000,000
+    /// in the first case below.
+    fn words_read(text: &str, pattern: &str) -> (Result<bool, PatternError>, usize) {
+        let mut like = LikeScratch::default();
+        let matched = like.matches(text, pattern, None, crate::backend::TextCase::Exact);
+        (matched, like.finder.words_read)
+    }
+
+    #[test]
+    fn a_missed_segment_reads_the_text_once() {
+        let text = "b".repeat(1_000_000);
+        let (matched, read) = words_read(&text, &"%a".repeat(3_000));
+        assert_eq!(matched, Ok(false));
+        assert!(
+            read <= text.len(),
+            "{read} words over {} characters",
+            text.len()
+        );
+    }
+
+    #[test]
+    fn segments_found_in_turn_read_the_text_between_them_once() {
+        let text = "a".repeat(1_000_000);
+        let (matched, read) = words_read(&text, &format!("{}%", "%a".repeat(3_000)));
+        assert_eq!(matched, Ok(true));
+        assert!(
+            read <= text.len(),
+            "{read} words over {} characters",
+            text.len()
+        );
+    }
+
+    /// A segment that nearly matches at every position costs one word per 64
+    /// of its positions per character.
+    #[test]
+    fn a_long_segment_reads_the_text_once_per_word_it_fills() {
+        let text = "a".repeat(1_000_000);
+        let segment = format!("{}b", "a".repeat(2_000));
+        let (matched, read) = words_read(&text, &format!("%{segment}%"));
+        assert_eq!(matched, Ok(false));
+        let words = segment.len().div_ceil(64);
+        assert!(
+            read <= text.len() * words,
+            "{read} words over {} characters",
+            text.len()
+        );
     }
 }

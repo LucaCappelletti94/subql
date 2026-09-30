@@ -370,8 +370,6 @@ mod served_statement_shape;
 
 mod quoted_parentheses;
 
-mod like_pattern_cost;
-
 mod semantics_nan;
 
 mod semantics_bool_order;
