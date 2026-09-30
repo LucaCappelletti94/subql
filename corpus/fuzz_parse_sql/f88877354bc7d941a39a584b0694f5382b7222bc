@@ -1,0 +1,1 @@
+SELECT * FROM  LIKE t WHERE Mid IN( SELECT t_id FROM mtus, actit, T(q*) > 1)

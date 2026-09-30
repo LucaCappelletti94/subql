@@ -1,0 +1,1 @@
+SELECT CAT,(DATe/BAE(), '_park_s%ed_', id), 60) = 1

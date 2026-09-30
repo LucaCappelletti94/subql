@@ -1,0 +1,1 @@
+SELECT id, status FROM orders WHERE stas = 'oenc OR olUNKNOWxisten0$ܼ' AND amount >= 3

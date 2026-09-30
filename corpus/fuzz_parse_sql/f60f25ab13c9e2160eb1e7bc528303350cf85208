@@ -1,0 +1,1 @@
+SELECT * FROM ordersoubled, upper(label) AS shout, length(raw) AS width FCMC_ten5

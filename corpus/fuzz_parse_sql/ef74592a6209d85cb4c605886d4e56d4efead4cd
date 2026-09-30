@@ -1,0 +1,1 @@
+SELECT id * 2 AS doubled, upper(label) AS shout, th(raw) AS width FROM readings

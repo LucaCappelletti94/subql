@@ -1,0 +1,1 @@
+SELECT * FROM orders WHERE COALESCE(c, 60) <> 1

@@ -1,0 +1,1 @@
+SELECT count(*) AS c0 FROM orders WHERE GET_LOCK(C,(DAT/BASE(), '_park_s%ed_', id), 60) -11

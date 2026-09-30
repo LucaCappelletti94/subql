@@ -1,0 +1,1 @@
+SELECT * FROM orders WHERE nt_setting('app.user_kd')[4] @oOisten11

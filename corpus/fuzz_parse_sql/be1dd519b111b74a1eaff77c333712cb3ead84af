@@ -1,0 +1,1 @@
+SELECT p_current_wal_lsn()::textcurrent_setting('app.user_id') AS v

@@ -1,0 +1,1 @@
+SELECT sFROM g GROUP BY s,d

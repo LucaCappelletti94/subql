@@ -1,0 +1,1 @@
+SELECT region  ords GROUP BY re?ion HAVING COUNT(*) 1

@@ -1,0 +1,1 @@
+SELECT CASE(T(SLECT 1) )A v

@@ -1,0 +1,1 @@
+SELECT VAR_PO(mut) FROM orders

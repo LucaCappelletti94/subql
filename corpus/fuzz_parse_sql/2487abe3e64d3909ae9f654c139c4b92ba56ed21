@@ -1,0 +1,1 @@
+SELECT * FROM orders WHERE GROUP -id IN (5, 3)

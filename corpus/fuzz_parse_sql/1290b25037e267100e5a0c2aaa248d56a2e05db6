@@ -1,0 +1,1 @@
+SELECT * FROM orders WHERE no+current(_ns'.gauesprc10d') OR oluexid|KNOWxten*05

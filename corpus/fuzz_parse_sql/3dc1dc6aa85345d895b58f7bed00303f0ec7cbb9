@@ -1,0 +1,1 @@
+SELECT * FROM orders WHERE !!!RE COALESC!!#!TRUE!!S = 1

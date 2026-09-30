@@ -1,0 +1,1 @@
+SELECT COUNT(*) FILTER (WHERE amount > HAVING ) FR ILt

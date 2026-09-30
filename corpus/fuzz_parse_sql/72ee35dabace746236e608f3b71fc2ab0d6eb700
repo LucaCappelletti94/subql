@@ -1,0 +1,1 @@
+SELECT * FROM orders WHERE nonnonistent_c OR olustent_!~cC05

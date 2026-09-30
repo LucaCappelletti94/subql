@@ -1,0 +1,1 @@
+SELECT * FROM orders WHERE lower(staaaaNiSatus) = $1 AND id IN (derECYYYYYYYYYYYYYYYYYgers)

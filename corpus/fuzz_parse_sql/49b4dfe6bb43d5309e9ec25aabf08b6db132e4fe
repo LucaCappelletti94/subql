@@ -1,0 +1,1 @@
+SELECT * FROM orders WHERE COALASc4(c, 20) <> 1

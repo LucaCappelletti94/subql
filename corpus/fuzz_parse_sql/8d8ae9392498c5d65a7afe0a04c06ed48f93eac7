@@ -1,0 +1,1 @@
+SELECT id,note amount,''tavus, token, f d, t, dp, bin, big FROM orders ORDER BY id

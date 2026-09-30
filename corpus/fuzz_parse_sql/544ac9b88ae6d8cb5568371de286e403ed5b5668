@@ -1,0 +1,1 @@
+SELECT * FROM orders WHERE lower(s) = $1 AND id IN (SELECT id FROM managers)

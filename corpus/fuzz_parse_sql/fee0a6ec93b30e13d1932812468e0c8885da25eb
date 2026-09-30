@@ -1,0 +1,1 @@
+SELECT * FROM  ILIKE t WHERE Mid IN( SELECT t_id FRO, mtus, actcUEO$1)

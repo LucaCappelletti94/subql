@@ -1,0 +1,1 @@
+SELECT * FROM orders WHERE +lo.er(status) = $0 AND i<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<d IN (zELECTagers)
