@@ -11,6 +11,7 @@ use sqlparser::ast::{
     Select, SelectItem, SelectItemQualifiedWildcardKind, SelectModifiers, SetExpr, Statement,
     TableFactor, Visit, Visitor,
 };
+use sqlparser::tokenizer::{Token, TokenWithSpan, Tokenizer};
 
 const WINDOW_FUNCTIONS_NOT_SUPPORTED: &str = "Window functions not supported";
 const UNSUPPORTED_PROJECTION: &str =
@@ -1331,15 +1332,12 @@ pub(crate) fn parse_single_statement(
         ));
     }
 
-    check_sql_sanity(sql)?;
+    let tokens = tokenize_within_bounds(sql, dialect)?;
 
-    let statements = sqlparser::parser::Parser::parse_sql(dialect, sql).map_err(|e| {
-        crate::RegisterError::ParseError {
-            line: 1,
-            column: 0,
-            message: e.to_string(),
-        }
-    })?;
+    let statements = sqlparser::parser::Parser::new(dialect)
+        .with_tokens_with_locations(tokens)
+        .parse_statements()
+        .map_err(|error| parse_error(&error))?;
 
     if statements.len() != 1 {
         return Err(crate::RegisterError::UnsupportedSql(
@@ -1669,7 +1667,7 @@ fn select_projection_mut(stmt: &mut Statement) -> Option<&mut Vec<SelectItem>> {
 /// cliff.
 ///
 /// Nesting a visitor cannot see is bounded before the parse instead:
-/// [`check_sql_sanity`] counts parentheses, brackets and array suffixes,
+/// [`tokenize_within_bounds`] counts parentheses, brackets and array suffixes,
 /// the last because a type nests once per suffix and the visitor has no
 /// hook to count that.
 fn refuse_deep_nesting(stmt: &Statement) -> Result<(), crate::RegisterError> {
@@ -1708,59 +1706,65 @@ pub(super) const MAX_EXPR_DEPTH: usize = 128;
 /// Maximum SQL input length (defense-in-depth against pathological inputs).
 pub(super) const MAX_SQL_LEN: usize = 8192;
 
-/// Reject SQL likely to drive sqlparser into pathological backtracking.
+fn parse_error(error: &sqlparser::parser::ParserError) -> crate::RegisterError {
+    crate::RegisterError::ParseError {
+        line: 1,
+        column: 0,
+        message: error.to_string(),
+    }
+}
+
+/// Tokenize `sql`, refusing text that fuzzing found drives sqlparser to near-exponential parse times.
 ///
-/// Tracks parenthesis nesting and consecutive-operator runs, requires
-/// balanced parens at EOF, and rejects non-whitespace control characters
-/// (NUL, vertical tab, form feed, etc.). Real SQL contains none of those.
-/// Fuzz-found inputs that hit them have driven sqlparser to near-exponential
-/// parse times.
-fn check_sql_sanity(sql: &str) -> Result<(), crate::RegisterError> {
+/// Nesting, array suffixes and operator runs are counted over tokens, so a
+/// character inside a literal, a quoted name or a comment is never structure.
+fn tokenize_within_bounds(
+    sql: &str,
+    dialect: &dyn sqlparser::dialect::Dialect,
+) -> Result<Vec<TokenWithSpan>, crate::RegisterError> {
+    // Real SQL carries no control character but tab, LF and CR, even inside a literal.
+    if sql
+        .bytes()
+        .any(|c| matches!(c, 0x00..=0x08 | 0x0B | 0x0C | 0x0E..=0x1F | 0x7F))
+    {
+        return Err(crate::RegisterError::UnsupportedSql(
+            "Control character in SQL".to_string(),
+        ));
+    }
+
+    let tokens = Tokenizer::new(dialect, sql)
+        .tokenize_with_location()
+        .map_err(|error| parse_error(&error.into()))?;
+
     let mut paren_depth: usize = 0;
     let mut bracket_depth: usize = 0;
     let mut bracket_pairs: usize = 0;
     let mut consecutive_ops: usize = 0;
 
-    for c in sql.bytes() {
-        match c {
-            b'(' => {
+    for token in &tokens {
+        match &token.token {
+            Token::LParen => {
                 paren_depth += 1;
                 consecutive_ops += 1;
             }
-            b')' => {
+            Token::RParen => {
                 paren_depth = paren_depth.saturating_sub(1);
                 consecutive_ops = 0;
             }
-            // Square brackets: PostgreSQL array subscripts (`arr[1]`) and
-            // SQL Server delimited identifiers (`[col]`). Both balanced
-            // in well-formed input. Unmatched `[` runs drove GenericDialect
-            // into hundreds of ms of array-subscript backtracking.
-            b'[' => {
+            // Unmatched `[` runs drove GenericDialect into array-subscript backtracking.
+            Token::LBracket => {
                 bracket_depth += 1;
-                // A type nests once per array suffix, and `INT[][][]` keeps
-                // the depth counted above at one while doing it, so the
-                // count of suffixes is what bounds how deep a type goes.
+                // `INT[][][]` nests once per suffix while its depth stays at one.
                 bracket_pairs += 1;
                 consecutive_ops = 0;
             }
-            b']' => {
+            Token::RBracket => {
                 bracket_depth = bracket_depth.saturating_sub(1);
                 consecutive_ops = 0;
             }
-            b'+' | b'-' | b'*' | b'/' | b'=' | b'<' | b'>' | b'!' | b'~' => {
-                consecutive_ops += 1;
-            }
-            b' ' | b'\t' | b'\n' | b'\r' => {}
-            // ASCII control characters other than tab/LF/CR have no place
-            // in SQL and are a strong adversarial-input signal.
-            0x00..=0x08 | 0x0B | 0x0C | 0x0E..=0x1F | 0x7F => {
-                return Err(crate::RegisterError::UnsupportedSql(
-                    "Control character in SQL".to_string(),
-                ));
-            }
-            _ => {
-                consecutive_ops = 0;
-            }
+            Token::Whitespace(_) => {}
+            other if is_operator(other) => consecutive_ops += 1,
+            _ => consecutive_ops = 0,
         }
 
         if paren_depth > MAX_EXPR_DEPTH
@@ -1785,7 +1789,50 @@ fn check_sql_sanity(sql: &str) -> Result<(), crate::RegisterError> {
         ));
     }
 
-    Ok(())
+    Ok(tokens)
+}
+
+/// Whether `token` is spelled only with `+ - * / = < > ! ~`, the characters of an operator run.
+fn is_operator(token: &Token) -> bool {
+    match token {
+        Token::Plus
+        | Token::Minus
+        | Token::Mul
+        | Token::Div
+        | Token::DuckIntDiv
+        | Token::Eq
+        | Token::DoubleEq
+        | Token::Neq
+        | Token::Lt
+        | Token::Gt
+        | Token::LtEq
+        | Token::GtEq
+        | Token::Spaceship
+        | Token::RArrow
+        | Token::Arrow
+        | Token::LongArrow
+        | Token::TwoWayArrow
+        | Token::ShiftLeft
+        | Token::ShiftRight
+        | Token::Tilde
+        | Token::TildeAsterisk
+        | Token::TildeEqual
+        | Token::DoubleTilde
+        | Token::DoubleTildeAsterisk
+        | Token::ExclamationMark
+        | Token::DoubleExclamationMark
+        | Token::ExclamationMarkTilde
+        | Token::ExclamationMarkTildeAsterisk
+        | Token::ExclamationMarkDoubleTilde
+        | Token::ExclamationMarkDoubleTildeAsterisk => true,
+        Token::CustomBinaryOperator(spelling) => spelling.bytes().all(|c| {
+            matches!(
+                c,
+                b'+' | b'-' | b'*' | b'/' | b'=' | b'<' | b'>' | b'!' | b'~'
+            )
+        }),
+        _ => false,
+    }
 }
 
 /// The one `SELECT` a query reduces to, with the table it reads.
@@ -2677,41 +2724,57 @@ fn renumber_placeholders(expr: &mut Expr, set_bind_count: usize) {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod sanity_tests {
-    use super::check_sql_sanity;
+    use super::tokenize_within_bounds;
     use crate::RegisterError;
+    use sqlparser::dialect::PostgreSqlDialect;
+
+    fn refusal(sql: &str) -> RegisterError {
+        tokenize_within_bounds(sql, &PostgreSqlDialect {}).unwrap_err()
+    }
 
     #[test]
     fn rejects_vertical_tab() {
-        let err = check_sql_sanity("SELECT * FROM t WHERE a\x0b= 1").unwrap_err();
-        assert!(matches!(err, RegisterError::UnsupportedSql(ref m) if m.contains("Control")));
+        let err = refusal("SELECT * FROM t WHERE a\x0b= 1");
+        assert!(matches!(&err, RegisterError::UnsupportedSql(m) if m.contains("Control")));
     }
 
     #[test]
     fn rejects_nul_byte() {
-        let err = check_sql_sanity("SELECT * FROM t WHERE a\x00= 1").unwrap_err();
-        assert!(matches!(err, RegisterError::UnsupportedSql(ref m) if m.contains("Control")));
+        let err = refusal("SELECT * FROM t WHERE a\x00= 1");
+        assert!(matches!(&err, RegisterError::UnsupportedSql(m) if m.contains("Control")));
     }
 
     #[test]
     fn rejects_unbalanced_open_parens() {
-        let err = check_sql_sanity("SELECT * FROM t WHERE ((((a = 1").unwrap_err();
-        assert!(matches!(err, RegisterError::UnsupportedSql(ref m) if m.contains("Unbalanced")));
+        let err = refusal("SELECT * FROM t WHERE ((((a = 1");
+        assert!(matches!(&err, RegisterError::UnsupportedSql(m) if m.contains("Unbalanced")));
     }
 
     #[test]
     fn rejects_unbalanced_open_brackets() {
-        let err = check_sql_sanity("SELECT * FROM t WHERE a[[[[ = 1").unwrap_err();
-        assert!(
-            matches!(err, RegisterError::UnsupportedSql(ref m) if m.contains("square brackets"))
+        let err = refusal("SELECT * FROM t WHERE a[[[[ = 1");
+        assert!(matches!(&err, RegisterError::UnsupportedSql(m) if m.contains("square brackets")));
+    }
+
+    #[test]
+    fn rejects_a_run_of_spaced_operators_past_the_bound() {
+        let sql = format!(
+            "SELECT * FROM t WHERE a = {}1",
+            "- ".repeat(super::MAX_EXPR_DEPTH)
         );
+        let err = refusal(&sql);
+        assert!(matches!(&err, RegisterError::UnsupportedSql(m) if m.contains("too deep")));
     }
 
     #[test]
     fn accepts_well_formed_sql() {
-        check_sql_sanity("SELECT * FROM t WHERE a = 1\nAND b > 2").unwrap();
-        check_sql_sanity("SELECT * FROM t WHERE x IN (1, 2, 3)").unwrap();
-        // PG array subscript with balanced brackets is fine.
-        check_sql_sanity("SELECT * FROM t WHERE arr[1] = 5").unwrap();
+        for sql in [
+            "SELECT * FROM t WHERE a = 1\nAND b > 2",
+            "SELECT * FROM t WHERE x IN (1, 2, 3)",
+            "SELECT * FROM t WHERE arr[1] = 5",
+        ] {
+            tokenize_within_bounds(sql, &PostgreSqlDialect {}).unwrap();
+        }
     }
 }
 
