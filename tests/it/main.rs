@@ -368,6 +368,8 @@ mod round_trip_pg_wal2json_e2e;
 
 mod served_statement_shape;
 
+mod quoted_parentheses;
+
 mod semantics_nan;
 
 mod semantics_bool_order;
