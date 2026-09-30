@@ -1,0 +1,1 @@
+loweid IN (SELECT id FROM manloweid IN (SELECT id FROM managers)agers)

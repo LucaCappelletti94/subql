@@ -1,0 +1,1 @@
+status LIKE 'p%c62' AND NOT (c1= 33)

@@ -1,0 +1,1 @@
+lower(s*c14s) HAVING COUNT(*) > 0
