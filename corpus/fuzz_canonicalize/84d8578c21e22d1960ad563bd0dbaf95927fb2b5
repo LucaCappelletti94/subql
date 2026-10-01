@@ -1,0 +1,1 @@
+lower(tatus) =d IN (SELECT id FROM manages)
