@@ -1,0 +1,1 @@
+SELECT * FROM orders WHERE c1 < c1 OR 3 LIKE ')%'

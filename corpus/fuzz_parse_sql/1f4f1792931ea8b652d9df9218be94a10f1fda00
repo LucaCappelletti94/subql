@@ -1,0 +1,1 @@
+SELECT * FROM orders WHERE Cc14Es(1 + enxi6CE(NULLcc14, 0) <> 1+6, 0) <> 1+enxist

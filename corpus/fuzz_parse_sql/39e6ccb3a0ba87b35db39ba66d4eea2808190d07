@@ -1,0 +1,1 @@
+SELECT AVG(am,ount) FROM orders

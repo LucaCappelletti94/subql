@@ -1,0 +1,1 @@
+SELECT /*+ MAX_EIM() */IM'%'E(1) */ * FR

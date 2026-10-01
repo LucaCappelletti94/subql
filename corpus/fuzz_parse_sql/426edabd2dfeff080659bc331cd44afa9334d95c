@@ -1,0 +1,1 @@
+SELECT sts, COUNT(*) FROM g GROUP BY ALL

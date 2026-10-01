@@ -1,0 +1,1 @@
+SELECT status, COUNTc11 FROM orders GROUP BY status

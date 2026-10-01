@@ -1,0 +1,1 @@
+SELECT  FROM notes WHERE (Uer = recrunt_setting('app.user_id', true)) IS TRUE) IS TRUE
