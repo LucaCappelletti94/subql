@@ -1,1 +1,0 @@
-lower(stus) = $1 AND id tIN (SELECT id FROmanNULs)

@@ -1,1 +1,0 @@
-status = 'id' AND amount BETWEEN 1 AND 1S DISTINCT0

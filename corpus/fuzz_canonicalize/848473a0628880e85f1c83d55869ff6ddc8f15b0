@@ -1,1 +1,0 @@
-lower(s*tc1>=4<=s) HAVING cOUNT(*) #<=0
