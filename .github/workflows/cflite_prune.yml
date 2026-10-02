@@ -2,7 +2,7 @@ name: ClusterFuzzLite corpus pruning
 
 on:
   schedule:
-    - cron: "0 5 * * *" # 05:00 UTC, an hour before batch fuzzing
+    - cron: "0 4 * * *" # 04:00 UTC, so the build plus the whole prune budget ends before batch fuzzing at 06:00
   workflow_dispatch:
 
 permissions:
@@ -25,7 +25,8 @@ jobs:
         uses: google/clusterfuzzlite/actions/run_fuzzers@884713a6c30a92e5e8544c39945cd7cb630abcd1 # v1
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
-          fuzz-seconds: 600
+          # Each target's merge times out at an even share of what is left, and a fast merge leaves its time to later targets.
+          fuzz-seconds: 3600
           mode: prune
           # The corpus store is this repository, so the job token can push to it.
           storage-repo: https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git
