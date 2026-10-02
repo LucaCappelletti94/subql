@@ -1,0 +1,1 @@
+SELECT id, amount sJJBJJJJJJJJJ,ibig FROM orders ORDER BY id

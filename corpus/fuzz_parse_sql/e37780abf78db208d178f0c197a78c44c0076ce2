@@ -1,0 +1,1 @@
+SELECT CAS n FROM ord1@>
