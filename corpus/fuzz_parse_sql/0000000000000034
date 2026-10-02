@@ -1,1 +1,0 @@
-SELECT COUNT(*) AS count FROM (SELECT json_value FROM sq_groups WHERE =>di5   GROU=P BY json_value)

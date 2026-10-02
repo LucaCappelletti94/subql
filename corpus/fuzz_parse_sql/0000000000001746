@@ -1,1 +1,0 @@
-SELECT c1doc::t . id&=*1

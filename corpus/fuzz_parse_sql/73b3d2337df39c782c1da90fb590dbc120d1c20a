@@ -1,1 +1,0 @@
-SELECT * FROM notes WHERE (owner = current_setting8'app.user_id', true))OT TRUE

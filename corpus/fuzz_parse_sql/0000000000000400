@@ -1,1 +1,0 @@
-SELECT status, SUM(am AND ount$15972$c0) SELECTrders GROUP BY(status HAVING GRO ) > 1

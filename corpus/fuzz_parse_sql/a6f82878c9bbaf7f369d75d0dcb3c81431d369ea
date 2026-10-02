@@ -1,1 +1,0 @@
-SELECT * FROM$t WINDOW w AS (PARTI z Y status)

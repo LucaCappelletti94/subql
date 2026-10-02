@@ -1,1 +1,0 @@
-SELECT COUNT(*) AS count FROM (SELECT json_value FROM sq_groups WHERE id >= 5 GROUP BY json_value)

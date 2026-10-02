@@ -1,1 +1,0 @@
-SELECT region, SUM(amount) FRoM orders GROUP BY regon HAVING SUM(amount) > NULL

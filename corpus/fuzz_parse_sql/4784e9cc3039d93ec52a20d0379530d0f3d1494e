@@ -1,1 +1,0 @@
-SELECT * FROM t WHERE a = 1; SELECT * t WHERE a = 1;E b = 2

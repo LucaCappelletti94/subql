@@ -1,1 +1,0 @@
-SELECT * FROM tiNdI(  SELECT t_id F#'open'HAVING COUNT(-----------------------------*)  > 1)

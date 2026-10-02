@@ -1,1 +1,0 @@
-SELECT  FROM notes WHERE (owner = recrunt_setting('app.user_id', true)) IS TRUE* FROM notes WHERE (owner = reing('app.user_id', true)) IS TRUE

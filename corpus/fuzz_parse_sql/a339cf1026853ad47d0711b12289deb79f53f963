@@ -1,1 +1,0 @@
-SELECT statu()* FROM g GROUP BY ALL

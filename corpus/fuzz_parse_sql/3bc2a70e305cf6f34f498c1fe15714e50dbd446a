@@ -1,1 +1,0 @@
-SELECT region  orders GROUP BY re?ion HAVING COUNT(*) 1

@@ -1,6 +1,0 @@
-SELECT s@@@FROM g GROUP BY ALL#
-
-
-
-
-##

@@ -1,1 +1,0 @@
-SELECT * FROM orders WHERE (amout > n1) IS NOT FALSE

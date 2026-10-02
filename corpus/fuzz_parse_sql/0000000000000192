@@ -1,1 +1,0 @@
-SELECT * FROM orders WHERE nonnonexistent_c OR oluexistent_!~cCTolumn >05

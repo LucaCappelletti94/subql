@@ -1,1 +1,0 @@
-SELECT id, status, status, active, token, sode, feeling, note, price  ,t,js, jb, dp,bin FROM orders ORDER BY id

@@ -1,1 +1,0 @@
-SELECT * FROM FROM orders GROUP  BY t ~HERE amount > 1/

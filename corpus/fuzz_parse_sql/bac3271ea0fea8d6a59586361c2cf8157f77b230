@@ -1,1 +1,0 @@
-SELECT id,note ap, bin, big FROM orders ORDER BY id

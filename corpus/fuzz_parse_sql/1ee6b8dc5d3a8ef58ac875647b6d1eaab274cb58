@@ -1,1 +1,0 @@
-SELECT id, amount, status,active, token, feeling, note, price, dt, ts, d, t,`dp, binBY id

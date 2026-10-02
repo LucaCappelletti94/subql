@@ -1,1 +1,0 @@
-SELECT * FROM orders WHERE status IN ('a', 'b', 'c') OR cA IS NULL

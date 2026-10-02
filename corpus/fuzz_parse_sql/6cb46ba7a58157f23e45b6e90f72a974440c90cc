@@ -1,1 +1,0 @@
-SELECT * FROM orders WHERE no_sng('.auesprc10d') OR oluexid|KNOWxten*05

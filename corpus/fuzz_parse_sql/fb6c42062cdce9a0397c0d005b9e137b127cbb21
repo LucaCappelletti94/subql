@@ -1,1 +1,0 @@
-SELECT i, SUM(amount) FROM gCOUNT(*) GROUP BY: sus, id

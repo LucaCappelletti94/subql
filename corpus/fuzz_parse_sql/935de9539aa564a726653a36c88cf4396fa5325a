@@ -1,1 +1,0 @@
-SELECT * FROM orders WHERE lower(ss) = $1 AND id IN (SELECELECtus) = $1 AND id IN (SELg2agers)

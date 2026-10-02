@@ -1,1 +1,0 @@
-SELECT * Frs WHERE status LIKE 'p!%' ESCAPE '!'

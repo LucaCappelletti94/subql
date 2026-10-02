@@ -1,1 +1,0 @@
-SELECT * FROM orders WHERE lower(status) = $0 AND id IN (SELEC$T ) = $1 AND id IN (SEL2agers)

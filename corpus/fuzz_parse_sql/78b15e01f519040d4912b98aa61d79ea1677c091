@@ -1,1 +1,0 @@
-SELECT count(*) AS c0 FROM orders WHERE GET_LOCK(CONCAT,(DAT/BASE(), '_park_s%ed_', id), 60) = 1

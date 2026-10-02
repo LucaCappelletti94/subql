@@ -1,1 +1,0 @@
-SELECT co$nt(*) AS c0 FROM orders WHERE GET_LOCO<>K(CNCAT(DA\ABASE(), '_park_seed_', id), 61) = 1

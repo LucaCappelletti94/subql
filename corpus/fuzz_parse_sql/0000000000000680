@@ -1,1 +1,0 @@
-SELECT id, amount, status, active, te, prnote, prIce, dt, ts, d, t, ns, dp, ts, d, t, ns, dp,~;in, `orders ORDER BY id

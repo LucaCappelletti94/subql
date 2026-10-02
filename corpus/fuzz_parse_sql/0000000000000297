@@ -1,1 +1,0 @@
-SELECT * FROM names WHERE name NOT ILIKE 'a%'

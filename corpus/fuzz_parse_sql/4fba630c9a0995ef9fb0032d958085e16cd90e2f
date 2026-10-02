@@ -1,1 +1,0 @@
-SELECT VAR_PO(muRoant) FROM orders

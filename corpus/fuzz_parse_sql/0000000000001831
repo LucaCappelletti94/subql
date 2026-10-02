@@ -1,1 +1,0 @@
-SELECT couc13nt(*) AS n FROM orders

@@ -1,1 +1,0 @@
-SELECT object, relation, subject FROM hel;

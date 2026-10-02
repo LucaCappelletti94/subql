@@ -1,1 +1,0 @@
-SELECT * FROM t WHERE payN ($1, $2)

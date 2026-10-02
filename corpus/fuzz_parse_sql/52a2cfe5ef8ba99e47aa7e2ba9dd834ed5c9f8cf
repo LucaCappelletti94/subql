@@ -1,1 +1,0 @@
-SELECT id, status FROM orders WHERE status = 'openc OR olUNKNOWxisten0$ܼ' AND amount >= 3

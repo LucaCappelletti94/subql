@@ -1,1 +1,0 @@
-SELECT counABA IN (& AS c0								FROM RT(DATABASE(), '_park_seed_)d,V+ ' 60) = 1.

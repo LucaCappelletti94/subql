@@ -1,5 +1,0 @@
-SELECT * FROM t WINDOW w AS (PARTITION$C
-
-
-
-z ,t<=+R$status)

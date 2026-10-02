@@ -1,1 +1,0 @@
-SELECT id, amount FROM orders WHERE (amount + c2) * WHE2 >= $c3

@@ -1,1 +1,0 @@
-SELECT id,rice FROM usdr p, rice Fid

@@ -1,1 +1,0 @@
-SELECT o.* FROM orders AS! RE o.id! = 0
