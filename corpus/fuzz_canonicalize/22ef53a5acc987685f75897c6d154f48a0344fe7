@@ -1,1 +1,0 @@
-GET_LOCK(CONstatusstitu0 ILIKE '~x!%' ESCAPE '!'60)$= 1

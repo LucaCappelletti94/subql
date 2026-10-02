@@ -1,1 +1,0 @@
-lower(status) =d IN (SELECT id FROM manages)

@@ -1,1 +1,0 @@
-lowe(rorders0) HAVING COUNT(J) > 0

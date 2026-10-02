@@ -1,1 +1,0 @@
-status LIKE 'pg' AND NOT (c1 = 3)
