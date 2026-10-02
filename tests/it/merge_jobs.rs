@@ -5,7 +5,9 @@ use sql_traits::structs::ParserDB;
 use sqlparser::dialect::PostgreSqlDialect;
 use subql::backend::Postgres;
 use subql::testing::TestEvent;
-use subql::{catalog_helpers, DefaultIds, SubscriptionEngine, SubscriptionRequest};
+use subql::{
+    catalog_helpers, DefaultIds, MergeJobId, MergeReport, SubscriptionEngine, SubscriptionRequest,
+};
 
 const DDL: &str = "CREATE TABLE orders (id INT PRIMARY KEY, price FLOAT, status TEXT);\
      CREATE TABLE customers (id INT PRIMARY KEY, name TEXT);";
@@ -80,11 +82,11 @@ fn a_merge_whose_name_was_dropped_is_still_completed() {
 fn draining_without_a_merge_reports_nothing() {
     let (_dir, mut engine, _shard) = engine_with_a_shard();
 
-    assert!(engine.pending_merges().is_empty());
-    assert!(engine
-        .complete_ready_merges()
-        .expect("the drain runs")
-        .is_empty());
+    assert_eq!(engine.pending_merges(), [] as [MergeJobId; 0]);
+    assert_eq!(
+        engine.complete_ready_merges().expect("the drain runs"),
+        [] as [MergeReport; 0]
+    );
 }
 
 /// A merge that fails does not take the applied ones with it.

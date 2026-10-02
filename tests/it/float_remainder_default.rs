@@ -94,5 +94,5 @@ fn a_remainder_the_backend_states_no_rule_for_reports_the_overflow() {
             operation: ArithmeticOp::Modulo,
         }]
     );
-    assert!(remainder.inserted().is_empty());
+    assert_eq!(remainder.inserted(), &[] as &[u64]);
 }

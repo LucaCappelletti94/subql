@@ -51,7 +51,7 @@ fn a_watched_nothing_answers_empty_with_its_checkpoint() {
 
     let event = invoice_row();
     let notified = engine.consumers(&event).expect("no subscription, no error");
-    assert!(notified.inserted().is_empty());
+    assert_eq!(notified.inserted(), &[] as &[u64]);
     assert_eq!(
         notified.checkpoint(),
         event.checkpoint().as_ref(),
@@ -59,7 +59,7 @@ fn a_watched_nothing_answers_empty_with_its_checkpoint() {
     );
 
     let dispatched = engine.dispatch(&event).expect("the same through dispatch");
-    assert!(dispatched.notifications().inserted().is_empty());
+    assert_eq!(dispatched.notifications().inserted(), &[] as &[u64]);
 }
 
 /// A table the catalog does not have at all is an error, on both paths.
@@ -129,7 +129,7 @@ fn a_table_only_a_read_answer_depends_on_is_not_unknown() {
     let dispatched = engine
         .dispatch(&event)
         .expect("the read answers keep the table known");
-    assert!(dispatched.notifications().inserted().is_empty());
+    assert_eq!(dispatched.notifications().inserted(), &[] as &[u64]);
     assert_eq!(
         dispatched.notifications().checkpoint(),
         event.checkpoint().as_ref(),
