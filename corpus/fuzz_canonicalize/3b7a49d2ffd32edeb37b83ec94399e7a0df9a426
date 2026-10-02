@@ -1,0 +1,1 @@
+status LIKE 'p%c6,2COUNTULL=Î(*)' AND NOT (c1= 33-1)

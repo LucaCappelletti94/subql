@@ -1,0 +1,1 @@
+status LIKE 'p%at_c6,2CoUNT(*)' AND NOT (c1= 33)
