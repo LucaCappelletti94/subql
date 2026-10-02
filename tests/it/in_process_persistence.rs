@@ -430,7 +430,7 @@ fn a_null_safe_equality_comes_back_answering_as_it_did() {
     let paid = restored
         .consumers(&row(subql::backend::Value::String("paid".into())))
         .expect("dispatch");
-    assert!(paid.inserted().is_empty());
+    assert_eq!(paid.inserted(), &[] as &[u64]);
 }
 
 /// A written `LIKE` escape comes back from its shard with the pattern it
@@ -464,11 +464,10 @@ fn a_written_like_escape_comes_back_answering_as_it_did() {
         restored.consumers(&row("p%")).expect("dispatch").inserted(),
         [1u64]
     );
-    assert!(restored
-        .consumers(&row("px"))
-        .expect("dispatch")
-        .inserted()
-        .is_empty());
+    assert_eq!(
+        restored.consumers(&row("px")).expect("dispatch").inserted(),
+        &[] as &[u64]
+    );
 }
 
 /// A column subset comes back from its shard still naming its columns, so an

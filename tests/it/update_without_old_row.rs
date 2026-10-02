@@ -81,8 +81,8 @@ fn a_changed_column_missing_from_the_old_row_leaves_a_still_matching_subscriber_
         &[1, 2],
     );
     assert_eq!(unanswered(&notifications), vec![1]);
-    assert!(notifications.inserted().is_empty());
-    assert!(notifications.updated().is_empty());
+    assert_eq!(notifications.inserted(), &[] as &[u64]);
+    assert_eq!(notifications.updated(), &[] as &[u64]);
 }
 
 /// Maxwell's old row carries `b` alone, and `a` did not change and does not
@@ -95,10 +95,10 @@ fn an_unchanged_column_missing_from_the_old_row_costs_nothing() {
         row(5, Value::Int(7), Value::Int(2)),
         &[2],
     );
-    assert!(unanswered(&notifications).is_empty());
-    assert!(notifications.inserted().is_empty());
-    assert!(notifications.deleted().is_empty());
-    assert!(notifications.updated().is_empty());
+    assert_eq!(unanswered(&notifications), [] as [u64; 0]);
+    assert_eq!(notifications.inserted(), &[] as &[u64]);
+    assert_eq!(notifications.deleted(), &[] as &[u64]);
+    assert_eq!(notifications.updated(), &[] as &[u64]);
 }
 
 /// The same update over a row the filter keeps. `a` holds its new value in
@@ -111,6 +111,6 @@ fn an_unchanged_matching_row_is_updated_rather_than_inserted() {
         &[2],
     );
     assert_eq!(notifications.updated(), [1]);
-    assert!(notifications.inserted().is_empty());
-    assert!(unanswered(&notifications).is_empty());
+    assert_eq!(notifications.inserted(), &[] as &[u64]);
+    assert_eq!(unanswered(&notifications), [] as [u64; 0]);
 }

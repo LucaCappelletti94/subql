@@ -43,7 +43,7 @@ fn an_adopted_answer_resolves_through_the_connector() {
     )
     .expect("reopen store");
     assert_eq!(restored.reads().restored.len(), 1, "the answer comes back");
-    assert!(restored.reads().dropped.is_empty());
+    assert_eq!(restored.reads().dropped, [] as [crate::DroppedRead; 0]);
 
     let orders = crate::catalog_helpers::table_id::<Postgres, _>(&catalog(), "orders")
         .expect("orders table exists");

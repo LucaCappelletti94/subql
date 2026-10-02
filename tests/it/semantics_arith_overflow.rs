@@ -140,7 +140,7 @@ fn sqlite_arithmetic_continues_on_the_promoted_real() {
         "SELECT * FROM t WHERE ((qty * qty) + qty) >= qty",
         i64::MAX
     );
-    assert!(notifications.evaluation_failures().is_empty());
+    assert_eq!(notifications.evaluation_failures(), []);
     assert_eq!(notifications.inserted(), &[1], "8.5e37 is above qty");
 }
 

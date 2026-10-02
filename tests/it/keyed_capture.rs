@@ -1036,7 +1036,7 @@ fn a_column_subset_under_an_evaluable_filter_reads_nothing() {
             &TestEvent::<SQLite>::update(table, cells("a"), cells("b")).with_pk_columns([0u16]),
         )
         .expect("apply");
-    assert!(applied.engine.updated().is_empty());
+    assert_eq!(applied.engine.updated(), &[] as &[u64]);
     let resolved = engine.resolve_collect().expect("resolve");
     assert!(resolved.row_deltas.is_empty() && resolved.rows_updates.is_empty());
     assert!(
