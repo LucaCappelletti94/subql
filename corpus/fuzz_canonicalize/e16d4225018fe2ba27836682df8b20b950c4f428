@@ -1,1 +1,0 @@
-status LIKE 'p%c6,2COUNT(*)' AND NOT (c1= 33)

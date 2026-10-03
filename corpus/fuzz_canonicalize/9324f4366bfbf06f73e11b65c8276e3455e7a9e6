@@ -1,1 +1,0 @@
-status = 'paid' AND amount BETWEEN 1 AND 10
