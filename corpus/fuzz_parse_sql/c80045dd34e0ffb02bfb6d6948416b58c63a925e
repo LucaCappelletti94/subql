@@ -1,0 +1,1 @@
+SELECT * FROM orders WHERE status IN ('a', b'$SO$%') OR-c0 IS NULL!

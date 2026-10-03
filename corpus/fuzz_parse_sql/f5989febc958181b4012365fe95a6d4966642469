@@ -1,0 +1,1 @@
+SELECT ent_wal_nsn()::textcurrent_setting('app.user_id') AS v

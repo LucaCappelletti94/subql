@@ -1,0 +1,1 @@
+SELECT * FROM orders WHERE COALESCE(c6< p) <> 1

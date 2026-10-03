@@ -1,0 +1,1 @@
+SELECT * FROM orders WHERE lower(statusetting('app.user_id')) = $0 AND id IN (W++c1+++++++t++t++++++++++non+++++t++++++++++++non++++ELEC4agers)

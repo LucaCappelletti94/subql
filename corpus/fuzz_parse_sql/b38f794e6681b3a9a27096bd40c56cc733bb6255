@@ -1,0 +1,1 @@
+SELECT regiBY regon HAVING SUM> NULL

@@ -1,0 +1,1 @@
+SELECT * FROM orders WHERE F*u LIKE nt IN (0, 2, 3)

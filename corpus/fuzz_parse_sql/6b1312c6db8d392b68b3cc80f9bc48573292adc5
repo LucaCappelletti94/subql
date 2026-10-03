@@ -1,0 +1,1 @@
+SELECT id, status, status,b, dpbin FROM orders ORDER BY id

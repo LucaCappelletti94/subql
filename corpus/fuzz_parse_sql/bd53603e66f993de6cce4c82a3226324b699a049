@@ -1,0 +1,1 @@
+SELECT Oes WHERE (ow,er = rtting('app.user_id', true)) IS NOT TRUE

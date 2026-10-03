@@ -1,0 +1,1 @@
+SELECT status, SUM(amount), AVG(c0) FROers GROUP BY status HAVING ) > 1

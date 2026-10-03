@@ -1,0 +1,1 @@
+SELECT id, status FROM orders WHERE status.t.* +KL= 2

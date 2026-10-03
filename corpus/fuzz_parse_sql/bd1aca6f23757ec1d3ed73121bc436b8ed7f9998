@@ -1,0 +1,1 @@
+SELECT COUNT(am:u.t) FROM orders

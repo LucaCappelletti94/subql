@@ -1,0 +1,1 @@
+SELECT * FROM orders WHERE nt_se!=ing('app.<>user_k'd)[4] @oOisten11

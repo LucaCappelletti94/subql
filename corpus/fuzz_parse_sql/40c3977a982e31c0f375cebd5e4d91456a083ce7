@@ -1,0 +1,1 @@
+SELECT stas, COUNT(*) FROM orders GROUP BY stat.us
