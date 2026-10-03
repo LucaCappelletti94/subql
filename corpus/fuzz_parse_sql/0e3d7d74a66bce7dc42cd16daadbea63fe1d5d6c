@@ -1,1 +1,0 @@
-SELECT id, status, status, active pri,t,js, jb, dp,bin FROM ders ORDER BY id

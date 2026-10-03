@@ -1,1 +1,0 @@
-SELECT * FROM orders WHERE lower(statuscurrent_setting('app.user_id')) = $0 AND id IN (W++c1+++++++t++t++++++++++non+++++t++++++++++++non++++ELEC2agers)

@@ -1,1 +1,0 @@
-SELECT countCUALESCE((4) AS c0 FR0) = 1

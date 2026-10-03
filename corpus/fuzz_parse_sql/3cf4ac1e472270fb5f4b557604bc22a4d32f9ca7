@@ -1,1 +1,0 @@
-SELECT SUM,at	 AS c1 FROM t

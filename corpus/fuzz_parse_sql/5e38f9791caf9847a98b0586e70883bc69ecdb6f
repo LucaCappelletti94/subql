@@ -1,1 +1,0 @@
-SELECT cou$$$$$$$$$$$$$$$$nt(*) AS c0 FROM orders WHERE GET_LOCO<>K(CNCAT(DATABASE(), '_park_seed_', id), 60) = q

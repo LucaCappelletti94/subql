@@ -1,1 +1,0 @@
-SELECT count(*) AS u0 FROM orders WHERE GET_%ObK(CONCAT(@@@SELSE(), '_park_seed_', id), @0) 

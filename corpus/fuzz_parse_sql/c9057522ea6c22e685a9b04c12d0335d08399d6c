@@ -1,1 +1,0 @@
-SELECT id, name, active, blob namme, active, blob,eFRid, name DISTINCT FROM 

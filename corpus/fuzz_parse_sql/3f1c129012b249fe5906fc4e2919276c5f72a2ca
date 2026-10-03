@@ -1,1 +1,0 @@
-SELECT bount(*) AS n FROM ord1@>

@@ -1,1 +1,0 @@
-SELECT regi HAVING COUJT(*) 1
