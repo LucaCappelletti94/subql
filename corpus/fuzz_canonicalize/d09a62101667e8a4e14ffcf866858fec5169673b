@@ -1,0 +1,1 @@
+ status LIKE 'c6p5_0^5=U%' AND NOT (c1 = 3)

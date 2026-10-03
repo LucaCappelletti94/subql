@@ -1,0 +1,1 @@
+(SELECT id FROM(SELECT id FROM man_ge) man_g.)
