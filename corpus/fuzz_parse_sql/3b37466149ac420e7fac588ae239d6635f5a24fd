@@ -1,1 +1,0 @@
-SELECT * FROM orders WHERE lower(s>atus) = $0 AND id IN (managers)

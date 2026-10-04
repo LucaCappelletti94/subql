@@ -1,1 +1,0 @@
-SELECT COUNT(*) FILTER (WHERE amo`` >  0)t

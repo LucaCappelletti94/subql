@@ -1,1 +1,0 @@
-SELECT status, COUNT(*) FROM orders GROUP BY stat.us

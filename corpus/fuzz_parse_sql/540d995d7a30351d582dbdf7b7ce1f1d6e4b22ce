@@ -1,1 +1,0 @@
-SELECT id,sleep(1) IS NULL AS slept FROM orders  id

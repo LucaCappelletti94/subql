@@ -1,1 +1,0 @@
-SELECT count(S0* c )A FROM orders WHERE GET_%ObK(CONCAT(DAT/BASE(), '_par AND k_seed_', id), @0) = 1

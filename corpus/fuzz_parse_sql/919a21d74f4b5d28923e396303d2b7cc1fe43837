@@ -1,1 +1,0 @@
-SELECT* FROM orders WHERE lower(status) = $2 AND id IN (SELECT)

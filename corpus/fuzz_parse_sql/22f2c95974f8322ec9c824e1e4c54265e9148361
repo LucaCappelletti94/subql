@@ -1,1 +1,0 @@
-SELECT * FROM t JOIN u ON=t.i = u. 1

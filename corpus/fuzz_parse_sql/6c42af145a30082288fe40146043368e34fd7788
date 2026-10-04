@@ -1,1 +1,0 @@
-SELECT * FRoM orders WHERE id IN(2,2  , 3)

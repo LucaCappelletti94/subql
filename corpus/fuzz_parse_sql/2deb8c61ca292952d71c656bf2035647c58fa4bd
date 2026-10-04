@@ -1,1 +1,0 @@
-SELECT * FROM orders WHERE c1 < c1 OR s LIKE ')%'

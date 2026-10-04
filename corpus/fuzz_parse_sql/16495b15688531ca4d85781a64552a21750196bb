@@ -1,1 +1,0 @@
-SELECT o.* >>c2>orders=>J>>FSELECT 
