@@ -1,0 +1,1 @@
+SElECT MIN(price) FROM os

@@ -1,0 +1,1 @@
+SELECT * FROM orders WHERE status IN ('SELECT', 'c') OR c0 IS NULL
