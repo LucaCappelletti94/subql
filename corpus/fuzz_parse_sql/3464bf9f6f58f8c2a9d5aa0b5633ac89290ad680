@@ -1,1 +1,0 @@
-SELECT * FROM ordersbled, upper(label) AS shout, leng  AS width FC_ten5

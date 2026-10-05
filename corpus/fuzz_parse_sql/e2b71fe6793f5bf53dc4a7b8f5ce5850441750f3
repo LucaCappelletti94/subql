@@ -1,1 +1,0 @@
-SELECT id, status FROM orders WHERE stas = 'oenc OR olUNܼ' AND amount >= 3

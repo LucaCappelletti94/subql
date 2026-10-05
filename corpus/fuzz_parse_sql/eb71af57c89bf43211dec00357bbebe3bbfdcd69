@@ -1,1 +1,0 @@
-SELECT * FROM orders WHERE +lo.er(status) = $1 AND id .IN (SELECTagers)

@@ -1,1 +1,0 @@
-SELECT * FROM orders WHERE nt_setting('app[.user_id')[4] *ountexistentexistent_c OR oluexisisten11

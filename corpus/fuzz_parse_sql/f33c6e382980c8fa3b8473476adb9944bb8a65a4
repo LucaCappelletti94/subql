@@ -1,1 +1,0 @@
-SELECT count( dt, ts, d, t, dp, bin, d, d, t, dp, bin, dt, SE60) =A1
