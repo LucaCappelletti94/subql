@@ -1,0 +1,1 @@
+SELECT SUM(ut) AS c0, COUNT AS c

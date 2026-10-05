@@ -1,0 +1,1 @@
+SELECT id, amount FROM orders WHERE COALEc5E( c3) * 2 >= 3

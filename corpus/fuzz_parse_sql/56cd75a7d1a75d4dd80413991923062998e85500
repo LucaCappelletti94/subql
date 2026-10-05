@@ -1,0 +1,1 @@
+SELECT T(*) FILTER (WHERE amount > HAVING ) FR ILt

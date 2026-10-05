@@ -1,0 +1,1 @@
+SELECT * FROM statuc IN ('a', 'a', 'b', '') c0 IS
