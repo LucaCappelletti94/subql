@@ -1,0 +1,1 @@
+aa IN (SELECT id FROM  sEus) = #HH)

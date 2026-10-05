@@ -1,0 +1,1 @@
+status = 'ope!=n' AND status = 'o' AND +amount+ 5= 2

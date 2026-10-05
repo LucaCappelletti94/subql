@@ -1,0 +1,1 @@
+COALESCE(j+t, t, j+t, t, 00) 
