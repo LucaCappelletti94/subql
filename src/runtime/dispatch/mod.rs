@@ -839,8 +839,10 @@ fn extend_subscriptions<I: IdTypes, B: Backend>(
     consumers: &RoaringBitmap,
     out: &mut impl Extend<SubscriptionId>,
 ) {
-    for ord_u32 in consumers {
-        out.extend(predicates.subscription_ids_of(pred_id, ConsumerOrdinal::new(ord_u32)));
+    if let Some(held) = predicates.bound.get(&pred_id) {
+        for ord_u32 in consumers {
+            out.extend(held.subscription_ids(ConsumerOrdinal::new(ord_u32)));
+        }
     }
 }
 

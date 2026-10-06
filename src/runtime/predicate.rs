@@ -439,6 +439,22 @@ pub struct PredicateBindings {
     pub by_ordinal: HashTrieMapSync<ConsumerOrdinal, SubscriptionSet>,
 }
 
+impl PredicateBindings {
+    /// The subscriptions held by `ordinal`, in order.
+    pub(crate) fn subscription_ids(
+        &self,
+        ordinal: ConsumerOrdinal,
+    ) -> impl Iterator<Item = SubscriptionId> + '_ {
+        let set = self.by_ordinal.get(&ordinal);
+        // A singleton avoids the tree iterator's allocated stack.
+        let one = set
+            .filter(|set| set.size() == 1)
+            .and_then(|set| set.first());
+        let many = set.filter(|set| set.size() > 1).map(|set| set.iter());
+        one.into_iter().chain(many.into_iter().flatten()).copied()
+    }
+}
+
 pub struct PredicateStore<I: IdTypes, B: Backend> {
     /// Every predicate on this table, by id.
     pub predicates: PredicateMap<B>,
@@ -599,20 +615,15 @@ impl<I: IdTypes, B: Backend> PredicateStore<I, B> {
     }
 
     /// The ids [`subscriptions_of`](Self::subscriptions_of) holds, in order.
-    ///
-    /// A tree iterator heap-allocates its stack, so the one-id set, which
-    /// dedup makes the usual case, is read through `first` instead.
     pub fn subscription_ids_of(
         &self,
         id: PredicateId,
         ordinal: ConsumerOrdinal,
     ) -> impl Iterator<Item = SubscriptionId> + '_ {
-        let set = self.subscriptions_of(id, ordinal);
-        let one = set
-            .filter(|set| set.size() == 1)
-            .and_then(|set| set.first());
-        let many = set.filter(|set| set.size() > 1).map(|set| set.iter());
-        one.into_iter().chain(many.into_iter().flatten()).copied()
+        self.bound
+            .get(&id)
+            .into_iter()
+            .flat_map(move |held| held.subscription_ids(ordinal))
     }
 
     /// Every predicate that has a holder, with the ordinals holding it.
