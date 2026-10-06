@@ -455,11 +455,12 @@ fn the_batch_path_seeds_the_identity_as_the_single_path_does() {
 }
 
 mod refusals {
-    use super::{engine, refusal, rows_of, subscribe, Engine, CALLER, DDL, SET_CALLER};
+    use super::{engine, note, refusal, rows_of, subscribe, Engine, CALLER, DDL, SET_CALLER};
     use sql_traits::structs::ParserDB;
     use sqlparser::dialect::PostgreSqlDialect;
     use subql::backend::{Postgres, Value};
-    use subql::{DefaultIds, SubscriptionEngine, SubscriptionRequest, Tier};
+    use subql::testing::TestEvent;
+    use subql::{DefaultIds, SubscriptionEngine, SubscriptionRequest, Tier, TierKind};
 
     /// The refusal the finding asked for by name: without the value the
     /// comparison admits the registration is refused with a message naming it,
@@ -625,18 +626,29 @@ mod refusals {
         }
     }
 
-    /// The set spelling reads the subject set and nothing else, so a subscriber
-    /// alone, or no subjects, leaves it nothing to admit.
+    /// The set spelling with no stated subjects is legal SQL that admits nobody,
+    /// so the registration succeeds and keeps the identity out of the empty set.
     #[test]
-    fn a_set_comparison_without_subjects_is_refused() {
-        let (mut engine, _) = engine();
-        let reason = refusal(
-            &mut engine,
-            SubscriptionRequest::new(1u64, SET_CALLER).subscriber(Value::String("alice".into())),
+    fn a_set_comparison_without_subjects_admits_nobody() {
+        let (mut engine, notes) = engine();
+        let registered = engine
+            .register(
+                SubscriptionRequest::new(1u64, SET_CALLER)
+                    .subscriber(Value::String("alice".into())),
+            )
+            .expect("an empty subject set is legal SQL");
+        assert_eq!(
+            registered.tier.kind(),
+            TierKind::InProcess,
+            "the empty set is maintained in process"
         );
+
+        let notifs = engine
+            .consumers(&TestEvent::insert(notes, note(1, "alice", 7)))
+            .expect("dispatch runs");
         assert!(
-            reason.contains("state its subjects"),
-            "the refusal names what is missing: {reason}"
+            notifs.inserted().is_empty(),
+            "the identity is not a stated subject and the empty set admits nobody"
         );
     }
 

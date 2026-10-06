@@ -12,6 +12,7 @@ pub fn predicate_data_equivalent(left: &PredicateData, right: &PredicateData) ->
         && left.prefilter_plan == right.prefilter_plan
         && left.dependency_columns == right.dependency_columns
         && left.projection == right.projection
+        && left.term_movements == right.term_movements
 }
 
 /// Deduplicate predicates by hash: keep most recent timestamp, error on semantic collision.

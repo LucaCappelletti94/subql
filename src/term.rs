@@ -105,7 +105,7 @@ pub enum TermCaller {
 }
 
 /// The table and columns whose changed rows move a membership term's set.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct TermMovement {
     /// The table whose changed rows move which subscribers the term admits.
     ///

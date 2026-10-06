@@ -45,6 +45,7 @@ pub fn shard_payload_with_consumers(
         consumer_dict: ConsumerDictData {
             ordinal_to_consumer: consumers,
         },
+        term_seeds: vec![],
         created_at_unix_ms,
     }
 }

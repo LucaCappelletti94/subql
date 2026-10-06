@@ -3,10 +3,10 @@
 use super::predicate_data::dedup_predicates_by_hash;
 use super::shard::{
     deserialize_shard_checked, BindingData, ConsumerDictData, PredicateData,
-    ShardFingerprintEnvelope, ShardPayload,
+    ShardFingerprintEnvelope, ShardPayload, TermSeedData,
 };
 use crate::{IdTypes, MergeError, MergeJobId, MergeReport, SubscriptionId, TableId};
-use hashbrown::HashMap;
+use hashbrown::{HashMap, HashSet};
 use std::sync::{
     mpsc::{self, Receiver, Sender, TryRecvError},
     Arc, Mutex,
@@ -210,6 +210,32 @@ fn unix_ms_from(now: std::time::SystemTime) -> Result<u64, String> {
         .map_err(|_| format!("UNIX timestamp does not fit into u64 milliseconds: {elapsed:?}"))
 }
 
+type TermSeedWinners<I> = HashMap<(u128, <I as IdTypes>::ConsumerId, u16), (u64, Vec<u8>)>;
+
+fn live_term_seeds<I: IdTypes>(
+    winners: TermSeedWinners<I>,
+    bindings: &[BindingData<I>],
+) -> Vec<TermSeedData<I>> {
+    let live_pairs: HashSet<(u128, I::ConsumerId)> = bindings
+        .iter()
+        .map(|binding| (binding.predicate_hash, binding.consumer_id))
+        .collect();
+    let mut seeds: Vec<_> = winners
+        .into_iter()
+        .filter(|((hash, consumer, _), _)| live_pairs.contains(&(*hash, *consumer)))
+        .map(
+            |((predicate_hash, consumer_id, slot), (_, seed))| TermSeedData {
+                predicate_hash,
+                consumer_id,
+                slot,
+                seed,
+            },
+        )
+        .collect();
+    seeds.sort_unstable_by_key(|seed| (seed.predicate_hash, seed.consumer_id, seed.slot));
+    seeds
+}
+
 /// Perform merge operation
 fn merge_shards_impl<I: IdTypes>(
     table_id: TableId,
@@ -220,6 +246,7 @@ fn merge_shards_impl<I: IdTypes>(
     let mut all_predicates = Vec::new();
     let mut all_bindings = Vec::new();
     let mut consumer_ordinals: Vec<I::ConsumerId> = Vec::new();
+    let mut seed_winners: TermSeedWinners<I> = HashMap::new();
 
     // 1. Load all shards
     for bytes in shard_bytes {
@@ -236,6 +263,17 @@ fn merge_shards_impl<I: IdTypes>(
         all_predicates.extend(payload.predicates);
         all_bindings.extend(payload.bindings);
         consumer_ordinals.extend(payload.consumer_dict.ordinal_to_consumer);
+        for seed in payload.term_seeds {
+            let key = (seed.predicate_hash, seed.consumer_id, seed.slot);
+            let candidate = (payload.created_at_unix_ms, seed.seed);
+            match seed_winners.get_mut(&key) {
+                Some(existing) if candidate > *existing => *existing = candidate,
+                Some(_) => {}
+                None => {
+                    seed_winners.insert(key, candidate);
+                }
+            }
+        }
     }
 
     // Deduplicate consumers via sort + dedup (O(n log n) instead of O(n^2))
@@ -275,19 +313,22 @@ fn merge_shards_impl<I: IdTypes>(
     let mut output_bindings: Vec<_> = unique_bindings.into_values().collect();
     output_bindings.sort_unstable_by_key(|b| b.subscription_id);
 
+    let output_seeds = live_term_seeds(seed_winners, &output_bindings);
+
     let created_at_unix_ms = unix_ms_from(std::time::SystemTime::now())?;
 
     // Capture lengths before moving into payload
     let num_output_predicates = output_predicates.len();
     let num_output_bindings = output_bindings.len();
 
-    // 5. Build merged payload
+    // 6. Build merged payload
     let payload: ShardPayload<I> = ShardPayload {
         predicates: output_predicates,
         bindings: output_bindings,
         consumer_dict: ConsumerDictData {
             ordinal_to_consumer: consumer_ordinals,
         },
+        term_seeds: output_seeds,
         created_at_unix_ms,
     };
 
@@ -356,6 +397,7 @@ mod tests {
             dependency_columns: vec![1],
             projection: crate::compiler::sql_shape::QueryProjection::Rows,
             refcount: 1,
+            term_movements: vec![],
             updated_at_unix_ms: 1000,
         };
 
@@ -365,6 +407,7 @@ mod tests {
             consumer_dict: ConsumerDictData {
                 ordinal_to_consumer: vec![],
             },
+            term_seeds: vec![],
             created_at_unix_ms: 1000,
         };
 
@@ -374,6 +417,7 @@ mod tests {
             consumer_dict: ConsumerDictData {
                 ordinal_to_consumer: vec![],
             },
+            term_seeds: vec![],
             created_at_unix_ms: 2000,
         };
 
@@ -409,6 +453,7 @@ mod tests {
             consumer_dict: ConsumerDictData {
                 ordinal_to_consumer: vec![10, 20],
             },
+            term_seeds: vec![],
             created_at_unix_ms: 1000,
         };
 
@@ -477,6 +522,7 @@ mod tests {
             consumer_dict: ConsumerDictData {
                 ordinal_to_consumer: vec![],
             },
+            term_seeds: vec![],
             created_at_unix_ms: 1000,
         };
         let shard = serialize_shard(1, &payload, &make_catalog()).unwrap();
@@ -502,6 +548,7 @@ mod tests {
             consumer_dict: ConsumerDictData {
                 ordinal_to_consumer: vec![],
             },
+            term_seeds: vec![],
             created_at_unix_ms: 1000,
         };
 
@@ -536,6 +583,7 @@ mod tests {
             consumer_dict: ConsumerDictData {
                 ordinal_to_consumer: vec![],
             },
+            term_seeds: vec![],
             created_at_unix_ms: 1000,
         };
 
@@ -565,6 +613,7 @@ mod tests {
             dependency_columns: vec![1],
             projection: crate::compiler::sql_shape::QueryProjection::Rows,
             refcount: 1,
+            term_movements: vec![],
             updated_at_unix_ms: 1000, // Older
         };
 
@@ -576,6 +625,7 @@ mod tests {
             dependency_columns: vec![1],
             projection: crate::compiler::sql_shape::QueryProjection::Rows,
             refcount: 2,
+            term_movements: vec![],
             updated_at_unix_ms: 2000, // Newer
         };
 
@@ -585,6 +635,7 @@ mod tests {
             consumer_dict: ConsumerDictData {
                 ordinal_to_consumer: vec![],
             },
+            term_seeds: vec![],
             created_at_unix_ms: 1000,
         };
 
@@ -594,6 +645,7 @@ mod tests {
             consumer_dict: ConsumerDictData {
                 ordinal_to_consumer: vec![],
             },
+            term_seeds: vec![],
             created_at_unix_ms: 2000,
         };
 
@@ -629,6 +681,7 @@ mod tests {
             dependency_columns: vec![1],
             projection: crate::compiler::sql_shape::QueryProjection::Rows,
             refcount: 1,
+            term_movements: vec![],
             updated_at_unix_ms: 1000,
         };
 
@@ -640,6 +693,7 @@ mod tests {
             dependency_columns: vec![2],
             projection: crate::compiler::sql_shape::QueryProjection::Rows,
             refcount: 1,
+            term_movements: vec![],
             updated_at_unix_ms: 2000,
         };
 
@@ -649,6 +703,7 @@ mod tests {
             consumer_dict: ConsumerDictData {
                 ordinal_to_consumer: vec![],
             },
+            term_seeds: vec![],
             created_at_unix_ms: 1000,
         };
 
@@ -658,6 +713,7 @@ mod tests {
             consumer_dict: ConsumerDictData {
                 ordinal_to_consumer: vec![],
             },
+            term_seeds: vec![],
             created_at_unix_ms: 2000,
         };
 
@@ -684,6 +740,7 @@ mod tests {
             dependency_columns: vec![1],
             projection: crate::compiler::sql_shape::QueryProjection::Rows,
             refcount: 1,
+            term_movements: vec![],
             updated_at_unix_ms: 10,
         };
         let mut right = left.clone();
@@ -719,6 +776,7 @@ mod tests {
             consumer_dict: ConsumerDictData {
                 ordinal_to_consumer: vec![],
             },
+            term_seeds: vec![],
             created_at_unix_ms: 1000,
         };
 
@@ -728,6 +786,7 @@ mod tests {
             consumer_dict: ConsumerDictData {
                 ordinal_to_consumer: vec![],
             },
+            term_seeds: vec![],
             created_at_unix_ms: 2000,
         };
 
@@ -814,6 +873,7 @@ mod tests {
             consumer_dict: ConsumerDictData {
                 ordinal_to_consumer: vec![],
             },
+            term_seeds: vec![],
             created_at_unix_ms: 1000,
         };
 
@@ -937,6 +997,7 @@ mod tests {
                 consumer_dict: ConsumerDictData {
                     ordinal_to_consumer: vec![],
                 },
+                term_seeds: vec![],
                 created_at_unix_ms: 1000,
             },
             stats: MergeStats {
@@ -979,6 +1040,7 @@ mod tests {
             dependency_columns: vec![0],
             projection: crate::compiler::sql_shape::QueryProjection::Rows,
             refcount: 1,
+            term_movements: vec![],
             updated_at_unix_ms: 1000,
         };
 
@@ -1005,6 +1067,7 @@ mod tests {
             consumer_dict: ConsumerDictData {
                 ordinal_to_consumer: vec![1],
             },
+            term_seeds: vec![],
             created_at_unix_ms: 1000,
         };
         let payload2: ShardPayload<DefaultIds> = ShardPayload {
@@ -1013,6 +1076,7 @@ mod tests {
             consumer_dict: ConsumerDictData {
                 ordinal_to_consumer: vec![1],
             },
+            term_seeds: vec![],
             created_at_unix_ms: 2000,
         };
 
@@ -1065,6 +1129,7 @@ mod tests {
             dependency_columns: vec![0],
             projection: crate::compiler::sql_shape::QueryProjection::Rows,
             refcount: 1,
+            term_movements: vec![],
             updated_at_unix_ms: 1000,
         };
         let pred_b = PredicateData {
@@ -1075,6 +1140,7 @@ mod tests {
             dependency_columns: vec![1],
             projection: crate::compiler::sql_shape::QueryProjection::Rows,
             refcount: 1,
+            term_movements: vec![],
             updated_at_unix_ms: 1000,
         };
 
@@ -1099,6 +1165,7 @@ mod tests {
             consumer_dict: ConsumerDictData {
                 ordinal_to_consumer: vec![1, 2],
             },
+            term_seeds: vec![],
             created_at_unix_ms: 1000,
         };
 
@@ -1148,5 +1215,168 @@ mod tests {
             sub_ids1.windows(2).all(|w| w[0] <= w[1]),
             "bindings must be sorted by subscription_id"
         );
+    }
+
+    fn term_seed_shard(
+        created_at: u64,
+        consumers: Vec<u64>,
+        seeds: Vec<(u64, Vec<u8>)>,
+    ) -> ShardPayload<DefaultIds> {
+        ShardPayload {
+            predicates: vec![PredicateData {
+                hash: 0x5A5A,
+                normalized_sql: "age > 18".to_string(),
+                bytecode_instructions: vec![],
+                prefilter_plan: codec::serialize(&crate::compiler::PrefilterPlan::default())
+                    .expect("the prefilter encodes"),
+                dependency_columns: vec![0],
+                projection: crate::compiler::sql_shape::QueryProjection::Rows,
+                refcount: 2,
+                updated_at_unix_ms: 1000,
+                term_movements: vec![],
+            }],
+            bindings: [(1, 7), (2, 8)]
+                .into_iter()
+                .map(|(subscription_id, consumer_id)| BindingData {
+                    subscription_id,
+                    predicate_hash: 0x5A5A,
+                    consumer_id,
+                    scope: SubscriptionScope::Durable,
+                    updated_at_unix_ms: created_at,
+                })
+                .collect(),
+            consumer_dict: ConsumerDictData {
+                ordinal_to_consumer: consumers,
+            },
+            term_seeds: seeds
+                .into_iter()
+                .map(|(consumer_id, seed)| TermSeedData {
+                    predicate_hash: 0x5A5A,
+                    consumer_id,
+                    slot: 0,
+                    seed,
+                })
+                .collect(),
+            created_at_unix_ms: created_at,
+        }
+    }
+
+    #[test]
+    fn test_merge_term_seeds_newer_withdrawal_wins_and_unrelated_intact() {
+        use crate::backend::{Postgres, Value};
+
+        let catalog = make_catalog();
+
+        let grant = (
+            vec![Value::<Postgres>::Int(7)],
+            vec![(
+                Value::<Postgres>::Int(7),
+                vec![Value::<Postgres>::Int(1), Value::<Postgres>::Int(2)],
+            )],
+        );
+        let grant_seed = codec::serialize(&grant).unwrap();
+        let empty = (
+            Vec::<Value<Postgres>>::new(),
+            Vec::<(Value<Postgres>, Vec<Value<Postgres>>)>::new(),
+        );
+        let empty_seed = codec::serialize(&empty).unwrap();
+        let intact = (
+            vec![Value::<Postgres>::Int(8)],
+            vec![(Value::<Postgres>::Int(8), vec![Value::<Postgres>::Int(3)])],
+        );
+        let intact_seed = codec::serialize(&intact).unwrap();
+        let unbound = (
+            vec![Value::<Postgres>::Int(9)],
+            Vec::<(Value<Postgres>, Vec<Value<Postgres>>)>::new(),
+        );
+        let unbound_seed = codec::serialize(&unbound).unwrap();
+
+        let older = term_seed_shard(
+            1000,
+            vec![7, 8],
+            vec![(7, grant_seed), (8, intact_seed.clone())],
+        );
+        let newer = term_seed_shard(
+            2000,
+            vec![7, 8, 9],
+            vec![(7, empty_seed.clone()), (9, unbound_seed)],
+        );
+
+        let shard_older = serialize_shard(1, &older, &catalog).unwrap();
+        let shard_newer = serialize_shard(1, &newer, &catalog).unwrap();
+        let envelope = expected_envelope(&catalog, 1).unwrap();
+
+        let mut shards = [shard_older, shard_newer];
+        for _ in 0..2 {
+            let merged =
+                merge_shards_impl::<DefaultIds>(1, &shards, &envelope, Instant::now()).unwrap();
+
+            assert_eq!(
+                merged.payload.term_seeds.len(),
+                2,
+                "the unbound consumer's record dies with its missing binding"
+            );
+            let keys: Vec<(u128, u64, u16)> = merged
+                .payload
+                .term_seeds
+                .iter()
+                .map(|s| (s.predicate_hash, s.consumer_id, s.slot))
+                .collect();
+            assert_eq!(
+                keys,
+                vec![(0x5A5A, 7, 0), (0x5A5A, 8, 0)],
+                "output is sorted by (predicate, consumer, slot)"
+            );
+            assert_eq!(
+                merged.payload.term_seeds[0].seed, empty_seed,
+                "the newer withdrawal beats the older grant in either input order"
+            );
+            assert_eq!(
+                merged.payload.term_seeds[1].seed, intact_seed,
+                "the consumer the newer shard does not name keeps its seed intact"
+            );
+            shards.reverse();
+        }
+    }
+
+    #[test]
+    fn test_merge_term_seeds_equal_timestamp_tie_breaks_on_seed_bytes_regardless_of_order() {
+        use crate::backend::{Postgres, Value};
+
+        let catalog = make_catalog();
+
+        let first = (
+            vec![Value::<Postgres>::Int(7)],
+            vec![(Value::<Postgres>::Int(7), vec![Value::<Postgres>::Int(1)])],
+        );
+        let second = (
+            vec![Value::<Postgres>::Int(7)],
+            vec![(Value::<Postgres>::Int(7), vec![Value::<Postgres>::Int(2)])],
+        );
+        let first_seed = codec::serialize(&first).unwrap();
+        let second_seed = codec::serialize(&second).unwrap();
+        assert!(first_seed < second_seed);
+
+        let low = term_seed_shard(1500, vec![7, 8], vec![(7, first_seed)]);
+        let high = term_seed_shard(1500, vec![7, 8], vec![(7, second_seed.clone())]);
+        let shard_low = serialize_shard(1, &low, &catalog).unwrap();
+        let shard_high = serialize_shard(1, &high, &catalog).unwrap();
+        let envelope = expected_envelope(&catalog, 1).unwrap();
+
+        let mut shards = [shard_low, shard_high];
+        for _ in 0..2 {
+            let merged =
+                merge_shards_impl::<DefaultIds>(1, &shards, &envelope, Instant::now()).unwrap();
+            assert_eq!(
+                merged.payload.term_seeds.len(),
+                1,
+                "both shards name the same (predicate, consumer, slot) path once each"
+            );
+            assert_eq!(
+                merged.payload.term_seeds[0].seed, second_seed,
+                "the equal-timestamp tie resolves to the greater encoding in either input order"
+            );
+            shards.reverse();
+        }
     }
 }

@@ -3,11 +3,15 @@
 use super::ids::{ConsumerOrdinal, PredicateHash, PredicateId};
 use super::indexes::IndexableAtom;
 use crate::backend::Backend;
+#[cfg(feature = "std")]
+use crate::term::TermSeed;
 use crate::term::{TermKey, TermRow};
 use crate::{
     compiler::{sql_shape::QueryProjection, BytecodeProgram, PrefilterPlan},
     ColumnId, IdTypes, SubscriptionId, SubscriptionScope,
 };
+#[cfg(feature = "std")]
+use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use hashbrown::{HashMap, HashSet};
@@ -280,6 +284,51 @@ impl<B: Backend> TermMembers<B> {
     #[must_use]
     pub fn claimed_by(&self, subscriber: &TermKey<B>) -> Option<&RoaringBitmap> {
         self.by_subscriber.get(subscriber)
+    }
+
+    /// One seed per ordinal holding a subject claim, pairing its claimed subjects with the value rows it admits today, each row under the subject granting it.
+    #[cfg(feature = "std")]
+    #[must_use]
+    pub(crate) fn snapshot_seeds(&self) -> Vec<(ConsumerOrdinal, TermSeed<B>)> {
+        let mut seeds: BTreeMap<ConsumerOrdinal, TermSeed<B>> = BTreeMap::new();
+        for ordinal in &self.claimed {
+            seeds.insert(
+                ConsumerOrdinal::new(ordinal),
+                TermSeed {
+                    subjects: Vec::new(),
+                    rows: Vec::new(),
+                },
+            );
+        }
+        for (subject, ordinals) in &self.by_subscriber {
+            for ordinal in ordinals {
+                if let Some(seed) = seeds.get_mut(&ConsumerOrdinal::new(ordinal)) {
+                    seed.subjects.push(subject.clone());
+                }
+            }
+        }
+        for (values, ordinals) in &self.by_value {
+            for ordinal in ordinals {
+                let Some(seed) = seeds.get_mut(&ConsumerOrdinal::new(ordinal)) else {
+                    continue;
+                };
+                let [sole] = seed.subjects.as_slice() else {
+                    continue;
+                };
+                seed.rows.push((sole.clone(), values.clone()));
+            }
+        }
+        for (ordinal, rows) in &self.granted_by {
+            let Some(seed) = seeds.get_mut(ordinal) else {
+                continue;
+            };
+            for (values, subjects) in rows {
+                for subject in subjects {
+                    seed.rows.push((subject.clone(), values.clone()));
+                }
+            }
+        }
+        seeds.into_iter().collect()
     }
 
     /// Add `ordinals` to the set `values` admit, as a membership row naming
@@ -1332,5 +1381,104 @@ mod tests {
         assert_eq!(ids.len(), 2);
         assert!(ids.contains(&10));
         assert!(ids.contains(&20));
+    }
+
+    /// A seed snapshot taken after one subject's grant of a row is withdrawn re-seeds the state the withdrawal left, and an ordinal claiming no subject still records an empty seed.
+    #[test]
+    #[cfg(feature = "std")]
+    fn snapshot_seeds_roundtrips_the_state_a_withdrawal_leaves() {
+        let mut store = PredicateStore::<DefaultIds, Postgres>::new();
+        let pred = store.add_predicate(make_predicate(0, 0xAA11));
+        let ordinal = ConsumerOrdinal::new(0);
+        let s1 = TermKey::<Postgres>::String("s1".into());
+        let s2 = TermKey::<Postgres>::String("s2".into());
+        let r1 = alloc::vec![TermKey::Int(1)];
+        let r2 = alloc::vec![TermKey::Int(2)];
+        let r3 = alloc::vec![TermKey::Int(3)];
+
+        store.seed_term(
+            pred,
+            0,
+            ordinal,
+            &[s1.clone(), s2.clone()],
+            alloc::vec![
+                (s1.clone(), r1.clone()),
+                (s2.clone(), r1.clone()),
+                (s1.clone(), r2.clone()),
+                (s2.clone(), r3.clone()),
+            ],
+        );
+
+        let one = RoaringBitmap::from_iter([ordinal.get()]);
+        store
+            .term_members_mut(pred, 0)
+            .expect("seeded above")
+            .narrow(&r1, &s1, &one);
+
+        let members = store.term_members(pred, 0).expect("seeded above");
+        let seeds = members.snapshot_seeds();
+        assert_eq!(seeds.len(), 1);
+        let (seeded, seed) = seeds.into_iter().next().expect("one seed");
+        assert_eq!(seeded, ordinal);
+        assert_eq!(seed.subjects.len(), 2);
+        assert!(seed.subjects.contains(&s1));
+        assert!(seed.subjects.contains(&s2));
+        assert_eq!(seed.rows.len(), 3);
+        let grants = |subject: &TermKey<Postgres>, row: &TermRow<Postgres>| {
+            seed.rows
+                .iter()
+                .any(|(held_subject, held_row)| *held_subject == *subject && *held_row == *row)
+        };
+        assert!(grants(&s2, &r1), "r1 survives through the grant s2 kept");
+        assert!(grants(&s1, &r2));
+        assert!(grants(&s2, &r3));
+        assert!(
+            !seed
+                .rows
+                .iter()
+                .any(|(subject, row)| subject == &s1 && row == &r1),
+            "the withdrawn grant of r1 must not reappear in the seed"
+        );
+
+        let mut restored = PredicateStore::<DefaultIds, Postgres>::new();
+        let restored_pred = restored.add_predicate(make_predicate(0, 0xAA11));
+        restored.seed_term(restored_pred, 0, ordinal, &seed.subjects, seed.rows);
+        let after = restored
+            .term_members(restored_pred, 0)
+            .expect("seeded above");
+        assert_eq!(after.claimed, members.claimed);
+        assert_eq!(after.several, members.several);
+        for subject in [&s1, &s2] {
+            assert_eq!(after.claimed_by(subject), members.claimed_by(subject));
+        }
+        let granted = |members: &TermMembers<Postgres>, row: &TermRow<Postgres>| {
+            members
+                .granted_by
+                .get(&ordinal)
+                .and_then(|rows| rows.get(row))
+                .cloned()
+                .unwrap_or_default()
+        };
+        for row in [&r1, &r2, &r3] {
+            assert_eq!(granted(after, row), granted(members, row));
+            assert_eq!(after.admits(row), members.admits(row));
+        }
+
+        let mut bare = PredicateStore::<DefaultIds, Postgres>::new();
+        let bare_pred = bare.add_predicate(make_predicate(1, 0xAA22));
+        let bare_ordinal = ConsumerOrdinal::new(0);
+        bare.seed_term(bare_pred, 0, bare_ordinal, &[], Vec::new());
+        let bare_seeds = bare
+            .term_members(bare_pred, 0)
+            .expect("seeded above")
+            .snapshot_seeds();
+        assert_eq!(
+            bare_seeds.len(),
+            1,
+            "an ordinal that claims no subject still records a seed"
+        );
+        assert_eq!(bare_seeds[0].0, bare_ordinal);
+        assert_eq!(bare_seeds[0].1.subjects, []);
+        assert_eq!(bare_seeds[0].1.rows, []);
     }
 }

@@ -82,6 +82,8 @@ pub mod persistence;
 pub mod pg_sqlite_emu;
 #[cfg(feature = "pg-streaming")]
 pub mod polling;
+#[cfg(feature = "membership-term")]
+mod read_rule;
 pub mod reexec;
 pub mod row_set;
 pub mod runtime;
