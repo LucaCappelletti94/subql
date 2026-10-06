@@ -1,1 +1,0 @@
-SELECT * FROM  ILIKE t WHERE Mid IN( SELECT @@@id@a, bin, biT, at_id FROM mtuc9 actit,id F$EO$1)

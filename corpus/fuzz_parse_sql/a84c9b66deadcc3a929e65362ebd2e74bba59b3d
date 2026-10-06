@@ -1,1 +1,0 @@
-SELECT * FROM orders WHERE nt_setting('appTRUEr_k'dorders)[4] @oOisten11

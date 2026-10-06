@@ -1,1 +1,0 @@
-SELECT /*+ EIM() */IM'%'E(1) */ * FR

@@ -1,1 +1,0 @@
-SELECT c FROM o WH (me, 'q1_cursor_')

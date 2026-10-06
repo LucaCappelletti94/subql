@@ -1,1 +1,0 @@
-SELECT /*+ ECTN_TIME(1) */ * FROM t

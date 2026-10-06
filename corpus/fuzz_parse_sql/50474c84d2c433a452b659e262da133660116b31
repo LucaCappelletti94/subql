@@ -1,1 +1,0 @@
-SELECT * FROM orders WHERE nonno<=C@@@@c5@@NOT @B'open'@@@@@@@@NOTWHER@ON@@amountn >10

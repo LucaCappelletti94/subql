@@ -1,1 +1,0 @@
-SELECT * FROM orders WHERE Fm*+nt IN (0, 2, 3)
