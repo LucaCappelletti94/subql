@@ -1,0 +1,1 @@
+SELECT * FROM dcs WHERE boS NOT NULL

@@ -1,0 +1,1 @@
+SELECT id, amount FROM orders WHERE COALCESE('%') * 1 >=  c

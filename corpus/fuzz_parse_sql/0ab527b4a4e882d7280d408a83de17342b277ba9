@@ -1,0 +1,1 @@
+SELECT * FROM orders WHERE l NOT IN (us) = $1 AND l NOT IN (uE蹽$nagers)

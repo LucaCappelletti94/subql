@@ -1,0 +1,1 @@
+SELECT * FROM orders WHERE 5	/	 NOT LiKnt_setting('app.user_')[4] @oOisten11

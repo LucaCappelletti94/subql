@@ -1,0 +1,1 @@
+SELECT * FROM orders WHERE nonnonexisnexiste ILIKE ddddddd-ddddd$d@d ILIKE Nte ILIKE ntte ILIKE nt_c5

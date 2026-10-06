@@ -1,0 +1,1 @@
+SELECT-OUNT(*) FROM orders GROUP BY status

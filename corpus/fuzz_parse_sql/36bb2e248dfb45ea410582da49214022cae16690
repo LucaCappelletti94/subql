@@ -1,0 +1,1 @@
+SELECT COUNT(*) FILTER (WHERE amount > HAVINT(*) FILTER (WHERE a'oun't > HAVING ) G L@N) FR I@Lt

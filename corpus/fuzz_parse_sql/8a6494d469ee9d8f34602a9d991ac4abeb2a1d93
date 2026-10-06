@@ -1,0 +1,1 @@
+SELECT * FROM orders WHERE staTEtus IN ('a', b'', '%') OR-c0 IS NULL!

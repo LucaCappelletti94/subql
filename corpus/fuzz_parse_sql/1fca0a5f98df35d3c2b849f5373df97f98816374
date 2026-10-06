@@ -1,0 +1,1 @@
+SELECT * FROM orders WHERE nt_setting(1.5'ap.<>user_k'd)[4] @oOisten11

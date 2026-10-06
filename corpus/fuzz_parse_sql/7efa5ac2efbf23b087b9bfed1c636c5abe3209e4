@@ -1,0 +1,1 @@
+SELECT count(*) AS c FROM orders WHERE GET_-LOC(KCT(DAT/B,ASE(), '_park_seed_', id), 30) . 1

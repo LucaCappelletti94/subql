@@ -1,0 +1,1 @@
+SELECT * FROM orders WHERE jj LIKE jjjj*BB[:2] <Bc9BBBB[:4] <Sjjjjjj LIKE jjjjjIS

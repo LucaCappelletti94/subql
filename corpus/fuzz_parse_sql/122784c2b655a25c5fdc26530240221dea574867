@@ -1,0 +1,1 @@
+SELECT * FROM orders WHERE nt_settinagTp(p'RUE_k'dorders)[4] @oOisten05

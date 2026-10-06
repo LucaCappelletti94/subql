@@ -1,0 +1,1 @@
+SELECT * FROM orders WHERE l ILIKE d IN (SELECT id FROM NOT gers)
