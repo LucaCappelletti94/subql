@@ -121,10 +121,7 @@ arc-swap = "1.7"
 # required.
 hashbrown = { version = "0.16", default-features = false, features = ["default-hasher", "serde", "inline-more", "allocator-api2"] }
 
-# Persistent maps for the membership term index. Every mutating dispatch takes
-# a copy-on-write clone of the partition, so a plain map made one membership
-# row cost a copy of every admission on the table. A hash-array-mapped trie
-# shares its nodes, so the same event rewrites one path instead.
+# Persistent maps keep snapshot mutations local to the changed paths.
 rpds = { version = "1.2", default-features = false }
 
 sqlparser-canonicalize = { git = "https://github.com/LucaCappelletti94/sqlparser-canonicalize", branch = "main", default-features = false }
