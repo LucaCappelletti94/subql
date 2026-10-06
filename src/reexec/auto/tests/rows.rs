@@ -85,6 +85,70 @@ fn match_rows_replays_without_reading_or_folding() {
 }
 
 #[test]
+fn matches_consumer_replays_one_consumer_without_reading_or_folding() {
+    let (mut e, tid) = engine_with_values(alloc::vec![Value::Float(7.0)]);
+    let min_id = crate::reexec::test_fixtures::register_scalar_query(
+        &mut e,
+        1u64,
+        "SELECT MIN(price) FROM orders",
+    );
+    crate::Install::install(
+        &mut e,
+        min_id,
+        crate::ScalarInstall {
+            value: Value::Float(5.0),
+            checkpoint: None::<crate::NoCheckpoint>,
+            fence: None,
+        },
+    )
+    .unwrap();
+    e.register(
+        SubscriptionRequest::new(2u64, "SELECT * FROM orders WHERE price < 100"),
+        (),
+    )
+    .unwrap();
+
+    let ev = delete_event(tid, 1, 5.0);
+    let replay = e.matches_consumer(&ev, 2).unwrap();
+    assert!(replay.deleted() && !replay.inserted() && !replay.updated());
+    assert!(
+        replay.evaluation_failures().is_empty() && replay.unanswered().is_empty(),
+        "the replay reports no failure or gap"
+    );
+    assert_eq!(
+        e.connector().call_count(),
+        0,
+        "the replay read nothing from the connector"
+    );
+
+    let absent = e.matches_consumer(&ev, 9).unwrap();
+    assert!(
+        !absent.inserted() && !absent.deleted() && !absent.updated(),
+        "the unbound consumer gets no verdict"
+    );
+
+    let settled = e.apply(&ev).unwrap().resolve_collect();
+    assert_eq!(
+        e.connector().call_count(),
+        1,
+        "the re-execution model was untouched, so the live read is the first"
+    );
+    assert_eq!(
+        settled
+            .reads
+            .expect("the re-execution resolves")
+            .scalar_updates[0]
+            .value,
+        Value::Float(7.0),
+        "the replay moved no folded state"
+    );
+    assert!(
+        settled.dispatched.engine.deleted().contains(&2),
+        "the live dispatch still reports the row subscriber"
+    );
+}
+
+#[test]
 fn describe_terms_is_reachable_through_the_wrapper() {
     let (e, _tid) = engine_with_values(alloc::vec![]);
     // A filter naming no membership subquery describes as empty.

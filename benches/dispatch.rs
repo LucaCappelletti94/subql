@@ -567,6 +567,102 @@ fn pattern_dispatch_benchmark(c: &mut Criterion) {
     group.finish();
 }
 
+fn shared_predicate_engine(
+    subscriber_count: u64,
+) -> (
+    SubscriptionEngine<TestEvent<Postgres>, DefaultIds, ParserDB>,
+    TestEvent<Postgres>,
+) {
+    let catalog = ParserDB::parse::<PostgreSqlDialect>(
+        "CREATE TABLE items (id INT PRIMARY KEY, owner TEXT NOT NULL, label TEXT);",
+    )
+    .unwrap();
+    let table = subql::catalog_helpers::table_id::<Postgres, _>(&catalog, "items").unwrap();
+    let mut engine = SubscriptionEngine::new(catalog, PostgreSqlDialect {});
+    for consumer in 0..subscriber_count {
+        engine
+            .register(SubscriptionRequest::new(
+                consumer,
+                "SELECT * FROM items WHERE id > 0",
+            ))
+            .unwrap();
+    }
+    let event = TestEvent::<Postgres>::insert(
+        table,
+        vec![
+            Value::Int(7),
+            Value::String("user-7".into()),
+            Value::String("x".into()),
+        ],
+    )
+    .with_pk_columns([0u16]);
+    (engine, event)
+}
+
+fn shared_predicate_match_benchmark(c: &mut Criterion) {
+    let mut group = c.benchmark_group("shared_predicate_match");
+    group.sample_size(20);
+    group.sampling_mode(SamplingMode::Flat);
+    group.warm_up_time(Duration::from_millis(500));
+    group.measurement_time(Duration::from_secs(3));
+
+    for &subscriber_count in &[100, 300, 1_000, 3_000, 10_000] {
+        let (mut engine, event) = shared_predicate_engine(subscriber_count);
+        let target = 7u64;
+
+        group.bench_with_input(
+            BenchmarkId::new("full", subscriber_count),
+            &subscriber_count,
+            |b, &_count| {
+                b.iter(|| {
+                    let reached = engine
+                        .consumers(black_box(&event))
+                        .unwrap()
+                        .inserted()
+                        .contains(&target);
+                    black_box(reached);
+                });
+            },
+        );
+
+        group.bench_with_input(
+            BenchmarkId::new("selected", subscriber_count),
+            &subscriber_count,
+            |b, &_count| {
+                b.iter(|| {
+                    let reached = engine
+                        .matches_consumer(black_box(&event), target)
+                        .unwrap()
+                        .inserted();
+                    black_box(reached);
+                });
+            },
+        );
+    }
+
+    let (mut engine, event) = shared_predicate_engine(100);
+    for i in 0..10_000 {
+        engine
+            .register(SubscriptionRequest::new(
+                100 + i,
+                format!("SELECT * FROM items WHERE owner = 'user-{i}'"),
+            ))
+            .unwrap();
+    }
+    let target = 7u64;
+    group.bench_function("selected_many_unrelated", |b| {
+        b.iter(|| {
+            let reached = engine
+                .matches_consumer(black_box(&event), target)
+                .unwrap()
+                .inserted();
+            black_box(reached);
+        });
+    });
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     pattern_dispatch_benchmark,
@@ -575,5 +671,6 @@ criterion_group!(
     index_efficiency_benchmark,
     registration_benchmark,
     deduplication_benchmark,
+    shared_predicate_match_benchmark,
 );
 criterion_main!(benches);

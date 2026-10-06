@@ -239,6 +239,7 @@ mod engine_removal_bookkeeping;
 mod engine_trait_surface;
 mod engine_unknown_tables;
 mod in_process_persistence;
+mod match_one_consumer;
 mod merge_jobs;
 mod read_fence;
 

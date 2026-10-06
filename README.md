@@ -58,6 +58,8 @@ assert_eq!(notifs.inserted(), vec![42]);
 
 Placeholder SQL plus typed binds is the engine's own contract, and `register_select_typed` is a producer for it. It renders the query exactly as diesel would send it and decodes each backend's serialized binds into typed values, so every subscription keeps the SQL the database can re-run when the engine hands the answer back to a re-read. A raw-text subscription (`SubscriptionRequest::new(42, "SELECT * FROM orders WHERE amount > 100")`) enters the same compile, index, and dedup path. SQLite and MySQL join through the `diesel-typed-sqlite` and `diesel-typed-mysql` features.
 
+For reconnect catchup, `SubscriptionEngine::matches_consumer(&event, consumer_id)` and `AutoResolvingEngine::matches_consumer(&event, consumer_id)` evaluate only that consumer's bound row predicates using current membership admissions. Their `ConsumerMatch` carries scalar `inserted`, `updated` and `deleted` flags, per-subscription `unanswered` and evaluation failures, and the checkpoint. Matching does not read connectors, fold aggregates, move memberships, stamp activity, or report narrowings.
+
 ## Streaming Aggregates
 
 Alongside row-match subscriptions, register an aggregate instead of a `SELECT *`. Diesel spells `COUNT(*)`, `COUNT(col)`, `SUM(col)` and `AVG(col)` as `.count()`, `diesel::dsl::count(col)`, `sum(col)` and `avg(col)`. The variance/stddev family (`VAR_POP`/`VAR_SAMP`/`STDDEV_POP`/`STDDEV_SAMP`) has no diesel built-in and arrives as SQL text through `register`. The engine keeps the running value and reports it whenever it moves, so the caller stores nothing and folds nothing.

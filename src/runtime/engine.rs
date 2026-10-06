@@ -4178,6 +4178,40 @@ where
         self.consumers_resolved(&event)
     }
 
+    /// Match only `consumer_id`'s row subscriptions against current admissions without moving memberships or activity.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DispatchError`] for an unknown table or a cell or predicate evaluation error.
+    pub fn matches_consumer(
+        &mut self,
+        event: &E,
+        consumer_id: I::ConsumerId,
+    ) -> Result<crate::ConsumerMatch<I, E::Checkpoint>, DispatchError> {
+        let event = crate::backend::ResolvedEvent::new(event, &self.database);
+        let table_id = event.table_id();
+        if !self.partitions.contains_key(&table_id) {
+            return if self.table_in_catalog(table_id) {
+                Ok(crate::ConsumerMatch::empty().with_checkpoint(event.checkpoint()))
+            } else {
+                Err(DispatchError::UnknownTableId(table_id))
+            };
+        }
+        let (partition, consumer_dict) =
+            table_context(&self.partitions, &self.consumer_dictionaries, table_id)?;
+        let Some(ordinal) = consumer_dict.get(consumer_id) else {
+            return Ok(crate::ConsumerMatch::empty().with_checkpoint(event.checkpoint()));
+        };
+        super::dispatch::match_consumer(
+            &event,
+            partition,
+            ordinal,
+            consumer_id,
+            &mut self.vm,
+            &self.database,
+        )
+    }
+
     fn consumers_resolved(
         &mut self,
         event: &crate::backend::ResolvedEvent<'_, E>,
@@ -5642,6 +5676,37 @@ mod tests {
     const DDL: &str = "CREATE TABLE orders (id INT PRIMARY KEY, amount INT, status TEXT);";
 
     type Engine = SubscriptionEngine<TestEvent<Postgres>, DefaultIds, ParserDB>;
+
+    #[test]
+    fn replay_matching_does_not_protect_a_subscription_from_activity_eviction() {
+        let database = ParserDB::parse::<PostgreSqlDialect>(DDL).expect("DDL parses");
+        let table =
+            catalog_helpers::table_id::<Postgres, _>(&database, "orders").expect("orders resolves");
+        let mut engine: Engine = SubscriptionEngine::new(database, PostgreSqlDialect {})
+            .with_max_subscriptions(2, EvictionPolicy::EvictLeastActive);
+        for consumer in [1, 2] {
+            engine
+                .register(SubscriptionRequest::new(consumer, "SELECT * FROM orders"))
+                .expect("subscription registers");
+        }
+        let event = TestEvent::insert(
+            table,
+            vec![Value::Int(1), Value::Int(10), Value::String("paid".into())],
+        );
+        for _ in 0..3 {
+            assert!(engine
+                .matches_consumer(&event, 1)
+                .expect("replay matches")
+                .inserted());
+        }
+        engine
+            .register(SubscriptionRequest::new(3, "SELECT * FROM orders"))
+            .expect("a cold subscription is evicted");
+        let notifications = engine.consumers(&event).expect("live dispatch matches");
+        let mut inserted = notifications.inserted().to_vec();
+        inserted.sort_unstable();
+        assert_eq!(inserted, [2, 3]);
+    }
 
     /// A consumer that holds nothing on a table loses its name there.
     ///
