@@ -22,6 +22,7 @@ use crate::ColumnId;
 use alloc::sync::Arc;
 use hashbrown::HashMap;
 use roaring::RoaringBitmap;
+use rpds::HashTrieMapSync;
 
 /// Indexable cell value (excludes NULL/Missing)
 ///
@@ -121,8 +122,8 @@ impl IndexableAtom {
 /// Hybrid indexes for candidate selection
 #[derive(Clone)]
 pub struct HybridIndexes {
-    /// Equality: col -> (val -> `RoaringBitmap<PredicateId>`)
-    pub equality: HashMap<ColumnId, HashMap<IndexableCell, RoaringBitmap>>,
+    /// Equality buckets share their value maps across snapshots.
+    pub equality: HashMap<ColumnId, HashTrieMapSync<IndexableCell, RoaringBitmap>>,
 
     /// Range: col -> the intervals on that column
     pub range: HashMap<ColumnId, RangeIndex>,
@@ -268,12 +269,12 @@ impl HybridIndexes {
         for atom in atoms {
             match atom {
                 IndexableAtom::Equality { column_id, value } => {
-                    self.equality
-                        .entry(*column_id)
-                        .or_default()
-                        .entry(value.clone())
-                        .or_default()
-                        .insert(pred_id_u32);
+                    let values = self.equality.entry(*column_id).or_default();
+                    if let Some(bitmap) = values.get_mut(value) {
+                        bitmap.insert(pred_id_u32);
+                    } else {
+                        values.insert_mut(value.clone(), RoaringBitmap::from_iter([pred_id_u32]));
+                    }
                 }
 
                 IndexableAtom::Range {
@@ -356,7 +357,7 @@ impl HybridIndexes {
                         if let Some(bitmap) = values.get_mut(value) {
                             bitmap.remove(pred_id_u32);
                             if bitmap.is_empty() {
-                                values.remove(value);
+                                values.remove_mut(value);
                             }
                         }
                         if values.is_empty() {
@@ -619,6 +620,66 @@ mod tests {
         assert!(indexes
             .query_equality(5, &IndexableCell::Int(999))
             .is_none());
+    }
+
+    #[test]
+    fn equality_mutations_preserve_cloned_snapshots() {
+        let shared = [IndexableAtom::Equality {
+            column_id: 5,
+            value: IndexableCell::Int(42),
+        }];
+        let other_column = [IndexableAtom::Equality {
+            column_id: 6,
+            value: IndexableCell::Int(42),
+        }];
+        let distinct = [IndexableAtom::Equality {
+            column_id: 5,
+            value: IndexableCell::Int(99),
+        }];
+        let ids = [0, 1, 2, 3, 4].map(PredicateId::from_slab_index);
+        let mut indexes = HybridIndexes::new();
+        indexes.add_predicate(ids[0], &shared, &[5], ROWS);
+        indexes.add_predicate(ids[1], &shared, &[5], ROWS);
+        indexes.add_predicate(ids[2], &other_column, &[6], ROWS);
+        let snapshot = indexes.clone();
+
+        indexes.add_predicate(ids[3], &shared, &[5], ROWS);
+        indexes.add_predicate(ids[4], &distinct, &[5], ROWS);
+        assert_eq!(
+            indexes.query_equality(5, &IndexableCell::Int(99)),
+            Some(&RoaringBitmap::from_iter([ids[4].as_u32()]))
+        );
+        assert!(snapshot
+            .query_equality(5, &IndexableCell::Int(99))
+            .is_none());
+
+        indexes.remove_predicate(ids[0], &shared, &[5], ROWS);
+        indexes.remove_predicate(ids[2], &other_column, &[6], ROWS);
+        indexes.remove_predicate(ids[4], &distinct, &[5], ROWS);
+        assert_eq!(
+            indexes.query_equality(5, &IndexableCell::Int(42)),
+            Some(&RoaringBitmap::from_iter([
+                ids[1].as_u32(),
+                ids[3].as_u32()
+            ]))
+        );
+        assert!(indexes.query_equality(5, &IndexableCell::Int(99)).is_none());
+        assert!(indexes.query_equality(6, &IndexableCell::Int(42)).is_none());
+        assert_eq!(
+            snapshot.query_equality(5, &IndexableCell::Int(42)),
+            Some(&RoaringBitmap::from_iter([
+                ids[0].as_u32(),
+                ids[1].as_u32()
+            ]))
+        );
+        assert_eq!(
+            snapshot.query_equality(6, &IndexableCell::Int(42)),
+            Some(&RoaringBitmap::from_iter([ids[2].as_u32()]))
+        );
+
+        indexes.remove_predicate(ids[1], &shared, &[5], ROWS);
+        indexes.remove_predicate(ids[3], &shared, &[5], ROWS);
+        assert!(indexes.query_equality(5, &IndexableCell::Int(42)).is_none());
     }
 
     #[test]
