@@ -1,0 +1,1 @@
+SELECT * FROM orders WHERE COALEsCE(NULL, 0) <> 1+enxist

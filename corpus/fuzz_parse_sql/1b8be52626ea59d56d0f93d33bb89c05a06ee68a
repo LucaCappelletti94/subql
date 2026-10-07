@@ -1,0 +1,1 @@
+SELECT * FROM orders WHERE lod IN (SELECtus) = $1 AND id IN (SHL2agers)

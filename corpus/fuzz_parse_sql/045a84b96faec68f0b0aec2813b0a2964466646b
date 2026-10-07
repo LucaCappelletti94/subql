@@ -1,0 +1,1 @@
+SELECT				mdddd IN (		SELECT id 0)

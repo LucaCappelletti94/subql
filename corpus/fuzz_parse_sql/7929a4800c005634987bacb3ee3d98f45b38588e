@@ -1,0 +1,1 @@
+SELECT count(*) AS0 FROM orders WHERE GET_(CONCAT(@@@SELSE(), '_par<=seed_', id), @0) 
