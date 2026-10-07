@@ -1,1 +1,0 @@
-LOCK(CONCAT(DATABASE(),E(), +'_parA@ASE()', id), 33) = p
