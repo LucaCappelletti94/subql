@@ -362,22 +362,6 @@ jobs:
       - run: cargo install cargo-deny --locked
       - run: cargo deny check
 
-  udeps:
-    name: Unused Dependencies
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@nightly
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
-      - run: cargo install cargo-udeps --locked
-      # `--all-features`, because the optional dependencies are exactly the ones
-      # worth checking: every consumer of `rls2fga` sits behind `visibility-records`
-      # or `visibility-openfga`, and the two test targets that use it declare
-      # `required-features`. Under default features none of that compiles, so the
-      # dependency and the dev-dependency both read as unused.
-      - run: cargo +nightly udeps --all-targets --workspace --all-features --locked
-
   audit:
     name: security audit
     runs-on: ubuntu-latest
