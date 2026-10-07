@@ -1,10 +1,12 @@
 //! Core type definitions for subql
 
+mod consumer_match;
 mod domain_id_types;
 mod generic_id_types;
 mod subscription_types;
 mod trait_definitions;
 
+pub use consumer_match::ConsumerMatch;
 pub use domain_id_types::{ColumnId, EventKind, MergeJobId, ShardId, TableId};
 pub use generic_id_types::{DefaultIds, Id, IdTypes, SubscriptionId, SubscriptionScope};
 pub use subscription_types::{

@@ -475,6 +475,8 @@ pub struct PredicateStore<I: IdTypes, B: Backend> {
     pub scope_index: HashTrieMapSync<I::SessionId, SubscriptionSet>,
     /// PredicateId -> who holds it, and through which subscriptions.
     pub bound: HashTrieMapSync<PredicateId, PredicateBindings>,
+    /// The distinct predicates each consumer ordinal holds on this table.
+    pub by_consumer: HashTrieMapSync<ConsumerOrdinal, RedBlackTreeSetSync<PredicateId>>,
     /// How many bindings each consumer holds on this table.
     ///
     /// Answers whether a consumer is still referenced without walking every
@@ -491,10 +493,7 @@ pub struct PredicateStore<I: IdTypes, B: Backend> {
     pub term_members: Arc<TermSlots<B>>,
 }
 
-// Every field is shared, so this is seven pointer copies. It stays hand-written
-// for the same reason `TermMembers`'s is, to keep the bounds off the backend
-// marker, and every mutation below goes through `Arc::make_mut` so the sharing
-// stays invisible to a reader.
+// Manual cloning keeps `Clone` bounds off the backend and identity markers.
 impl<I: IdTypes, B: Backend> Clone for PredicateStore<I, B> {
     fn clone(&self) -> Self {
         Self {
@@ -505,6 +504,7 @@ impl<I: IdTypes, B: Backend> Clone for PredicateStore<I, B> {
             bindings: self.bindings.clone(),
             scope_index: self.scope_index.clone(),
             bound: self.bound.clone(),
+            by_consumer: self.by_consumer.clone(),
             consumer_bindings: self.consumer_bindings.clone(),
             term_members: Arc::clone(&self.term_members),
         }
@@ -523,6 +523,7 @@ impl<I: IdTypes, B: Backend> PredicateStore<I, B> {
             bindings: HashTrieMapSync::new_sync(),
             scope_index: HashTrieMapSync::new_sync(),
             bound: HashTrieMapSync::new_sync(),
+            by_consumer: HashTrieMapSync::new_sync(),
             consumer_bindings: HashTrieMapSync::new_sync(),
             term_members: Arc::new(HashMap::new()),
         }
@@ -624,6 +625,20 @@ impl<I: IdTypes, B: Backend> PredicateStore<I, B> {
             .get(&id)
             .into_iter()
             .flat_map(move |held| held.subscription_ids(ordinal))
+    }
+
+    /// The distinct predicates `ordinal` holds, in id order.
+    pub(crate) fn predicate_ids_for(
+        &self,
+        ordinal: ConsumerOrdinal,
+    ) -> impl Iterator<Item = PredicateId> + '_ {
+        let set = self.by_consumer.get(&ordinal);
+        // A singleton avoids the tree iterator's allocated stack.
+        let one = set
+            .filter(|set| set.size() == 1)
+            .and_then(|set| set.first());
+        let many = set.filter(|set| set.size() > 1).map(|set| set.iter());
+        one.into_iter().chain(many.into_iter().flatten()).copied()
     }
 
     /// Every predicate that has a holder, with the ordinals holding it.
@@ -753,6 +768,14 @@ impl<I: IdTypes, B: Backend> PredicateStore<I, B> {
             bound.insert_mut(sub_id);
             held.by_ordinal.insert_mut(consumer_ord, bound);
         });
+
+        let mut held_preds = self
+            .by_consumer
+            .get(&consumer_ord)
+            .cloned()
+            .unwrap_or_default();
+        held_preds.insert_mut(pred_id);
+        self.by_consumer.insert_mut(consumer_ord, held_preds);
     }
 
     fn remove_binding_indexes(&mut self, binding: SubscriptionBinding<I>) {
@@ -807,6 +830,14 @@ impl<I: IdTypes, B: Backend> PredicateStore<I, B> {
             for ((pred, _), members) in Arc::make_mut(&mut self.term_members) {
                 if *pred == pred_id {
                     Arc::make_mut(members).forget(consumer_ord);
+                }
+            }
+            if let Some(mut held_preds) = self.by_consumer.get(&consumer_ord).cloned() {
+                held_preds.remove_mut(&pred_id);
+                if held_preds.is_empty() {
+                    self.by_consumer.remove_mut(&consumer_ord);
+                } else {
+                    self.by_consumer.insert_mut(consumer_ord, held_preds);
                 }
             }
         }
@@ -1343,5 +1374,180 @@ mod tests {
         assert_eq!(ids.len(), 2);
         assert!(ids.contains(&10));
         assert!(ids.contains(&20));
+    }
+
+    #[test]
+    fn predicate_ids_for_lists_distinct_predicates_in_order() {
+        let mut store = PredicateStore::<DefaultIds, Postgres>::new();
+        let pred_a = store.add_predicate(make_predicate(0, 0xA001));
+        let pred_b = store.add_predicate(make_predicate(1, 0xA002));
+        let ord = ConsumerOrdinal::new(7);
+
+        store.add_binding(SubscriptionBinding {
+            subscription_id: 1,
+            predicate_id: pred_a,
+            consumer_id: 1,
+            consumer_ordinal: ord,
+            scope: SubscriptionScope::Durable,
+            updated_at_unix_ms: 0,
+        });
+        store.add_binding(SubscriptionBinding {
+            subscription_id: 2,
+            predicate_id: pred_b,
+            consumer_id: 1,
+            consumer_ordinal: ord,
+            scope: SubscriptionScope::Durable,
+            updated_at_unix_ms: 0,
+        });
+        store.add_binding(SubscriptionBinding {
+            subscription_id: 3,
+            predicate_id: pred_a,
+            consumer_id: 1,
+            consumer_ordinal: ord,
+            scope: SubscriptionScope::Durable,
+            updated_at_unix_ms: 0,
+        });
+
+        let ids: Vec<_> = store.predicate_ids_for(ord).collect();
+        assert_eq!(
+            ids,
+            vec![pred_a, pred_b],
+            "each distinct predicate once, in id order"
+        );
+        assert!(
+            store
+                .predicate_ids_for(ConsumerOrdinal::new(99))
+                .next()
+                .is_none(),
+            "an ordinal with no binding names no predicate"
+        );
+    }
+
+    #[test]
+    fn predicate_ids_for_survives_overwrite() {
+        let mut store = PredicateStore::<DefaultIds, Postgres>::new();
+        let pred_a = store.add_predicate(make_predicate(0, 0xA101));
+        let pred_b = store.add_predicate(make_predicate(1, 0xA102));
+        let ord = ConsumerOrdinal::new(3);
+
+        store.add_binding(SubscriptionBinding {
+            subscription_id: 10,
+            predicate_id: pred_a,
+            consumer_id: 1,
+            consumer_ordinal: ord,
+            scope: SubscriptionScope::Durable,
+            updated_at_unix_ms: 0,
+        });
+
+        store.add_binding(SubscriptionBinding {
+            subscription_id: 10,
+            predicate_id: pred_b,
+            consumer_id: 1,
+            consumer_ordinal: ord,
+            scope: SubscriptionScope::Durable,
+            updated_at_unix_ms: 0,
+        });
+
+        assert_eq!(
+            store.predicate_ids_for(ord).collect::<Vec<_>>(),
+            vec![pred_b],
+            "the overwritten predicate leaves the reverse index"
+        );
+        assert!(store
+            .predicate_ids_for(ConsumerOrdinal::new(99))
+            .next()
+            .is_none());
+
+        store.add_binding(SubscriptionBinding {
+            subscription_id: 10,
+            predicate_id: pred_a,
+            consumer_id: 1,
+            consumer_ordinal: ord,
+            scope: SubscriptionScope::Durable,
+            updated_at_unix_ms: 0,
+        });
+        assert_eq!(
+            store.predicate_ids_for(ord).collect::<Vec<_>>(),
+            vec![pred_a]
+        );
+    }
+
+    #[test]
+    fn predicate_ids_for_keeps_the_predicate_while_another_scope_holds_it() {
+        let mut store = PredicateStore::<DefaultIds, Postgres>::new();
+        let pred = store.add_predicate(make_predicate(0, 0xA201));
+        let ord = ConsumerOrdinal::new(0);
+
+        store.add_binding(SubscriptionBinding {
+            subscription_id: 1,
+            predicate_id: pred,
+            consumer_id: 9,
+            consumer_ordinal: ord,
+            scope: SubscriptionScope::Durable,
+            updated_at_unix_ms: 0,
+        });
+        store.add_binding(SubscriptionBinding {
+            subscription_id: 2,
+            predicate_id: pred,
+            consumer_id: 9,
+            consumer_ordinal: ord,
+            scope: SubscriptionScope::Session(100),
+            updated_at_unix_ms: 0,
+        });
+
+        let _ = store.remove_binding(1);
+        assert_eq!(
+            store.predicate_ids_for(ord).collect::<Vec<_>>(),
+            vec![pred],
+            "the other scope still holds it"
+        );
+
+        let _ = store.remove_binding(2);
+        assert!(
+            store.predicate_ids_for(ord).next().is_none(),
+            "the last binding takes the predicate with it"
+        );
+    }
+
+    #[test]
+    fn predicate_ids_for_is_fresh_after_an_ordinal_is_issued_twice() {
+        let mut store = PredicateStore::<DefaultIds, Postgres>::new();
+        let pred_a = store.add_predicate(make_predicate(0, 0xA301));
+        let pred_b = store.add_predicate(make_predicate(1, 0xA302));
+        let ord = ConsumerOrdinal::new(0);
+
+        store.add_binding(SubscriptionBinding {
+            subscription_id: 1,
+            predicate_id: pred_a,
+            consumer_id: 1,
+            consumer_ordinal: ord,
+            scope: SubscriptionScope::Durable,
+            updated_at_unix_ms: 0,
+        });
+        assert_eq!(
+            store.predicate_ids_for(ord).collect::<Vec<_>>(),
+            vec![pred_a]
+        );
+
+        let _ = store.remove_binding(1);
+        assert!(store.predicate_ids_for(ord).next().is_none());
+        assert!(
+            store.by_consumer.get(&ord).is_none(),
+            "no empty set is left under the freed ordinal"
+        );
+
+        store.add_binding(SubscriptionBinding {
+            subscription_id: 2,
+            predicate_id: pred_b,
+            consumer_id: 2,
+            consumer_ordinal: ord,
+            scope: SubscriptionScope::Durable,
+            updated_at_unix_ms: 0,
+        });
+        assert_eq!(
+            store.predicate_ids_for(ord).collect::<Vec<_>>(),
+            vec![pred_b],
+            "the re-issued ordinal names only its own predicate"
+        );
     }
 }
