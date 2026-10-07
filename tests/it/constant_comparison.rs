@@ -112,3 +112,29 @@ fn literals_of_two_kinds_with_no_column_are_routed() {
         assert_eq!(delivers::<SQLite>(predicate), None, "SQLite, {predicate}");
     }
 }
+
+#[test]
+fn boolean_conditions_preserve_their_truth_on_every_backend() {
+    for (predicate, expected) in [
+        ("TRUE", true),
+        ("FALSE", false),
+        ("(FALSE)", false),
+        ("NOT FALSE", true),
+        ("TRUE AND n = 0", true),
+        ("FALSE AND n = 0", false),
+        ("n = 0 AND TRUE", true),
+        ("n = 0 AND FALSE", false),
+        ("TRUE OR n = 1", true),
+        ("FALSE OR n = 0", true),
+        ("n = 1 OR TRUE", true),
+        ("n = 1 OR FALSE", false),
+    ] {
+        assert_eq!(
+            delivers::<Postgres>(predicate),
+            Some(expected),
+            "{predicate}"
+        );
+        assert_eq!(delivers::<MySql>(predicate), Some(expected), "{predicate}");
+        assert_eq!(delivers::<SQLite>(predicate), Some(expected), "{predicate}");
+    }
+}

@@ -53,8 +53,7 @@ pub struct SubscriptionRequest<I: IdTypes, B: Backend = crate::backend::Postgres
     /// membership table. A changed membership row naming any of them moves
     /// what the filter admits.
     ///
-    /// Required by a filter naming the set, and empty is refused for the same
-    /// reason an absent one is: the subscription could never deliver.
+    /// An empty set admits no rows.
     pub(crate) subjects: alloc::vec::Vec<Value<B>>,
     /// The value rows this caller's subjects currently match, grouped by the
     /// columns each membership subquery compares, each row carrying the subject
@@ -1010,6 +1009,8 @@ pub struct Served<B: Backend = crate::backend::Postgres> {
     pub predicate_hash: u128,
     /// True if a new predicate was created, false if reused existing
     pub created_new_predicate: bool,
+    /// Whether the predicate includes the table's classified read rule.
+    pub read_rule_folded: bool,
     /// Projection kind for this subscription
     pub projection: crate::compiler::sql_shape::QueryProjection,
     /// Component-seed query for the aggregate, for bootstrap or reset.

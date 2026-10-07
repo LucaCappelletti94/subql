@@ -58,6 +58,16 @@ assert_eq!(notifs.inserted(), vec![42]);
 
 Placeholder SQL plus typed binds is the engine's own contract, and `register_select_typed` is a producer for it. It renders the query exactly as diesel would send it and decodes each backend's serialized binds into typed values, so every subscription keeps the SQL the database can re-run when the engine hands the answer back to a re-read. A raw-text subscription (`SubscriptionRequest::new(42, "SELECT * FROM orders WHERE amount > 100")`) enters the same compile, index, and dedup path. SQLite and MySQL join through the `diesel-typed-sqlite` and `diesel-typed-mysql` features.
 
+## Caller-bound read rules
+
+With `membership-term`, `with_translator` intersects caller-bound row subscriptions with the table's complete classified public read rule. `Served::read_rule_folded` reports whether the intersection is served in process. Rules that cannot be classified or served keep query-only matching and require the caller's visibility check.
+
+The fold admits no rows when the table has row security and no permissive read policy.
+
+Identity and subject-set comparisons use separate term slots, including when they compare one column. Empty subject sets admit nobody through the set comparison. `describe_terms` exposes seed reads for membership-table rules, whose current admissions, granting subjects, and membership watches persist in durable shards.
+
+`unregister_query` accepts the original query interest, and complete owner transfers report both audiences. Missing old-image cells remain `unanswered` and require a read before a transition can be settled.
+
 ## Streaming Aggregates
 
 Alongside row-match subscriptions, register an aggregate instead of a `SELECT *`. Diesel spells `COUNT(*)`, `COUNT(col)`, `SUM(col)` and `AVG(col)` as `.count()`, `diesel::dsl::count(col)`, `sum(col)` and `avg(col)`. The variance/stddev family (`VAR_POP`/`VAR_SAMP`/`STDDEV_POP`/`STDDEV_SAMP`) has no diesel built-in and arrives as SQL text through `register`. The engine keeps the running value and reports it whenever it moves, so the caller stores nothing and folds nothing.

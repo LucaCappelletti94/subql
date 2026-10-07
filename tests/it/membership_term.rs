@@ -486,23 +486,6 @@ mod refusals {
         );
     }
 
-    /// A term needs to know which caller values it filters for, because those
-    /// are what a changed membership row is matched against.
-    #[test]
-    fn a_term_is_refused_without_a_subject() {
-        let (mut engine, _) = engine();
-        let reason = refusal(&mut engine, SubscriptionRequest::new(1u64, TERM));
-        assert!(
-            reason.contains("state its subscriber"),
-            "the refusal should ask for the subscriber, got {reason:?}"
-        );
-        let reason = refusal(&mut engine, SubscriptionRequest::new(1u64, SET_TERM));
-        assert!(
-            reason.contains("state its subjects"),
-            "the refusal should ask for the subjects, got {reason:?}"
-        );
-    }
-
     /// One accumulator is shared between an aggregate's consumers, and a term gives
     /// each of them a different set of rows to aggregate.
     #[test]
@@ -672,23 +655,6 @@ mod refusals {
             "the refusal should ask for the subscriber, got {reason:?}"
         );
     }
-
-    /// The mirror: a membership spelled against the caller's set reads the
-    /// whole set, and the one identity is not it.
-    #[test]
-    fn a_set_membership_ignores_the_subscriber() {
-        let (mut engine, _) = engine();
-        let reason = refusal(
-            &mut engine,
-            SubscriptionRequest::new(1u64, SET_TERM)
-                .subscriber(Value::String("alice".into()))
-                .term_values(vec!["project_id"], rows_of("alice", vec![Value::Int(7)])),
-        );
-        assert!(
-            reason.contains("state its subjects"),
-            "the refusal should ask for the subjects, got {reason:?}"
-        );
-    }
 }
 
 mod changed_membership {
@@ -709,6 +675,38 @@ mod changed_membership {
 
     fn membership(project: i64, user: &str) -> Vec<Value<Postgres>> {
         vec![Value::Int(project), Value::String(user.into())]
+    }
+
+    #[test]
+    fn an_empty_subject_set_ignores_identity_and_membership_grants() {
+        let (mut engine, docs) = engine();
+        let members = members_table(&engine);
+        engine
+            .register(
+                SubscriptionRequest::new(1u64, SET_TERM).subscriber(Value::String("alice".into())),
+            )
+            .expect("the empty subject set registers");
+        engine
+            .register(subscribe_as(2, &[("alice", 7)]))
+            .expect("the claimed subject registers");
+
+        assert_eq!(
+            engine
+                .consumers(&TestEvent::insert(docs, doc(1, 7, "initial")))
+                .expect("the initial document dispatches")
+                .inserted(),
+            &[2]
+        );
+        engine
+            .consumers(&TestEvent::insert(members, membership(9, "alice")))
+            .expect("the membership grant dispatches");
+        assert_eq!(
+            engine
+                .consumers(&TestEvent::insert(docs, doc(2, 9, "granted")))
+                .expect("the newly granted document dispatches")
+                .inserted(),
+            &[2]
+        );
     }
 
     /// A membership appearing moves the subscriber set, and the subscription is told

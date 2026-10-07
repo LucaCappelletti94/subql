@@ -362,7 +362,7 @@ where
         database,
         &mut compiling,
         0,
-        ScalarFamily::String.into(),
+        ScalarFamily::Bool.into(),
     )?;
     ensure_condition::<B, DB>(expr, table_id, database, &mut compiling)?;
     let terms = canonicalize_term_slots(&mut compiling, canonicalizer)?;
@@ -505,7 +505,7 @@ where
                         database,
                         out,
                         depth + 1,
-                        ScalarFamily::String.into(),
+                        ScalarFamily::Bool.into(),
                     )?;
                     ensure_condition::<B, DB>(left, table_id, database, out)?;
 
@@ -519,7 +519,7 @@ where
                         database,
                         out,
                         depth + 1,
-                        ScalarFamily::String.into(),
+                        ScalarFamily::Bool.into(),
                     )?;
                     ensure_condition::<B, DB>(right, table_id, database, out)?;
                     out.push(Instruction::And);
@@ -534,7 +534,7 @@ where
                         database,
                         out,
                         depth + 1,
-                        ScalarFamily::String.into(),
+                        ScalarFamily::Bool.into(),
                     )?;
                     ensure_condition::<B, DB>(left, table_id, database, out)?;
 
@@ -548,7 +548,7 @@ where
                         database,
                         out,
                         depth + 1,
-                        ScalarFamily::String.into(),
+                        ScalarFamily::Bool.into(),
                     )?;
                     ensure_condition::<B, DB>(right, table_id, database, out)?;
                     out.push(Instruction::Or);

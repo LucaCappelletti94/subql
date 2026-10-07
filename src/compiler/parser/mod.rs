@@ -435,6 +435,7 @@ fn parse_query_front_half<B, DB>(
     dialect: &B::Dialect,
     database: &DB,
     binds: &[Value<B>],
+    read_rule: Option<&Expr>,
 ) -> Result<ParsedQuery, RegisterError>
 where
     B: Backend + SqlLiteralParse,
@@ -443,6 +444,18 @@ where
     let stmt = sql_shape::parse_single_statement(sql, dialect as &dyn Dialect)?;
     let (table_name, where_clause) = extract_table_and_where(&stmt)?;
     let where_clause = resolve_where_placeholders::<B>(where_clause, binds)?;
+    let where_clause = if let Some(rule) = read_rule {
+        Some(where_clause.map_or_else(
+            || rule.clone(),
+            |interest| Expr::BinaryOp {
+                left: alloc::boxed::Box::new(interest),
+                op: sqlparser::ast::BinaryOperator::And,
+                right: alloc::boxed::Box::new(rule.clone()),
+            },
+        ))
+    } else {
+        where_clause
+    };
     let table_id = resolve_table_id::<B, DB>(&table_name, database)?;
     let projection = sql_shape::extract_projection::<B, DB>(&stmt, table_id, database)?;
     let canonicalizer = Canonicalizer::new(dialect as &dyn Dialect);
@@ -486,29 +499,15 @@ where
     B: Backend + SqlLiteralParse,
     DB: DatabaseLike,
 {
-    let pq = parse_query_front_half::<B, DB>(sql, dialect, database, binds)?;
+    let pq = parse_query_front_half::<B, DB>(sql, dialect, database, binds, None)?;
 
-    // Compile WHERE clause to bytecode.
-    let (program, terms): (BytecodeProgram<B>, Vec<CompiledTerm>) =
-        if let Some(expr) = pq.where_clause.as_ref() {
-            compile_expression::<B, DB>(
-                expr,
-                pq.table_id,
-                database,
-                &Canonicalizer::new(dialect as &dyn Dialect),
-                increment,
-            )?
-        } else {
-            // No WHERE clause matches every row. Feed the bare `true` literal
-            // through the same wrapper that trailing bare-value predicates use
-            // so the VM sees a Tri-typed result at TOS.
-            let mut instructions = alloc::vec![Instruction::PushLiteral(B::parse_literal(
-                &SqlValue::Boolean(true),
-                ScalarFamily::Bool.into(),
-            )?)];
-            wrap_bare_value_as_tri::<B>(&mut instructions, ComparisonRef::NONE)?;
-            (BytecodeProgram::new(instructions), Vec::new())
-        };
+    let (program, terms) = compile_where_clause(
+        pq.where_clause.as_ref(),
+        pq.table_id,
+        database,
+        dialect,
+        increment,
+    )?;
 
     let prefilter_plan =
         build_prefilter_plan::<B, DB>(pq.where_clause.as_ref(), pq.table_id, database);
@@ -521,6 +520,95 @@ where
         projection: pq.projection,
         terms,
     })
+}
+
+/// Compile bind-resolved query interest intersected with the table's read rule.
+#[cfg(feature = "membership-term")]
+pub(crate) fn parse_compile_normalize_and_prefilter_with_read_rule<B, DB>(
+    sql: &str,
+    dialect: &B::Dialect,
+    database: &DB,
+    binds: &[Value<B>],
+    increment: Option<crate::backend::DivisionPrecisionIncrement>,
+    read_rule: &Expr,
+) -> Result<CompiledQuery<B>, RegisterError>
+where
+    B: Backend + SqlLiteralParse,
+    DB: DatabaseLike,
+{
+    let pq = parse_query_front_half::<B, DB>(sql, dialect, database, binds, Some(read_rule))?;
+    let (program, terms) = compile_where_clause(
+        pq.where_clause.as_ref(),
+        pq.table_id,
+        database,
+        dialect,
+        increment,
+    )?;
+    let prefilter_plan =
+        build_prefilter_plan::<B, DB>(pq.where_clause.as_ref(), pq.table_id, database);
+
+    Ok(CompiledQuery {
+        table_id: pq.table_id,
+        program,
+        normalized: pq.normalized,
+        prefilter_plan,
+        projection: pq.projection,
+        terms,
+    })
+}
+
+/// Hash bind-resolved query interest intersected with the table's read rule.
+#[cfg(all(feature = "membership-term", not(feature = "std")))]
+pub(crate) fn parse_and_resolve_hash_with_read_rule<B, DB>(
+    sql: &str,
+    dialect: &B::Dialect,
+    database: &DB,
+    binds: &[Value<B>],
+    read_rule: &Expr,
+) -> Result<(TableId, PredicateHash), RegisterError>
+where
+    B: Backend + SqlLiteralParse,
+    DB: DatabaseLike,
+{
+    let pq = parse_query_front_half::<B, DB>(sql, dialect, database, binds, Some(read_rule))?;
+    let hash_input = projection_hash_input(&pq.normalized, &pq.projection);
+    let hash = canonicalize::hash_sql(&hash_input);
+
+    Ok((pq.table_id, hash))
+}
+
+/// Compile one statement's WHERE clause, absent clauses included, into
+/// bytecode and the membership terms the clause lifts.
+fn compile_where_clause<B, DB>(
+    where_clause: Option<&Expr>,
+    table_id: TableId,
+    database: &DB,
+    dialect: &B::Dialect,
+    increment: Option<crate::backend::DivisionPrecisionIncrement>,
+) -> Result<(BytecodeProgram<B>, Vec<CompiledTerm>), RegisterError>
+where
+    B: Backend + SqlLiteralParse,
+    DB: DatabaseLike,
+{
+    if let Some(expr) = where_clause {
+        compile_expression::<B, DB>(
+            expr,
+            table_id,
+            database,
+            &Canonicalizer::new(dialect as &dyn Dialect),
+            increment,
+        )
+    } else {
+        // No WHERE clause matches every row. Feed the bare `true` literal
+        // through the same wrapper that trailing bare-value predicates use
+        // so the VM sees a Tri-typed result at TOS.
+        let mut instructions = alloc::vec![Instruction::PushLiteral(B::parse_literal(
+            &SqlValue::Boolean(true),
+            ScalarFamily::Bool.into(),
+        )?)];
+        wrap_bare_value_as_tri::<B>(&mut instructions, ComparisonRef::NONE)?;
+        Ok((BytecodeProgram::new(instructions), Vec::new()))
+    }
 }
 
 /// Compile `filter` as the WHERE clause of a statement over `table_id`.
@@ -858,6 +946,24 @@ fn agg_tag(spec: &AggSpec) -> String {
     }
 }
 
+/// Hash query interest after resolving its bind values.
+pub(crate) fn parse_and_resolve_hash_with_binds<B, DB>(
+    sql: &str,
+    dialect: &B::Dialect,
+    database: &DB,
+    binds: &[Value<B>],
+) -> Result<(TableId, PredicateHash), RegisterError>
+where
+    B: Backend + SqlLiteralParse,
+    DB: DatabaseLike,
+{
+    let pq = parse_query_front_half::<B, DB>(sql, dialect, database, binds, None)?;
+    let hash_input = projection_hash_input(&pq.normalized, &pq.projection);
+    let hash = canonicalize::hash_sql(&hash_input);
+
+    Ok((pq.table_id, hash))
+}
+
 /// Lightweight parse path that extracts `(TableId, PredicateHash)` from SQL
 /// without compiling bytecode or building a prefilter plan.
 ///
@@ -871,11 +977,7 @@ where
     B: Backend + SqlLiteralParse,
     DB: DatabaseLike,
 {
-    let pq = parse_query_front_half::<B, DB>(sql, dialect, database, &[])?;
-    let hash_input = projection_hash_input(&pq.normalized, &pq.projection);
-    let hash = canonicalize::hash_sql(&hash_input);
-
-    Ok((pq.table_id, hash))
+    parse_and_resolve_hash_with_binds::<B, DB>(sql, dialect, database, &[])
 }
 
 /// Derive the follow-subscription SELECT for an UPDATE statement.

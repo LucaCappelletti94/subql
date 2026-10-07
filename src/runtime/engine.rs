@@ -3,6 +3,8 @@
 
 mod agg_maintenance;
 mod install;
+#[cfg(feature = "std")]
+mod term_persistence;
 
 use super::indexes::IndexableAtom;
 use super::{
@@ -114,6 +116,7 @@ struct CompiledSpec<I: IdTypes, B: Backend> {
     prefilter_plan: PrefilterPlan,
     projection: QueryProjection,
     hash: u128,
+    read_rule_folded: bool,
     /// Runnable component-seed bundle (SQL plus per-column decode kinds)
     /// for an aggregate registration, `None` for row subscriptions.
     /// Rendered once at compile time.
@@ -366,6 +369,8 @@ where
     /// deployment-specific, and defaulting it fails silently when wrong.
     #[cfg(feature = "membership-term")]
     translator: Option<rls2fga::translator::Translator>,
+    #[cfg(feature = "membership-term")]
+    read_rules: HashMap<TableId, sqlparser::ast::Expr>,
     /// MySQL's `div_precision_increment` as this deployment declared it.
     /// Only an engine whose `/` answers a decimal needs it, and that
     /// engine refuses the operator until it is given.
@@ -377,11 +382,6 @@ where
     /// subscribed table's partition, and the row that moves its subscriber set
     /// arrives on another table entirely.
     ///
-    /// In-memory only (not persisted), like
-    /// [`pk_follows`](Self::pk_follows): across a restart a durable term
-    /// subscription comes back with an empty subscriber set and admits nobody
-    /// until the client registers again. That is the freshness-losing direction,
-    /// never a row delivered to somebody the filter excludes.
     term_watch: HashMap<TableId, Vec<TermWatch>>,
     /// Running total per aggregate subscription.
     ///
@@ -514,13 +514,6 @@ fn caller_values<I: IdTypes, B: Backend>(
                     subjects.push(subject);
                 }
             }
-            if subjects.is_empty() {
-                return Err(RegisterError::MembershipTermRefused(format!(
-                    "this filter's {what} names the caller's subject set, so the subscription \
-                     has to state its subjects. SubQL matches a row against them, so with none \
-                     the subscription could never deliver."
-                )));
-            }
             Ok(subjects)
         }
     }
@@ -617,22 +610,17 @@ where
         atoms
     }
 
-    /// Compile `sql` and settle every membership term its filter names, which is
-    /// everything registration decides before it needs the seed.
-    ///
-    /// Shared with [`Self::describe_terms`], so a filter described is a filter
-    /// `register` accepts, and one refused is refused there for the same reason.
+    /// Compile query interest and any complete caller-bound read rule into one predicate.
     fn compile_and_plan_terms(
         &self,
-        sql: &str,
-        binds: &[Value<E::Backend>],
+        spec: &SubscriptionRequest<I, E::Backend>,
         database_reads_per_consumer: bool,
-    ) -> Result<(CompiledQuery<E::Backend>, Vec<TermPlan>), RegisterError> {
+    ) -> Result<(CompiledQuery<E::Backend>, Vec<TermPlan>, bool), RegisterError> {
         let compiled = parse_compile_normalize_and_prefilter_with_binds::<E::Backend, DB>(
-            sql,
+            &spec.sql,
             &self.dialect,
             &self.database,
-            binds,
+            &spec.binds,
             self.division_increment,
         )?;
 
@@ -664,7 +652,42 @@ where
 
         let plans =
             self.check_membership_terms(&compiled.terms, compiled.table_id, &compiled.projection)?;
-        Ok((compiled, plans))
+        #[cfg(feature = "membership-term")]
+        if (spec.subscriber.is_some() || !spec.subjects.is_empty())
+            && matches!(
+                compiled.projection,
+                QueryProjection::Rows | QueryProjection::Columns { .. }
+            )
+        {
+            if let Some(rule) = self.read_rules.get(&compiled.table_id) {
+                if let Ok(folded) =
+                    crate::compiler::parser::parse_compile_normalize_and_prefilter_with_read_rule::<
+                        E::Backend,
+                        DB,
+                    >(
+                        &spec.sql,
+                        &self.dialect,
+                        &self.database,
+                        &spec.binds,
+                        self.division_increment,
+                        rule,
+                    )
+                {
+                    if let Ok(plans) = self.check_membership_terms(
+                        &folded.terms,
+                        folded.table_id,
+                        &folded.projection,
+                    ) {
+                        if plans.iter().all(|plan| {
+                            plan.caller != TermCaller::Identity || spec.subscriber.is_some()
+                        }) {
+                            return Ok((folded, plans, true));
+                        }
+                    }
+                }
+            }
+        }
+        Ok((compiled, plans, false))
     }
 
     /// What each term in `spec`'s filter needs stated, without registering
@@ -693,7 +716,7 @@ where
         &self,
         spec: &SubscriptionRequest<I, E::Backend>,
     ) -> Result<Vec<TermDescription>, RegisterError> {
-        let (compiled, plans) = self.compile_and_plan_terms(&spec.sql, &spec.binds, false)?;
+        let (compiled, plans, _) = self.compile_and_plan_terms(spec, false)?;
         plans
             .iter()
             .zip(&compiled.terms)
@@ -714,8 +737,8 @@ where
         spec: SubscriptionRequest<I, E::Backend>,
         database_reads_per_consumer: bool,
     ) -> Result<CompiledSpec<I, E::Backend>, RegisterError> {
-        let (compiled, term_plans) =
-            self.compile_and_plan_terms(&spec.sql, &spec.binds, database_reads_per_consumer)?;
+        let (compiled, term_plans, read_rule_folded) =
+            self.compile_and_plan_terms(&spec, database_reads_per_consumer)?;
         let CompiledQuery {
             table_id,
             program: bytecode,
@@ -761,6 +784,7 @@ where
             prefilter_plan,
             projection,
             hash,
+            read_rule_folded,
             bootstrap,
             term_plans,
             term_seeds,
@@ -826,16 +850,17 @@ where
                 }
             }
 
-            // Two terms comparing one column would make that column's name
-            // ambiguous in the values a subscription states for it, and the
-            // names are the only thing both sides share.
-            if terms.iter().any(|other| {
-                other.slot != term.slot
-                    && other
-                        .columns
-                        .iter()
-                        .any(|column| term.columns.contains(column))
-            }) {
+            // Only moving terms need disjoint column names for stated seed rows.
+            if !term.compares_the_caller()
+                && terms.iter().any(|other| {
+                    !other.compares_the_caller()
+                        && other.slot != term.slot
+                        && other
+                            .columns
+                            .iter()
+                            .any(|column| term.columns.contains(column))
+                })
+            {
                 let column = term.columns[0];
                 return Err(RegisterError::MembershipTermRefused(format!(
                     "two membership terms in one filter compare column {column} of table \
@@ -934,12 +959,10 @@ where
                         })
                 })
                 .collect::<Result<_, _>>()?;
-            // The one term comparing exactly this column set, since two terms
-            // sharing any column were refused above. The caller's order may
-            // differ from the filter's, so each stated row is permuted into the
-            // term's own order below.
+            // Stated rows name moving terms, independently of self-seeding caller slots.
             let term = terms
                 .iter()
+                .filter(|term| !term.compares_the_caller())
                 .find(|term| {
                     term.columns.len() == stated.len()
                         && stated.iter().all(|column| term.columns.contains(column))
@@ -952,14 +975,6 @@ where
                          together. The values would be stored where nothing reads them."
                     ))
                 })?;
-            if term.compares_the_caller() {
-                return Err(RegisterError::MembershipTermRefused(format!(
-                    "this subscription states values for columns {column_names:?}, which its \
-                     filter compares to the caller directly. A caller comparison seeds itself \
-                     from the values it admits, and stated values would admit rows the \
-                     filter's text never names."
-                )));
-            }
             let order: Vec<usize> = term
                 .columns
                 .iter()
@@ -1320,6 +1335,8 @@ where
             aggregate_registrations: HashMap::new(),
             #[cfg(feature = "membership-term")]
             translator: None,
+            #[cfg(feature = "membership-term")]
+            read_rules: HashMap::new(),
             division_increment: None,
             term_watch: HashMap::new(),
             aggregates: HashMap::new(),
@@ -1373,6 +1390,7 @@ where
     #[cfg(feature = "membership-term")]
     #[must_use]
     pub fn with_translator(mut self, translator: rls2fga::translator::Translator) -> Self {
+        self.read_rules = crate::read_rule::read_rules(&self.database, &translator);
         self.translator = Some(translator);
         self
     }
@@ -1648,6 +1666,7 @@ where
                     created_new_predicate: false,
                     projection: compiled.projection,
                     aggregate_bootstrap: compiled.bootstrap,
+                    read_rule_folded: compiled.read_rule_folded,
                 }),
                 evicted: Vec::new(),
                 not_served_because: None,
@@ -1746,6 +1765,7 @@ where
                 created_new_predicate: created_new,
                 projection: compiled.projection,
                 aggregate_bootstrap: compiled.bootstrap,
+                read_rule_folded: compiled.read_rule_folded,
             }),
             evicted,
             not_served_because: None,
@@ -3385,6 +3405,7 @@ where
                                 created_new_predicate: false,
                                 projection: compiled_spec.projection,
                                 aggregate_bootstrap: compiled_spec.bootstrap,
+                                read_rule_folded: compiled_spec.read_rule_folded,
                             }),
                             evicted: Vec::new(),
                             not_served_because: None,
@@ -3406,6 +3427,7 @@ where
                                 created_new_predicate: false,
                                 projection: compiled_spec.projection,
                                 aggregate_bootstrap: compiled_spec.bootstrap,
+                                read_rule_folded: compiled_spec.read_rule_folded,
                             }),
                             evicted: Vec::new(),
                             not_served_because: None,
@@ -3426,6 +3448,7 @@ where
                             created_new_predicate: false, // filled in phase 2
                             projection: compiled_spec.projection.clone(),
                             aggregate_bootstrap: None, // filled in phase 2
+                            read_rule_folded: compiled_spec.read_rule_folded,
                         }),
                         evicted: Vec::new(),
                         not_served_because: None,
@@ -4709,11 +4732,7 @@ where
         }
     }
 
-    /// Unregister all subscriptions for a consumer matching a specific SQL query.
-    ///
-    /// Parses the SQL just enough to compute the predicate hash (no bytecode
-    /// compilation), then removes all bindings for `consumer_id` that share that
-    /// hash.
+    /// Remove a consumer's in-process subscriptions matching the query's source interest.
     pub fn unregister_query(
         &mut self,
         consumer_id: I::ConsumerId,
@@ -4733,19 +4752,54 @@ where
             return Ok(empty);
         };
 
-        // Find the predicate for this hash.
         let snapshot = partition.load_snapshot();
-        let Some(pred_id) = snapshot.predicates.find_by_hash(hash) else {
-            return Ok(empty);
-        };
-
-        // Collect subscription IDs belonging to this consumer on this predicate.
+        let pred_id = snapshot.predicates.find_by_hash(hash);
+        #[cfg(all(feature = "membership-term", not(feature = "std")))]
+        let folded_id = self.read_rules.get(&table_id).and_then(|rule| {
+            crate::compiler::parser::parse_and_resolve_hash_with_read_rule::<E::Backend, DB>(
+                sql,
+                &self.dialect,
+                &self.database,
+                &[],
+                rule,
+            )
+            .ok()
+            .and_then(|(_, folded_hash)| snapshot.predicates.find_by_hash(folded_hash))
+        });
         let to_remove: Vec<SubscriptionId> = snapshot
             .predicates
             .bindings
             .values()
-            .filter(|b| b.predicate_id == pred_id && b.consumer_id == consumer_id)
-            .map(|b| b.subscription_id)
+            .filter(|binding| {
+                if binding.consumer_id != consumer_id {
+                    return false;
+                }
+                let matches_compiled = Some(binding.predicate_id) == pred_id;
+                #[cfg(all(feature = "membership-term", not(feature = "std")))]
+                let matches_folded = Some(binding.predicate_id) == folded_id;
+                #[cfg(not(all(feature = "membership-term", not(feature = "std"))))]
+                let matches_folded = false;
+                #[cfg(feature = "std")]
+                let matches_source = self
+                    .in_process_sources
+                    .get(&binding.subscription_id)
+                    .is_some_and(|source| {
+                        crate::compiler::parser::parse_and_resolve_hash_with_binds::<
+                                E::Backend,
+                                DB,
+                            >(
+                                source.source_query.sql(),
+                                &self.dialect,
+                                &self.database,
+                                source.source_query.binds(),
+                            )
+                            .is_ok_and(|source_hash| source_hash == (table_id, hash))
+                    });
+                #[cfg(not(feature = "std"))]
+                let matches_source = false;
+                matches_compiled || matches_folded || matches_source
+            })
+            .map(|binding| binding.subscription_id)
             .collect();
 
         if to_remove.is_empty() {
@@ -4977,6 +5031,7 @@ where
 
         // Convert predicates to serializable format
         let mut predicate_data_vec = Vec::new();
+        let mut term_movements = self.snapshot_term_movements(table_id);
         for (_idx, pred) in snapshot.predicates.predicates.iter() {
             let pred_data = PredicateData {
                 hash: pred.hash,
@@ -4989,6 +5044,7 @@ where
                 projection: pred.projection.clone(),
                 refcount: snapshot.predicates.refcount(pred.id),
                 updated_at_unix_ms: pred.updated_at_unix_ms,
+                term_movements: term_movements.remove(&pred.id).unwrap_or_default(),
             };
             predicate_data_vec.push(pred_data);
         }
@@ -5033,6 +5089,7 @@ where
             predicates: predicate_data_vec,
             bindings: binding_data_vec,
             consumer_dict: consumer_dict_data,
+            term_seeds: Self::snapshot_term_seeds(table_id, &snapshot.predicates, consumer_dict)?,
             #[allow(clippy::cast_possible_truncation)]
             created_at_unix_ms: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -5176,6 +5233,10 @@ where
     ) {
         self.partitions.insert(table_id, partition);
         self.consumer_dictionaries.insert(table_id, consumer_dict);
+        self.term_watch.retain(|_, watches| {
+            watches.retain(|watch| watch.subscribed != table_id);
+            !watches.is_empty()
+        });
         // Clear old subscription_to_table and binding_dedup entries for this table.
         self.subscription_to_table
             .retain(|_, mapped_table_id| *mapped_table_id != table_id);
@@ -5215,7 +5276,9 @@ where
                 }
             }
         });
+        let watches = self.rebuild_term_state(table_id, payload, &consumer_dict, &mut partition)?;
         self.replace_table_state(table_id, partition, consumer_dict, &entries);
+        self.watch_terms(watches);
         Ok(())
     }
 

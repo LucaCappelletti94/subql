@@ -34,7 +34,7 @@ use sql_traits::{
 ///
 /// Loading refuses a shard carrying any other version, so a change to what a
 /// stored field means bumps it.
-const SHARD_VERSION: u16 = 15;
+const SHARD_VERSION: u16 = 16;
 
 /// Hard cap for decompressed shard payload size (defense in depth).
 ///
@@ -267,6 +267,8 @@ pub struct ShardPayload<I: IdTypes> {
     pub bindings: Vec<BindingData<I>>,
     /// Consumer dictionary
     pub consumer_dict: ConsumerDictData<I>,
+    /// Term seed records, one per bound (predicate, consumer, slot)
+    pub term_seeds: Vec<TermSeedData<I>>,
     /// Shard creation timestamp (milliseconds since Unix epoch)
     pub created_at_unix_ms: u64,
 }
@@ -277,6 +279,7 @@ impl<I: IdTypes> Clone for ShardPayload<I> {
             predicates: self.predicates.clone(),
             bindings: self.bindings.clone(),
             consumer_dict: self.consumer_dict.clone(),
+            term_seeds: self.term_seeds.clone(),
             created_at_unix_ms: self.created_at_unix_ms,
         }
     }
@@ -293,6 +296,7 @@ pub struct PredicateData {
     pub projection: QueryProjection,
     pub refcount: u32,
     pub updated_at_unix_ms: u64,
+    pub term_movements: Vec<(u16, crate::term::TermMovement)>, // Slot plus the movement, one per membership term
 }
 
 /// Serializable binding data
@@ -325,6 +329,28 @@ impl<I: IdTypes> Clone for ConsumerDictData<I> {
     fn clone(&self) -> Self {
         Self {
             ordinal_to_consumer: self.ordinal_to_consumer.clone(),
+        }
+    }
+}
+
+/// Explicit current claims and grants for a bound predicate, consumer, and slot.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(bound = "")]
+pub struct TermSeedData<I: IdTypes> {
+    pub predicate_hash: u128,
+    pub consumer_id: I::ConsumerId,
+    pub slot: u16,
+    /// Codec encoding of `(Vec<Value<B>>, Vec<(Value<B>, Vec<Value<B>>)>)`.
+    pub seed: Vec<u8>,
+}
+
+impl<I: IdTypes> Clone for TermSeedData<I> {
+    fn clone(&self) -> Self {
+        Self {
+            predicate_hash: self.predicate_hash,
+            consumer_id: self.consumer_id,
+            slot: self.slot,
+            seed: self.seed.clone(),
         }
     }
 }
@@ -634,7 +660,7 @@ mod tests {
 
     /// Every envelope field roundtrips through the on-wire header.
     #[test]
-    fn test_v15_envelope_roundtrip() {
+    fn test_v16_envelope_roundtrip() {
         let catalog = make_catalog();
         let tid = fixture_table_id(&catalog);
         let payload = shard_payload_with_consumers(vec![1, 2, 3], 42);
@@ -642,7 +668,7 @@ mod tests {
         let bytes = serialize_shard(tid, &payload, &catalog).unwrap();
         let (header, _) = deserialize_shard::<DefaultIds, _>(&bytes, &catalog).unwrap();
 
-        assert_eq!(header.version, 15);
+        assert_eq!(header.version, 16);
         assert_eq!(header.fingerprint.algorithm_id, ALGORITHM_ID_SHA2_256);
         assert_eq!(header.fingerprint.canonicalization_version, 1);
         assert_eq!(header.fingerprint.profile_id, 1);
@@ -661,7 +687,8 @@ mod tests {
     /// which fails every dispatch under `AND`, `OR` and `NOT`, and a program
     /// kept from it would also absorb a fresh registration of the same filter.
     /// Its `LIKE` also carries no escape field, so its bytes would decode
-    /// against a different shape.
+    /// against a different shape. v15 predates the term seed and movement
+    /// fields, so its payload restores no term state at all.
     #[test]
     fn test_older_versions_rejected() {
         let catalog = make_catalog();
@@ -669,7 +696,7 @@ mod tests {
         let payload = empty_shard_payload(1);
         let bytes = serialize_shard(tid, &payload, &catalog).unwrap();
 
-        for stored in [6_u16, 7, 8, 9, 10, 11, 12, 13, 14] {
+        for stored in [6_u16, 7, 8, 9, 10, 11, 12, 13, 14, 15] {
             let tampered = tamper_shard_header(&bytes, |hdr| {
                 hdr.version = stored;
             });
@@ -678,10 +705,10 @@ mod tests {
             assert!(
                 matches!(
                     &result,
-                    Err(StorageError::VersionMismatch { expected: 15, got })
+                    Err(StorageError::VersionMismatch { expected: 16, got })
                         if *got == stored
                 ),
-                "expected VersionMismatch{{expected: 15, got: {stored}}}, got {result:?}"
+                "expected VersionMismatch{{expected: 16, got: {stored}}}, got {result:?}"
             );
         }
     }

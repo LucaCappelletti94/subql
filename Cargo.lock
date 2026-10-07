@@ -4617,7 +4617,7 @@ dependencies = [
 [[package]]
 name = "rls2fga"
 version = "0.1.0"
-source = "git+https://github.com/LucaCappelletti94/rls2fga?branch=main#10839a694ac77b23c8005d882d7d69915ab7989c"
+source = "git+https://github.com/LucaCappelletti94/rls2fga?branch=main#357b14ef5626ce479ab1e00357ed71a5d61c27dc"
 dependencies = [
  "openfga-client",
  "rls2fga-types",
@@ -4631,7 +4631,7 @@ dependencies = [
 [[package]]
 name = "rls2fga-types"
 version = "0.1.0"
-source = "git+https://github.com/LucaCappelletti94/rls2fga?branch=main#10839a694ac77b23c8005d882d7d69915ab7989c"
+source = "git+https://github.com/LucaCappelletti94/rls2fga?branch=main#357b14ef5626ce479ab1e00357ed71a5d61c27dc"
 dependencies = [
  "serde",
  "thiserror 2.0.20",
