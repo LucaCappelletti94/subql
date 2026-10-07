@@ -1,1 +1,0 @@
-SELECT * FROM orders WHERE nt_sotting('app[.user_id')[4] *ounteisten11

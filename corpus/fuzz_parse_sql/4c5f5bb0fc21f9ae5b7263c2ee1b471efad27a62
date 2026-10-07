@@ -1,1 +1,0 @@
-SELECT SUM(t) AS c0, UNT(a AS c0, COUNT(amougt) AS c1 FROM) AS

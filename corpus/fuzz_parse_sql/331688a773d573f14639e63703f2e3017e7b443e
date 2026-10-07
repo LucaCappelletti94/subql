@@ -1,1 +1,0 @@
-SELECT st-OUNT(*) FROM orders GROUP BY status

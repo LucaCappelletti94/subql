@@ -1,1 +1,0 @@
-SELECT s FROM orders WHEREMIN(price)  GROUP BY status

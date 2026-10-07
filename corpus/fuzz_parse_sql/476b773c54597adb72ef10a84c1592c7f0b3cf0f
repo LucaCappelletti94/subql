@@ -1,1 +1,0 @@
-SELECT * FROM orders WHERE l NOT IN (ts) = $2 AND id
