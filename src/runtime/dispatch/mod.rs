@@ -20,6 +20,9 @@ use roaring::RoaringBitmap;
 use sql_traits::prelude::DatabaseLike;
 
 pub(crate) mod column_probes;
+mod consumer;
+
+pub(crate) use consumer::match_consumer;
 
 use self::column_probes::{probe_column_for_agg, probe_column_for_index};
 
@@ -399,42 +402,71 @@ where
     let mut facts: Vec<TermFacts<'a>> = Vec::with_capacity(pred.bytecode.term_columns.len());
     let mut term_absent: Option<crate::ColumnId> = None;
     for (slot, columns) in pred.bytecode.term_columns.iter().enumerate() {
-        let slot = u16::try_from(slot).unwrap_or(u16::MAX);
-        // A NULL cell dominates an unreadable one: SQL never matches through a
-        // NULL, so the term admits nobody whatever the other cells hold, while
-        // an unreadable cell alone leaves the term unable to say.
-        let mut keys = Vec::with_capacity(columns.len());
-        let mut nobody = false;
-        let mut unknown = false;
-        for column in columns {
-            let value = event
-                .value_at(db, row, *column)
-                .map_err(DispatchError::Value)?;
-            let missing = value.is_missing();
-            match TermLookup::of(value) {
-                TermLookup::Key(key) => keys.push(key),
-                TermLookup::Nobody => nobody = true,
-                TermLookup::Unknown => {
-                    unknown = true;
-                    if missing && term_absent.is_none() {
-                        term_absent = Some(*column);
-                    }
+        let (fact, absent) = term_fact_for_row((pred.id, slot, columns), store, event, row, db)?;
+        term_absent = term_absent.or(absent);
+        facts.push(fact);
+    }
+    Ok((facts, term_absent))
+}
+
+fn term_fact_for_row<'a, I, E, DB>(
+    (predicate, slot, columns): (PredicateId, usize, &[crate::ColumnId]),
+    store: &'a PredicateStore<I, E::Backend>,
+    event: &E,
+    row: RowKind,
+    db: &DB,
+) -> Result<(TermFacts<'a>, Option<crate::ColumnId>), DispatchError>
+where
+    I: IdTypes,
+    E: CdcEvent,
+    DB: DatabaseLike,
+{
+    let admits = |keys| {
+        store
+            .term_members(predicate, u16::try_from(slot).unwrap_or(u16::MAX))
+            .and_then(|members| members.admits(keys))
+    };
+    if let [column] = columns {
+        let value = event
+            .value_at(db, row, *column)
+            .map_err(DispatchError::Value)?;
+        let absent = value.is_missing().then_some(*column);
+        let fact = match TermLookup::of(value) {
+            TermLookup::Key(key) => TermFacts::Admits(admits(core::slice::from_ref(&key))),
+            TermLookup::Nobody => TermFacts::Admits(None),
+            TermLookup::Unknown => TermFacts::CannotSay,
+        };
+        return Ok((fact, absent));
+    }
+    let mut keys = Vec::with_capacity(columns.len());
+    let mut nobody = false;
+    let mut unknown = false;
+    let mut absent = None;
+    for column in columns {
+        let value = event
+            .value_at(db, row, *column)
+            .map_err(DispatchError::Value)?;
+        let missing = value.is_missing();
+        match TermLookup::of(value) {
+            TermLookup::Key(key) => keys.push(key),
+            TermLookup::Nobody => nobody = true,
+            TermLookup::Unknown => {
+                unknown = true;
+                if missing && absent.is_none() {
+                    absent = Some(*column);
                 }
             }
         }
-        facts.push(if nobody {
-            TermFacts::Admits(None)
-        } else if unknown {
-            TermFacts::CannotSay
-        } else {
-            TermFacts::Admits(
-                store
-                    .term_members(pred.id, slot)
-                    .and_then(|members| members.admits(&keys)),
-            )
-        });
     }
-    Ok((facts, term_absent))
+    // SQL `NULL` dominates an absent column in a composite membership key.
+    let fact = if nobody {
+        TermFacts::Admits(None)
+    } else if unknown {
+        TermFacts::CannotSay
+    } else {
+        TermFacts::Admits(admits(&keys))
+    };
+    Ok((fact, absent))
 }
 
 /// Consumer dictionary translating between ordinals and ConsumerIds.
@@ -839,8 +871,10 @@ fn extend_subscriptions<I: IdTypes, B: Backend>(
     consumers: &RoaringBitmap,
     out: &mut impl Extend<SubscriptionId>,
 ) {
-    for ord_u32 in consumers {
-        out.extend(predicates.subscription_ids_of(pred_id, ConsumerOrdinal::new(ord_u32)));
+    if let Some(held) = predicates.bound.get(&pred_id) {
+        for ord_u32 in consumers {
+            out.extend(held.subscription_ids(ConsumerOrdinal::new(ord_u32)));
+        }
     }
 }
 

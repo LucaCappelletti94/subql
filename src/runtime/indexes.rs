@@ -14,8 +14,9 @@
 //! UPDATE candidates come from [`HybridIndexes::full_row`] instead.
 
 use super::ids::PredicateId;
+use super::partition::ColumnProbe;
 use super::range_index::{RangeIndex, RangeKey, RangeProbe};
-use crate::backend::{Backend, Value};
+use crate::backend::{Backend, CellPresence, Value};
 use crate::compiler::sql_shape::QueryProjection;
 use crate::compiler::{PlannerAtom, PlannerValue};
 use crate::ColumnId;
@@ -115,6 +116,30 @@ impl IndexableAtom {
                     NullKind::IsNotNull
                 },
             },
+        }
+    }
+
+    /// Whether `probe` admits this atom's predicate to the candidate set.
+    #[must_use]
+    pub(super) fn admits(&self, probe: &ColumnProbe) -> bool {
+        match self {
+            Self::Equality { value, .. } => probe.value.as_ref().is_some_and(|cell| cell == value),
+            Self::Range { lower, upper, .. } => {
+                let Some(numeric) = probe.value.as_ref().and_then(NumericValue::from_indexable)
+                else {
+                    return false;
+                };
+                // NaN stays a candidate because ordering depends on the backend.
+                if numeric.is_unordered() {
+                    return true;
+                }
+                lower.is_none_or(|l| numeric.reaches(l)) && upper.is_none_or(|u| numeric.within(u))
+            }
+            Self::Null { kind, .. } => match kind {
+                NullKind::IsNull => probe.presence == CellPresence::Null,
+                NullKind::IsNotNull => probe.presence == CellPresence::Present,
+            },
+            Self::Fallback => true,
         }
     }
 }
@@ -535,6 +560,7 @@ impl Default for HybridIndexes {
 mod tests {
     use super::*;
     use crate::backend::{Postgres, Value};
+    use crate::runtime::partition::ColumnProbe;
 
     /// Every predicate under test here is a row subscription. Aggregate
     /// routing is covered in `partition`, where the candidate sets differ.
@@ -1067,5 +1093,71 @@ mod tests {
         let result = HybridIndexes::select_update_deps(&free, &dep_map, &[99]);
         assert!(result.contains(0));
         assert!(!result.contains(1));
+    }
+
+    /// Scalar and bitmap candidate admission must agree.
+    #[test]
+    fn admits_routes_a_cell_like_the_index_does() {
+        let equality = IndexableAtom::Equality {
+            column_id: 0,
+            value: IndexableCell::Int(42),
+        };
+        assert!(equality.admits(&ColumnProbe::present(Some(IndexableCell::Int(42)))));
+        assert!(
+            !equality.admits(&ColumnProbe::present(Some(IndexableCell::Int(99)))),
+            "a different known value must not be admitted"
+        );
+        assert!(
+            !equality.admits(&ColumnProbe::present(None)),
+            "a present cell without an indexable payload is the caller's to route"
+        );
+        assert!(!equality.admits(&ColumnProbe::null()));
+        assert!(!equality.admits(&ColumnProbe::missing()));
+
+        let range = IndexableAtom::Range {
+            column_id: 0,
+            lower: Some(0),
+            upper: Some(10),
+        };
+        assert!(range.admits(&ColumnProbe::present(Some(IndexableCell::Int(5)))));
+        assert!(
+            !range.admits(&ColumnProbe::present(Some(IndexableCell::Int(15)))),
+            "a value above the upper bound is not a candidate"
+        );
+        assert!(
+            !range.admits(&ColumnProbe::present(Some(IndexableCell::String(
+                "x".into()
+            )))),
+            "a non-numeric cell is not a candidate for a numeric range"
+        );
+        assert!(
+            range.admits(&ColumnProbe::present(Some(IndexableCell::Float(
+                f64::NAN.to_bits()
+            )))),
+            "a NaN has no place on the line, so the range keeps it a candidate"
+        );
+
+        let is_null = IndexableAtom::Null {
+            column_id: 0,
+            kind: NullKind::IsNull,
+        };
+        assert!(is_null.admits(&ColumnProbe::null()));
+        assert!(!is_null.admits(&ColumnProbe::present(None)));
+        assert!(!is_null.admits(&ColumnProbe::missing()));
+
+        let is_not_null = IndexableAtom::Null {
+            column_id: 0,
+            kind: NullKind::IsNotNull,
+        };
+        assert!(is_not_null.admits(&ColumnProbe::present(Some(IndexableCell::Int(1)))));
+        assert!(is_not_null.admits(&ColumnProbe::present(None)));
+        assert!(!is_not_null.admits(&ColumnProbe::null()));
+        assert!(
+            !is_not_null.admits(&ColumnProbe::missing()),
+            "an absent cell is the dependency index's to route"
+        );
+
+        assert!(IndexableAtom::Fallback.admits(&ColumnProbe::missing()));
+        assert!(IndexableAtom::Fallback.admits(&ColumnProbe::undecodable()));
     }
 }

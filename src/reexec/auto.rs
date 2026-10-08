@@ -958,4 +958,17 @@ where
     {
         self.inner.consumers(event)
     }
+
+    /// Match one consumer's row subscriptions without connector reads, folds, membership movement or activity stamps.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::DispatchError`] when the event cannot be matched.
+    pub fn matches_consumer(
+        &mut self,
+        event: &E,
+        consumer_id: I::ConsumerId,
+    ) -> Result<crate::ConsumerMatch<I, E::Checkpoint>, crate::DispatchError> {
+        self.inner.matches_consumer(event, consumer_id)
+    }
 }

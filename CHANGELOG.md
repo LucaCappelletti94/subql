@@ -6,6 +6,7 @@ All notable changes to subql are recorded here. The format follows [Keep a Chang
 
 ### Changed
 
+- Live dispatch resolves each matched predicate's binding record once before enumerating its consumers' subscription ids.
 - Equality-index value maps use `rpds::HashTrieMapSync`, so registration and removal copy only mutated paths while published snapshots retain their candidates.
 - Caller-bound row subscriptions intersect query interest with complete classified public read policies through `membership-term`. `Served::read_rule_folded` reports the fold, and unservable policies retain query-only matching. A folded rule with no permissive read policy admits no rows.
 - Identity and subject-set comparisons can share a compared column, with separate seeds. Empty subject sets admit nobody through their comparison.
@@ -40,6 +41,7 @@ All notable changes to subql are recorded here. The format follows [Keep a Chang
 
 ### Added
 
+- `SubscriptionEngine::matches_consumer` and `AutoResolvingEngine::matches_consumer` return a `ConsumerMatch` with one consumer's scalar row-transition flags, missing-cell reports, evaluation failures and checkpoint by evaluating only its bound predicates against current term admissions, without dispatch side effects.
 - `AutoResolvingEngine::set_rotation_threshold`, `rotation_threshold`, `set_durability_mode`, `durability_mode` and `snapshot_table` reach the wrapped engine's storage controls. A restart comes back at the default threshold, and without them an engine rebuilt through `adopt` could not have its registrations written again.
 - The sync `DieselConnector`, `PgDieselConnector` and `MysqlDieselConnector` implement cursors, so a routed row subscription, whose first answer is read through one, gets an answer through them. They answered `CursorError::Unsupported`. The PostgreSQL connector streams a `DECLARE`d cursor inside a read-only repeatable-read transaction on its one connection, and every read on it runs inside that transaction while a cursor is open. The SQLite and MySQL connectors read the whole answer in one snapshot when the cursor opens and page it from memory, since neither offers a cursor a single connection can hold across calls.
 - `Backend::int_as_float` reads an integer operand of arithmetic beside a float as the backend's float. The shipped backends widen through `f64`, and the default `None` keeps a backend on other carriers answering such arithmetic `NULL`.
