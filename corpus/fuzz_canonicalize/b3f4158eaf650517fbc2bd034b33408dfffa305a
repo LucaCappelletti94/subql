@@ -1,0 +1,1 @@
+NMIN((tamt IS NULL) IS NULL)
