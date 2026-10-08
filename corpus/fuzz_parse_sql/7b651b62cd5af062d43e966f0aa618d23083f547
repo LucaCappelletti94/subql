@@ -1,0 +1,1 @@
+SELECT T id FROM orders WHERE  ST[]09= ctt.stat~=E

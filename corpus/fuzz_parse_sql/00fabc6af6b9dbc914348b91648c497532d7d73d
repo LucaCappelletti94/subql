@@ -1,0 +1,1 @@
+SELECT count(*) AS c0 FROM orders WHERE GET_LOCK(CONCAT,(DACT@@@_@@NOT @ECT.LECT@@@@@@SELECT@@@@@@ECT@@T@@N''''@NOT @E@T@@T@@@_''''@ELEC@@@@T@@@_''''@NOT @ECT@@T@@N''''@T@@N''''@NOT/BAc3SE(), ECT@@T@@N''''@NOT/BAc3SE(), '_park_s%ed_', id), 60) = 1

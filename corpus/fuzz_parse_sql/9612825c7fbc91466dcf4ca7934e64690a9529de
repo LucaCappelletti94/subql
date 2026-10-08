@@ -1,0 +1,1 @@
+SELECT  FROM orders WHERE (amount + c4) * c3

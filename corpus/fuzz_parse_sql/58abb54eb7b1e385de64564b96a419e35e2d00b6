@@ -1,0 +1,1 @@
+SELECT *,cti, blob'%!!!id!a'

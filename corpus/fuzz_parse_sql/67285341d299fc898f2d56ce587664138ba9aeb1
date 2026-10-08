@@ -1,0 +1,1 @@
+SELECT* FROM status IN ('a', 'b', 'c') ORc0', '

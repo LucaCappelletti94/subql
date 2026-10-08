@@ -1,0 +1,1 @@
+SELECT othHeregion.stta.stastta.IN(|)ast

@@ -1,0 +1,1 @@
+SELECT count(*) AS c5 FROM orders WHERE GET_LOCK(C,SELECT!~*@@@N~I*R-@@NOT  @Emt?I?Tuu1.H.ci_ !~*@@@N~I*R !~*@@@N~I*R-@@NOT  @Emt?I?Tuu0.H.ci_ !~*@@@N~(DAT/BASE(),I*RO- '_park_s%ed_', id), 60) -11
