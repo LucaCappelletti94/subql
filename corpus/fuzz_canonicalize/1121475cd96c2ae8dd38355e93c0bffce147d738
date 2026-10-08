@@ -1,1 +1,0 @@
-status LIKE 'p%' AND NOT (c1 = 3)

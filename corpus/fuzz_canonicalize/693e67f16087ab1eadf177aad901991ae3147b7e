@@ -1,1 +1,0 @@
-LOCK(CONCAT(DATE(),E(), +'_parA@ASE()', id), 33) = p
