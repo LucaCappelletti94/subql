@@ -1,1 +1,0 @@
-SELECT id, d, t, dp, bin, dt, ts, dtaorders ORDER BY iffdt,  d, t, dp, bin, dt, ts, d, t, dp, bin, bin,  dp, bin, dt, ts, d, tdt,  d, t, dp, bin, dt, ts, d, t, dp, bin, bin, bn, dt. ts, d, t, dp, bin, big FROM orders Y id

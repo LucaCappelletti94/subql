@@ -1,1 +1,0 @@
-SELECT * FROM orders WHERE pqice > 8.0

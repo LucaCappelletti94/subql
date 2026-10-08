@@ -1,1 +1,0 @@
-SELECT c1entz.rlAnsn()::textcutting('app.user_id') AS v

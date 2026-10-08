@@ -1,1 +1,0 @@
-SELECT centz.rlAnsn()::textcuttng('app.user_id') AS v

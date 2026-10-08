@@ -1,1 +1,0 @@
-SELECT count(*) AS c0 FROM orders WHERE GET_LOCK( AND (DAT@@@NO/BASE(), '_park_seed_', id), 22) = 1
