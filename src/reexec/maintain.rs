@@ -63,8 +63,9 @@ struct ExtremeChange<B: Backend> {
 
 /// A row the query may hold.
 enum Membership<B: Backend> {
-    /// Whether the row matches is not known: a column the query depends on
-    /// is missing from it, or the engine refuses to evaluate the filter.
+    /// Whether the row matches is not known: a cell the filter or the
+    /// aggregate needs is missing from it, or the engine refuses to evaluate
+    /// the filter.
     Unknown,
     /// The row matches, with its aggregated value.
     Row(Value<B>),
@@ -177,8 +178,9 @@ impl<B: Backend, C: Checkpoint> MinMaxQuery<B, C> {
 
     /// The `row` view of `event` as the query may hold it, `None` when the
     /// filter excludes it. Only `Tri::True` matches, so NULL excludes the row
-    /// as SQL does. A refused evaluation is unknown, since the refusal cannot
-    /// say whether the row belongs.
+    /// as SQL does. The row is unknown when the filter is refused, when an
+    /// unknown verdict read a cell the event omits, or when the aggregated
+    /// cell is omitted, since a read answers each of them.
     fn membership<E, DB>(
         &self,
         event: &E,
@@ -191,7 +193,15 @@ impl<B: Backend, C: Checkpoint> MinMaxQuery<B, C> {
         DB: DatabaseLike,
     {
         match vm.eval(&self.where_program, event, row, db) {
-            Ok(Tri::True) => Some(Membership::Row(self.agg_value(event, row, db))),
+            Ok(Tri::True) => {
+                let value = self.agg_value(event, row, db);
+                Some(if value.is_missing() {
+                    Membership::Unknown
+                } else {
+                    Membership::Row(value)
+                })
+            }
+            Ok(Tri::Unknown) if vm.absent_column().is_some() => Some(Membership::Unknown),
             Ok(_) => None,
             Err(_) => Some(Membership::Unknown),
         }
@@ -208,20 +218,6 @@ impl<B: Backend, C: Checkpoint> MinMaxQuery<B, C> {
             .unwrap_or(Value::Missing)
     }
 
-    /// Whether any column the query depends on is absent (`Missing`) in
-    /// the `row` view of `event` (a sparse image we cannot reason about).
-    fn any_dependency_missing<E, DB>(&self, event: &E, row: RowKind, db: &DB) -> bool
-    where
-        E: CdcEvent<Backend = B>,
-        DB: DatabaseLike,
-    {
-        self.dependency_columns.iter().any(|&col| {
-            event
-                .value_at(db, row, col)
-                .map_or(true, |v| v.is_missing())
-        })
-    }
-
     fn change<E, DB>(&self, event: &E, vm: &mut Vm<B>, db: &DB) -> ExtremeChange<B>
     where
         E: CdcEvent<Backend = B>,
@@ -229,13 +225,7 @@ impl<B: Backend, C: Checkpoint> MinMaxQuery<B, C> {
     {
         let kind = event.kind();
         let removed = matches!(kind, EventKind::Delete | EventKind::Update)
-            .then(|| {
-                if self.any_dependency_missing(event, RowKind::Old, db) {
-                    Some(Membership::Unknown)
-                } else {
-                    self.membership(event, RowKind::Old, vm, db)
-                }
-            })
+            .then(|| self.membership(event, RowKind::Old, vm, db))
             .flatten();
         let added = matches!(kind, EventKind::Insert | EventKind::Update)
             .then(|| self.membership(event, RowKind::New, vm, db))
@@ -629,18 +619,14 @@ impl<B: Backend + SqlLiteralParse, C: Checkpoint> GroupedMinMaxQuery<B, C> {
         let Some(key) = self.plan.group_key_encoder.encode(&values) else {
             return Ok(ObservedRow::MissingGroup);
         };
-        if self.plan.where_dependency_columns.iter().any(|column| {
-            event
-                .value_at(db, row, *column)
-                .map_or(true, |value| value.is_missing())
-        }) {
-            return Ok(ObservedRow::Refresh { key, values });
-        }
         match vm.eval(&self.plan.where_program, event, row, db) {
             Ok(Tri::True) => {}
+            // An unknown verdict that read an omitted cell may still admit the
+            // row, and a refusal cannot say, so the group is read for both.
+            Ok(Tri::Unknown) if vm.absent_column().is_some() => {
+                return Ok(ObservedRow::Refresh { key, values });
+            }
             Ok(_) => return Ok(ObservedRow::Excluded),
-            // The refusal cannot say whether the row belongs, so the group
-            // is read.
             Err(_) => return Ok(ObservedRow::Refresh { key, values }),
         }
         let value = event.value_at(db, row, self.plan.agg_column)?;

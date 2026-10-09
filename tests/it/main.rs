@@ -140,6 +140,8 @@ mod follow_insert_sqlite;
 #[cfg(feature = "pg-sqlite-emu")]
 mod follow_pg_sqlite_emu;
 
+mod extreme_filter_cells;
+
 mod follow_row_dialects;
 
 mod grouped_aggregate_totals;
