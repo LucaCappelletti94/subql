@@ -140,9 +140,15 @@ impl RelationPool {
     }
 
     /// Enumerating SQL whose rows name the pooled relation by its new name.
+    ///
+    /// Only the `relation` column's literal moves, so a table, type or value spelled like the
+    /// relation stays as it was.
     #[must_use]
     pub fn sql(&self, sql: &str) -> String {
-        sql.replace(&format!("'{}'", self.from), &format!("'{}'", self.onto))
+        sql.replace(
+            &format!("'{}' AS relation", self.from),
+            &format!("'{}' AS relation", self.onto),
+        )
     }
 
     fn relation(&self, relation: &RelationName) -> RelationName {
