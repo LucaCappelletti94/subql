@@ -1,0 +1,1 @@
+SELECT sFRO g GROUP BY us,# / 

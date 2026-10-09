@@ -1,0 +1,1 @@
+SELECT * FROM notes WHERE (osting('axp.user_id', true)) IS NOT TRUE

@@ -1,0 +1,1 @@
+SELECT *t WINDOW w AS BT

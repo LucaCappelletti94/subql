@@ -1,0 +1,1 @@
+SELECT * FROM orders WHERE n BETWEEN o AND exi NOT LIKE stent_c OR d#<>d=dNsten10

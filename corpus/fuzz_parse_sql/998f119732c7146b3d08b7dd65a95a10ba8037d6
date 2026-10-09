@@ -1,0 +1,1 @@
+SELECT id FROM orders WHERE CK(CONCAT(Dd= $1 AND i), 29) = Cnon ORDER BY id

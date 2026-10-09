@@ -1,0 +1,1 @@
+SELECT * FROM orders WHERE amoW@T-nt IS NULL

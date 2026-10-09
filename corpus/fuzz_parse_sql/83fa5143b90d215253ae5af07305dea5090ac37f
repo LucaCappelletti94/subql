@@ -1,0 +1,1 @@
+SELECT * FROM orders WHERE non@@@c5@ @B'open'@@@@@no<=C@@@@c0@@NOT @B'open'@@@@@o<=C@@@@c5@@NOT @B'open'@@@@@@@@@@NOTWHER@ON@@amountn >81

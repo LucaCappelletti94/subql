@@ -1,0 +1,1 @@
+SELECT * FROM orders WHERE nisteneGtncm AND nc4<c1Gtncm AND nc21 @05

@@ -1,0 +1,1 @@
+SELECT COUNT(*) FILTER (WHERE amouVINT(*) FILTER (WHERE amount > HA ) FR) FR I@Lt
