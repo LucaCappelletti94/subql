@@ -1,5 +1,4 @@
 //! A `MIN` or `MAX` reads the database exactly when a cell the event omits could change its answer.
-#![allow(clippy::unwrap_used)]
 
 use sql_traits::structs::ParserDB;
 use sqlparser::dialect::PostgreSqlDialect;
@@ -16,8 +15,9 @@ type Event = TestEvent<Postgres, PgLsn>;
 type Engine = SubscriptionEngine<Event, DefaultIds, ParserDB>;
 
 fn engine() -> (Engine, TableId) {
-    let catalog = ParserDB::parse::<PostgreSqlDialect>(DDL).unwrap();
-    let orders = catalog_helpers::table_id::<Postgres, _>(&catalog, "orders").unwrap();
+    let catalog = ParserDB::parse::<PostgreSqlDialect>(DDL).expect("DDL parses");
+    let orders =
+        catalog_helpers::table_id::<Postgres, _>(&catalog, "orders").expect("orders resolves");
     (
         SubscriptionEngine::new(catalog, PostgreSqlDialect {}),
         orders,
@@ -32,7 +32,7 @@ fn scalar(filter: &str) -> (Engine, TableId) {
             7u64,
             format!("SELECT MIN(amount) FROM orders WHERE {filter}"),
         ))
-        .unwrap()
+        .expect("the extreme registers")
         .subscription_id;
     Install::install(
         &mut engine,
@@ -43,7 +43,7 @@ fn scalar(filter: &str) -> (Engine, TableId) {
             fence: None,
         },
     )
-    .unwrap();
+    .expect("the read installs");
     (engine, orders)
 }
 
@@ -55,7 +55,7 @@ fn grouped(filter: &str) -> (Engine, TableId) {
             7u64,
             format!("SELECT region, MIN(amount) FROM orders WHERE {filter} GROUP BY region"),
         ))
-        .unwrap()
+        .expect("the grouped extreme registers")
         .subscription_id;
     Install::install(
         &mut engine,
@@ -69,7 +69,7 @@ fn grouped(filter: &str) -> (Engine, TableId) {
             fence: None,
         },
     )
-    .unwrap();
+    .expect("the group seed installs");
     (engine, orders)
 }
 
@@ -90,7 +90,7 @@ fn paid() -> Value<Postgres> {
 fn reads(engine: &mut Engine, event: Event) -> usize {
     engine
         .dispatch(&event.with_pk_columns([0u16]).with_checkpoint(PgLsn(10)))
-        .unwrap()
+        .expect("dispatch runs")
         .triggers()
         .len()
 }
