@@ -14,7 +14,7 @@ use rls2fga_types::{RelationShapes, RowDecision};
 use rls2fga_types::{ColumnName, RelationName, TableId as ContractTableId};
 use sql_traits::prelude::DatabaseLike;
 
-use crate::visibility::records::is_evaluable;
+use crate::visibility::records::{grants_everyone, is_evaluable};
 use crate::visibility::store::{
     name_gap, Enumeration, Materialisation, Region, Replay, Uncovered, UncoveredReason,
 };
@@ -130,8 +130,10 @@ impl<DB: DatabaseLike> Shapes<DB> {
     ///
     /// A recipe is kept only when it is one of the actions consulted, one row
     /// decides it, every leaf shape is evaluable from a row image, and every
-    /// leaf reads the one table the recipe is then keyed by. Everything else is
-    /// simply absent, and an absent recipe delegates.
+    /// leaf reads the one table the recipe is then keyed by. A leaf granting
+    /// everyone is kept only when each of its shapes states an unconditional
+    /// wildcard. Everything else is simply absent, and an absent recipe
+    /// delegates.
     ///
     /// `can_update` is never one of them. It is
     /// `can_update_using and can_update_check`, an intersection across the row
@@ -485,9 +487,9 @@ fn is_request_gated(decision: &RowDecision) -> bool {
         RowDecision::Any(children) | RowDecision::All(children) => {
             children.iter().any(is_request_gated)
         }
-        // A leaf grants names outright, and a composition this does not
-        // recognise cannot be evaluated at all, so it is never indexed and
-        // cannot reach here.
+        // A leaf grants names and the everyone arm every user, neither through
+        // the request, and a composition this does not recognise cannot be
+        // evaluated at all, so it is never indexed and cannot reach here.
         _ => false,
     }
 }
@@ -1056,32 +1058,51 @@ fn usable_table<'a, B: crate::backend::Backend, DB: DatabaseLike>(
     decision: &'a RowDecision,
     db: &DB,
 ) -> Option<&'a ContractTableId> {
-    let mut table: Option<&ContractTableId> = None;
     match decision {
         RowDecision::Leaf { shapes, .. } | RowDecision::RequestGated { shapes, .. } => {
-            for shape in shapes {
-                if !is_evaluable::<B, DB>(shape, db) {
-                    return None;
-                }
-                let RecordDerivation::FromRow { table: name, .. } = &shape.derivation else {
-                    return None;
-                };
-                if *table.get_or_insert(name) != name {
-                    return None;
-                }
+            shapes_table::<B, DB>(shapes, db)
+        }
+        // A shape naming a subject would be read as granting every user.
+        RowDecision::Everyone { shapes, .. } => {
+            if shapes.iter().all(|shape| grants_everyone(shape).is_some()) {
+                shapes_table::<B, DB>(shapes, db)
+            } else {
+                None
             }
         }
         RowDecision::Any(children) | RowDecision::All(children) => {
+            let mut table: Option<&ContractTableId> = None;
             for child in children {
                 let name = usable_table::<B, DB>(child, db)?;
                 if *table.get_or_insert(name) != name {
                     return None;
                 }
             }
+            table
         }
         // `RowDecision` is `#[non_exhaustive]`: a composition this does not
         // understand is delegated rather than guessed at.
-        _ => return None,
+        _ => None,
+    }
+}
+
+/// The one table every shape reads from its own row, or [`None`] when one
+/// cannot be evaluated from a row image or two read different tables.
+fn shapes_table<'a, B: crate::backend::Backend, DB: DatabaseLike>(
+    shapes: &'a [RecordDescription],
+    db: &DB,
+) -> Option<&'a ContractTableId> {
+    let mut table: Option<&ContractTableId> = None;
+    for shape in shapes {
+        if !is_evaluable::<B, DB>(shape, db) {
+            return None;
+        }
+        let RecordDerivation::FromRow { table: name, .. } = &shape.derivation else {
+            return None;
+        };
+        if *table.get_or_insert(name) != name {
+            return None;
+        }
     }
     table
 }
@@ -1097,6 +1118,7 @@ mod tests {
 
     use core::ops::Not;
 
+    use rls2fga::classifier::function_registry::{SessionAttribute, SessionAttributeKind};
     use rls2fga::translator::{Outputs, TranslatorBuilder};
     use rls2fga_types::ConfidenceLevel;
     use rls2fga_types::TypeName;
@@ -1124,9 +1146,17 @@ mod tests {
     ];
 
     fn translated(sql: &str) -> (ParserDB, Outputs) {
+        translated_declaring(sql, [])
+    }
+
+    fn translated_declaring(
+        sql: &str,
+        attributes: impl IntoIterator<Item = SessionAttribute>,
+    ) -> (ParserDB, Outputs) {
         let db = ParserDB::parse::<PostgreSqlDialect>(sql).unwrap();
         let outputs = TranslatorBuilder::new()
             .with_min_confidence(ConfidenceLevel::B)
+            .with_session_attributes(attributes)
             .build()
             .translate(&db)
             .unwrap()
@@ -1152,7 +1182,14 @@ mod tests {
 
     /// Build the index the way a real caller does, from all three reports.
     fn shapes(sql: &str) -> Shapes<ParserDB> {
-        let (db, outputs) = translated(sql);
+        shapes_declaring(sql, [])
+    }
+
+    fn shapes_declaring(
+        sql: &str,
+        attributes: impl IntoIterator<Item = SessionAttribute>,
+    ) -> Shapes<ParserDB> {
+        let (db, outputs) = translated_declaring(sql, attributes);
         let translation = outputs.translation();
         let enumerations = enumerations(&outputs);
         let naming = alloc::borrow::Cow::from(translation.row_naming()).into_owned();
@@ -1284,6 +1321,79 @@ mod tests {
                 "no policy admits {statement:?} here"
             );
             assert!(shapes.answers_locally(docs, statement));
+        }
+    }
+
+    /// The four restrictive policies that hold a bot to its declared list, one
+    /// per command, each admitting the table's own `table:verb` entry or `*`.
+    fn bot_gates(table: &str) -> alloc::string::String {
+        let listed = |verb: &str| {
+            alloc::format!(
+                "'{table}:{verb}' = ANY(string_to_array(current_setting('app.bot_list', true), ',')) \
+                 OR '*' = ANY(string_to_array(current_setting('app.bot_list', true), ','))"
+            )
+        };
+        alloc::format!(
+            "CREATE POLICY {table}_cap_read ON {table} AS RESTRICTIVE FOR SELECT USING ({read});
+             CREATE POLICY {table}_cap_insert ON {table} AS RESTRICTIVE FOR INSERT WITH CHECK ({insert});
+             CREATE POLICY {table}_cap_update ON {table} AS RESTRICTIVE FOR UPDATE
+               USING ({update}) WITH CHECK ({update});
+             CREATE POLICY {table}_cap_delete ON {table} AS RESTRICTIVE FOR DELETE USING ({delete});",
+            read = listed("read"),
+            insert = listed("insert"),
+            update = listed("update"),
+            delete = listed("delete"),
+        )
+    }
+
+    /// `table` behind `grant` and the bot gates, translated with the caller and
+    /// the bot list declared as the request carries them.
+    fn gated(table: &str, grant: &str) -> Shapes<ParserDB> {
+        let sql = alloc::format!(
+            "CREATE TABLE {table} (id INTEGER PRIMARY KEY, owner TEXT);
+             ALTER TABLE {table} ENABLE ROW LEVEL SECURITY;
+             CREATE POLICY {table}_p ON {table} FOR ALL USING ({grant}) WITH CHECK ({grant});
+             {gates}",
+            gates = bot_gates(table),
+        );
+        shapes_declaring(
+            &sql,
+            [
+                SessionAttribute::setting("app.user_id", SessionAttributeKind::CallerId),
+                SessionAttribute::setting("app.bot_list", SessionAttributeKind::SetAttribute),
+            ],
+        )
+    }
+
+    /// The gate reads only the request, which every question carries, so it
+    /// leaves a row its own columns decide answered without a round trip.
+    #[test]
+    fn a_bot_gate_on_an_owned_table_is_answered_locally() {
+        let shapes = gated("notes", "owner = current_setting('app.user_id', true)");
+        let notes = table(&shapes, "notes");
+        for statement in EVERY_STATEMENT {
+            assert!(
+                shapes.answers_locally(notes, statement),
+                "the owner is in the row and the bot list is in the request, \
+                 so {statement:?} needs nobody else: {:?}",
+                shapes.answer(notes, statement)
+            );
+        }
+    }
+
+    /// A table every caller may use, capped by the gate alone, which the
+    /// request settles for every row.
+    #[test]
+    fn a_bot_gate_on_an_open_table_is_answered_locally() {
+        let shapes = gated("orders", "true");
+        let orders = table(&shapes, "orders");
+        for statement in EVERY_STATEMENT {
+            assert!(
+                shapes.answers_locally(orders, statement),
+                "the policy admits every caller and the bot list is in the \
+                 request, so {statement:?} needs nobody else: {:?}",
+                shapes.answer(orders, statement)
+            );
         }
     }
 

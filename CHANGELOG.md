@@ -42,6 +42,7 @@ All notable changes to subql are recorded here. The format follows [Keep a Chang
 
 ### Added
 
+- A relation `rls2fga` reports as `RowDecision::Everyone`, which a `USING (true)` policy yields, is answered from the changed row. It grants every watcher known by a name of the wildcard's type on a row whose shapes yield a record, and nobody on a row they do not. A table open to everyone and capped by a request-only gate, such as a bot list, is therefore answered without a round trip.
 - `testing::relation_pool::RelationPool` restates one membership source's relation as another's across shapes and enumerating SQL, so a test can give two producers one region, which no `rls2fga` translation produces.
 - `SubscriptionEngine::matches_consumer` and `AutoResolvingEngine::matches_consumer` return a `ConsumerMatch` with one consumer's scalar row-transition flags, missing-cell reports, evaluation failures and checkpoint by evaluating only its bound predicates against current term admissions, without dispatch side effects.
 - `AutoResolvingEngine::set_rotation_threshold`, `rotation_threshold`, `set_durability_mode`, `durability_mode` and `snapshot_table` reach the wrapped engine's storage controls. A restart comes back at the default threshold, and without them an engine rebuilt through `adopt` could not have its registrations written again.

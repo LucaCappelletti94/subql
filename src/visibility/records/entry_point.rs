@@ -3,7 +3,7 @@ use core::cell::Cell;
 
 use rls2fga_types::{
     records_from_row, ColumnKind, ColumnRead, Guard, Record, RecordDerivation, RecordDescription,
-    ValueSource,
+    TypeName, ValueSource,
 };
 use rls2fga_types::{AttributeLiteral, AttributeOperator, AttributePredicate};
 use sql_traits::prelude::DatabaseLike;
@@ -61,6 +61,23 @@ pub fn is_evaluable<B: crate::backend::Backend, DB: DatabaseLike>(
     db: &DB,
 ) -> bool {
     unsupported_description::<B, DB>(description, db).is_none()
+}
+
+/// The type whose every member `description` grants, when it states one
+/// unconditional wildcard record per row it admits.
+///
+/// [`None`] for a named subject, and for a wildcard under a condition, since
+/// the request completes that one and taking it as everyone is a wrong allow.
+#[must_use]
+pub fn grants_everyone(description: &RecordDescription) -> Option<&TypeName> {
+    match &description.derivation {
+        RecordDerivation::FromRow { template, .. }
+            if template.subject_key.is_wildcard() && template.context.is_none() =>
+        {
+            Some(&template.subject_type)
+        }
+        _ => None,
+    }
 }
 
 /// Why a row view cannot answer `description`, or [`None`].
