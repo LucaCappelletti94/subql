@@ -67,6 +67,7 @@ fn wiring(sql: &str) -> Wiring {
         .with_session_attributes([
             SessionAttribute::setting("app.user_id", SessionAttributeKind::CallerId),
             SessionAttribute::setting("app.subjects", SessionAttributeKind::SetAttribute),
+            SessionAttribute::setting("app.bot_list", SessionAttributeKind::SetAttribute),
         ])
         .build()
         .translate(&db)
@@ -1896,4 +1897,229 @@ CREATE POLICY notes_p ON notes FOR ALL USING (
         [Verdict::Deny, Verdict::Allow],
         "and the condition now carries carol rather than alice"
     );
+}
+
+/// The four restrictive policies that hold a bot to its declared list, one per
+/// command, each admitting the table's own `table:verb` entry or `*`.
+fn bot_gates(table: &str) -> String {
+    let listed = |verb: &str| {
+        format!(
+            "'{table}:{verb}' = ANY(string_to_array(current_setting('app.bot_list', true), ',')) \
+             OR '*' = ANY(string_to_array(current_setting('app.bot_list', true), ','))"
+        )
+    };
+    format!(
+        "CREATE POLICY {table}_cap_read ON {table} AS RESTRICTIVE FOR SELECT USING ({read});
+         CREATE POLICY {table}_cap_insert ON {table} AS RESTRICTIVE FOR INSERT WITH CHECK ({insert});
+         CREATE POLICY {table}_cap_update ON {table} AS RESTRICTIVE FOR UPDATE
+           USING ({update}) WITH CHECK ({update});
+         CREATE POLICY {table}_cap_delete ON {table} AS RESTRICTIVE FOR DELETE USING ({delete});",
+        read = listed("read"),
+        insert = listed("insert"),
+        update = listed("update"),
+        delete = listed("delete"),
+    )
+}
+
+/// A caller and the bot list its request carried, `None` for a request that
+/// carried none.
+#[derive(Clone, Debug)]
+struct Bot {
+    name: String,
+    list: Option<Vec<String>>,
+}
+
+impl Subject for Bot {
+    fn subjects(&self) -> impl Iterator<Item = Cow<'_, str>> {
+        core::iter::once(Cow::Borrowed(self.name.as_str()))
+    }
+
+    fn request_value(&self, parameter: &str, out: &mut RequestValues) -> bool {
+        let (Some(list), "app_bot_list") = (self.list.as_ref(), parameter) else {
+            return false;
+        };
+        for entry in list {
+            out.push(entry);
+        }
+        true
+    }
+}
+
+/// A backend that grants nothing and counts the watchers it was asked about,
+/// so a verdict it did not write is one the row and the request settled.
+#[derive(Default)]
+struct Unasked {
+    asked: std::sync::atomic::AtomicUsize,
+}
+
+impl Unasked {
+    /// How many watchers reached the backend since the last call.
+    fn take_asked(&self) -> usize {
+        self.asked.swap(0, std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+impl VisibilityPolicy for Unasked {
+    type Watcher = Bot;
+    type Error = core::convert::Infallible;
+    type Backend = Postgres;
+
+    fn may_see<R>(
+        &self,
+        _row: &R,
+        watchers: &[Bot],
+        _verdicts: &mut [Verdict],
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send
+    where
+        R: subql::visibility::RowView<Backend = Postgres> + Sync + ?Sized,
+    {
+        self.asked
+            .fetch_add(watchers.len(), std::sync::atomic::Ordering::Relaxed);
+        async { Ok(()) }
+    }
+
+    fn may_write<R>(
+        &self,
+        _write: RowWrite<'_, R>,
+        _watcher: &Bot,
+    ) -> impl Future<Output = Result<Verdict, Self::Error>> + Send
+    where
+        R: subql::visibility::RowView<Backend = Postgres> + Sync + ?Sized,
+    {
+        self.asked
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        async { Ok(Verdict::Deny) }
+    }
+}
+
+/// Two callers, the row's owner and somebody else, each with a list holding
+/// `table`'s own entries, only `*`, another table's entry, or nothing.
+fn bots(table: &str) -> Vec<Bot> {
+    let lists = [
+        vec![
+            format!("{table}:read"),
+            format!("{table}:insert"),
+            format!("{table}:delete"),
+        ],
+        vec!["*".to_owned()],
+        vec!["elsewhere:read".to_owned()],
+        Vec::new(),
+    ];
+    ["user:alice", "user:carol"]
+        .into_iter()
+        .flat_map(|caller| {
+            lists.iter().map(move |list| Bot {
+                name: caller.to_owned(),
+                list: Some(list.clone()),
+            })
+        })
+        .collect()
+}
+
+/// A bot gate answered from the row and the request agrees with the service,
+/// for a table its owner column decides and for one every caller may use.
+///
+/// Every combination is asked: the row admitting the caller or not, against a
+/// list holding the table's own entry, only `*`, another table's entry, or
+/// nothing. A request carrying no list is not the row's to settle, so it alone
+/// reaches the backend.
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "requires docker"]
+async fn a_bot_gate_is_answered_locally_as_the_service_answers() {
+    let schema = format!(
+        "CREATE TABLE public.notes(id INTEGER PRIMARY KEY, owner TEXT);
+         ALTER TABLE notes ENABLE ROW LEVEL SECURITY;
+         CREATE POLICY notes_p ON notes FOR ALL
+           USING (owner = current_setting('app.user_id', true))
+           WITH CHECK (owner = current_setting('app.user_id', true));
+         {notes}
+         CREATE TABLE public.orders(id INTEGER PRIMARY KEY, owner TEXT);
+         ALTER TABLE orders ENABLE ROW LEVEL SECURITY;
+         CREATE POLICY orders_p ON orders FOR ALL USING (true) WITH CHECK (true);
+         {orders}",
+        notes = bot_gates("notes"),
+        orders = bot_gates("orders"),
+    );
+
+    let mut client = openfga().await;
+    let wired = wiring(&schema);
+    let model = wired.model.clone();
+    let (store, model_id) =
+        create_store_with_model(&mut client, "subql-bot-gate-parity", &model).await;
+    let shapes = wired.shapes();
+    let service = OpenFgaPolicy::<_, _, Bot, Postgres>::new(
+        Arc::clone(&shapes),
+        client.clone(),
+        store.clone(),
+    )
+    .expect("the index carries the bot list parameter")
+    .authorization_model_id(model_id);
+    let local = RowPolicy::new(Arc::clone(&shapes), Unasked::default());
+
+    for name in ["notes", "orders"] {
+        let table = catalog_helpers::table_id::<Postgres, _>(shapes.catalog(), name)
+            .expect("the table is in the catalog");
+        let stored = TestEvent::<Postgres>::insert(
+            table,
+            vec![Value::Int(1), Value::String("alice".into())],
+        )
+        .with_pk_columns([0u16]);
+        let (diff, _requeries) = shapes.diff(&stored).expect("an insert states its facts");
+        service.apply(&diff).await.expect("write the row's facts");
+        let row = EventRow::current(&stored, shapes.catalog()).expect("post-image");
+
+        let watchers = bots(name);
+
+        let mut answered = Vec::new();
+        Verdict::reset(&mut answered, watchers.len());
+        local
+            .may_see(&row, &watchers, &mut answered)
+            .await
+            .expect("the stand-in never fails");
+        let mut expected = Vec::new();
+        Verdict::reset(&mut expected, watchers.len());
+        service
+            .may_see(&row, &watchers, &mut expected)
+            .await
+            .expect("the service answered");
+        assert_eq!(answered, expected, "reading {name} for {watchers:?}");
+
+        for watcher in &watchers {
+            for write in [
+                RowWrite::Insert { new: &row },
+                RowWrite::Delete { old: &row },
+            ] {
+                assert_eq!(
+                    local.may_write(write, watcher).await.expect("never fails"),
+                    service
+                        .may_write(write, watcher)
+                        .await
+                        .expect("the service answered"),
+                    "{:?} on {name} for {watcher:?}",
+                    write.op(),
+                );
+            }
+        }
+        assert_eq!(
+            local.inner().take_asked(),
+            0,
+            "the row and the request settle every question on {name}"
+        );
+
+        let unset = [Bot {
+            name: "user:alice".to_owned(),
+            list: None,
+        }];
+        let mut verdict = Vec::new();
+        Verdict::reset(&mut verdict, 1);
+        local
+            .may_see(&row, &unset, &mut verdict)
+            .await
+            .expect("the stand-in never fails");
+        assert_eq!(
+            local.inner().take_asked(),
+            1,
+            "a request carrying no list leaves the gate open, so {name} delegates it"
+        );
+    }
 }

@@ -58,8 +58,9 @@ mod tests {
     use rls2fga_types::ConfidenceLevel;
     use rls2fga_types::TypeName;
     use rls2fga_types::{
-        ColumnKind, ConditionName, ContextRendering, ObjectKey, RecordContext, RecordContextEntry,
-        RecordDerivation, RecordDescription, RecordTemplate, SubjectKey, ValueSource,
+        ColumnKind, ConditionName, ContextRendering, Guard, ObjectKey, RecordContext,
+        RecordContextEntry, RecordDerivation, RecordDescription, RecordTemplate, SubjectKey,
+        ValueSource,
     };
     use rls2fga_types::{RelationShapes, RowDecision};
     use sqlparser::dialect::PostgreSqlDialect;
@@ -2190,6 +2191,96 @@ CREATE POLICY notes_p ON notes USING (owner = current_setting('app.department', 
             let got = see(&policy, &event, &watchers(&["user:alice"])).unwrap();
 
             assert_eq!(got, [Verdict::Allow], "{label}: the backend answered");
+            assert_eq!(policy.inner().see_calls(), 1, "{label}");
+        }
+    }
+
+    /// An unconditional wildcard shape reading `docs`, admitting only a row
+    /// whose `owner_id` is set, as an open policy's tuple is admitted by its
+    /// guards.
+    fn everyone_shape() -> RecordDescription {
+        RecordDescription {
+            tables: vec![test_names::table("docs")],
+            derivation: RecordDerivation::FromRow {
+                table: test_names::table("docs"),
+                template: Box::new(RecordTemplate {
+                    object_type: TypeName::canonicalized("docs"),
+                    object_key: id_key(),
+                    relation: test_names::relation("owner"),
+                    subject_type: TypeName::canonicalized("user"),
+                    subject_key: SubjectKey::wildcard(),
+                    context: None,
+                }),
+                guards: vec![Guard::NotNull(test_names::column_read("owner_id"))],
+            },
+        }
+    }
+
+    fn everyone(shapes: Vec<RecordDescription>) -> RowDecision {
+        RowDecision::Everyone {
+            relation: test_names::relation("owner"),
+            shapes,
+        }
+    }
+
+    /// The wildcard admits every name of its type on a row the guards let
+    /// through, and nobody on one they stop, with no round trip either way.
+    #[test]
+    fn an_everyone_recipe_grants_every_user_on_a_row_it_admits() {
+        let (db, _) = translated(OWNERSHIP);
+        let docs = docs_id(&db);
+        let policy = RowPolicy::new(
+            shared(db, &can_select(everyone(vec![everyone_shape()]))),
+            Delegate::default(),
+        );
+        assert!(policy.answers_locally(docs, ActionStatement::Select));
+        let names = watchers(&["user:alice", "user:carol", "teams:7", "user:alice#member"]);
+
+        let admitted = insert(docs, docs_row(text("alice"), Value::Null));
+        assert_eq!(
+            see(&policy, &admitted, &names).unwrap(),
+            [Verdict::Allow, Verdict::Allow, Verdict::Deny, Verdict::Deny],
+            "every user, and neither another type nor a userset"
+        );
+
+        let stopped = insert(docs, docs_row(Value::Null, Value::Null));
+        assert_eq!(
+            see(&policy, &stopped, &names).unwrap(),
+            [Verdict::Deny; 4],
+            "the guard admits no record for this row, so nobody is granted"
+        );
+        assert_eq!(policy.inner().see_calls(), 0);
+    }
+
+    /// An everyone recipe whose shape names a subject, or grants the wildcard
+    /// under a condition the request completes, is not read as everyone.
+    #[test]
+    fn an_everyone_recipe_over_another_shape_is_delegated() {
+        let cases = [
+            ("a named subject", shape_on("docs", "owner_id")),
+            (
+                "a conditional wildcard",
+                gated_shape_on("docs", "row_owner", "owner_id"),
+            ),
+        ];
+        for (label, shape) in cases {
+            let (db, _) = translated(OWNERSHIP);
+            let docs = docs_id(&db);
+            let event = insert(docs, docs_row(text("alice"), Value::Null));
+            let policy = RowPolicy::new(
+                shared(db, &can_select(everyone(vec![shape]))),
+                Delegate::default(),
+            );
+
+            assert!(
+                !policy.answers_locally(docs, ActionStatement::Select),
+                "{label}"
+            );
+            assert_eq!(
+                see(&policy, &event, &watchers(&["user:carol"])).unwrap(),
+                [Verdict::Deny],
+                "{label}: the backend answered"
+            );
             assert_eq!(policy.inner().see_calls(), 1, "{label}");
         }
     }

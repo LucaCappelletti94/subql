@@ -5,7 +5,7 @@ use rls2fga_types::{ActionAnswer, ActionJudgement, ActionStatement, RowVersion};
 use rls2fga_types::{RequestComparison, RowDecision};
 use sql_traits::prelude::DatabaseLike;
 
-use crate::visibility::records::records_from_row_view;
+use crate::visibility::records::{grants_everyone, records_from_row_view};
 use crate::visibility::{RowView, RowWrite, Verdict, VisibilityPolicy};
 use crate::TableId;
 
@@ -99,6 +99,7 @@ where
             watcher,
             values,
         ),
+        RowDecision::Everyone { shapes, .. } => everyone::<R, DB, S>(shapes, row, db, watcher),
         RowDecision::Any(children) => {
             let mut unresolved = false;
             for child in children {
@@ -144,6 +145,43 @@ where
         // indexed either, so this is defence in depth rather than the only
         // guard.
         _ => Local::Unresolved,
+    }
+}
+
+/// Whether the row admits every user and `watcher` is one.
+///
+/// The records name the wildcard, which no watcher is called, so what the row
+/// settles is whether a shape yields a record at all. The shape's guards decide
+/// that, a key that cannot be named among them.
+///
+/// A watcher counts when it is known by a name of the granted type, which is
+/// what the wildcard admits on the service. A userset is not a member of that
+/// type and is not admitted there either.
+fn everyone<R, DB, S>(shapes: &[RecordDescription], row: &R, db: &DB, watcher: &S) -> Local
+where
+    R: RowView + ?Sized,
+    DB: DatabaseLike,
+    S: Subject + ?Sized,
+{
+    let mut granted = false;
+    for shape in shapes {
+        // Indexing refuses any other shape, so this is defence in depth.
+        let Some(subject_type) = grants_everyone(shape) else {
+            return Local::Unresolved;
+        };
+        let Ok(records) = records_from_row_view::<R, DB>(shape, row, db) else {
+            return Local::Unresolved;
+        };
+        granted |= !records.is_empty()
+            && watcher.subjects().any(|name| {
+                name.split_once(':')
+                    .is_some_and(|(kind, key)| kind == subject_type.as_str() && !key.contains('#'))
+            });
+    }
+    if granted {
+        Local::Allow
+    } else {
+        Local::Deny
     }
 }
 
