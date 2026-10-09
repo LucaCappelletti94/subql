@@ -28,13 +28,14 @@ use openfga_client::client::{
 };
 use openfga_client::tonic::transport::Channel;
 use rls2fga::classifier::function_registry::{SessionAttribute, SessionAttributeKind};
-use rls2fga::generator::well_known::member_relation;
+use rls2fga::generator::json_model::{AuthorizationModel, Userset};
 use rls2fga::translator::{Outputs, TranslatorBuilder};
 use rls2fga::types::ActionStatement;
 use rls2fga::types::ConfidenceLevel;
-use rls2fga::types::{Record, RecordContextValue};
+use rls2fga::types::{ConditionName, Record, RecordContextValue, RecordDescription, RelationName};
 use sqlparser::dialect::PostgreSqlDialect;
 use subql::backend::{Postgres, Value};
+use subql::testing::relation_pool::{relation_fed_by, RelationPool};
 use subql::testing::TestEvent;
 use subql::visibility::openfga::{OpenFgaPolicy, ReconcileError, Reconciled};
 use subql::visibility::policy::{RequestValues, RowPolicy, Subject};
@@ -51,7 +52,9 @@ use subql::{catalog_helpers, ParserDB, TableId};
 struct Wiring {
     db: ParserDB,
     outputs: Outputs,
-    model: rls2fga::generator::json_model::AuthorizationModel,
+    model: AuthorizationModel,
+    /// Two membership sources restated onto one relation, in the shapes and the model alike.
+    pool: Option<RelationPool>,
 }
 
 /// The request-scoped values are declared for every schema here, because
@@ -70,33 +73,131 @@ fn wiring(sql: &str) -> Wiring {
         .expect("the visibility schema translates")
         .outputs_accepting_gaps();
     let model = outputs.json_model();
-    Wiring { db, outputs, model }
+    Wiring {
+        db,
+        outputs,
+        model,
+        pool: None,
+    }
 }
 
 impl Wiring {
+    /// The relation rows of `table` feed, by the name the translation gave it.
+    fn fed_by(&self, table: &str) -> RelationName {
+        relation_fed_by(self.outputs.translation().relations(), table)
+    }
+
+    /// The relation `from`'s rows feed restated as the one `onto`'s rows feed, so the two
+    /// producers share a region on a real server, which rls2fga never emits on its own.
+    fn pooled(mut self, from: &str, onto: &str) -> Self {
+        let pool = RelationPool::between(self.outputs.translation().relations(), from, onto);
+        pool_model(&mut self.model, &pool);
+        self.pool = Some(pool);
+        self
+    }
+
     /// The index every reader shares.
     fn shapes(self) -> Arc<Shapes<ParserDB>> {
-        let Self { db, outputs, .. } = self;
+        let Self {
+            db, outputs, pool, ..
+        } = self;
         let translation = outputs.translation();
         // A skipped query carries no description, so `filter_map` drops exactly
         // the entries that enumerate nothing.
-        let enumerations: Vec<Enumeration<'_>> = outputs
+        let queries: Vec<(Cow<'_, RecordDescription>, Cow<'_, str>, Option<&str>)> = outputs
             .tuple_queries()
             .iter()
             .filter_map(|query| {
-                query.description.as_ref().map(|description| Enumeration {
-                    description,
-                    sql: &query.sql,
-                    condition: query.condition.as_deref(),
+                query.description.as_ref().map(|description| {
+                    let condition = query.condition.as_ref().map(ConditionName::as_str);
+                    pool.as_ref().map_or_else(
+                        || {
+                            (
+                                Cow::Borrowed(description),
+                                Cow::Borrowed(query.sql.as_str()),
+                                condition,
+                            )
+                        },
+                        |pool| {
+                            (
+                                Cow::Owned(pool.description(description)),
+                                Cow::Owned(pool.sql(&query.sql)),
+                                condition,
+                            )
+                        },
+                    )
                 })
             })
             .collect();
+        let enumerations: Vec<Enumeration<'_>> = queries
+            .iter()
+            .map(|(description, sql, condition)| Enumeration {
+                description,
+                sql,
+                condition: *condition,
+            })
+            .collect();
+        let relations = pool.as_ref().map_or_else(
+            || Cow::Borrowed(translation.relations()),
+            |pool| Cow::Owned(pool.relations(translation.relations())),
+        );
         Arc::new(
-            Shapes::new::<Postgres>(db, translation.relations(), &enumerations)
+            Shapes::new::<Postgres>(db, &relations, &enumerations)
                 .with_row_naming(translation.row_naming())
                 .with_action_relations(translation.action_relations())
                 .with_required_parameters(translation.notes()),
         )
+    }
+}
+
+/// `model` with `pool`'s restated relation dropped, its user types added to the one it pooled
+/// into, and every rewrite that read it reading that one instead.
+fn pool_model(model: &mut AuthorizationModel, pool: &RelationPool) {
+    for definition in &mut model.type_definitions {
+        if let Some(relations) = definition.relations.as_mut() {
+            relations.remove(pool.from());
+            for userset in relations.values_mut() {
+                restate(userset, pool);
+            }
+        }
+        if let Some(metadata) = definition.metadata.as_mut() {
+            if let Some(dropped) = metadata.relations.remove(pool.from()) {
+                metadata
+                    .relations
+                    .get_mut(pool.onto())
+                    .expect("both sources feed one type")
+                    .directly_related_user_types
+                    .extend(dropped.directly_related_user_types);
+            }
+        }
+    }
+}
+
+fn restate(userset: &mut Userset, pool: &RelationPool) {
+    let rename = |relation: &mut RelationName| {
+        if relation == pool.from() {
+            *relation = pool.onto().clone();
+        }
+    };
+    match userset {
+        Userset::This { .. } => {}
+        Userset::ComputedUserset { computed_userset } => rename(&mut computed_userset.relation),
+        Userset::TupleToUserset { tuple_to_userset } => {
+            rename(&mut tuple_to_userset.tupleset.relation);
+            rename(&mut tuple_to_userset.computed_userset.relation);
+        }
+        Userset::Union { union } => union
+            .child
+            .iter_mut()
+            .for_each(|child| restate(child, pool)),
+        Userset::Intersection { intersection } => intersection
+            .child
+            .iter_mut()
+            .for_each(|child| restate(child, pool)),
+        Userset::Difference { difference } => {
+            restate(&mut difference.base, pool);
+            restate(&mut difference.subtract, pool);
+        }
     }
 }
 
@@ -298,6 +399,7 @@ async fn write_subject_fanout_facts(
     client: &mut OpenFgaServiceClient<Channel>,
     store: &str,
     model_id: &str,
+    member: &RelationName,
 ) {
     client
         .write(WriteRequest {
@@ -312,13 +414,13 @@ async fn write_subject_fanout_facts(
                     },
                     TupleKey {
                         user: "user:alice-secondary".to_owned(),
-                        relation: "member".to_owned(),
+                        relation: member.to_string(),
                         object: "teams:1".to_owned(),
                         condition: None,
                     },
                     TupleKey {
                         user: "user:bob-secondary".to_owned(),
-                        relation: "member".to_owned(),
+                        relation: member.to_string(),
                         object: "teams:2".to_owned(),
                         condition: None,
                     },
@@ -375,6 +477,7 @@ async fn a_question_the_row_does_not_settle_is_answered_by_the_service() {
     let docs = catalog_helpers::table_id::<subql::backend::Postgres, _>(&wired.db, "docs")
         .expect("docs is in the catalog");
     let model = wired.model.clone();
+    let member = wired.fed_by("team_members");
 
     let store = client
         .create_store(CreateStoreRequest {
@@ -402,7 +505,7 @@ async fn a_question_the_row_does_not_settle_is_answered_by_the_service() {
                     },
                     TupleKey {
                         user: "user:alice".to_owned(),
-                        relation: "member".to_owned(),
+                        relation: member.to_string(),
                         object: "teams:1".to_owned(),
                         condition: None,
                     },
@@ -498,9 +601,10 @@ async fn a_second_subject_name_grants_only_its_watcher() {
     let docs = catalog_helpers::table_id::<Postgres, _>(&wired.db, "docs")
         .expect("docs is in the catalog");
     let model = wired.model.clone();
+    let member = wired.fed_by("team_members");
     let (store, model_id) =
         create_store_with_model(&mut client, "subql-subject-fanout", &model).await;
-    write_subject_fanout_facts(&mut client, &store, &model_id).await;
+    write_subject_fanout_facts(&mut client, &store, &model_id, &member).await;
     let shapes = wired.shapes();
     let policy = OpenFgaPolicy::<_, _, Aliases, Postgres>::new(Arc::clone(&shapes), client, store)
         .expect("the index carries the read relation")
@@ -534,6 +638,7 @@ async fn direct_writes_preserve_the_final_chunk() {
     let mut client = openfga().await;
     let wired = wiring(SCHEMA);
     let model = wired.model.clone();
+    let member = wired.fed_by("team_members");
     let (store, model_id) =
         create_store_with_model(&mut client, "subql-direct-write-limit", &model).await;
     let shapes = wired.shapes();
@@ -546,7 +651,7 @@ async fn direct_writes_preserve_the_final_chunk() {
         .collect();
     let records: Vec<Record> = expected
         .iter()
-        .map(|subject| plain_membership("teams:3", subject))
+        .map(|subject| plain_membership(&member, "teams:3", subject))
         .collect();
 
     policy
@@ -558,7 +663,7 @@ async fn direct_writes_preserve_the_final_chunk() {
         .await
         .expect("retry every chunk");
 
-    let mut stored = stored_members(&mut client, &store).await;
+    let mut stored = stored_members(&mut client, &store, &member).await;
     expected.sort();
     stored.sort();
     assert_eq!(stored, expected);
@@ -584,6 +689,7 @@ async fn a_batch_over_the_cap_is_split_and_stays_positional() {
     let docs = catalog_helpers::table_id::<subql::backend::Postgres, _>(&wired.db, "docs")
         .expect("docs is in the catalog");
     let model = wired.model.clone();
+    let member = wired.fed_by("team_members");
 
     let store = client
         .create_store(CreateStoreRequest {
@@ -605,7 +711,7 @@ async fn a_batch_over_the_cap_is_split_and_stays_positional() {
     }];
     tuples.extend(audience.iter().step_by(3).map(|name| TupleKey {
         user: name.clone(),
-        relation: "member".to_owned(),
+        relation: member.to_string(),
         object: "teams:1".to_owned(),
         condition: None,
     }));
@@ -794,6 +900,7 @@ CREATE POLICY p ON docs FOR SELECT USING (
         catalog_helpers::table_id::<subql::backend::Postgres, _>(&wired.db, "team_members")
             .expect("members is in the catalog");
     let model = wired.model.clone();
+    let member = wired.fed_by("team_members");
 
     let store = client
         .create_store(CreateStoreRequest {
@@ -833,14 +940,14 @@ CREATE POLICY p ON docs FOR SELECT USING (
         .condition()
         .expect("the membership is conditional");
     let expiry = "2027-01-01T00:00:00+00:00";
-    let stale = membership("user:alice", condition, expiry);
+    let stale = membership(&member, "user:alice", condition, expiry);
     backend
         .write_records(std::slice::from_ref(&stale))
         .await
         .expect("seed the membership");
 
     assert_eq!(
-        stored_members(&mut client, &store).await,
+        stored_members(&mut client, &store, &member).await,
         ["user:alice".to_owned()]
     );
     assert!(
@@ -861,7 +968,7 @@ CREATE POLICY p ON docs FOR SELECT USING (
     };
     assert_eq!(withdrawn_fact.subject, "user:alice");
     assert_eq!(withdrawn_fact.object, "teams:3");
-    assert_eq!(withdrawn_fact.relation, member_relation().to_string());
+    assert_eq!(withdrawn_fact.relation, member.to_string());
     assert_eq!(
         withdrawn_fact.context, stale.context,
         "the withdrawal carries the context the store held the tuple under"
@@ -876,7 +983,7 @@ CREATE POLICY p ON docs FOR SELECT USING (
         .expect("retry the applied deletion");
 
     assert_eq!(
-        stored_members(&mut client, &store).await,
+        stored_members(&mut client, &store, &member).await,
         Vec::<String>::new()
     );
 
@@ -884,6 +991,7 @@ CREATE POLICY p ON docs FOR SELECT USING (
         .reconcile_records(
             requery,
             &[membership(
+                &member,
                 "user:bob",
                 condition,
                 "2027-01-01T00:00:00+00:00",
@@ -894,6 +1002,7 @@ CREATE POLICY p ON docs FOR SELECT USING (
     assert_eq!(
         refreshed.added,
         vec![membership(
+            &member,
             "user:bob",
             condition,
             "2027-01-01T00:00:00+00:00",
@@ -903,13 +1012,14 @@ CREATE POLICY p ON docs FOR SELECT USING (
     assert!(refreshed.removed.is_empty(), "nothing left to withdraw");
 
     assert_eq!(
-        stored_members(&mut client, &store).await,
+        stored_members(&mut client, &store, &member).await,
         ["user:bob".to_owned()]
     );
 }
 
-/// Two membership sources feeding one relation, one settled by the row and one
-/// only a replay reaches. Their regions overlap, so they form one group.
+/// Two membership sources, one settled by the row and one only a replay
+/// reaches. Pooled onto one relation, their regions overlap and they form one
+/// group.
 const SHARED_REGION: &str = "
 CREATE TABLE public.teams(id INTEGER PRIMARY KEY);
 CREATE TABLE public.team_members(team_id INTEGER REFERENCES teams(id), user_id TEXT);
@@ -965,10 +1075,10 @@ impl Replayer for CannedReplay {
     }
 }
 
-fn plain_membership(object: &str, subject: &str) -> Record {
+fn plain_membership(member: &RelationName, object: &str, subject: &str) -> Record {
     Record {
         object: object.to_owned(),
-        relation: member_relation(),
+        relation: member.clone(),
         subject: subject.to_owned(),
         context: None,
     }
@@ -987,8 +1097,9 @@ fn plain_membership(object: &str, subject: &str) -> Record {
 async fn a_group_keeps_every_members_facts_in_one_reconcile() {
     let mut client = openfga().await;
 
-    let wired = wiring(SHARED_REGION);
+    let wired = wiring(SHARED_REGION).pooled("team_guests", "team_members");
     let model = wired.model.clone();
+    let member = wired.fed_by("team_members");
     let store = client
         .create_store(CreateStoreRequest {
             name: "subql-group-union".to_owned(),
@@ -1012,8 +1123,8 @@ async fn a_group_keeps_every_members_facts_in_one_reconcile() {
     // and alice is granted by the settled producer but not yet stored.
     backend
         .write_records(&[
-            plain_membership("teams:3", "user:carol"),
-            plain_membership("teams:3", "user:dave"),
+            plain_membership(&member, "teams:3", "user:carol"),
+            plain_membership(&member, "teams:3", "user:dave"),
         ])
         .await
         .expect("seed the store");
@@ -1043,11 +1154,11 @@ async fn a_group_keeps_every_members_facts_in_one_reconcile() {
         rows: vec![
             (
                 "team_members",
-                vec![plain_membership("teams:3", "user:alice")],
+                vec![plain_membership(&member, "teams:3", "user:alice")],
             ),
             (
                 "team_guests",
-                vec![plain_membership("teams:3", "user:carol")],
+                vec![plain_membership(&member, "teams:3", "user:carol")],
             ),
         ],
     };
@@ -1068,7 +1179,7 @@ async fn a_group_keeps_every_members_facts_in_one_reconcile() {
 
     assert_eq!(
         report.added,
-        [plain_membership("teams:3", "user:alice")],
+        [plain_membership(&member, "teams:3", "user:alice")],
         "the settled producer's fact was missing and is written"
     );
     let [withdrawn] = report.removed.as_slice() else {
@@ -1076,7 +1187,7 @@ async fn a_group_keeps_every_members_facts_in_one_reconcile() {
     };
     assert_eq!(withdrawn.subject, "user:dave");
 
-    let mut stored = stored_members(&mut client, &store).await;
+    let mut stored = stored_members(&mut client, &store, &member).await;
     stored.sort();
     assert_eq!(
         stored,
@@ -1103,8 +1214,9 @@ async fn a_group_keeps_every_members_facts_in_one_reconcile() {
 async fn two_members_contradicting_one_fact_are_refused_before_any_write() {
     let mut client = openfga().await;
 
-    let wired = wiring(SHARED_REGION);
+    let wired = wiring(SHARED_REGION).pooled("team_guests", "team_members");
     let model = wired.model.clone();
+    let member = wired.fed_by("team_members");
     let store = client
         .create_store(CreateStoreRequest {
             name: "subql-group-contradiction".to_owned(),
@@ -1125,7 +1237,7 @@ async fn two_members_contradicting_one_fact_are_refused_before_any_write() {
     .authorization_model_id(model_id);
 
     backend
-        .write_records(&[plain_membership("teams:3", "user:carol")])
+        .write_records(&[plain_membership(&member, "teams:3", "user:carol")])
         .await
         .expect("seed the store");
 
@@ -1133,19 +1245,19 @@ async fn two_members_contradicting_one_fact_are_refused_before_any_write() {
     // under a condition, and the store can hold one of the two.
     let conditional = Record {
         context: Some(RecordContextValue {
-            condition: "when_team_guests_expires_at".to_owned(),
+            condition: ConditionName::canonicalized("when_team_guests_expires_at"),
             values: BTreeMap::from([(
                 "expires_at".to_owned(),
                 "2027-01-01T00:00:00+00:00".to_owned(),
             )]),
         }),
-        ..plain_membership("teams:3", "user:carol")
+        ..plain_membership(&member, "teams:3", "user:carol")
     };
     let replay = CannedReplay {
         rows: vec![
             (
                 "team_members",
-                vec![plain_membership("teams:3", "user:carol")],
+                vec![plain_membership(&member, "teams:3", "user:carol")],
             ),
             ("team_guests", vec![conditional]),
         ],
@@ -1168,7 +1280,7 @@ async fn two_members_contradicting_one_fact_are_refused_before_any_write() {
     );
 
     assert_eq!(
-        stored_members(&mut client, &store).await,
+        stored_members(&mut client, &store, &member).await,
         ["user:carol".to_owned()],
         "and the store is untouched, so nothing was written before the refusal"
     );
@@ -1191,6 +1303,7 @@ async fn a_reconcile_removes_a_fact_for_an_object_the_event_never_named() {
         catalog_helpers::table_id::<subql::backend::Postgres, _>(&wired.db, "paper_shares")
             .expect("shares are in the catalog");
     let model = wired.model.clone();
+    let shared = wired.fed_by("paper_shares");
     let store = client
         .create_store(CreateStoreRequest {
             name: "subql-group-unnamed".to_owned(),
@@ -1212,8 +1325,8 @@ async fn a_reconcile_removes_a_fact_for_an_object_the_event_never_named() {
 
     backend
         .write_records(&[
-            plain_membership("papers:1", "user:alice"),
-            plain_membership("papers:2", "user:bob"),
+            plain_membership(&shared, "papers:1", "user:alice"),
+            plain_membership(&shared, "papers:2", "user:bob"),
         ])
         .await
         .expect("seed the store");
@@ -1237,7 +1350,7 @@ async fn a_reconcile_removes_a_fact_for_an_object_the_event_never_named() {
     let replay = CannedReplay {
         rows: vec![(
             "paper_shares",
-            vec![plain_membership("papers:1", "user:alice")],
+            vec![plain_membership(&shared, "papers:1", "user:alice")],
         )],
     };
 
@@ -1286,6 +1399,8 @@ struct Restored {
     kept: Vec<Record>,
     /// Facts only the store still holds: mallory's membership and doc 2's link.
     stale: Vec<Record>,
+    /// The relation `team_members` rows feed.
+    member: RelationName,
 }
 
 /// [`TWO_ALONE`]'s facts over a store whose model is written from `model_sql`.
@@ -1297,6 +1412,7 @@ async fn restored(name: &str, model_sql: &str) -> Restored {
     let wired = wiring(TWO_ALONE);
     let members = catalog_helpers::table_id::<Postgres, _>(&wired.db, "team_members")
         .expect("members is in the catalog");
+    let member = wired.fed_by("team_members");
     let shapes = wired.shapes();
     let backend = OpenFgaPolicy::<_, _, String, Postgres>::new(
         Arc::clone(&shapes),
@@ -1338,11 +1454,11 @@ async fn restored(name: &str, model_sql: &str) -> Restored {
     };
     let expiry = "2027-01-01T00:00:00+00:00";
     let kept = vec![
-        membership("user:alice", condition, expiry),
+        membership(&member, "user:alice", condition, expiry),
         doc_on_team_3("docs:1"),
     ];
     let stale = vec![
-        membership("user:mallory", condition, expiry),
+        membership(&member, "user:mallory", condition, expiry),
         doc_on_team_3("docs:2"),
     ];
     backend
@@ -1356,6 +1472,7 @@ async fn restored(name: &str, model_sql: &str) -> Restored {
         backend,
         kept,
         stale,
+        member,
     }
 }
 
@@ -1398,7 +1515,7 @@ async fn a_restore_sweeps_keyed_and_row_settled_facts_alike() {
 
     let link = restored.kept[1].relation.to_string();
     assert_eq!(
-        stored_members(&mut restored.client, &restored.store).await,
+        stored_members(&mut restored.client, &restored.store, &restored.member).await,
         ["user:alice".to_owned()]
     );
     assert_eq!(
@@ -1469,7 +1586,7 @@ CREATE POLICY f ON folders FOR SELECT USING (owner_id = current_user);
         .expect("sweep the store");
 
     assert_eq!(
-        stored_members(&mut restored.client, &restored.store).await,
+        stored_members(&mut restored.client, &restored.store, &restored.member).await,
         ["user:alice".to_owned()],
         "the sweep ran"
     );
@@ -1486,7 +1603,8 @@ CREATE POLICY f ON folders FOR SELECT USING (owner_id = current_user);
 #[ignore = "requires docker"]
 async fn one_sweep_heals_a_group_region_and_the_loads_regions() {
     let mut client = openfga().await;
-    let wired = wiring(SHARED_REGION);
+    let wired = wiring(SHARED_REGION).pooled("team_guests", "team_members");
+    let member = wired.fed_by("team_members");
     let (store, model_id) =
         create_store_with_model(&mut client, "subql-sweep-group", &wired.model).await;
     let shapes = wired.shapes();
@@ -1514,8 +1632,8 @@ async fn one_sweep_heals_a_group_region_and_the_loads_regions() {
 
     backend
         .write_records(&[
-            plain_membership("teams:3", "user:carol"),
-            plain_membership("teams:3", "user:dave"),
+            plain_membership(&member, "teams:3", "user:carol"),
+            plain_membership(&member, "teams:3", "user:dave"),
             doc_on_team("docs:4", "teams:1"),
         ])
         .await
@@ -1524,11 +1642,11 @@ async fn one_sweep_heals_a_group_region_and_the_loads_regions() {
         rows: vec![
             (
                 "team_members",
-                vec![plain_membership("teams:3", "user:alice")],
+                vec![plain_membership(&member, "teams:3", "user:alice")],
             ),
             (
                 "team_guests",
-                vec![plain_membership("teams:3", "user:carol")],
+                vec![plain_membership(&member, "teams:3", "user:carol")],
             ),
         ],
     };
@@ -1549,7 +1667,10 @@ async fn one_sweep_heals_a_group_region_and_the_loads_regions() {
             .collect::<Vec<_>>(),
         ["docs:4"]
     );
-    assert_eq!(group.added, [plain_membership("teams:3", "user:alice")]);
+    assert_eq!(
+        group.added,
+        [plain_membership(&member, "teams:3", "user:alice")]
+    );
     assert_eq!(
         group
             .removed
@@ -1559,25 +1680,34 @@ async fn one_sweep_heals_a_group_region_and_the_loads_regions() {
         ["user:dave"]
     );
 
-    let mut members = stored_members(&mut client, &store).await;
+    let mut members = stored_members(&mut client, &store, &member).await;
     members.sort();
     assert_eq!(members, ["user:alice".to_owned(), "user:carol".to_owned()]);
 }
 
-fn membership(subject: &str, condition: &str, expires_at: &str) -> Record {
+fn membership(
+    member: &RelationName,
+    subject: &str,
+    condition: &ConditionName,
+    expires_at: &str,
+) -> Record {
     Record {
         object: "teams:3".to_owned(),
-        relation: member_relation(),
+        relation: member.clone(),
         subject: subject.to_owned(),
         context: Some(RecordContextValue {
-            condition: condition.to_owned(),
+            condition: condition.clone(),
             values: BTreeMap::from([("expires_at".to_owned(), expires_at.to_owned())]),
         }),
     }
 }
 
-async fn stored_members(client: &mut OpenFgaServiceClient<Channel>, store: &str) -> Vec<String> {
-    stored_relation(client, store, &member_relation().to_string(), "teams:3").await
+async fn stored_members(
+    client: &mut OpenFgaServiceClient<Channel>,
+    store: &str,
+    member: &RelationName,
+) -> Vec<String> {
+    stored_relation(client, store, &member.to_string(), "teams:3").await
 }
 
 async fn stored_relation_keys(

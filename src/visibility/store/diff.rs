@@ -217,14 +217,12 @@ mod tests {
     use alloc::vec;
     use rls2fga_types::{BoundQuery, Record, RecordDerivation, RecordDescription, ReplayScope};
 
-    use rls2fga::generator::well_known::{
-        can_delete_relation, can_select_relation, member_relation,
-    };
+    use rls2fga::generator::well_known::{can_delete_relation, can_select_relation};
     use rls2fga::translator::TranslatorBuilder;
     use rls2fga_types::ConfidenceLevel;
     use rls2fga_types::RecordError;
-    use rls2fga_types::RelationName;
     use rls2fga_types::RelationShapes;
+    use rls2fga_types::{ConditionName, RelationName};
     use sqlparser::dialect::PostgreSqlDialect;
 
     use crate::backend::{CdcEvent, Postgres, RowKind, Value};
@@ -232,7 +230,7 @@ mod tests {
     use crate::visibility::records::RowRecordError;
     use crate::visibility::shapes::Shapes;
     use crate::visibility::store::{Enumeration, Requery, StoreDiffError, UncoveredReason};
-    use crate::visibility::test_names;
+    use crate::visibility::{test_names, test_pooling};
     use crate::{
         catalog_helpers, ColumnId, EventKind, NoCheckpoint, ParserDB, TableId, ValueError,
     };
@@ -288,9 +286,10 @@ CREATE POLICY p ON docs FOR SELECT USING (
             AND team_members.expires_at > now()));
 ";
 
-    /// Two membership sources feeding `teams#member`: one the row settles and
-    /// one only a replay reaches. The replay's slice is also stated by the
-    /// settled shape, so reconciling it would delete that shape's facts.
+    /// Two membership sources on `teams`: one the row settles and one only a
+    /// replay reaches. Pooled onto one relation, the replay's slice is also
+    /// stated by the settled shape, so reconciling it would delete that
+    /// shape's facts.
     const SHARED_SLICE: &str = "
 CREATE TABLE public.teams(id INTEGER PRIMARY KEY);
 CREATE TABLE public.team_members(team_id INTEGER REFERENCES teams(id), user_id TEXT);
@@ -321,8 +320,8 @@ CREATE POLICY p ON papers FOR SELECT USING (
 ";
 
     /// Two membership sources a row settles on its own, on different tables.
-    /// Differencing one of them cannot see the other, so a fact both state is
-    /// deleted when either row goes.
+    /// Pooled onto one relation, differencing one of them cannot see the
+    /// other, so a fact both state is deleted when either row goes.
     const TWO_SETTLED: &str = "
 CREATE TABLE public.teams(id INTEGER PRIMARY KEY);
 CREATE TABLE public.team_members(team_id INTEGER REFERENCES teams(id), user_id TEXT);
@@ -368,7 +367,7 @@ CREATE TABLE readings(tenant_id INTEGER, reading_id INTEGER, starts_at TIMESTAMP
                 query.description.as_ref().map(|description| Enumeration {
                     description,
                     sql: &query.sql,
-                    condition: query.condition.as_deref(),
+                    condition: query.condition.as_ref().map(ConditionName::as_str),
                 })
             })
             .collect();
@@ -605,11 +604,19 @@ CREATE TABLE readings(tenant_id INTEGER, reading_id INTEGER, starts_at TIMESTAMP
 
         assert_eq!(
             diff.added,
-            [record("teams:3", member_relation(), "user:bob")]
+            [record(
+                "teams:3",
+                test_names::membership_relation(MEMBERSHIP, "team_members"),
+                "user:bob"
+            )]
         );
         assert_eq!(
             diff.removed,
-            [record("teams:3", member_relation(), "user:alice")]
+            [record(
+                "teams:3",
+                test_names::membership_relation(MEMBERSHIP, "team_members"),
+                "user:alice"
+            )]
         );
     }
 
@@ -728,7 +735,11 @@ CREATE TABLE readings(tenant_id INTEGER, reading_id INTEGER, starts_at TIMESTAMP
         assert!(diff.added.is_empty(), "{:?}", diff.added);
         assert_eq!(
             diff.removed,
-            [record("teams:3", member_relation(), "user:alice")],
+            [record(
+                "teams:3",
+                test_names::membership_relation(RESIDUAL, "team_members"),
+                "user:alice"
+            )],
             "alice's membership is gone, so the fact it carried has to be removed"
         );
         assert!(
@@ -780,7 +791,7 @@ CREATE TABLE readings(tenant_id INTEGER, reading_id INTEGER, starts_at TIMESTAMP
             *keyed.query.scope(),
             ReplayScope::Object {
                 object_type: test_names::object_type("teams"),
-                relations: alloc::vec![member_relation()],
+                relations: alloc::vec![test_names::membership_relation(EXPIRING, "team_members")],
             },
             "the replay determines the one team's member facts"
         );
@@ -1350,7 +1361,10 @@ CREATE TABLE readings(tenant_id INTEGER, reading_id INTEGER, starts_at TIMESTAMP
             panic!("one relation on one type: {group:?}");
         };
         assert_eq!(part.object_type(), "papers");
-        assert_eq!(part.relation(), &member_relation());
+        assert_eq!(
+            part.relation(),
+            &test_names::membership_relation(WHOLE_SHAPE, "paper_shares")
+        );
         assert_eq!(
             part.subject_type(),
             None,
@@ -1372,7 +1386,10 @@ CREATE TABLE readings(tenant_id INTEGER, reading_id INTEGER, starts_at TIMESTAMP
     /// `tests/it/visibility_openfga_e2e.rs`.
     #[test]
     fn a_group_of_two_producers_is_formed_over_the_shared_region() {
-        let store = shapes(SHARED_SLICE);
+        let store =
+            test_pooling::shapes(SHARED_SLICE, "team_guests", "team_members", |shapes, _| {
+                shapes
+            });
         assert!(
             store.uncovered().is_empty(),
             "both producers enumerate, so the region is reconcilable: {:?}",
@@ -1420,7 +1437,9 @@ CREATE TABLE readings(tenant_id INTEGER, reading_id INTEGER, starts_at TIMESTAMP
     /// fact the other table's producer still states.
     #[test]
     fn two_settled_producers_on_one_region_are_grouped() {
-        let store = shapes(TWO_SETTLED);
+        let store = test_pooling::shapes(TWO_SETTLED, "team_leads", "team_members", |shapes, _| {
+            shapes
+        });
         assert!(store.uncovered().is_empty(), "{:?}", store.uncovered());
 
         let leads = table(&store, "team_leads");
@@ -1661,7 +1680,7 @@ CREATE TABLE readings(tenant_id INTEGER, reading_id INTEGER, starts_at TIMESTAMP
                 query.description.as_ref().map(|description| Enumeration {
                     description,
                     sql: &query.sql,
-                    condition: query.condition.as_deref(),
+                    condition: query.condition.as_ref().map(ConditionName::as_str),
                 })
             })
             .collect();

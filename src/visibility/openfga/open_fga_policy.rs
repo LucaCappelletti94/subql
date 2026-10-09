@@ -16,7 +16,7 @@ use openfga_client::tonic::body::Body;
 use openfga_client::tonic::client::GrpcService;
 use openfga_client::tonic::codegen::{Bytes, StdError};
 use rls2fga_types::RelationName;
-use rls2fga_types::{Record, RecordContextValue, ReplayScope};
+use rls2fga_types::{ConditionName, Record, RecordContextValue, ReplayScope};
 use sql_traits::prelude::DatabaseLike;
 
 use crate::backend::Backend;
@@ -1413,7 +1413,7 @@ fn tuple_of(record: &Record) -> TupleKey {
 /// The condition a record's context asks the server to complete.
 fn condition_of(context: &RecordContextValue) -> RelationshipCondition {
     RelationshipCondition {
-        name: context.condition.clone(),
+        name: context.condition.to_string(),
         context: Some(Struct {
             fields: context
                 .values
@@ -1434,10 +1434,11 @@ fn condition_of(context: &RecordContextValue) -> RelationshipCondition {
 /// What a stored condition states, read back into the currency a record's
 /// context is written in, so a withdrawal and a grant compare directly.
 ///
-/// `None` where a value is not a string, which no context this policy writes
-/// can be. A record renders its values as the tuple SQL rendered them and the
-/// spelling is the identity there, so a number read as `1` where the database
-/// rendered `1.00` would name a bearer nothing granted.
+/// `None` where a value is not a string or the name is not a valid condition
+/// name, which no context this policy writes can be. A record renders its
+/// values as the tuple SQL rendered them and the spelling is the identity
+/// there, so a number read as `1` where the database rendered `1.00` would
+/// name a bearer nothing granted.
 fn context_of(condition: &RelationshipCondition) -> Option<RecordContextValue> {
     let mut values = BTreeMap::new();
     for (key, value) in condition.context.iter().flat_map(|struct_| &struct_.fields) {
@@ -1447,7 +1448,7 @@ fn context_of(condition: &RelationshipCondition) -> Option<RecordContextValue> {
         values.insert(key.clone(), text.clone());
     }
     Some(RecordContextValue {
-        condition: condition.name.clone(),
+        condition: ConditionName::try_from(condition.name.clone()).ok()?,
         values,
     })
 }
@@ -1533,16 +1534,17 @@ mod tests {
     use super::{
         batch_request, condition_of, consistency_for, context_for, difference, fits_one_call,
         triple_of, tuple_of, usable_index, ActionStatement, Asked, BatchCheckItem,
-        BatchCheckRequest, CheckRequestTupleKey, ConsistencyPreference, Kind, OpenFgaError,
-        OpenFgaPolicy, OpenFgaServiceClient, ProstValue, Question, ReconcileError, Record,
-        RecordContextValue, RelationName, RelationshipCondition, RequestValues, RequiredParameter,
-        RowWrite, Struct, Subject, TupleKeyWithoutCondition, WriteRequest, MAX_TUPLES_PER_WRITE,
+        BatchCheckRequest, CheckRequestTupleKey, ConditionName, ConsistencyPreference, Kind,
+        OpenFgaError, OpenFgaPolicy, OpenFgaServiceClient, ProstValue, Question, ReconcileError,
+        Record, RecordContextValue, RelationName, RelationshipCondition, RequestValues,
+        RequiredParameter, RowWrite, Struct, Subject, TupleKeyWithoutCondition, WriteRequest,
+        MAX_TUPLES_PER_WRITE,
     };
     use crate::backend::{Postgres, Value};
     use crate::testing::{block_on, TestEvent};
     use crate::visibility::shapes::Shapes;
     use crate::visibility::store::{Enumeration, Replay, Replayer, Requeries, Requery, StoreDiff};
-    use crate::visibility::{test_names, EventRow, Verdict, VisibilityPolicy};
+    use crate::visibility::{test_names, test_pooling, EventRow, Verdict, VisibilityPolicy};
     use crate::{catalog_helpers, ParserDB};
     use alloc::string::String;
     use alloc::sync::Arc;
@@ -1632,7 +1634,7 @@ mod tests {
             relation: test_names::relation("owner"),
             subject: "user:*".to_string(),
             context: Some(RecordContextValue {
-                condition: "when_row_owner".to_string(),
+                condition: ConditionName::canonicalized("when_row_owner"),
                 values: BTreeMap::from([("row_owner".to_string(), "alice".to_string())]),
             }),
         };
@@ -1987,7 +1989,7 @@ CREATE POLICY notes_p ON notes USING (
                 query.description.as_ref().map(|description| Enumeration {
                     description,
                     sql: &query.sql,
-                    condition: query.condition.as_deref(),
+                    condition: query.condition.as_ref().map(ConditionName::as_str),
                 })
             })
             .collect()
@@ -2845,14 +2847,14 @@ CREATE POLICY p ON docs FOR SELECT USING (
             relation: test_names::relation("owner"),
             subject: "user:alice".to_string(),
             context: condition.map(|condition| RecordContextValue {
-                condition: condition.to_string(),
+                condition: ConditionName::canonicalized(condition),
                 values: BTreeMap::new(),
             }),
         }
     }
 
-    /// A shared membership region beside a row-settled owner, so a sweep has a
-    /// group and a region the load owns.
+    /// Two membership sources beside a row-settled owner. Pooled onto one
+    /// relation, a sweep has a group and a region the load owns.
     const SWEEP: &str = "
 CREATE TABLE teams(id INTEGER PRIMARY KEY);
 CREATE TABLE team_members(team_id INTEGER REFERENCES teams(id), user_id TEXT);
@@ -2869,6 +2871,21 @@ CREATE POLICY t ON teams FOR SELECT USING (
             AND team_guests.expires_at > now()));
 CREATE POLICY d ON docs FOR SELECT USING (owner_id = current_user);
 ";
+
+    /// `SWEEP` with its two membership sources stating one relation, so the region is shared.
+    fn sweep_shapes() -> Arc<Shapes<ParserDB>> {
+        Arc::new(test_pooling::shapes(
+            SWEEP,
+            "team_guests",
+            "team_members",
+            |shapes, translation| {
+                let naming = Cow::from(translation.row_naming()).into_owned();
+                shapes
+                    .with_row_naming(&naming)
+                    .with_action_relations(translation.action_relations())
+            },
+        ))
+    }
 
     /// Canned replays, each recognised by the table its SQL reads.
     struct Canned(Vec<(&'static str, Vec<Record>)>);
@@ -2928,7 +2945,7 @@ CREATE POLICY d ON docs FOR SELECT USING (owner_id = current_user);
     /// A store already equal to the load costs the one read and sends nothing.
     #[test]
     fn an_equal_store_costs_the_read_and_no_write() {
-        let shapes = shapes_over(SWEEP);
+        let shapes = sweep_shapes();
         let (owner, member, stray) = sweep_facts(&shapes);
         let transport = Scripted::new([ScriptedReply::message(stored(&[&owner, &member, &stray]))]);
         let policy = OpenFgaPolicy::<_, _, String, Postgres>::new(
@@ -2954,7 +2971,7 @@ CREATE POLICY d ON docs FOR SELECT USING (owner_id = current_user);
     /// read and before any write.
     #[test]
     fn an_ambiguous_load_is_refused_before_any_write() {
-        let shapes = shapes_over(SWEEP);
+        let shapes = sweep_shapes();
         let (owner, member, _) = sweep_facts(&shapes);
         let transport = Scripted::new([ScriptedReply::message(stored(&[]))]);
         let policy = OpenFgaPolicy::<_, _, String, Postgres>::new(
@@ -2965,7 +2982,7 @@ CREATE POLICY d ON docs FOR SELECT USING (owner_id = current_user);
         .unwrap();
         let gated = Record {
             context: Some(RecordContextValue {
-                condition: "when_owner".to_string(),
+                condition: ConditionName::canonicalized("when_owner"),
                 values: BTreeMap::new(),
             }),
             ..owner.clone()
@@ -3002,7 +3019,7 @@ CREATE POLICY d ON docs FOR SELECT USING (owner_id = current_user);
     /// whose difference is already known, is written.
     #[test]
     fn a_failing_replay_leaves_the_loads_difference_unsent() {
-        let shapes = shapes_over(SWEEP);
+        let shapes = sweep_shapes();
         let (owner, _, _) = sweep_facts(&shapes);
         let transport = Scripted::new([ScriptedReply::message(stored(&[&owner]))]);
         let policy = OpenFgaPolicy::<_, _, String, Postgres>::new(
@@ -3025,7 +3042,7 @@ CREATE POLICY d ON docs FOR SELECT USING (owner_id = current_user);
     /// anything is written, including the load's pending addition.
     #[test]
     fn a_replay_outside_its_region_is_refused_before_any_write() {
-        let shapes = shapes_over(SWEEP);
+        let shapes = sweep_shapes();
         let (owner, _, _) = sweep_facts(&shapes);
         let transport = Scripted::new([ScriptedReply::message(stored(&[]))]);
         let policy = OpenFgaPolicy::<_, _, String, Postgres>::new(

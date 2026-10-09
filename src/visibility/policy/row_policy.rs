@@ -76,7 +76,7 @@ use crate::TableId;
 ///         query.description.as_ref().map(|description| Enumeration {
 ///             description,
 ///             sql: &query.sql,
-///             condition: query.condition.as_deref(),
+///             condition: query.condition.as_ref().map(rls2fga_types::ConditionName::as_str),
 ///         })
 ///     })
 ///     .collect();

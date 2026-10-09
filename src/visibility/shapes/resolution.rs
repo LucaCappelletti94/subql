@@ -68,7 +68,7 @@ static UNRESTRICTED: ActionAnswer = ActionAnswer::Unrestricted;
 ///         query.description.as_ref().map(|description| Enumeration {
 ///             description,
 ///             sql: &query.sql,
-///             condition: query.condition.as_deref(),
+///             condition: query.condition.as_ref().map(rls2fga_types::ConditionName::as_str),
 ///         })
 ///     })
 ///     .collect();
@@ -311,7 +311,7 @@ impl<DB: DatabaseLike> Shapes<DB> {
     ///         query.description.as_ref().map(|description| Enumeration {
     ///             description,
     ///             sql: &query.sql,
-    ///             condition: query.condition.as_deref(),
+    ///             condition: query.condition.as_ref().map(rls2fga_types::ConditionName::as_str),
     ///         })
     ///     })
     ///     .collect();
@@ -777,7 +777,7 @@ fn replay_of(
     {
         return Some(Replay::new(
             query.clone(),
-            condition.clone(),
+            condition.as_ref().map(ToString::to_string),
             region.clone(),
         ));
     }
@@ -1101,10 +1101,13 @@ mod tests {
     use rls2fga_types::ConfidenceLevel;
     use rls2fga_types::TypeName;
     use rls2fga_types::{ActionAnswer, ActionStatement};
-    use rls2fga_types::{RecordDerivation, RecordDescription, RelationName, RelationShapes};
+    use rls2fga_types::{
+        ConditionName, RecordDerivation, RecordDescription, RelationName, RelationShapes,
+    };
     use sqlparser::dialect::PostgreSqlDialect;
 
     use super::{Enumeration, Materialisation, Region, Shapes};
+    use crate::visibility::{test_names, test_pooling};
     use crate::{catalog_helpers, ParserDB, TableId};
 
     /// Every statement a table can be asked about, so a test says "every" rather
@@ -1141,7 +1144,7 @@ mod tests {
                 query.description.as_ref().map(|description| Enumeration {
                     description,
                     sql: &query.sql,
-                    condition: query.condition.as_deref(),
+                    condition: query.condition.as_ref().map(ConditionName::as_str),
                 })
             })
             .collect()
@@ -1385,7 +1388,11 @@ mod tests {
             "the row-settled link"
         );
         assert_eq!(
-            owns("teams:3", "member", "user:alice"),
+            owns(
+                "teams:3",
+                test_names::membership_relation(TWO_ALONE, "team_members").as_str(),
+                "user:alice"
+            ),
             1,
             "the keyed membership"
         );
@@ -1400,8 +1407,7 @@ mod tests {
     /// of it and owns everything alone beside it.
     #[test]
     fn a_group_region_is_left_to_its_members() {
-        let shapes = shapes(
-            "CREATE TABLE teams(id INTEGER PRIMARY KEY);
+        let sql = "CREATE TABLE teams(id INTEGER PRIMARY KEY);
              CREATE TABLE team_members(team_id INTEGER REFERENCES teams(id), user_id TEXT);
              CREATE TABLE team_guests(team_id INTEGER REFERENCES teams(id), user_id TEXT,
                                       expires_at TIMESTAMPTZ);
@@ -1416,12 +1422,23 @@ mod tests {
                        WHERE team_guests.team_id = teams.id
                          AND team_guests.user_id = current_user
                          AND team_guests.expires_at > now()));
-             CREATE POLICY d ON docs FOR SELECT USING (owner_id = current_user);",
-        );
+             CREATE POLICY d ON docs FOR SELECT USING (owner_id = current_user);";
+        let shapes =
+            test_pooling::shapes(sql, "team_guests", "team_members", |shapes, translation| {
+                let naming = alloc::borrow::Cow::from(translation.row_naming()).into_owned();
+                shapes
+                    .with_row_naming(&naming)
+                    .with_action_relations(translation.action_relations())
+                    .with_unrestricted_tables(translation.unrestricted_tables())
+            });
         let [group] = shapes.materialisations() else {
             panic!("one shared region: {:?}", shapes.materialisations());
         };
-        assert!(group.region().holds("teams:3", "member", "user:alice"));
+        assert!(group.region().holds(
+            "teams:3",
+            test_names::membership_relation(sql, "team_members").as_str(),
+            "user:alice"
+        ));
         assert!(
             shapes
                 .load_regions()

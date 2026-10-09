@@ -20,6 +20,9 @@ use sql_traits::prelude::DatabaseLike;
 #[cfg(feature = "testing")]
 pub mod dispatch_fixtures;
 
+#[cfg(all(any(test, feature = "testing"), feature = "visibility-records"))]
+pub mod relation_pool;
+
 /// Concrete [`CdcEvent`] fixture for tests.
 ///
 /// Fields are public so tests can mutate individual row images without
