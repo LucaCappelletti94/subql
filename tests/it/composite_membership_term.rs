@@ -13,6 +13,7 @@ use subql::backend::{Postgres, ScalarFamily, Value};
 use subql::testing::TestEvent;
 use subql::{
     catalog_helpers, DefaultIds, RegisterError, SubscriptionEngine, SubscriptionRequest, TableId,
+    UnansweredCell,
 };
 
 // `docs` is keyed on (tenant_id, id) together: upstream serves a multi-pair
@@ -193,6 +194,50 @@ fn a_null_compared_cell_admits_nobody() {
     let row = vec![Value::Null, Value::Int(5), Value::String("d".into())];
     let notifs = engine.consumers(&TestEvent::insert(docs, row)).unwrap();
     assert!(notifs.inserted().is_empty(), "nobody holds that pair");
+}
+
+/// A missing cell beside a NULL one cannot change the term's answer, so it is reported only when no NULL decides the term.
+#[test]
+fn a_missing_cell_beside_a_null_one_is_not_unanswered() {
+    let (mut engine, docs, _) = engine();
+    let sql = format!("{TERM} OR title = 'x'");
+    let registered = engine
+        .register(
+            SubscriptionRequest::new(1u64, sql.as_str())
+                .subscriber(Value::String("alice".into()))
+                .term_values(
+                    vec!["tenant_id", "id"],
+                    vec![(
+                        Value::String("alice".into()),
+                        vec![Value::Int(1), Value::Int(5)],
+                    )],
+                ),
+        )
+        .unwrap();
+
+    let decided = TestEvent::insert(docs, vec![Value::Null, Value::Missing, Value::Null]);
+    let whole = engine.consumers(&decided).unwrap();
+    assert_eq!(whole.inserted(), &[] as &[u64]);
+    assert_eq!(whole.unanswered(), []);
+    assert_eq!(
+        engine.matches_consumer(&decided, 1).unwrap().unanswered(),
+        []
+    );
+
+    let undecided = engine
+        .consumers(&TestEvent::insert(
+            docs,
+            vec![Value::Int(1), Value::Missing, Value::Null],
+        ))
+        .unwrap();
+    assert_eq!(
+        undecided.unanswered(),
+        [UnansweredCell {
+            subscription_id: registered.subscription_id,
+            consumer_id: 1,
+            column: 1
+        }]
+    );
 }
 
 /// A new membership row moves the pair set and reports the narrowing with the

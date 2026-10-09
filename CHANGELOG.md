@@ -77,6 +77,7 @@ All notable changes to subql are recorded here. The format follows [Keep a Chang
 
 ### Fixed
 
+- A composite membership term with a `NULL` key cell no longer reports a missing cell beside it as `unanswered`. The `NULL` already decides that the term admits nobody, so `AutoResolvingEngine` queued a database read for a cell that could not change the answer.
 - A parenthesis, bracket or operator character inside a string literal, a quoted name or a comment no longer counts towards the nesting bounds checked before parsing. `WHERE status = 'a('` was refused at every tier as `Unbalanced parentheses`, and a literal holding more than 128 dashes as `Expression nesting too deep`. A parenthesis closed only inside a comment is now refused as unbalanced, where it failed as a parse error.
 - Arithmetic over operands it is not computed over, a cell whose kind contradicts its column's declared type or a promoted integer beside a float on a backend with no `Backend::int_as_float`, reports the new `EvaluationRefusal::OperandKinds` for the subscription. It answered `NULL`, so `IS NULL` over the result selected a row no engine would.
 - A `MIN` or `MAX` subscription, grouped or not, reads the database when the engine refuses to evaluate its filter for a changed row. It took the row as excluded, so a grouped `MIN` over SQLite silently missed a group whose only row the filter could not evaluate.
