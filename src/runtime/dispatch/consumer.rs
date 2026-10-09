@@ -56,14 +56,13 @@ where
         context.row,
         context.db,
         truths,
+        term_absent,
     );
     match result {
         Ok(truth) => Ok(Verdict {
             matched: truth == Tri::True,
             refused: None,
-            unanswered: (truth == Tri::Unknown)
-                .then(|| context.vm.absent_column().or(term_absent))
-                .flatten(),
+            unanswered: context.vm.absent_column(),
         }),
         Err(VmError::Refused(refused)) => Ok(Verdict {
             matched: false,

@@ -266,14 +266,12 @@ where
             }
             Err(other) => return Err(dispatch_vm_error(other)),
         };
-        // Only an unknown verdict is unanswerable. A decisive `false`
-        // read the absent cell and SQL's three-valued logic settled the
-        // answer anyway, as in `body = 'x' AND tag = 'no'`, so there is
-        // nothing a read would tell the caller.
-        let absent = (verdict == Tri::Unknown)
-            .then(|| vm.absent_column())
-            .flatten()
-            .map(|column| (bitmap.clone(), column));
+        // Only an unknown verdict the omitted cells could still turn into
+        // a match is unanswerable. A decisive answer read the absent cell
+        // and SQL's three-valued logic settled it anyway, as in
+        // `body = 'x' AND tag = 'no'`, so there is nothing a read would
+        // tell the caller.
+        let absent = vm.absent_column().map(|column| (bitmap.clone(), column));
         return Ok(RowVerdict {
             matched: if verdict == Tri::True {
                 Matched::Every(bitmap)
@@ -324,10 +322,11 @@ where
         // answered needs its subscriber set computed, so this costs what it
         // did before either report existed.
         let mut missing_here = None;
-        let refusal = match vm.eval_with_terms(&pred.bytecode, event, row, db, &truths) {
+        let refusal = match vm.eval_with_terms(&pred.bytecode, event, row, db, &truths, term_absent)
+        {
             Ok(Tri::True) => None,
-            // Same rule per assignment: a decisive `false` is an answer.
-            Ok(Tri::Unknown) => match vm.absent_column().or(term_absent) {
+            // Same rule per assignment: a decisive answer is an answer.
+            Ok(Tri::Unknown) => match vm.absent_column() {
                 Some(column) => {
                     missing_here = Some(column);
                     None

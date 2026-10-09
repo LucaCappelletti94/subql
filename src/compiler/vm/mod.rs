@@ -12,7 +12,7 @@
 //! * A compiled program is Backend-scoped and reusable across every
 //!   `E: CdcEvent<Backend = B>`.
 //! * The final instruction of a well-formed program leaves exactly one
-//!   `StackValue::Tri` on the stack, or exactly one
+//!   `StackValue::Truth` on the stack, or exactly one
 //!   `StackValue::Value` carrying `Value::Null` / `Value::Missing` (both
 //!   lift to `Tri::Unknown`). Any other final shape is a compiler bug and
 //!   surfaces as [`VmError::MalformedProgram`].
@@ -31,6 +31,7 @@
 //!   `Bool = i64`).
 
 pub mod arithmetic;
+mod possible;
 pub mod refusal;
 
 use super::{
@@ -44,6 +45,7 @@ use arithmetic::{
     arithmetic_add, arithmetic_divide, arithmetic_modulo, arithmetic_multiply, arithmetic_negate,
     arithmetic_subtract,
 };
+use possible::Possible;
 use refusal::{DanglingEscape, EvaluationRefusal};
 use sql_traits::prelude::DatabaseLike;
 
@@ -99,7 +101,7 @@ pub enum VmError {
 ///
 /// `Value(_)` holds arithmetic results and absent operands. A present
 /// literal or column cell is referred to rather than copied, by
-/// `Literal(_)` and `Cell(_)`. `Tri(_)` variants come from comparison,
+/// `Literal(_)` and `Cell(_)`. `Truth(_)` variants come from comparison,
 /// null-check, and logical instructions.
 enum StackValue<B: Backend> {
     /// Scalar value (from arithmetic, or an absent literal or cell).
@@ -108,8 +110,8 @@ enum StackValue<B: Backend> {
     Literal(usize),
     /// A present cell of this column, lent by the event for the evaluated row.
     Cell(crate::ColumnId),
-    /// Tri-state boolean (from comparisons, null checks, or logical ops).
-    Tri(Tri),
+    /// The truths a condition may take (from comparisons, null checks, or logical ops).
+    Truth(Possible),
 }
 
 // `Clone`, `Debug`, and `PartialEq` are hand-implemented for the same
@@ -122,7 +124,7 @@ impl<B: Backend> Clone for StackValue<B> {
             Self::Value(v) => Self::Value(v.clone()),
             Self::Literal(ip) => Self::Literal(*ip),
             Self::Cell(col) => Self::Cell(*col),
-            Self::Tri(t) => Self::Tri(*t),
+            Self::Truth(t) => Self::Truth(*t),
         }
     }
 }
@@ -133,7 +135,7 @@ impl<B: Backend> core::fmt::Debug for StackValue<B> {
             Self::Value(v) => f.debug_tuple("Value").field(v).finish(),
             Self::Literal(ip) => f.debug_tuple("Literal").field(ip).finish(),
             Self::Cell(col) => f.debug_tuple("Cell").field(col).finish(),
-            Self::Tri(t) => f.debug_tuple("Tri").field(t).finish(),
+            Self::Truth(t) => f.debug_tuple("Truth").field(t).finish(),
         }
     }
 }
@@ -144,7 +146,7 @@ impl<B: Backend> PartialEq for StackValue<B> {
             (Self::Value(a), Self::Value(b)) => a == b,
             (Self::Literal(a), Self::Literal(b)) => a == b,
             (Self::Cell(a), Self::Cell(b)) => a == b,
-            (Self::Tri(a), Self::Tri(b)) => a == b,
+            (Self::Truth(a), Self::Truth(b)) => a == b,
             _ => false,
         }
     }
@@ -159,13 +161,17 @@ pub struct Vm<B: Backend> {
     /// Value stack (grows during evaluation).
     stack: Vec<StackValue<B>>,
     /// The first column this evaluation read that the event does not
-    /// carry, cleared at the start of each evaluation.
+    /// carry, or the omitted column a term's unknown truth stands for,
+    /// cleared at the start of each evaluation.
     ///
     /// Recorded where the cell is read rather than derived from the
     /// program's column list, so a short circuit that never reaches the
     /// absent cell records nothing, and so a `Null` cell, which is a value
     /// the database holds, is never mistaken for an absent one.
     absent_column: Option<crate::ColumnId>,
+    /// Whether the last evaluation's omitted cells decide between a match
+    /// and none.
+    undecided: bool,
     /// Buffers every `LIKE` match reuses, so matching allocates nothing once warm.
     like: LikeScratch,
 }
@@ -180,6 +186,7 @@ impl<B: Backend> Vm<B> {
         Self {
             stack: Vec::with_capacity(16),
             absent_column: None,
+            undecided: false,
             like: LikeScratch::default(),
         }
     }
@@ -207,18 +214,25 @@ impl<B: Backend> Vm<B> {
         E: CdcEvent<Backend = B>,
         DB: DatabaseLike,
     {
-        self.eval_with_terms(program, event, row, db, &[])
+        self.eval_with_terms(program, event, row, db, &[], None)
     }
 
-    /// The column the last evaluation read and the event did not carry, or
-    /// `None` when every cell it read was there.
+    /// The column the last evaluation read and the event did not carry,
+    /// when the cells the event omitted decide between a match and none.
     ///
-    /// Only meaningful immediately after an evaluation, which resets it.
-    /// The caller decides what an absent cell means: the answer is not
-    /// false, it is missing, and a caller holding a connector can re-read.
+    /// `None` when every cell it read was there, and also when the carried
+    /// cells settle the answer regardless, as in `body = 'x' AND tag = 'no'`
+    /// or `body = 'x' AND tag = NULL` with `body` omitted. Only meaningful
+    /// immediately after an evaluation, which resets it. The caller decides
+    /// what an absent cell means: the answer is not false, it is missing,
+    /// and a caller holding a connector can re-read.
     #[must_use]
     pub const fn absent_column(&self) -> Option<crate::ColumnId> {
-        self.absent_column
+        if self.undecided {
+            self.absent_column
+        } else {
+            None
+        }
     }
 
     /// Evaluate `program` with one truth per membership term slot.
@@ -233,6 +247,10 @@ impl<B: Backend> Vm<B> {
     ///
     /// As [`Vm::eval`], plus [`VmError::MissingTermTruth`] when the program
     /// names a slot outside `truths`.
+    ///
+    /// An unknown truth stands for a term whose compared cell the event
+    /// omitted, named by `omitted_term`, so [`Vm::absent_column`] reports it
+    /// when that term is what leaves the answer open.
     pub fn eval_with_terms<E, DB>(
         &mut self,
         program: &BytecodeProgram<B>,
@@ -240,6 +258,7 @@ impl<B: Backend> Vm<B> {
         row: RowKind,
         db: &DB,
         truths: &[Tri],
+        omitted_term: Option<crate::ColumnId>,
     ) -> Result<Tri, VmError>
     where
         E: CdcEvent<Backend = B>,
@@ -247,6 +266,7 @@ impl<B: Backend> Vm<B> {
     {
         self.stack.clear();
         self.absent_column = None;
+        self.undecided = false;
 
         let instructions = &program.instructions;
         let len = instructions.len();
@@ -257,12 +277,16 @@ impl<B: Backend> Vm<B> {
             row,
             db,
         };
+        let terms = Terms {
+            truths,
+            omitted: omitted_term,
+        };
 
         // Execute instructions with explicit instruction pointer (supports jumps).
         while ip < len {
             match &instructions[ip] {
                 Instruction::JumpIfFalse(offset) => {
-                    let top = self.peek_tri()?;
+                    let top = self.peek_possible()?.tri();
                     if top == Tri::False {
                         if *offset == 0 {
                             return Err(VmError::BadJump(ip));
@@ -276,7 +300,7 @@ impl<B: Backend> Vm<B> {
                     }
                 }
                 Instruction::JumpIfTrue(offset) => {
-                    let top = self.peek_tri()?;
+                    let top = self.peek_possible()?.tri();
                     if top == Tri::True {
                         if *offset == 0 {
                             return Err(VmError::BadJump(ip));
@@ -290,16 +314,17 @@ impl<B: Backend> Vm<B> {
                     }
                 }
                 other => {
-                    self.execute(ip, other, &src, truths)?;
+                    self.execute(ip, other, &src, &terms)?;
                 }
             }
             ip += 1;
         }
 
         match self.stack.pop() {
-            Some(StackValue::Tri(result)) => {
+            Some(StackValue::Truth(result)) => {
                 if self.stack.is_empty() {
-                    Ok(result)
+                    self.undecided = result.undecided();
+                    Ok(result.tri())
                 } else {
                     Err(VmError::MalformedProgram)
                 }
@@ -311,6 +336,7 @@ impl<B: Backend> Vm<B> {
                 // Any other bare `Value` is a compiler bug: boolean
                 // columns must be lowered with an explicit comparison.
                 if self.stack.is_empty() && v.is_absent() {
+                    self.undecided = v.is_missing();
                     Ok(Tri::Unknown)
                 } else {
                     Err(VmError::MalformedProgram)
@@ -328,7 +354,7 @@ impl<B: Backend> Vm<B> {
         ip: usize,
         instruction: &Instruction<B>,
         src: &Operands<'_, B, E, DB>,
-        truths: &[Tri],
+        terms: &Terms<'_>,
     ) -> Result<(), VmError>
     where
         E: CdcEvent<Backend = B>,
@@ -361,14 +387,14 @@ impl<B: Backend> Vm<B> {
             Instruction::Equal(comparison) => {
                 let result =
                     self.compare_values(src, *comparison, |ctx, a, b| values_equal(ctx, a, b))?;
-                self.stack.push(StackValue::Tri(result));
+                self.replace_compared(result);
             }
 
             Instruction::NotEqual(comparison) => {
                 let result = self.compare_values(src, *comparison, |ctx, a, b| {
                     values_equal(ctx, a, b).map(|equal| !equal)
                 })?;
-                self.stack.push(StackValue::Tri(result));
+                self.replace_compared(result);
             }
 
             Instruction::NotDistinct(comparison) => {
@@ -388,37 +414,37 @@ impl<B: Backend> Vm<B> {
             }
 
             Instruction::IsTruth { value, negated } => {
-                let condition = self.pop_tri()?;
-                let result = truth_test(condition, *value, *negated, self.absent_column.is_some());
-                self.stack.push(StackValue::Tri(result));
+                let condition = self.pop_possible()?;
+                self.stack
+                    .push(StackValue::Truth(condition.is(*value, *negated)));
             }
 
             Instruction::LessThan(comparison) => {
                 let result = self.compare_ordered(src, *comparison, |ord| {
                     matches!(ord, core::cmp::Ordering::Less)
                 })?;
-                self.stack.push(StackValue::Tri(result));
+                self.replace_compared(result);
             }
 
             Instruction::LessThanOrEqual(comparison) => {
                 let result = self.compare_ordered(src, *comparison, |ord| {
                     !matches!(ord, core::cmp::Ordering::Greater)
                 })?;
-                self.stack.push(StackValue::Tri(result));
+                self.replace_compared(result);
             }
 
             Instruction::GreaterThan(comparison) => {
                 let result = self.compare_ordered(src, *comparison, |ord| {
                     matches!(ord, core::cmp::Ordering::Greater)
                 })?;
-                self.stack.push(StackValue::Tri(result));
+                self.replace_compared(result);
             }
 
             Instruction::GreaterThanOrEqual(comparison) => {
                 let result = self.compare_ordered(src, *comparison, |ord| {
                     !matches!(ord, core::cmp::Ordering::Less)
                 })?;
-                self.stack.push(StackValue::Tri(result));
+                self.replace_compared(result);
             }
 
             // A null test reads absence as its answer, which is why it is
@@ -455,20 +481,20 @@ impl<B: Backend> Vm<B> {
             }
 
             Instruction::And => {
-                let b = self.pop_tri()?;
-                let a = self.pop_tri()?;
-                self.stack.push(StackValue::Tri(a.and(b)));
+                let b = self.pop_possible()?;
+                let a = self.pop_possible()?;
+                self.stack.push(StackValue::Truth(a.and(b)));
             }
 
             Instruction::Or => {
-                let b = self.pop_tri()?;
-                let a = self.pop_tri()?;
-                self.stack.push(StackValue::Tri(a.or(b)));
+                let b = self.pop_possible()?;
+                let a = self.pop_possible()?;
+                self.stack.push(StackValue::Truth(a.or(b)));
             }
 
             Instruction::Not => {
-                let a = self.pop_tri()?;
-                self.stack.push(StackValue::Tri(a.not()));
+                let a = self.pop_possible()?;
+                self.stack.push(StackValue::Truth(a.not()));
             }
 
             Instruction::In {
@@ -597,11 +623,20 @@ impl<B: Backend> Vm<B> {
             Instruction::JumpIfFalse(_) | Instruction::JumpIfTrue(_) => {}
 
             Instruction::TermTruth(slot) => {
-                let truth = truths
+                let truth = terms
+                    .truths
                     .get(usize::from(*slot))
                     .copied()
                     .ok_or(VmError::MissingTermTruth(*slot))?;
-                self.stack.push(StackValue::Tri(truth));
+                let possible = if truth == Tri::Unknown {
+                    if self.absent_column.is_none() {
+                        self.absent_column = terms.omitted;
+                    }
+                    Possible::ANY
+                } else {
+                    Possible::of(truth)
+                };
+                self.stack.push(StackValue::Truth(possible));
             }
         }
 
@@ -677,54 +712,80 @@ impl<B: Backend> Vm<B> {
         Ok(())
     }
 
-    /// Drop the `consumed` operands on top of the stack and push `result`.
+    /// Drop the `consumed` operands on top of the stack and push `result`,
+    /// which an omitted operand leaves open to every truth when it is unknown.
     #[expect(
         clippy::inline_always,
         reason = "measured under cachegrind: the per-operator operand path costs more instructions when left to the heuristic"
     )]
     #[inline(always)]
     fn replace_top(&mut self, consumed: usize, result: Tri) {
+        let possible = if result == Tri::Unknown && self.omits_operand(consumed) {
+            Possible::ANY
+        } else {
+            Possible::of(result)
+        };
         // Popped one by one: `truncate` does not inline, and this is per operator.
         for _ in 0..consumed {
             self.stack.pop();
         }
-        self.stack.push(StackValue::Tri(result));
+        self.stack.push(StackValue::Truth(possible));
     }
 
-    fn pop_tri(&mut self) -> Result<Tri, VmError> {
-        match self.stack.pop() {
-            Some(StackValue::Tri(t)) => Ok(t),
-            // `Null` / `Missing` are legitimate operands for logical ops
-            // (`NULL AND true` = `Unknown`). Concrete scalar values are
-            // NOT, the compiler must lower boolean columns via an
-            // explicit comparison. `Bool` on the stack is a compiler bug.
-            Some(StackValue::Value(v)) if v.is_absent() => Ok(Tri::Unknown),
-            Some(StackValue::Value(_) | StackValue::Literal(_) | StackValue::Cell(_)) => {
-                Err(VmError::TypeMismatch {
-                    expected: "Tri",
-                    got: "Value",
-                })
-            }
-            None => Err(VmError::StackUnderflow),
+    /// Whether one of the `consumed` operands on top of the stack is a cell the event omitted.
+    #[inline(never)]
+    fn omits_operand(&self, consumed: usize) -> bool {
+        self.stack
+            .iter()
+            .rev()
+            .take(consumed)
+            .any(|slot| matches!(slot, StackValue::Value(value) if value.is_missing()))
+    }
+
+    /// Replace a comparison's two operands with `result`.
+    ///
+    /// A comparison with a `NULL` operand is unknown whatever the other
+    /// holds, so an omitted operand beside it leaves nothing open.
+    #[expect(
+        clippy::inline_always,
+        reason = "measured under cachegrind: the per-operator operand path costs more instructions when left to the heuristic"
+    )]
+    #[inline(always)]
+    fn replace_compared(&mut self, result: Tri) {
+        if result == Tri::Unknown && self.compares_null() {
+            self.stack.pop();
+            self.stack.pop();
+            self.stack
+                .push(StackValue::Truth(Possible::of(Tri::Unknown)));
+        } else {
+            self.replace_top(2, result);
         }
     }
 
-    fn peek_tri(&self) -> Result<Tri, VmError> {
-        match self.stack.last() {
-            Some(StackValue::Tri(t)) => Ok(*t),
-            Some(StackValue::Value(v)) if v.is_absent() => Ok(Tri::Unknown),
-            Some(StackValue::Value(_) | StackValue::Literal(_) | StackValue::Cell(_)) => {
-                Err(VmError::TypeMismatch {
-                    expected: "Tri",
-                    got: "Value",
-                })
-            }
-            None => Err(VmError::StackUnderflow),
-        }
+    /// Whether one of the two compared operands on top of the stack is `NULL`.
+    #[inline(never)]
+    fn compares_null(&self) -> bool {
+        self.stack
+            .iter()
+            .rev()
+            .take(2)
+            .any(|slot| matches!(slot, StackValue::Value(value) if value.is_null()))
+    }
+
+    fn pop_possible(&mut self) -> Result<Possible, VmError> {
+        self.stack
+            .pop()
+            .map_or(Err(VmError::StackUnderflow), |slot| truths_of(&slot))
+    }
+
+    fn peek_possible(&self) -> Result<Possible, VmError> {
+        self.stack
+            .last()
+            .map_or(Err(VmError::StackUnderflow), truths_of)
     }
 
     fn compare_values<E: CdcEvent<Backend = B>, DB: DatabaseLike, F>(
-        &mut self,
+        &self,
         src: &Operands<'_, B, E, DB>,
         comparison: ComparisonRef,
         f: F,
@@ -738,20 +799,17 @@ impl<B: Backend> Vm<B> {
     {
         let a = peek(&self.stack, 1, src)?;
         let b = peek(&self.stack, 0, src)?;
-        let result = if a.is_absent() || b.is_absent() {
+        Ok(if a.is_absent() || b.is_absent() {
             Tri::Unknown
         } else if f(comparison_context(src.program, comparison)?, a, b).map_err(VmError::Refused)? {
             Tri::True
         } else {
             Tri::False
-        };
-        self.stack.pop();
-        self.stack.pop();
-        Ok(result)
+        })
     }
 
     fn compare_ordered<E: CdcEvent<Backend = B>, DB: DatabaseLike, F>(
-        &mut self,
+        &self,
         src: &Operands<'_, B, E, DB>,
         comparison: ComparisonRef,
         f: F,
@@ -761,11 +819,8 @@ impl<B: Backend> Vm<B> {
     {
         let a = peek(&self.stack, 1, src)?;
         let b = peek(&self.stack, 0, src)?;
-        let result = compare_ordered_values(comparison_context(src.program, comparison)?, a, b, f)
-            .map_err(VmError::Refused)?;
-        self.stack.pop();
-        self.stack.pop();
-        Ok(result)
+        compare_ordered_values(comparison_context(src.program, comparison)?, a, b, f)
+            .map_err(VmError::Refused)
     }
 }
 
@@ -830,7 +885,7 @@ fn referred<'s, B: Backend, E: CdcEvent<Backend = B>, DB: DatabaseLike>(
             Ok(Cow::Borrowed(value)) => Ok(value),
             _ => Err(BadOperand::Malformed),
         },
-        StackValue::Value(_) | StackValue::Tri(_) => Err(BadOperand::NotAValue),
+        StackValue::Value(_) | StackValue::Truth(_) => Err(BadOperand::NotAValue),
     }
 }
 
@@ -873,17 +928,23 @@ fn value_truth<B: Backend>(value: &Value<B>) -> Result<Tri, VmError> {
     }
 }
 
-/// Whether `condition` is `value`, negated for `IS NOT`.
+/// The truths a slot read as a condition may take.
 ///
-/// Whether an unknown came from an absent cell is not carried on the stack,
-/// so any absent cell read so far keeps an unknown unanswered.
-fn truth_test(condition: Tri, value: Tri, negated: bool, read_absent_cell: bool) -> Tri {
-    if condition == Tri::Unknown && read_absent_cell {
-        Tri::Unknown
-    } else if (condition == value) != negated {
-        Tri::True
-    } else {
-        Tri::False
+/// `Null` / `Missing` are legitimate operands for logical ops
+/// (`NULL AND true` = `Unknown`), a `Missing` one open to every truth.
+/// Concrete scalar values are NOT, the compiler must lower boolean columns
+/// via an explicit comparison. `Bool` on the stack is a compiler bug.
+const fn truths_of<B: Backend>(slot: &StackValue<B>) -> Result<Possible, VmError> {
+    match slot {
+        StackValue::Truth(possible) => Ok(*possible),
+        StackValue::Value(value) if value.is_missing() => Ok(Possible::ANY),
+        StackValue::Value(value) if value.is_null() => Ok(Possible::of(Tri::Unknown)),
+        StackValue::Value(_) | StackValue::Literal(_) | StackValue::Cell(_) => {
+            Err(VmError::TypeMismatch {
+                expected: "Tri",
+                got: "Value",
+            })
+        }
     }
 }
 
@@ -894,6 +955,13 @@ struct Operands<'a, B: Backend, E, DB> {
     event: &'a E,
     row: RowKind,
     db: &'a DB,
+}
+
+/// The truths an evaluation's membership terms take, and the column whose
+/// omission leaves a term unknown.
+struct Terms<'a> {
+    truths: &'a [Tri],
+    omitted: Option<crate::ColumnId>,
 }
 
 /// Whether a present value costs more to copy onto the stack than to refer
@@ -1534,7 +1602,7 @@ mod tests {
 
         for truth in [Tri::True, Tri::False, Tri::Unknown] {
             assert_eq!(
-                vm.eval_with_terms(&program, &e, RowKind::New, &pg_catalog(), &[truth])
+                vm.eval_with_terms(&program, &e, RowKind::New, &pg_catalog(), &[truth], None)
                     .unwrap(),
                 truth,
                 "slot 0 answers with exactly the truth it was handed"
@@ -1560,7 +1628,7 @@ mod tests {
         let e = insert_pg(vec![Value::Int(1)]);
 
         let eval = |vm: &mut Vm<Postgres>, truths: &[Tri]| {
-            vm.eval_with_terms(&program, &e, RowKind::New, &pg_catalog(), truths)
+            vm.eval_with_terms(&program, &e, RowKind::New, &pg_catalog(), truths, None)
                 .unwrap()
         };
 
@@ -1597,7 +1665,8 @@ mod tests {
                 &matching,
                 RowKind::New,
                 &pg_catalog(),
-                &[Tri::True]
+                &[Tri::True],
+                None
             )
             .unwrap(),
             Tri::True,
@@ -1609,7 +1678,8 @@ mod tests {
                 &matching,
                 RowKind::New,
                 &pg_catalog(),
-                &[Tri::False]
+                &[Tri::False],
+                None
             )
             .unwrap(),
             Tri::False,
@@ -1621,7 +1691,8 @@ mod tests {
                 &failing,
                 RowKind::New,
                 &pg_catalog(),
-                &[Tri::True]
+                &[Tri::True],
+                None
             )
             .unwrap(),
             Tri::False,
@@ -1640,7 +1711,14 @@ mod tests {
         let e = insert_pg(vec![Value::Int(1)]);
 
         assert_eq!(
-            vm.eval_with_terms(&program, &e, RowKind::New, &pg_catalog(), &[Tri::True]),
+            vm.eval_with_terms(
+                &program,
+                &e,
+                RowKind::New,
+                &pg_catalog(),
+                &[Tri::True],
+                None
+            ),
             Err(VmError::MissingTermTruth(1)),
             "one truth supplied, slot 1 asked for: the caller is told, not answered"
         );
@@ -1648,24 +1726,6 @@ mod tests {
             vm.eval(&program, &e, RowKind::New, &pg_catalog()),
             Err(VmError::MissingTermTruth(1)),
             "plain eval supplies no truths at all, so any slot is missing"
-        );
-    }
-
-    /// `eval` is `eval_with_terms` with no truths, so the 23 existing call
-    /// sites keep their behaviour on every term-free program.
-    #[test]
-    fn eval_agrees_with_eval_with_terms_on_a_term_free_program() {
-        let mut vm: Vm<Postgres> = Vm::new();
-        let program: BytecodeProgram<Postgres> = BytecodeProgram::new(vec![
-            Instruction::LoadColumn(0),
-            Instruction::PushLiteral(Value::Int(18)),
-            Instruction::GreaterThan(ComparisonRef::NONE),
-        ]);
-        let e = insert_pg(vec![Value::Int(25)]);
-
-        assert_eq!(
-            vm.eval(&program, &e, RowKind::New, &pg_catalog()),
-            vm.eval_with_terms(&program, &e, RowKind::New, &pg_catalog(), &[]),
         );
     }
 
