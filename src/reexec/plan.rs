@@ -92,7 +92,6 @@ pub struct GroupedMinMaxPlan<B: Backend> {
     pub group_columns: Vec<ColumnId>,
     pub group_idents: Vec<Ident>,
     pub dependency_columns: Vec<ColumnId>,
-    pub where_dependency_columns: Vec<ColumnId>,
     pub where_program: Arc<BytecodeProgram<B>>,
     pub statement: Statement,
     pub read_projection: Vec<SelectItem>,
@@ -331,7 +330,7 @@ where
     let positional_scope_bind_index = crate::compiler::sql_shape::select_of(&parsed.statement)
         .and_then(|select| select.selection.as_ref())
         .map_or(0, crate::compiler::sql_shape::count_placeholders_in_expr);
-    let mut dependency_columns = parsed.where_dependency_columns.clone();
+    let mut dependency_columns = parsed.where_dependency_columns;
     for column in projection
         .groups
         .iter()
@@ -351,7 +350,6 @@ where
             group_columns: projection.groups,
             group_idents,
             dependency_columns,
-            where_dependency_columns: parsed.where_dependency_columns,
             read_projection,
             where_program: Arc::new(parsed.where_program),
             statement: parsed.statement,
