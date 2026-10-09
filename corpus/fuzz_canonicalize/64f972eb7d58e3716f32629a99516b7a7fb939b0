@@ -1,0 +1,1 @@
+LOCK(CONCAT((CONCAT(DATE(),E(), +'_parA@ASE()',id), 33) =DATE(),E(), +'_parA@ASE()',id), 33) = p
