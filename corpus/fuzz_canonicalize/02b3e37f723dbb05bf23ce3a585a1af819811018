@@ -1,1 +1,0 @@
-status LIKE '%pc6,2' AND NOT (1= 31)
