@@ -317,6 +317,41 @@ fn an_unanswerable_filter_cell_stops_maintenance_instead_of_half_folding() {
     assert_ne!(row_subscription.subscription_id, aggregate.subscription_id);
 }
 
+/// An omitted filter cell beside a `NULL` the conjunction can never get
+/// past leaves nothing for a read to answer: the new row is out whatever
+/// the cell holds, so the count folds the removal in process.
+#[test]
+fn an_omitted_filter_cell_a_null_conjunct_settles_keeps_maintenance() {
+    let (mut engine, orders) = engine(8);
+    let aggregate = engine
+        .register(SubscriptionRequest::new(
+            7u64,
+            "SELECT COUNT(*) FROM orders WHERE status = 'paid' AND region = 'north'",
+        ))
+        .expect("filtered count registers");
+    Install::install(
+        &mut engine,
+        aggregate.subscription_id,
+        AggregateSeedInstall {
+            rows: vec![vec![Value::Int(1)]],
+            fence: None,
+        },
+    )
+    .expect("seed aggregate");
+
+    let mut new_row = row(1, "north", "paid");
+    new_row[1] = Value::Null;
+    new_row[3] = Value::Missing;
+    let event = TestEvent::update(orders, row(1, "north", "paid"), new_row)
+        .with_pk_columns([0u16])
+        .with_checkpoint(PgLsn(41));
+    let output = engine.dispatch(&event).expect("dispatch succeeds");
+
+    assert_eq!(output.transitions(), []);
+    assert_eq!(output.triggers().len(), 0);
+    assert_eq!(output.aggregate_updates().len(), 1);
+}
+
 #[test]
 fn unfiltered_count_needs_no_old_row_and_stays_in_process() {
     let (mut engine, orders) = engine(8);

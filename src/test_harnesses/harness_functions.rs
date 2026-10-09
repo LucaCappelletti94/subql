@@ -241,7 +241,14 @@ pub fn harness_vm_eval(data: &[u8]) {
     let event = TestEvent::<Postgres>::insert(0, cells);
 
     let mut vm = Vm::<Postgres>::new();
-    let _ = vm.eval_with_terms(&program, &event, RowKind::New, fuzz_catalog(), &truths);
+    let _ = vm.eval_with_terms(
+        &program,
+        &event,
+        RowKind::New,
+        fuzz_catalog(),
+        &truths,
+        None,
+    );
 }
 
 /// Feed raw bytes to shard deserialization.

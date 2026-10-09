@@ -438,6 +438,73 @@ fn a_decisive_false_after_the_absent_cell_reports_nothing() {
     assert_eq!(notifications.inserted(), &[] as &[u64]);
 }
 
+/// Whether the filter matched and whether it was reported unanswered, for a
+/// row whose `body` is omitted and whose `tag` is `NULL`.
+fn beside_a_null_tag(filter: &str) -> (bool, bool) {
+    let (mut engine, table) = engine();
+    engine
+        .register(SubscriptionRequest::new(
+            1u64,
+            format!("SELECT * FROM docs WHERE {filter}"),
+        ))
+        .expect("registers");
+    let notifications = engine
+        .consumers(&TestEvent::insert(
+            table,
+            vec![Value::Int(1), Value::Missing, Value::Null],
+        ))
+        .expect("dispatch succeeds");
+    (
+        !notifications.inserted().is_empty(),
+        !notifications.unanswered().is_empty(),
+    )
+}
+
+/// A `NULL` conjunct is never true, so the conjunction cannot match
+/// whatever the omitted cell holds, and a read could not change that.
+#[test]
+fn a_null_conjunct_settles_a_missing_cell() {
+    assert_eq!(
+        beside_a_null_tag("body = 'keep' AND tag = 'x'"),
+        (false, false)
+    );
+    assert_eq!(
+        beside_a_null_tag("(body = 'keep') IS TRUE AND tag = 'x'"),
+        (false, false)
+    );
+    assert_eq!(
+        beside_a_null_tag("(body = 'keep' AND tag = 'x') IS NOT TRUE"),
+        (true, false),
+        "a conjunction that is never true is never `TRUE`, so the row matches"
+    );
+}
+
+/// A comparison with a `NULL` operand is unknown whatever the other operand
+/// holds, so an omitted cell compared with it is settled too.
+#[test]
+fn a_comparison_with_a_null_operand_settles_a_missing_cell() {
+    assert_eq!(beside_a_null_tag("body = tag"), (false, false));
+    assert_eq!(beside_a_null_tag("body < tag"), (false, false));
+    assert_eq!(
+        beside_a_null_tag("NOT (body <> tag)"),
+        (false, false),
+        "the negation of an unknown comparison is still unknown"
+    );
+}
+
+/// Where the omitted cell alone can make the filter true, the read stays.
+#[test]
+fn a_null_operand_the_missing_cell_can_outweigh_is_reported() {
+    assert_eq!(
+        beside_a_null_tag("body = 'keep' OR tag = 'x'"),
+        (false, true)
+    );
+    assert_eq!(
+        beside_a_null_tag("NOT (body = 'keep' AND tag = 'x')"),
+        (false, true)
+    );
+}
+
 /// A membership term's columns are read outside the VM, so an absent one is
 /// invisible to the VM's own record of it and has to be carried separately.
 /// The term cannot say who the row admits, the predicate is unknown, and

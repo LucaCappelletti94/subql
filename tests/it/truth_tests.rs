@@ -199,16 +199,16 @@ fn a_missing_cell_leaves_a_truth_test_unanswered() {
         (vec![1], vec![]),
         "`m = 4` is false, so the conjunction is false whatever `n` holds"
     );
-    // Conservative on purpose: `m` is a present `NULL`, so the conjunction is
-    // false or unknown and never true, yet it is left unanswered because `n` was
-    // read absent, and the stack does not say which operand the unknown came from.
+    // `flag` is a present `NULL`, so the conjunction is false or unknown and
+    // never true whatever `n` holds, which settles the test although `n` is
+    // absent.
     assert_eq!(
         dispatch(
             "(n = 3 AND flag) IS TRUE",
             vec![Value::Int(1), Value::Missing, Value::Int(3), Value::Null]
         ),
-        (vec![], vec![1]),
-        "an unknown that read an absent cell is unanswered"
+        (vec![], vec![]),
+        "a conjunction a `NULL` keeps from being true is not `TRUE`"
     );
     assert_eq!(
         dispatch("flag IS UNKNOWN", n_missing()),
