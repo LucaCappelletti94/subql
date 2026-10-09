@@ -458,15 +458,14 @@ where
             }
         }
     }
-    // SQL `NULL` dominates an absent column in a composite membership key.
-    let fact = if nobody {
-        TermFacts::Admits(None)
-    } else if unknown {
-        TermFacts::CannotSay
-    } else {
-        TermFacts::Admits(admits(&keys))
-    };
-    Ok((fact, absent))
+    // SQL never matches through a NULL, so a NULL cell decides the term and a missing one beside it is not asked for.
+    if nobody {
+        return Ok((TermFacts::Admits(None), None));
+    }
+    if unknown {
+        return Ok((TermFacts::CannotSay, absent));
+    }
+    Ok((TermFacts::Admits(admits(&keys)), None))
 }
 
 /// Consumer dictionary translating between ordinals and ConsumerIds.
