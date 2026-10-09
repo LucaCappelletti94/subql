@@ -32,7 +32,9 @@ use rls2fga::generator::json_model::{AuthorizationModel, Userset};
 use rls2fga::translator::{Outputs, TranslatorBuilder};
 use rls2fga::types::ActionStatement;
 use rls2fga::types::ConfidenceLevel;
-use rls2fga::types::{ConditionName, Record, RecordContextValue, RecordDescription, RelationName};
+use rls2fga::types::{
+    ConditionName, Record, RecordContextValue, RecordDerivation, RecordDescription, RelationName,
+};
 use sqlparser::dialect::PostgreSqlDialect;
 use subql::backend::{Postgres, Value};
 use subql::testing::relation_pool::{relation_fed_by, RelationPool};
@@ -2066,8 +2068,9 @@ impl<W: Subject + Clone + Send + Sync + 'static> VisibilityPolicy for Unasked<W>
     }
 }
 
-/// Two callers, the row's owner and somebody else, each with a list holding
-/// `table`'s own entries, only `*`, another table's entry, or nothing.
+/// Callers each with a list holding `table`'s own entries, only `*`, another
+/// table's entry, or nothing: the row's owner, somebody else, a userset and an
+/// object of a type that is not the caller's.
 fn bots(table: &str) -> Vec<Bot> {
     let lists = [
         vec![
@@ -2079,7 +2082,7 @@ fn bots(table: &str) -> Vec<Bot> {
         vec!["elsewhere:read".to_owned()],
         Vec::new(),
     ];
-    ["user:alice", "user:carol"]
+    ["user:alice", "user:carol", "notes:2#owner", "orders:2"]
         .into_iter()
         .flat_map(|caller| {
             lists.iter().map(move |list| Bot {
@@ -2090,17 +2093,16 @@ fn bots(table: &str) -> Vec<Bot> {
         .collect()
 }
 
-/// A bot gate answered from the row and the request agrees with the service,
-/// for a table its owner column decides and for one every caller may use.
-///
-/// Every combination is asked: the row admitting the caller or not, against a
-/// list holding the table's own entry, only `*`, another table's entry, or
-/// nothing. A request carrying no list is not the row's to settle, so it alone
-/// reaches the backend.
-#[tokio::test(flavor = "current_thread")]
-#[ignore = "requires docker"]
-async fn a_bot_gate_is_answered_locally_as_the_service_answers() {
-    let schema = format!(
+/// A table its owner column decides, one every caller may use, one only the
+/// list admits to, and one the list or the owner column admits to.
+fn bot_gated_schema() -> String {
+    let listed = |table: &str| {
+        format!(
+            "'{table}:read' = ANY(string_to_array(current_setting('app.bot_list', true), ',')) \
+             OR '*' = ANY(string_to_array(current_setting('app.bot_list', true), ','))"
+        )
+    };
+    format!(
         "CREATE TABLE public.notes(id INTEGER PRIMARY KEY, owner TEXT);
          ALTER TABLE notes ENABLE ROW LEVEL SECURITY;
          CREATE POLICY notes_p ON notes FOR ALL
@@ -2110,27 +2112,61 @@ async fn a_bot_gate_is_answered_locally_as_the_service_answers() {
          CREATE TABLE public.orders(id INTEGER PRIMARY KEY, owner TEXT);
          ALTER TABLE orders ENABLE ROW LEVEL SECURITY;
          CREATE POLICY orders_p ON orders FOR ALL USING (true) WITH CHECK (true);
-         {orders}",
+         {orders}
+         CREATE TABLE public.pages(id INTEGER PRIMARY KEY, owner TEXT);
+         ALTER TABLE pages ENABLE ROW LEVEL SECURITY;
+         CREATE POLICY pages_p ON pages FOR SELECT USING ({pages});
+         CREATE TABLE public.posts(id INTEGER PRIMARY KEY, owner TEXT);
+         ALTER TABLE posts ENABLE ROW LEVEL SECURITY;
+         CREATE POLICY posts_p ON posts FOR SELECT
+           USING ({posts} OR owner = current_setting('app.user_id', true));",
         notes = bot_gates("notes"),
         orders = bot_gates("orders"),
-    );
-
-    let mut client = openfga().await;
-    let wired = wiring(&schema);
-    let model = wired.model.clone();
-    let (store, model_id) =
-        create_store_with_model(&mut client, "subql-bot-gate-parity", &model).await;
-    let shapes = wired.shapes();
-    let service = OpenFgaPolicy::<_, _, Bot, Postgres>::new(
-        Arc::clone(&shapes),
-        client.clone(),
-        store.clone(),
+        pages = listed("pages"),
+        posts = listed("posts"),
     )
-    .expect("the index carries the bot list parameter")
-    .authorization_model_id(model_id);
+}
+
+/// The records the translation states whatever the rows hold, such as a
+/// request gate's entries, which the load writes once and no row's change
+/// states.
+fn constants(outputs: &Outputs) -> Vec<Record> {
+    outputs
+        .tuple_queries()
+        .iter()
+        .filter_map(|query| match &query.description.as_ref()?.derivation {
+            RecordDerivation::Constant { record } => Some(record.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// A bot gate answered from the row and the request agrees with the service,
+/// on every table of [`bot_gated_schema`].
+///
+/// Every combination is asked: the row admitting the caller or not, against a
+/// list holding the table's own entry, only `*`, another table's entry, or
+/// nothing. A request carrying no list is not the row's to settle, so it alone
+/// reaches the backend.
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "requires docker"]
+async fn a_bot_gate_is_answered_locally_as_the_service_answers() {
+    let mut client = openfga().await;
+    let wired = wiring(&bot_gated_schema());
+    let (store, model_id) =
+        create_store_with_model(&mut client, "subql-bot-gate-parity", &wired.model).await;
+    let constants = constants(&wired.outputs);
+    let shapes = wired.shapes();
+    let service = OpenFgaPolicy::<_, _, Bot, Postgres>::new(Arc::clone(&shapes), client, store)
+        .expect("the index carries the bot list parameter")
+        .authorization_model_id(model_id);
+    service
+        .write_records(&constants)
+        .await
+        .expect("write the gate entries");
     let local = RowPolicy::new(Arc::clone(&shapes), Unasked::default());
 
-    for name in ["notes", "orders"] {
+    for name in ["notes", "orders", "pages", "posts"] {
         let table = catalog_helpers::table_id::<Postgres, _>(shapes.catalog(), name)
             .expect("the table is in the catalog");
         let stored = TestEvent::<Postgres>::insert(
@@ -2180,8 +2216,10 @@ async fn a_bot_gate_is_answered_locally_as_the_service_answers() {
             "the row and the request settle every question on {name}"
         );
 
+        // Somebody the row does not admit, since an owner is granted on `posts`
+        // whatever the list says.
         let unset = [Bot {
-            name: "user:alice".to_owned(),
+            name: "user:carol".to_owned(),
             list: None,
         }];
         let mut verdict = Vec::new();

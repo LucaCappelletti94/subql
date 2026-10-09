@@ -71,8 +71,8 @@ mod tests {
     use crate::visibility::shapes::{Shapes, SharedShapes};
     use crate::visibility::{EventRow, RowView, RowWrite, Verdict, VisibilityPolicy};
     use crate::{catalog_helpers, ColumnId, ParserDB, TableId, ValueError};
-    use rls2fga_types::RequestComparison;
     use rls2fga_types::{ActionStatement, RowVersion};
+    use rls2fga_types::{RequestAtom, RequestComparison, RequestPredicate};
 
     #[derive(Debug, PartialEq, Eq)]
     struct Unreachable;
@@ -2102,6 +2102,84 @@ CREATE POLICY notes_p ON notes USING (owner = current_setting('app.department', 
 
         assert_eq!(verdicts, [Verdict::Allow], "the backend answered");
         assert_eq!(policy.inner().calls(), 1);
+    }
+
+    /// One test of `app_subjects` against `value`.
+    fn atom(comparison: RequestComparison, value: &str) -> RequestPredicate {
+        RequestPredicate::Holds(RequestAtom {
+            request_parameter: "app_subjects".to_string(),
+            comparison,
+            value: value.to_string(),
+        })
+    }
+
+    /// A request gate decides from the caller's values alone, for watchers of
+    /// the type it grants, on a row that yields its link.
+    ///
+    /// The link and the granted type are the translation's own. The predicate
+    /// is widened to nest both compositions and both comparisons, which no
+    /// single policy here produces, so a value one comparison accepts and the
+    /// other refuses moves the verdict.
+    #[test]
+    fn a_request_gate_is_decided_by_the_callers_values() {
+        let (db, mut relations) = translated_with_keys(
+            "CREATE TABLE docs(id INTEGER PRIMARY KEY, owner_id TEXT, editor_id TEXT);
+             ALTER TABLE docs ENABLE ROW LEVEL SECURITY;
+             CREATE POLICY p ON docs FOR SELECT
+               USING ('a' = ANY(string_to_array(current_setting('app.subjects', true), ',')));",
+        );
+        let docs = docs_id(&db);
+        let gate = relations
+            .iter_mut()
+            .find(|entry| entry.relation == can_select_relation())
+            .and_then(|entry| entry.decision.as_mut());
+        let predicate = match gate {
+            Some(RowDecision::Request { predicate, .. }) => predicate,
+            other => panic!("a policy reading only the request is a request gate: {other:?}"),
+        };
+        *predicate = RequestPredicate::All(vec![
+            atom(RequestComparison::CallerSetHolds, "a"),
+            RequestPredicate::Any(vec![
+                atom(RequestComparison::CallerValueEquals, "a"),
+                atom(RequestComparison::CallerSetHolds, "z"),
+            ]),
+        ]);
+        let event = insert(docs, docs_row(text("alice"), Value::Null));
+        let policy = RowPolicy::new(shared(db, &relations), Named::<Principal>::default());
+        let view = EventRow::current(&event, policy.catalog()).unwrap();
+
+        let watchers = [
+            Principal::holding("user:one", &["a"]),
+            Principal::holding("user:two", &["a", "b"]),
+            Principal::holding("user:three", &["a", "z"]),
+            Principal::holding("user:four", &["b"]),
+            Principal::holding("user:five", &[]),
+            Principal::holding("group:g#member", &["a"]),
+            Principal::holding("bot:x", &["a"]),
+            Principal::silent("user:six"),
+        ];
+        let mut verdicts = vec![Verdict::Deny; watchers.len()];
+        block_on(policy.may_see(&view, &watchers, &mut verdicts)).unwrap();
+
+        assert_eq!(
+            verdicts,
+            [
+                Verdict::Allow,
+                Verdict::Deny,
+                Verdict::Allow,
+                Verdict::Deny,
+                Verdict::Deny,
+                Verdict::Deny,
+                Verdict::Deny,
+                Verdict::Deny,
+            ]
+        );
+        assert_eq!(policy.inner().calls(), 1);
+        assert_eq!(
+            policy.inner().seen(),
+            1,
+            "only the watcher that cannot state its values is delegated"
+        );
     }
 
     fn id_key() -> ObjectKey {
