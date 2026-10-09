@@ -107,3 +107,34 @@ fn a_wire_cell_is_decoded_once_per_event() {
         wal2json_insert,
     );
 }
+
+#[test]
+fn a_consumer_match_allocates_no_transition_output_for_shared_predicates() {
+    let _serial = PROFILER
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _profiler = dhat::Profiler::builder().testing().build();
+    let mut engine: SubscriptionEngine<_, DefaultIds, ParserDB> =
+        SubscriptionEngine::new(bench_catalog_folded(), PostgreSqlDialect {});
+    for consumer in 0..1_000u64 {
+        engine
+            .register(SubscriptionRequest::new(consumer, "SELECT * FROM orders"))
+            .unwrap();
+    }
+    let event = make_test_event_folded(mix_seed(0));
+    engine.matches_consumer(&event, 7).unwrap();
+    let before = dhat::HeapStats::get().total_blocks;
+    for _ in 0..EVENTS {
+        let result = engine.matches_consumer(&event, 7).unwrap();
+        assert_eq!(result.inserted(), event.kind() == subql::EventKind::Insert);
+        assert_eq!(
+            result.deleted(),
+            matches!(
+                event.kind(),
+                subql::EventKind::Delete | subql::EventKind::Truncate
+            )
+        );
+        assert_eq!(result.updated(), event.kind() == subql::EventKind::Update);
+    }
+    assert_eq!(dhat::HeapStats::get().total_blocks - before, 0);
+}
