@@ -58,7 +58,7 @@ mod tests {
     use rls2fga_types::ConfidenceLevel;
     use rls2fga_types::TypeName;
     use rls2fga_types::{
-        ColumnKind, ContextRendering, ObjectKey, RecordContext, RecordContextEntry,
+        ColumnKind, ConditionName, ContextRendering, ObjectKey, RecordContext, RecordContextEntry,
         RecordDerivation, RecordDescription, RecordTemplate, SubjectKey, ValueSource,
     };
     use rls2fga_types::{RelationShapes, RowDecision};
@@ -2090,7 +2090,7 @@ CREATE POLICY notes_p ON notes USING (owner = current_setting('app.department', 
                     subject_type: TypeName::canonicalized("user"),
                     subject_key: SubjectKey::wildcard(),
                     context: Some(RecordContext {
-                        condition: format!("when_{key}"),
+                        condition: ConditionName::canonicalized(format!("when_{key}")),
                         entries: vec![RecordContextEntry {
                             key: key.to_string(),
                             value: ValueSource::column(column),

@@ -501,7 +501,7 @@ CREATE POLICY docs_owner ON docs USING (owner = current_user);";
 
     #[test]
     fn a_timestamp_context_keeps_serving() {
-        use rls2fga_types::{RecordContext, RecordContextEntry};
+        use rls2fga_types::{ConditionName, RecordContext, RecordContextEntry};
 
         let db = catalog();
         let mut d = description(ValueSource::column("owner"), vec![]);
@@ -509,7 +509,7 @@ CREATE POLICY docs_owner ON docs USING (owner = current_user);";
             unreachable!("the ownership description reads the row");
         };
         template.context = Some(RecordContext {
-            condition: "when_docs".into(),
+            condition: ConditionName::canonicalized("when_docs"),
             entries: vec![RecordContextEntry {
                 key: "at".into(),
                 value: ValueSource::typed_column(name("at"), ColumnKind::TimestampTz),

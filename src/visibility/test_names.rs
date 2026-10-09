@@ -13,9 +13,10 @@ use rls2fga_types::ConfidenceLevel;
 use rls2fga_types::RelationShapes;
 use rls2fga_types::TableId;
 use rls2fga_types::{ColumnKind, ColumnRead, RecordDerivation};
-use rls2fga_types::{ColumnName, RelationName, TypeName};
+use rls2fga_types::{ColumnName, ConditionName, RelationName, TypeName};
 use sqlparser::dialect::PostgreSqlDialect;
 
+use crate::testing::relation_pool::relation_fed_by;
 use crate::ParserDB;
 
 /// A table owned by a column, which is the smallest schema that mints all three kinds.
@@ -74,6 +75,14 @@ pub fn relation(name: &str) -> RelationName {
         .unwrap_or_else(|| panic!("the model declares no relation named '{name}'"))
 }
 
+/// The relation `sql`'s translation settles from rows of the `membership` table.
+///
+/// rls2fga names each membership source's relation itself, so a test asks for it rather than spelling it.
+#[must_use]
+pub fn membership_relation(sql: &str, membership: &str) -> RelationName {
+    relation_fed_by(&translated(sql), membership)
+}
+
 /// The shape connetto writes on every table: the caller's identity, or a key
 /// the caller's request holds, in one policy.
 const HELD_KEYS: &str = "CREATE TABLE notes (id INTEGER PRIMARY KEY, owner TEXT);
@@ -89,7 +98,7 @@ CREATE POLICY notes_p ON notes USING (
 /// values are declared. Both names carry a hash of the policy they came from,
 /// so neither can be spelled here.
 #[must_use]
-pub fn gated_relation() -> (RelationName, String) {
+pub fn gated_relation() -> (RelationName, ConditionName) {
     let db = ParserDB::parse::<PostgreSqlDialect>(HELD_KEYS).expect("the fixture parses");
     TranslatorBuilder::new()
         .with_min_confidence(ConfidenceLevel::B)

@@ -71,6 +71,10 @@ pub mod transition;
 #[cfg(all(test, feature = "visibility-records"))]
 pub(crate) mod test_names;
 
+// Two sources stating one relation, which no translation produces. Test-only.
+#[cfg(all(test, feature = "visibility-records"))]
+pub(crate) mod test_pooling;
+
 pub(crate) mod event_row;
 pub(crate) mod row_write;
 pub(crate) mod verdict;
