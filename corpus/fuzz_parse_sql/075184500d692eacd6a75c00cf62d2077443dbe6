@@ -1,1 +1,0 @@
-SELECT * FROM orders WHERE 5	/	 NOT LiK=nt_setting('app.user_')[4] @oOisten11

@@ -1,1 +1,0 @@
-SELECT * FROM orders WHERE non_colu<>mnc1<>mnc11 >05

@@ -1,1 +1,0 @@
-SELECT * FROM notes WHERE (owner = rre~t_setting('app.user_id', true)) != NOT TRUE

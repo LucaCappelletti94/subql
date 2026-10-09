@@ -1,1 +1,0 @@
-SELECT * FROM orders WHERE lower2 AND #d IN (SIL	)
