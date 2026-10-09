@@ -17,11 +17,11 @@ use super::sweep::sweep;
 use subql::backend::SQLite;
 use subql::compiler::Tri;
 
-/// Where this module records its own seeds.
-///
-/// Not the shipped sweeps' file. These failures are manufactured, and a
-/// seed for a manufactured failure is noise in a real sweep's replay set.
-const TRIAGE_REGRESSIONS: &str = "target/triage.proptest-regressions";
+// Kept apart from the shipped sweeps' file, whose replay set a manufactured failure would pollute.
+// One file per test, since each test clears its own and the tests run in parallel.
+const TRIPLE_REGRESSIONS: &str = "target/triage-reproducible-triple.proptest-regressions";
+const SEED_REGRESSIONS: &str = "target/triage-records-its-seed.proptest-regressions";
+const STOP_REGRESSIONS: &str = "target/triage-stops-the-sweep.proptest-regressions";
 
 /// An engine that answers `TRUE` to everything.
 ///
@@ -54,9 +54,9 @@ impl Oracle for ContraryOracle {
 /// be pieced together from a previous failure is not a reproduction.
 #[test]
 fn a_failing_case_reports_a_reproducible_triple() {
-    let _ = std::fs::remove_file(TRIAGE_REGRESSIONS);
+    let _ = std::fs::remove_file(TRIPLE_REGRESSIONS);
     let mut oracle = ContraryOracle;
-    let found = sweep(&mut oracle, Engine::Sqlite, 8, TRIAGE_REGRESSIONS);
+    let found = sweep(&mut oracle, Engine::Sqlite, 8, TRIPLE_REGRESSIONS);
 
     let failure = found
         .failure
@@ -90,21 +90,21 @@ fn a_failing_case_reports_a_reproducible_triple() {
 /// reproduction in the failure message is what travels.
 #[test]
 fn a_failure_records_its_seed() {
-    let _ = std::fs::remove_file(TRIAGE_REGRESSIONS);
+    let _ = std::fs::remove_file(SEED_REGRESSIONS);
     let mut oracle = ContraryOracle;
-    let found = sweep(&mut oracle, Engine::Sqlite, 8, TRIAGE_REGRESSIONS);
+    let found = sweep(&mut oracle, Engine::Sqlite, 8, SEED_REGRESSIONS);
     assert!(
         found.failure.is_some(),
         "the double diverges by construction"
     );
 
-    let persisted = std::fs::read_to_string(TRIAGE_REGRESSIONS)
+    let persisted = std::fs::read_to_string(SEED_REGRESSIONS)
         .expect("the failing seed is recorded beside the run");
     assert!(
         persisted.contains("cc "),
         "proptest records a seed line: {persisted}"
     );
-    let _ = std::fs::remove_file(TRIAGE_REGRESSIONS);
+    let _ = std::fs::remove_file(SEED_REGRESSIONS);
 }
 
 /// The sweep stops at the first divergence rather than sweeping on.
@@ -115,9 +115,9 @@ fn a_failure_records_its_seed() {
 /// defect seen again.
 #[test]
 fn a_divergence_stops_the_sweep() {
-    let _ = std::fs::remove_file(TRIAGE_REGRESSIONS);
+    let _ = std::fs::remove_file(STOP_REGRESSIONS);
     let mut oracle = ContraryOracle;
-    let found = sweep(&mut oracle, Engine::Sqlite, 8, TRIAGE_REGRESSIONS);
+    let found = sweep(&mut oracle, Engine::Sqlite, 8, STOP_REGRESSIONS);
     assert!(found.failure.is_some());
     assert_eq!(
         found.forms, 1,
@@ -127,7 +127,7 @@ fn a_divergence_stops_the_sweep() {
     // `TRUE` to everything agrees with subql on any row subql also
     // selects, so the divergence lands on a later row of the same form
     // and the cases before it are genuine agreements.
-    let _ = std::fs::remove_file(TRIAGE_REGRESSIONS);
+    let _ = std::fs::remove_file(STOP_REGRESSIONS);
 }
 
 /// A refused setup and a refused predicate are told apart.
