@@ -2026,6 +2026,45 @@ CREATE POLICY notes_p ON notes USING (owner = current_setting('app.department', 
         assert_eq!(policy.inner().calls(), 0);
     }
 
+    /// A request-gated record grants the wildcard of its subject type, which
+    /// admits only watchers named by that type, as it does on the service.
+    ///
+    /// A userset and a name of another type sent a matching value too, and the
+    /// comparison alone would grant them.
+    #[test]
+    fn a_request_gated_record_admits_only_its_subject_type() {
+        let (db, _) = translated(OWNERSHIP);
+        let docs = docs_id(&db);
+        let relations = vec![RelationShapes {
+            type_name: test_names::docs_type(),
+            relation: can_select_relation(),
+            from_one_row: true,
+            shapes: Vec::new(),
+            decision: Some(RowDecision::RequestGated {
+                relation: test_names::relation("owner"),
+                shapes: vec![gated_shape_on("docs", "row_owner", "owner_id")],
+                context_key: "row_owner".to_string(),
+                request_parameter: "app_subjects".to_string(),
+                comparison: RequestComparison::CallerSetHolds,
+            }),
+            grants_nobody: false,
+        }];
+        let event = insert(docs, docs_row(text("alice"), Value::Null));
+        let policy = RowPolicy::new(shared(db, &relations), Named::<Principal>::default());
+        let view = EventRow::current(&event, policy.catalog()).unwrap();
+
+        let watchers = [
+            Principal::holding("user:one", &["alice"]),
+            Principal::holding("group:g#member", &["alice"]),
+            Principal::holding("bot:x", &["alice"]),
+        ];
+        let mut verdicts = vec![Verdict::Deny; 3];
+        block_on(policy.may_see(&view, &watchers, &mut verdicts)).unwrap();
+
+        assert_eq!(verdicts, [Verdict::Allow, Verdict::Deny, Verdict::Deny]);
+        assert_eq!(policy.inner().calls(), 0);
+    }
+
     /// A record carrying its side under a different key than the recipe names is
     /// refused rather than compared.
     ///

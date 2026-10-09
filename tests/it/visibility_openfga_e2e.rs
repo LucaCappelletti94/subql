@@ -1763,6 +1763,7 @@ async fn stored_relation(
 ///
 /// The held-keys arm is a condition the server completes from the question, so
 /// a watcher that cannot state its keys is refused rather than answered.
+#[derive(Clone, Debug)]
 struct Principal {
     name: String,
     keys: Vec<String>,
@@ -1899,6 +1900,70 @@ CREATE POLICY notes_p ON notes FOR ALL USING (
     );
 }
 
+/// A held-keys arm admits only watchers of the type its wildcard names, locally
+/// as on the service.
+///
+/// Every watcher below sent the row's owner as a key, so the comparison alone
+/// grants all of them. The service grants `user:*`, which neither a userset nor
+/// an object of another type is a member of.
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "requires docker"]
+async fn a_held_key_admits_only_the_wildcards_type() {
+    const HELD_KEYS: &str = "
+CREATE TABLE public.notes(id INTEGER PRIMARY KEY, owner TEXT NOT NULL);
+ALTER TABLE notes ENABLE ROW LEVEL SECURITY;
+CREATE POLICY notes_p ON notes FOR ALL USING (
+  owner = current_setting('app.user_id', true)
+  OR owner = ANY(string_to_array(current_setting('app.subjects', true), ',')));
+";
+
+    let mut client = openfga().await;
+    let wired = wiring(HELD_KEYS);
+    let (store, model_id) =
+        create_store_with_model(&mut client, "subql-held-key-type", &wired.model).await;
+    let shapes = wired.shapes();
+    let service =
+        OpenFgaPolicy::<_, _, Principal, Postgres>::new(Arc::clone(&shapes), client, store)
+            .expect("the index carries what the questions need")
+            .authorization_model_id(model_id);
+    let local = RowPolicy::new(Arc::clone(&shapes), Unasked::<Principal>::default());
+
+    let notes = catalog_helpers::table_id::<Postgres, _>(shapes.catalog(), "notes")
+        .expect("notes is in the catalog");
+    let stored =
+        TestEvent::<Postgres>::insert(notes, vec![Value::Int(1), Value::String("alice".into())])
+            .with_pk_columns([0u16]);
+    let (diff, _requeries) = shapes.diff(&stored).expect("an insert states its facts");
+    service.apply(&diff).await.expect("write the row's facts");
+    let row = EventRow::current(&stored, shapes.catalog()).expect("post-image");
+
+    let watchers = [
+        Principal::new("user:bob", &["alice"]),
+        Principal::new("notes:2#owner", &["alice"]),
+        Principal::new("notes:2", &["alice"]),
+    ];
+    let mut answered = Vec::new();
+    Verdict::reset(&mut answered, watchers.len());
+    local
+        .may_see(&row, &watchers, &mut answered)
+        .await
+        .expect("the stand-in never fails");
+    let mut expected = Vec::new();
+    Verdict::reset(&mut expected, watchers.len());
+    service
+        .may_see(&row, &watchers, &mut expected)
+        .await
+        .expect("the service answered");
+
+    assert_eq!(expected, [Verdict::Allow, Verdict::Deny, Verdict::Deny]);
+    assert_eq!(answered, expected, "for {watchers:?}");
+    assert_eq!(
+        local.inner().take_asked(),
+        0,
+        "the row and the request settle every watcher"
+    );
+}
+
 /// The four restrictive policies that hold a bot to its declared list, one per
 /// command, each admitting the table's own `table:verb` entry or `*`.
 fn bot_gates(table: &str) -> String {
@@ -1947,27 +2012,36 @@ impl Subject for Bot {
 
 /// A backend that grants nothing and counts the watchers it was asked about,
 /// so a verdict it did not write is one the row and the request settled.
-#[derive(Default)]
-struct Unasked {
+struct Unasked<W> {
     asked: std::sync::atomic::AtomicUsize,
+    watcher: core::marker::PhantomData<fn() -> W>,
 }
 
-impl Unasked {
+impl<W> Default for Unasked<W> {
+    fn default() -> Self {
+        Self {
+            asked: std::sync::atomic::AtomicUsize::new(0),
+            watcher: core::marker::PhantomData,
+        }
+    }
+}
+
+impl<W> Unasked<W> {
     /// How many watchers reached the backend since the last call.
     fn take_asked(&self) -> usize {
         self.asked.swap(0, std::sync::atomic::Ordering::Relaxed)
     }
 }
 
-impl VisibilityPolicy for Unasked {
-    type Watcher = Bot;
+impl<W: Subject + Clone + Send + Sync + 'static> VisibilityPolicy for Unasked<W> {
+    type Watcher = W;
     type Error = core::convert::Infallible;
     type Backend = Postgres;
 
     fn may_see<R>(
         &self,
         _row: &R,
-        watchers: &[Bot],
+        watchers: &[W],
         _verdicts: &mut [Verdict],
     ) -> impl Future<Output = Result<(), Self::Error>> + Send
     where
@@ -1981,7 +2055,7 @@ impl VisibilityPolicy for Unasked {
     fn may_write<R>(
         &self,
         _write: RowWrite<'_, R>,
-        _watcher: &Bot,
+        _watcher: &W,
     ) -> impl Future<Output = Result<Verdict, Self::Error>> + Send
     where
         R: subql::visibility::RowView<Backend = Postgres> + Sync + ?Sized,
