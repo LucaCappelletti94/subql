@@ -230,13 +230,11 @@ diesel-dynamic-schema = { version = "0.2", default-features = false, optional = 
 # deps so the emulator stays a pure-Rust addition.
 pg2sqlite = { git = "https://github.com/LucaCappelletti94/pg2sqlite", branch = "main", default-features = false, optional = true }
 
-# Output contracts and row evaluation for `visibility-records`. Pinned to the
-# commit of rls2fga's `upstream/request-gate-cost` branch that adds
-# `RowDecision::Request`, until that branch reaches rls2fga `main`.
-rls2fga-types = { git = "https://github.com/LucaCappelletti94/rls2fga", rev = "c49cd3202397a016dd236ec6d7095f040b461c15", default-features = false, optional = true }
+# Output contracts and row evaluation for `visibility-records`.
+rls2fga-types = { git = "https://github.com/LucaCappelletti94/rls2fga", branch = "main", default-features = false, optional = true }
 
 # Full translation for `membership-term`.
-rls2fga = { git = "https://github.com/LucaCappelletti94/rls2fga", rev = "c49cd3202397a016dd236ec6d7095f040b461c15", default-features = false, optional = true }
+rls2fga = { git = "https://github.com/LucaCappelletti94/rls2fga", branch = "main", default-features = false, optional = true }
 
 # OpenFGA gRPC client, behind `visibility-openfga`. The only maintained Rust
 # client for it: OpenFGA publishes no official Rust SDK and never has. No
@@ -335,7 +333,7 @@ proptest = "1"
 # Default features on, since the translator is `std`-only, plus `client` so
 # `tests/visibility_openfga_e2e.rs` writes the emitted model to the server
 # through rls2fga rather than converting it here.
-rls2fga = { git = "https://github.com/LucaCappelletti94/rls2fga", rev = "c49cd3202397a016dd236ec6d7095f040b461c15", features = ["client"] }
+rls2fga = { git = "https://github.com/LucaCappelletti94/rls2fga", branch = "main", features = ["client"] }
 
 # Multi-task async runtime for tests that need real concurrency (e.g.
 # `tests/reexec_throttle.rs`, which observes peak in-flight connector
