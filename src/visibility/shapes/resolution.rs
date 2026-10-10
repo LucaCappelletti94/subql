@@ -480,17 +480,17 @@ impl<DB: DatabaseLike> Shapes<DB> {
     }
 }
 
-/// Whether `decision` grants anywhere through a request-gated comparison.
+/// Whether `decision` grants anywhere through a value the caller's request
+/// carries.
 fn is_request_gated(decision: &RowDecision) -> bool {
     match decision {
-        RowDecision::RequestGated { .. } => true,
+        RowDecision::RequestGated { .. } | RowDecision::Request { .. } => true,
         RowDecision::Any(children) | RowDecision::All(children) => {
             children.iter().any(is_request_gated)
         }
         // A leaf grants names and the everyone arm every user, neither through
-        // the request, and a composition this does not recognise cannot be
-        // evaluated at all, so it is never indexed and cannot reach here.
-        _ => false,
+        // the request.
+        RowDecision::Leaf { .. } | RowDecision::Everyone { .. } => false,
     }
 }
 
@@ -1052,16 +1052,16 @@ fn resolve_key<B: crate::backend::Backend, DB: DatabaseLike>(
 /// It names no table either, so both fall out of the same walk rather than
 /// needing a guard that says so twice.
 ///
-/// A recipe shape this does not recognise falls to the wildcard and delegates.
-/// That is the whole protection against a composition a later rls2fga adds.
+/// Every variant is matched, so a composition a later rls2fga adds fails to
+/// compile here until it is either evaluated or refused.
 fn usable_table<'a, B: crate::backend::Backend, DB: DatabaseLike>(
     decision: &'a RowDecision,
     db: &DB,
 ) -> Option<&'a ContractTableId> {
     match decision {
-        RowDecision::Leaf { shapes, .. } | RowDecision::RequestGated { shapes, .. } => {
-            shapes_table::<B, DB>(shapes, db)
-        }
+        RowDecision::Leaf { shapes, .. }
+        | RowDecision::RequestGated { shapes, .. }
+        | RowDecision::Request { shapes, .. } => shapes_table::<B, DB>(shapes, db),
         // A shape naming a subject would be read as granting every user.
         RowDecision::Everyone { shapes, .. } => {
             if shapes.iter().all(|shape| grants_everyone(shape).is_some()) {
@@ -1080,9 +1080,6 @@ fn usable_table<'a, B: crate::backend::Backend, DB: DatabaseLike>(
             }
             table
         }
-        // `RowDecision` is `#[non_exhaustive]`: a composition this does not
-        // understand is delegated rather than guessed at.
-        _ => None,
     }
 }
 
@@ -1394,6 +1391,39 @@ mod tests {
                  request, so {statement:?} needs nobody else: {:?}",
                 shapes.answer(orders, statement)
             );
+        }
+    }
+
+    /// A read policy the bot list alone decides, and one the list or the
+    /// owner column decides, both settled by the request and the row.
+    #[test]
+    fn a_read_policy_on_the_request_alone_is_answered_locally() {
+        let listed = "'*' = ANY(string_to_array(current_setting('app.bot_list', true), ','))";
+        for (name, using) in [
+            ("pages", alloc::string::String::from(listed)),
+            (
+                "posts",
+                alloc::format!("{listed} OR owner = current_setting('app.user_id', true)"),
+            ),
+        ] {
+            let shapes = shapes_declaring(
+                &alloc::format!(
+                    "CREATE TABLE {name} (id INTEGER PRIMARY KEY, owner TEXT);
+                     ALTER TABLE {name} ENABLE ROW LEVEL SECURITY;
+                     CREATE POLICY {name}_p ON {name} FOR SELECT USING ({using});"
+                ),
+                [
+                    SessionAttribute::setting("app.user_id", SessionAttributeKind::CallerId),
+                    SessionAttribute::setting("app.bot_list", SessionAttributeKind::SetAttribute),
+                ],
+            );
+            let id = table(&shapes, name);
+            assert!(
+                shapes.answers_locally(id, ActionStatement::Select),
+                "{name}: {:?}",
+                shapes.answer(id, ActionStatement::Select)
+            );
+            assert!(shapes.has_request_gated_recipe(), "{name}");
         }
     }
 

@@ -1075,7 +1075,7 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 [[package]]
 name = "rls2fga"
 version = "0.1.0"
-source = "git+https://github.com/LucaCappelletti94/rls2fga?branch=main#fe5f857b69d54942a7e706c95ff850484fca2b24"
+source = "git+https://github.com/LucaCappelletti94/rls2fga?branch=main#649d793542eb2a411f542f823d9e5d7b2b927dc2"
 dependencies = [
  "rls2fga-types",
  "serde",
@@ -1088,7 +1088,7 @@ dependencies = [
 [[package]]
 name = "rls2fga-types"
 version = "0.1.0"
-source = "git+https://github.com/LucaCappelletti94/rls2fga?branch=main#fe5f857b69d54942a7e706c95ff850484fca2b24"
+source = "git+https://github.com/LucaCappelletti94/rls2fga?branch=main#649d793542eb2a411f542f823d9e5d7b2b927dc2"
 dependencies = [
  "serde",
  "thiserror",

@@ -2,7 +2,7 @@ use alloc::vec::Vec;
 
 use rls2fga_types::RecordDescription;
 use rls2fga_types::{ActionAnswer, ActionJudgement, ActionStatement, RowVersion};
-use rls2fga_types::{RequestComparison, RowDecision};
+use rls2fga_types::{RequestComparison, RequestPredicate, RowDecision};
 use sql_traits::prelude::DatabaseLike;
 
 use crate::visibility::records::{grants_everyone, records_from_row_view};
@@ -100,51 +100,67 @@ where
             values,
         ),
         RowDecision::Everyone { shapes, .. } => everyone::<R, DB, S>(shapes, row, db, watcher),
-        RowDecision::Any(children) => {
-            let mut unresolved = false;
-            for child in children {
-                match evaluate(child, row, db, watcher, values) {
-                    // One arm granting settles a union, whatever the others
-                    // say. This is what keeps one unreadable arm from
-                    // disabling the whole table.
-                    Local::Allow => return Local::Allow,
-                    Local::Unresolved => unresolved = true,
-                    Local::Deny => {}
-                }
-            }
-            if unresolved {
-                Local::Unresolved
-            } else {
-                Local::Deny
-            }
+        RowDecision::Request {
+            shapes,
+            subject_type,
+            predicate,
+            ..
+        } => request::<R, DB, S>(
+            shapes,
+            subject_type.as_str(),
+            predicate,
+            row,
+            db,
+            watcher,
+            values,
+        ),
+        RowDecision::Any(children) => any(children
+            .iter()
+            .map(|child| evaluate(child, row, db, watcher, values))),
+        RowDecision::All(children) => all(children
+            .iter()
+            .map(|child| evaluate(child, row, db, watcher, values))),
+    }
+}
+
+/// A union of `arms`.
+///
+/// One arm granting settles it, whatever the others say. This is what keeps
+/// one unreadable arm from disabling the whole table.
+fn any(arms: impl Iterator<Item = Local>) -> Local {
+    let mut unresolved = false;
+    for arm in arms {
+        match arm {
+            Local::Allow => return Local::Allow,
+            Local::Unresolved => unresolved = true,
+            Local::Deny => {}
         }
-        RowDecision::All(children) => {
-            let mut denied = false;
-            let mut unresolved = false;
-            for child in children {
-                match evaluate(child, row, db, watcher, values) {
-                    Local::Deny => denied = true,
-                    Local::Unresolved => unresolved = true,
-                    Local::Allow => {}
-                }
-            }
-            // A denying arm beside an unreadable one is deliberately not a
-            // local refusal. It would be correct, and a subtly wrong exclusion
-            // is a silent wrong refusal, so it waits for a restrictive policy
-            // to exist and be tested against.
-            if unresolved {
-                Local::Unresolved
-            } else if denied {
-                Local::Deny
-            } else {
-                Local::Allow
-            }
+    }
+    if unresolved {
+        Local::Unresolved
+    } else {
+        Local::Deny
+    }
+}
+
+/// An intersection of `arms`.
+///
+/// A denying arm beside an unreadable one is deliberately not a local refusal.
+/// It would be correct, and a subtly wrong exclusion is a silent wrong refusal,
+/// so it waits for a restrictive policy to exist and be tested against.
+fn all(arms: impl Iterator<Item = Local>) -> Local {
+    let mut denied = false;
+    for arm in arms {
+        match arm {
+            Local::Unresolved => return Local::Unresolved,
+            Local::Deny => denied = true,
+            Local::Allow => {}
         }
-        // `RowDecision` is `#[non_exhaustive]`: a composition this does not
-        // understand is delegated rather than guessed at. Such a recipe is not
-        // indexed either, so this is defence in depth rather than the only
-        // guard.
-        _ => Local::Unresolved,
+    }
+    if denied {
+        Local::Deny
+    } else {
+        Local::Allow
     }
 }
 
@@ -248,20 +264,7 @@ where
             let Some(value) = context.values.get(context_key) else {
                 return Local::Unresolved;
             };
-            granted |= named_by_type(watcher, subject_type)
-                && match comparison {
-                    RequestComparison::CallerSetHolds => values.holds(value),
-                    // One value, not one of several: a watcher that sent a set
-                    // where the policy compares a single value has not satisfied
-                    // it, and reading any element as a match is a wrong allow.
-                    RequestComparison::CallerValueEquals => {
-                        values.len() == 1 && values.holds(value)
-                    }
-                    // `RequestComparison` is `#[non_exhaustive]`: a comparison this
-                    // does not know cannot be applied, and its records grant
-                    // everyone until one is.
-                    _ => return Local::Unresolved,
-                };
+            granted |= named_by_type(watcher, subject_type) && compares(comparison, values, value);
         }
     }
 
@@ -269,6 +272,82 @@ where
         Local::Allow
     } else {
         Local::Deny
+    }
+}
+
+/// Whether the caller's values satisfy `comparison` against `value`.
+fn compares(comparison: RequestComparison, values: &RequestValues, value: &str) -> bool {
+    match comparison {
+        RequestComparison::CallerSetHolds => values.holds(value),
+        // One value, not one of several: a watcher that sent a set where the
+        // policy compares a single value has not satisfied it, and reading any
+        // element as a match is a wrong allow.
+        RequestComparison::CallerValueEquals => values.len() == 1 && values.holds(value),
+    }
+}
+
+/// Whether a row that yields its link to the table's request gate admits
+/// `watcher`, which the caller's own values decide the same way on every row.
+///
+/// The gate grants the wildcard of `subject_type`, so a watcher named by
+/// another type or a userset is refused whatever it sent, as on the service.
+fn request<R, DB, S>(
+    shapes: &[RecordDescription],
+    subject_type: &str,
+    predicate: &RequestPredicate,
+    row: &R,
+    db: &DB,
+    watcher: &S,
+    values: &mut RequestValues,
+) -> Local
+where
+    R: RowView + ?Sized,
+    DB: DatabaseLike,
+    S: Subject + ?Sized,
+{
+    if !named_by_type(watcher, subject_type) {
+        return Local::Deny;
+    }
+    let mut linked = false;
+    for shape in shapes {
+        let Ok(records) = records_from_row_view::<R, DB>(shape, row, db) else {
+            return Local::Unresolved;
+        };
+        linked |= !records.is_empty();
+    }
+    if linked {
+        holds(predicate, watcher, values)
+    } else {
+        Local::Deny
+    }
+}
+
+/// Whether the values `watcher` sent satisfy `predicate`.
+fn holds<S: Subject + ?Sized>(
+    predicate: &RequestPredicate,
+    watcher: &S,
+    values: &mut RequestValues,
+) -> Local {
+    match predicate {
+        RequestPredicate::Holds(atom) => {
+            values.reset();
+            // A watcher that cannot say what it sent loses speed and never
+            // correctness.
+            if !watcher.request_value(&atom.request_parameter, values) {
+                return Local::Unresolved;
+            }
+            if compares(atom.comparison, values, &atom.value) {
+                Local::Allow
+            } else {
+                Local::Deny
+            }
+        }
+        RequestPredicate::Any(children) => {
+            any(children.iter().map(|child| holds(child, watcher, values)))
+        }
+        RequestPredicate::All(children) => {
+            all(children.iter().map(|child| holds(child, watcher, values)))
+        }
     }
 }
 
