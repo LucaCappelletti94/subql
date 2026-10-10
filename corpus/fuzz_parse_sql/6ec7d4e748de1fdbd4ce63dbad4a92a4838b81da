@@ -1,1 +1,0 @@
-SELECT * FROM orders WHERE hid IN (SELECELECtus) = $2 AND id IN (SELg2agers)

@@ -1,1 +1,0 @@
-SELECT * FROM orders WHERE nonnisnexiste ILIKE ntte ILIKE nt_snt_

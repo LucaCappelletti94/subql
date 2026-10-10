@@ -1,1 +1,0 @@
-SeLECT id, amount FROM orders WHERE COAMESCE( c3) *2* 3
