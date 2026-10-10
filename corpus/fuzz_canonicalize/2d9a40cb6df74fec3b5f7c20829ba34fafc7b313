@@ -1,0 +1,1 @@
+eid IN (SELECT id FROM maNLL,r)
