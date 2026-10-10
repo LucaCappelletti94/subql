@@ -172,11 +172,7 @@ where
         let Ok(records) = records_from_row_view::<R, DB>(shape, row, db) else {
             return Local::Unresolved;
         };
-        granted |= !records.is_empty()
-            && watcher.subjects().any(|name| {
-                name.split_once(':')
-                    .is_some_and(|(kind, key)| kind == subject_type.as_str() && !key.contains('#'))
-            });
+        granted |= !records.is_empty() && named_by_type(watcher, subject_type.as_str());
     }
     if granted {
         Local::Allow
@@ -185,12 +181,23 @@ where
     }
 }
 
+/// Whether `watcher` is known by a name of `subject_type`, which is what that
+/// type's wildcard admits on the service. A userset is not a member of the type
+/// and is not admitted there either.
+fn named_by_type<S: Subject + ?Sized>(watcher: &S, subject_type: &str) -> bool {
+    watcher.subjects().any(|name| {
+        name.split_once(':')
+            .is_some_and(|(kind, key)| kind == subject_type && !key.contains('#'))
+    })
+}
+
 /// Whether the caller's own value completes the comparison this row's side
 /// half-settles.
 ///
-/// The records here grant `user:*`, so taking their subject at face value
-/// grants everyone. The row's side is in the record's condition context, under
-/// `context_key`, and only the caller's value decides it.
+/// The records here grant the wildcard of their subject type, so taking their
+/// subject at face value grants every watcher of that type. The row's side is
+/// in the record's condition context, under `context_key`, and only the
+/// caller's value decides it.
 #[allow(clippy::too_many_arguments)]
 fn request_gated<R, DB, S>(
     shapes: &[RecordDescription],
@@ -220,6 +227,12 @@ where
             return Local::Unresolved;
         };
         for record in records {
+            // The service admits a watcher of the wildcard's type and nobody
+            // else. A named subject is not what this variant carries, so it is
+            // delegated rather than read.
+            let Some((subject_type, "*")) = record.subject.split_once(':') else {
+                return Local::Unresolved;
+            };
             let Some(context) = record.context.as_ref() else {
                 // A record with no context cannot be the row's side of a
                 // comparison, and its subject is the wildcard, so reading it
@@ -235,17 +248,20 @@ where
             let Some(value) = context.values.get(context_key) else {
                 return Local::Unresolved;
             };
-            granted |= match comparison {
-                RequestComparison::CallerSetHolds => values.holds(value),
-                // One value, not one of several: a watcher that sent a set
-                // where the policy compares a single value has not satisfied
-                // it, and reading any element as a match is a wrong allow.
-                RequestComparison::CallerValueEquals => values.len() == 1 && values.holds(value),
-                // `RequestComparison` is `#[non_exhaustive]`: a comparison this
-                // does not know cannot be applied, and its records grant
-                // everyone until one is.
-                _ => return Local::Unresolved,
-            };
+            granted |= named_by_type(watcher, subject_type)
+                && match comparison {
+                    RequestComparison::CallerSetHolds => values.holds(value),
+                    // One value, not one of several: a watcher that sent a set
+                    // where the policy compares a single value has not satisfied
+                    // it, and reading any element as a match is a wrong allow.
+                    RequestComparison::CallerValueEquals => {
+                        values.len() == 1 && values.holds(value)
+                    }
+                    // `RequestComparison` is `#[non_exhaustive]`: a comparison this
+                    // does not know cannot be applied, and its records grant
+                    // everyone until one is.
+                    _ => return Local::Unresolved,
+                };
         }
     }
 
