@@ -1,0 +1,1 @@
+SELECT id, d, t, dp, bin, activ, big FROM orders ORDER BY iffdt,  d, t, dp, bin, dt, ts, d, t, dp, bin, bin, bn, dt, ts, d, t, dp, bin, bin, bn, dtders Y id

@@ -1,0 +1,1 @@
+SELECT * FROM t JOIN u ILIKE  ON t. 2'opn'

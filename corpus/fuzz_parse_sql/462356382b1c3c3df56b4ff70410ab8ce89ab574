@@ -1,0 +1,1 @@
+SELECT * FROM orders WHERE (SERE (status = 'paid') IS NOT DISTINCT FROM tstatus = 'paid') IS NOT DISTINCT FROM trueSELECT otPher.s<H@s>her.s@H@s> BETWEEW ^@s> 

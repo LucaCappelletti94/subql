@@ -1,0 +1,1 @@
+SELECT * FROM orders WHERE non@@@c5@@NOT @B'open'@@@@5@@NOT @B'open'@@@@@@@@NOTWHER@ON@@amountn >10
