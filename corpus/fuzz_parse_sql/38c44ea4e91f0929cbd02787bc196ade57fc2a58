@@ -1,1 +1,0 @@
-SELECT * FROM orders WHERE l@@O NOT IN (ts) GROUP BY id
