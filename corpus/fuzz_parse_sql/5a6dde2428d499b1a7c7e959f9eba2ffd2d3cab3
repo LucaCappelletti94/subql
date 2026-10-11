@@ -1,0 +1,1 @@
+SELECT * FROM orders WHERE nGcurrent_setting('c1p.user_id')[atu]
