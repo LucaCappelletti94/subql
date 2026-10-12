@@ -1,0 +1,1 @@
+SELECT * FROM orders WHERE Cc1E(NULL=cxi6, 0) <> 1+enxist

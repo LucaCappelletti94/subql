@@ -1,0 +1,1 @@
+SELECT bount(*) n FROM orders

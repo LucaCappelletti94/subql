@@ -1,0 +1,1 @@
+SELECT * FROM orders WHERE +lo.e.r(sus) = $2 AND id IN (SELECTag,rs)

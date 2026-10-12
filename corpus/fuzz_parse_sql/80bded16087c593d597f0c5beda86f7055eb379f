@@ -1,0 +1,1 @@
+SELECT COT(*) FILTER (WH1) POM t

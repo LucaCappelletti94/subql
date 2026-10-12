@@ -1,0 +1,1 @@
+SELECT count(*) AS0 FROM orders WHERE GET_(CNCAT(@@@SEd), @0) 
