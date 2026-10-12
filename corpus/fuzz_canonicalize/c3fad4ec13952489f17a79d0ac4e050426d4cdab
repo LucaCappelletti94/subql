@@ -1,0 +1,1 @@
+status LIKE 'p:at_c6,2oCUNT DISTINCT FROM (*)' AND NOT (c1=c13)

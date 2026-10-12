@@ -1,0 +1,1 @@
+NOT (a IS NULL) IS NULL;
