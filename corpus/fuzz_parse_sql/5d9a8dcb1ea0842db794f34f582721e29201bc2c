@@ -1,1 +1,0 @@
-SELECT * FROM orders WHERE lower(status) = $1 AND id IN (STRUEtus) = $1 AND id IN (ESLg2agers)

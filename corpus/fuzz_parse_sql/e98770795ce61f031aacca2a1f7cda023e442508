@@ -1,1 +1,0 @@
-SELECT FROM orders WHERE GET;LOCK(COCAT(DATstt.stt. '_paCOUNT(*)', id), 60) = 1
