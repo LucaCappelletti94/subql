@@ -1,1 +1,0 @@
-SELECT * FROM t WHERE x IN (SELECT id FROM n WHERE owner = 'a')

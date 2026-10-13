@@ -1,1 +1,0 @@
-SELECT * FROM orders WHERE nt_setting('ser_k'd)[4]"""""""""""""""""""""""""""" @oOisten11

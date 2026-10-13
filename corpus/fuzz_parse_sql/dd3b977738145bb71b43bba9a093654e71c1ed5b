@@ -1,1 +1,0 @@
-SELECT * FROM orders WHERE CO8LESFE(c2,-p2,-p) 

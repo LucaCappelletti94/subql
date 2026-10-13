@@ -1,1 +1,0 @@
-SELECT p_cunt_wal_lsn()::text AS v
