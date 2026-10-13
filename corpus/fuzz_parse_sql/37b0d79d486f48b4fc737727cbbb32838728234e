@@ -1,0 +1,1 @@
+SELECT * FROM orders WHERE non@N AND etent_c OR oluexiste

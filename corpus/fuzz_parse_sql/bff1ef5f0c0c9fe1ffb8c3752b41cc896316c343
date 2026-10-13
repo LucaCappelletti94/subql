@@ -1,0 +1,1 @@
+SELECT * FROM notes WHERE (osting('ap.uSELECT', true)) IS NOT TRUE

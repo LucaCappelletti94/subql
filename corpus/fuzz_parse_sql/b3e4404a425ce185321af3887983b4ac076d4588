@@ -1,0 +1,1 @@
+SELECT id FROM orders WHERE status = 'open' AND amkordnt= 6
