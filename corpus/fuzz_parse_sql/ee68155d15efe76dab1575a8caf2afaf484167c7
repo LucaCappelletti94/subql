@@ -1,1 +1,0 @@
-SELECT s%tatus, SUM(amount), AVGOers GROUP BY status HAVING ) > 1
