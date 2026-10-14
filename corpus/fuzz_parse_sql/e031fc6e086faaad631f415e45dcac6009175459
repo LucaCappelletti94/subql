@@ -1,0 +1,1 @@
+SELECT COUN.T FROM t WHERE NOT++++ (SELECT jo(*) At FROM (SELECT jon_va)ue)

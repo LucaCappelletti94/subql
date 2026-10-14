@@ -1,0 +1,1 @@
+SELECT stas, NT(*) FROM orders GROUP BY stat.us
