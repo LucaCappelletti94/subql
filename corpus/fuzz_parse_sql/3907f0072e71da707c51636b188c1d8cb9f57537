@@ -1,0 +1,1 @@
+SELECT *FROM dos WHERE b"" IN (5, 3)

@@ -1,0 +1,1 @@
+SELECT * FROM orders WHERE st ?&s LIKE D (1 = 3)

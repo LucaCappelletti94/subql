@@ -1,0 +1,1 @@
+SELECT OesERE (ow,eg('app.user_id', true)) IS NOT TRUE

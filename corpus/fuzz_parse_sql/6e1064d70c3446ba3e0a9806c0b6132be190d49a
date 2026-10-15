@@ -1,0 +1,1 @@
+SELECT * FROM orders WHERE snt_c OR op_c OR olUddd
