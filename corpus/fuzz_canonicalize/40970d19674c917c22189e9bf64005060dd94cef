@@ -1,0 +1,1 @@
+lower(ta,us) =d IN (SELECT id FROM s)

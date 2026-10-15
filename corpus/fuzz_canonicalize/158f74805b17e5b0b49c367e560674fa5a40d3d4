@@ -1,0 +1,1 @@
+status LIKE 'p:at_c(*)' AND NOT (c1= 33)
