@@ -221,10 +221,12 @@ fn analyze_expr<B: SqlLiteralParse, DB: DatabaseLike>(
 
         Expr::Nested(expr) => analyze_expr::<B, DB>(expr, table_id, database, negated),
 
+        // A `GLOBAL` list never compiles, so it falls through to unknown.
         Expr::InList {
             expr,
             list,
             negated: list_negated,
+            global: false,
         } => analyze_in_list::<B, DB>(expr, list, *list_negated ^ negated, table_id, database),
 
         Expr::Between {

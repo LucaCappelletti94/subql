@@ -1015,9 +1015,10 @@ pub fn derive_update_follow_select_with_set_binds<D: Dialect>(
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
-    //! Bind-placeholder resolution tests. The broad parser suite is not
-    //! here yet. These pin the `Value::Bytes` placeholder path added
-    //! alongside the existing `SqlLiteralParse::parse_literal` decode leg.
+    //! Bind-placeholder resolution tests, and the conditions only a foreign
+    //! dialect parses. The broad parser suite is not here yet. The bind tests
+    //! pin the `Value::Bytes` placeholder path added alongside the existing
+    //! `SqlLiteralParse::parse_literal` decode leg.
     use super::{value_to_sql_value, SqlLiteralParse};
     use crate::backend::{Backend, MySql, Postgres, SQLite, ScalarFamily, Value};
     use crate::RegisterError;
@@ -1138,5 +1139,67 @@ mod tests {
              project_id IN (SELECT project_id FROM project_members WHERE user_id = \
              current_setting('app.user_id', true))"
         );
+    }
+
+    /// Compile the WHERE clause of `SELECT * FROM orders WHERE {condition}` as
+    /// ClickHouse parses it, the one dialect that spells `GLOBAL IN`.
+    fn compile_clickhouse_condition(condition: &str) -> Result<(), RegisterError> {
+        use sql_traits::structs::ParserDB;
+        use sqlparser::dialect::{ClickHouseDialect, PostgreSqlDialect};
+        use sqlparser_canonicalize::Canonicalizer;
+
+        let database = ParserDB::parse::<PostgreSqlDialect>(
+            "CREATE TABLE orders (id INT PRIMARY KEY); \
+             CREATE TABLE members (order_id INT, user_id TEXT);",
+        )
+        .unwrap();
+        let sql = format!("SELECT * FROM orders WHERE {condition}");
+        let stmt = crate::compiler::sql_shape::parse_single_statement(&sql, &ClickHouseDialect {})
+            .unwrap();
+        let (table_name, where_clause) = super::extract_table_and_where(&stmt).unwrap();
+        let table_id = super::resolve_table_id::<Postgres, _>(&table_name, &database).unwrap();
+        super::compile_expression::<Postgres, _>(
+            &where_clause.unwrap(),
+            table_id,
+            &database,
+            &Canonicalizer::new(&PostgreSqlDialect {}),
+            None,
+        )
+        .map(|_| ())
+    }
+
+    /// `GLOBAL` makes a distributed ClickHouse query read the right-hand side
+    /// on the initiator and broadcast it, which no backend here has, so a
+    /// `GLOBAL` membership test is refused where its plain spelling compiles.
+    #[test]
+    fn a_global_membership_test_is_refused_where_the_plain_one_compiles() {
+        let membership = "(SELECT order_id FROM members WHERE user_id = \
+                          current_setting('app.user_id', true))";
+        for (plain, global) in [
+            (
+                "id IN (1, 2)".to_string(),
+                "id GLOBAL IN (1, 2)".to_string(),
+            ),
+            (
+                "id NOT IN (1, 2)".to_string(),
+                "id GLOBAL NOT IN (1, 2)".to_string(),
+            ),
+            (
+                format!("id IN {membership}"),
+                format!("id GLOBAL IN {membership}"),
+            ),
+        ] {
+            assert!(
+                compile_clickhouse_condition(&plain).is_ok(),
+                "{plain} should compile"
+            );
+            assert!(
+                matches!(
+                    compile_clickhouse_condition(&global),
+                    Err(RegisterError::UnsupportedSql(_))
+                ),
+                "{global} should be refused as an unsupported condition"
+            );
+        }
     }
 }
