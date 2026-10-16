@@ -1,0 +1,1 @@
+SELECT * FROM orders WHERE noneitelu<>mncolu<>mnc1<>mnc11 >05

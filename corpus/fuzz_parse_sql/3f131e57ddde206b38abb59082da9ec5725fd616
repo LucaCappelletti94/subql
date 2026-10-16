@@ -1,0 +1,1 @@
+SELECT count(*) AS c0 FROM orders WHERE GK(CONCAT(D, id), @1) 

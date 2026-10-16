@@ -1,0 +1,1 @@
+SELECT CAT,(DATe'open') = 1

@@ -1,0 +1,1 @@
+SELECT * FROM notes WHERE (ow@mt?'', tjuner =(nonnm~*s?'app.user_id', true)) IS TRUE
