@@ -9,6 +9,14 @@ permissions:
   contents: read
   actions: read
 
+# Batch fuzzing writes the same corpus branch and merges back whatever it read,
+# so a batch run that starts before pruning pushes would restore pruned inputs.
+concurrency:
+  group: clusterfuzzlite-corpus
+  cancel-in-progress: false
+  # A later run waits behind any run already pending.
+  queue: max
+
 jobs:
   Pruning:
     runs-on: ubuntu-latest

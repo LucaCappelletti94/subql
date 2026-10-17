@@ -9,6 +9,13 @@ permissions:
   contents: read
   actions: read
 
+# Shared with pruning, which replaces the corpus this run merges into.
+concurrency:
+  group: clusterfuzzlite-corpus
+  cancel-in-progress: false
+  # A later run waits behind any run already pending.
+  queue: max
+
 jobs:
   BatchFuzzing:
     runs-on: ubuntu-latest
