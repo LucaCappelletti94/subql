@@ -1,0 +1,1 @@
+SELECT * FROM orders WHERE non_colu<>0<>m11 >05

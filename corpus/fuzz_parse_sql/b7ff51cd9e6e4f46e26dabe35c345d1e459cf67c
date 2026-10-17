@@ -1,0 +1,1 @@
+SELECT * FROM orders WHERE t.s.tas.t>=a.ECac3LECT

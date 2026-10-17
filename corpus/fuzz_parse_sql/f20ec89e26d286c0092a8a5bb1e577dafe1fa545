@@ -1,0 +1,1 @@
+SELECT s g GROUP BY atid, T d

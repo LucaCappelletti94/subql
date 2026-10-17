@@ -1,0 +1,1 @@
+SELECT status, SUM(amount) FROM orders GROUP BY status HAVING COUNT(*) > 1
