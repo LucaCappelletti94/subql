@@ -710,9 +710,9 @@ dependencies = [
 
 [[package]]
 name = "libc"
-version = "0.2.190"
+version = "0.2.191"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ce5d3ddc6d3fa000eb1536d85e147bfe31aacaba692ed6a876f95cb7c855be78"
+checksum = "65cd87c9a6d60536580b316ad985726104730a5151c99845f2490428ef91240a"
 
 [[package]]
 name = "libfuzzer-sys"
@@ -1264,7 +1264,7 @@ dependencies = [
 [[package]]
 name = "sql-traits"
 version = "0.1.0"
-source = "git+https://github.com/earth-metabolome-initiative/sql-traits?branch=main#ed633d8a00b325c8ea3855b97ab418e8ac40f8af"
+source = "git+https://github.com/earth-metabolome-initiative/sql-traits?branch=main#507edc69488854a01db1226b04346ea9751a0740"
 dependencies = [
  "geometric-traits",
  "serde",
@@ -1313,7 +1313,7 @@ dependencies = [
 [[package]]
 name = "sqlparser"
 version = "0.63.0"
-source = "git+https://github.com/apache/datafusion-sqlparser-rs?branch=main#66d90faaa2a9279e019eeaa484d3071c790b6eae"
+source = "git+https://github.com/apache/datafusion-sqlparser-rs?branch=main#5a975d0f4e7dc22b0226eaa8facc12a2fab1aca1"
 dependencies = [
  "log",
  "recursive",
@@ -1343,7 +1343,7 @@ dependencies = [
 [[package]]
 name = "sqlparser_derive"
 version = "0.6.0"
-source = "git+https://github.com/apache/datafusion-sqlparser-rs?branch=main#66d90faaa2a9279e019eeaa484d3071c790b6eae"
+source = "git+https://github.com/apache/datafusion-sqlparser-rs?branch=main#5a975d0f4e7dc22b0226eaa8facc12a2fab1aca1"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1598,9 +1598,9 @@ checksum = "a2c754d6c33795a1c324727428e5a7dedb5b06195f9890bdbcba760d3e246563"
 
 [[package]]
 name = "unicode-normalization"
-version = "0.1.25"
+version = "0.1.26"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5fd4f6878c9cb28d874b009da9e8d183b5abc80117c40bbd187a1fde336be6e8"
+checksum = "75cd3fb03d5288b3ba9a1ee103ac7e9cbb59f0b03d64f8ddfcc04dd42758a85d"
 dependencies = [
  "tinyvec",
 ]
