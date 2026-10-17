@@ -1,1 +1,0 @@
-SELECT aMorgers ORDER BY ts, d, t1 id

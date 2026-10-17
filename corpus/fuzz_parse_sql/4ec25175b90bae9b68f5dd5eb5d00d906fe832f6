@@ -1,1 +1,0 @@
-SELECT * FROM orders WHERE nt_setting('pp'dorders)[5] @sten11

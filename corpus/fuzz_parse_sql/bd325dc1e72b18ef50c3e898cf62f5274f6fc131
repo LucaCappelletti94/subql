@@ -1,1 +1,0 @@
-SELECT * FROM orders WHERE nt_setting('app.u&+er_id')[4] 11
