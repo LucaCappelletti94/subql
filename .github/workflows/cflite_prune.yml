@@ -14,6 +14,8 @@ permissions:
 concurrency:
   group: clusterfuzzlite-corpus
   cancel-in-progress: false
+  # A later run waits behind any run already pending.
+  queue: max
 
 jobs:
   Pruning:
