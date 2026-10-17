@@ -1,0 +1,1 @@
+ status LIKE 'Et5_s0Lastat%_%' AND NOT (c0> 3)

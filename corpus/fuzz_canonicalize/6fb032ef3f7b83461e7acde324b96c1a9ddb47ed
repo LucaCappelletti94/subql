@@ -1,0 +1,1 @@
+ status LIKE 'caC' AND NOT (c1 =c3)
