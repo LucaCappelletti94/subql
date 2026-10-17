@@ -3862,7 +3862,7 @@ dependencies = [
 [[package]]
 name = "pg2sqlite"
 version = "0.1.0"
-source = "git+https://github.com/LucaCappelletti94/pg2sqlite?branch=main#e7791853cc092e982022b9501261d30639eb41e9"
+source = "git+https://github.com/LucaCappelletti94/pg2sqlite?branch=main#53e1d81515a9e4ca831c3568a1109b9515454f1c"
 dependencies = [
  "sql-traits",
  "sqlparser",
