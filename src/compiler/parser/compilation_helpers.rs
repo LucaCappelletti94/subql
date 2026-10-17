@@ -754,11 +754,19 @@ where
             out.push(Instruction::PushLiteral(value));
         }
 
+        // `GLOBAL` makes a distributed ClickHouse query evaluate the right-hand
+        // side once on the initiator and broadcast it, a meaning no backend
+        // here has.
+        Expr::InList { global: true, .. } | Expr::InSubquery { global: true, .. } => {
+            return Err(unsupported_expression(expr));
+        }
+
         // IN Lists
         Expr::InList {
             expr,
             list,
             negated,
+            global: false,
         } => {
             refuse_condition_operand(expr)?;
             let list_target = tested_side_kind::<B, DB>(expr, table_id, database, depth, "IN")?;
@@ -817,6 +825,7 @@ where
             expr: tested,
             subquery,
             negated,
+            global: false,
         } => {
             if *negated {
                 return Err(negated_term_refusal());

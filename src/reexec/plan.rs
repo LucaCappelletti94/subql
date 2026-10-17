@@ -1076,6 +1076,7 @@ fn key_predicate(plan: &KeyedPlan) -> Expr {
         expr: alloc::boxed::Box::new(key_expr),
         list: Vec::new(),
         negated: false,
+        global: false,
     }
 }
 

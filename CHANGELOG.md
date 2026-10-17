@@ -7,6 +7,7 @@ All notable changes to subql are recorded here. The format follows [Keep a Chang
 ### Changed
 
 - `visibility` follows `rls2fga` main, where each membership source states its own relation and condition names are `ConditionName`. A condition read back from an OpenFGA store whose name is not a valid condition name is read as no context, like a context value that is not a string.
+- subql follows `sqlparser` main past ClickHouse `GLOBAL IN`. The compiler does not serve a `GLOBAL` membership test, `x GLOBAL IN (...)` or `x GLOBAL IN (SELECT ...)`, and refuses it as it refuses any unsupported condition, because the distributed read it asks for exists only in ClickHouse.
 - Live dispatch resolves each matched predicate's binding record once before enumerating its consumers' subscription ids.
 - Equality-index value maps use `rpds::HashTrieMapSync`, so registration and removal copy only mutated paths while published snapshots retain their candidates.
 - Caller-bound row subscriptions intersect query interest with complete classified public read policies through `membership-term`. `Served::read_rule_folded` reports the fold, and unservable policies retain query-only matching. A folded rule with no permissive read policy admits no rows.
