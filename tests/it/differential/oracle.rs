@@ -219,6 +219,24 @@ const fn tri_of(verdict: Option<bool>) -> Tri {
     }
 }
 
+/// Run setup and map a nullable integer verdict to the tri-state.
+fn answer_int_verdict<C>(connection: &mut C, case: &OracleCase<'_>) -> OracleVerdict
+where
+    C: diesel::Connection,
+    diesel::query_builder::SqlQuery: diesel::query_dsl::methods::ExecuteDsl<C>
+        + for<'query> diesel::query_dsl::LoadQuery<'query, C, IntVerdict>,
+{
+    for statement in case.setup() {
+        if let Err(error) = sql_query(statement).execute(connection) {
+            return OracleVerdict::SetupFailed(error.to_string());
+        }
+    }
+    match sql_query(case.verdict_sql()).get_result::<IntVerdict>(connection) {
+        Ok(row) => OracleVerdict::Answered(tri_of(row.verdict.map(|flag| flag != 0))),
+        Err(error) => OracleVerdict::Refused(error.to_string()),
+    }
+}
+
 /// PostgreSQL, asked over a live connection.
 pub struct PgOracle {
     pub connection: diesel::PgConnection,
@@ -259,15 +277,7 @@ impl Oracle for MySqlOracle {
     }
 
     fn answer(&mut self, case: &OracleCase<'_>) -> OracleVerdict {
-        for statement in case.setup() {
-            if let Err(error) = sql_query(statement).execute(&mut self.connection) {
-                return OracleVerdict::SetupFailed(error.to_string());
-            }
-        }
-        match sql_query(case.verdict_sql()).get_result::<IntVerdict>(&mut self.connection) {
-            Ok(row) => OracleVerdict::Answered(tri_of(row.verdict.map(|flag| flag != 0))),
-            Err(error) => OracleVerdict::Refused(error.to_string()),
-        }
+        answer_int_verdict(&mut self.connection, case)
     }
 }
 
@@ -298,15 +308,7 @@ impl Oracle for SqliteOracle {
     }
 
     fn answer(&mut self, case: &OracleCase<'_>) -> OracleVerdict {
-        for statement in case.setup() {
-            if let Err(error) = sql_query(statement).execute(&mut self.connection) {
-                return OracleVerdict::SetupFailed(error.to_string());
-            }
-        }
-        match sql_query(case.verdict_sql()).get_result::<IntVerdict>(&mut self.connection) {
-            Ok(row) => OracleVerdict::Answered(tri_of(row.verdict.map(|flag| flag != 0))),
-            Err(error) => OracleVerdict::Refused(error.to_string()),
-        }
+        answer_int_verdict(&mut self.connection, case)
     }
 }
 
