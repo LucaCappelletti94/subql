@@ -1,0 +1,1 @@
+SELECT  FROM notes WHERE (owner('apuser_id', tru  (e)) IS TRUE)IS TRUE
