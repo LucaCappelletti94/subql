@@ -9,6 +9,13 @@ permissions:
   contents: write
   pull-requests: write
 
+# Every run checks out main, so a newer run resolves the same tree against
+# newer tips and supersedes one still running. One group also keeps two runs
+# from racing on the refresh branch.
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: true
+
 jobs:
   refresh:
     name: refresh the resolved pins
