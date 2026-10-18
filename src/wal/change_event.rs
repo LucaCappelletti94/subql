@@ -18,7 +18,7 @@
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
-use pg_walstream::{ChangeEvent, ColumnValue, EventType, RowData};
+use pg_walstream::{ChangeEvent, ColumnValue, EventType, ReplicaIdentity, RowData};
 use sql_traits::prelude::DatabaseLike;
 
 use super::pg_type::text_to_pg_value_by_kind;
@@ -311,6 +311,36 @@ const fn image_for(event: &ChangeEvent, row: RowKind) -> Option<&RowData> {
     }
 }
 
+/// Whether a `NULL` in column `name` of the `row` image of `event` is
+/// padding rather than a value.
+///
+/// Postgres sends the old image of a table whose replica identity is not
+/// `FULL` full width, its key columns followed by `NULL` in every other
+/// column. Those `NULL`s say nothing about the row. A non-null cell there is
+/// a real value, which a `DEFAULT` partitioned root sends for a `FULL`
+/// partition under `publish_via_partition_root`.
+fn is_padding(event: &ChangeEvent, row: RowKind, name: &str) -> bool {
+    if row == RowKind::New {
+        return false;
+    }
+    match &event.event_type {
+        EventType::Update {
+            replica_identity,
+            key_columns,
+            ..
+        }
+        | EventType::Delete {
+            replica_identity,
+            key_columns,
+            ..
+        } => {
+            *replica_identity != ReplicaIdentity::Full
+                && !key_columns.iter().any(|key| &**key == name)
+        }
+        _ => false,
+    }
+}
+
 wire_cdc_event!(PgChangeEvent, Postgres, PgCommitPosition);
 
 impl WireEvent for PgChangeEvent {
@@ -343,9 +373,11 @@ impl WireEvent for PgChangeEvent {
     }
 
     fn wire_changed_columns<DB: DatabaseLike>(&self, db: &DB, table_id: TableId) -> Vec<ColumnId> {
+        // Only a `FULL` old image carries the columns an update left alone.
         let EventType::Update {
             old_data: Some(old),
             new_data,
+            replica_identity: ReplicaIdentity::Full,
             ..
         } = &self.change.event_type
         else {
@@ -354,6 +386,7 @@ impl WireEvent for PgChangeEvent {
         let Ok(arity) = catalog_helpers::table_arity(db, table_id) else {
             return Vec::new();
         };
+        // An unchanged TOASTed value is not sent even under `FULL`.
         if old.len() != arity || new_data.len() != arity {
             return Vec::new();
         }
@@ -384,6 +417,7 @@ impl WireEvent for PgChangeEvent {
             // are both Missing here: they escalate to re-execution rather
             // than surfacing as a decode error.
             None | Some(ColumnValue::Binary(_)) => Ok(Value::Missing),
+            Some(ColumnValue::Null) if is_padding(&self.change, row, &name) => Ok(Value::Missing),
             Some(ColumnValue::Null) => Ok(Value::Null),
             Some(ColumnValue::Text(bytes)) => {
                 catalog_helpers::column_scalar_kind::<Postgres, DB>(db, table_id, col).map_or(
@@ -419,8 +453,12 @@ impl WireEvent for PgChangeEvent {
 mod tests {
     use super::*;
     use crate::backend::CdcEvent;
+    use crate::visibility::transition::{transitions, Transition, TransitionError, Transitions};
+    use crate::visibility::{RowView, RowWrite, Verdict, VisibilityPolicy};
     use crate::{PgLsn, PgXid};
-    use pg_walstream::{Lsn, ReplicaIdentity};
+    use core::convert::Infallible;
+    use core::future::{ready, Future};
+    use pg_walstream::Lsn;
     use sql_traits::structs::ParserDB;
     use sqlparser::dialect::PostgreSqlDialect;
 
@@ -521,21 +559,52 @@ mod tests {
         );
     }
 
+    /// Postgres sends a key-only old image full width, every non-key cell
+    /// `NULL`, and pg_walstream decodes those cells to [`ColumnValue::Null`].
+    fn padded_old_image(id: &str) -> RowData {
+        row(vec![
+            ("id", ColumnValue::text(id)),
+            ("customer", ColumnValue::Null),
+            ("amount", ColumnValue::Null),
+            ("status", ColumnValue::Null),
+        ])
+    }
+
+    fn delete(
+        old_data: RowData,
+        replica_identity: ReplicaIdentity,
+        keys: &[&str],
+    ) -> PgChangeEvent {
+        at(ChangeEvent {
+            event_type: EventType::Delete {
+                schema: "public".into(),
+                table: "orders".into(),
+                relation_oid: 1,
+                old_data,
+                replica_identity,
+                key_columns: keys.iter().map(|&key| key.into()).collect(),
+            },
+            lsn: Lsn::new(0),
+            metadata: None,
+        })
+    }
+
     #[test]
-    fn update_sparse_old_image_leaves_changed_empty() {
+    fn update_key_only_old_image_leaves_changed_empty() {
         let db = orders();
         let ev = at(ChangeEvent {
             event_type: EventType::Update {
                 schema: "public".into(),
                 table: "orders".into(),
                 relation_oid: 1,
-                // REPLICA IDENTITY DEFAULT: old image carries the key only.
-                old_data: Some(row(vec![("id", ColumnValue::text("7"))])),
+                old_data: Some(padded_old_image("7")),
+                // `SET id = 8, status = NULL` changed `status` to the value
+                // its padding happens to spell.
                 new_data: row(vec![
-                    ("id", ColumnValue::text("7")),
+                    ("id", ColumnValue::text("8")),
                     ("customer", ColumnValue::text("3")),
                     ("amount", ColumnValue::text("250")),
-                    ("status", ColumnValue::text("paid")),
+                    ("status", ColumnValue::Null),
                 ]),
                 replica_identity: ReplicaIdentity::Default,
                 key_columns: vec!["id".into()],
@@ -545,32 +614,130 @@ mod tests {
         });
         assert!(
             ev.changed_columns(&db).is_empty(),
-            "old image has only the pk so non-pk changes are indeterminate"
+            "old image has only the key so non-key changes are indeterminate"
         );
+        assert_eq!(ev.value_at(&db, RowKind::Old, 3).unwrap(), Value::Missing);
         // Pre-update PK identifies the row through the old image.
         assert_eq!(ev.value_at(&db, RowKind::Pk, 0).unwrap(), Value::Int(7));
     }
 
     #[test]
-    fn delete_pk_from_key_columns_and_old_image() {
+    fn delete_key_only_old_image_reads_padding_as_missing() {
         let db = orders();
-        let ev = at(ChangeEvent {
-            event_type: EventType::Delete {
-                schema: "public".into(),
-                table: "orders".into(),
-                relation_oid: 1,
-                old_data: row(vec![("id", ColumnValue::text("9"))]),
-                replica_identity: ReplicaIdentity::Default,
-                key_columns: vec!["id".into()],
-            },
-            lsn: Lsn::new(0),
-            metadata: None,
-        });
+        let ev = delete(padded_old_image("9"), ReplicaIdentity::Default, &["id"]);
         assert_eq!(ev.kind(), EventKind::Delete);
         assert_eq!(ev.pk_columns(&db), vec![0u16]);
         assert_eq!(ev.value_at(&db, RowKind::Old, 0).unwrap(), Value::Int(9));
         assert_eq!(ev.value_at(&db, RowKind::Pk, 0).unwrap(), Value::Int(9));
+        for col in 1..=3 {
+            assert_eq!(ev.value_at(&db, RowKind::Old, col).unwrap(), Value::Missing);
+        }
         assert_eq!(ev.value_at(&db, RowKind::New, 0).unwrap(), Value::Missing);
+    }
+
+    /// Under `publish_via_partition_root` a `DEFAULT` root over a `FULL`
+    /// partition sends key tuples carrying the whole old row. Its values are
+    /// read, and a `NULL` among them cannot be told from padding.
+    #[test]
+    fn key_tuple_with_real_values_keeps_them() {
+        let db = orders();
+        let old = row(vec![
+            ("id", ColumnValue::text("9")),
+            ("customer", ColumnValue::text("3")),
+            ("amount", ColumnValue::Null),
+            ("status", ColumnValue::text("paid")),
+        ]);
+        let ev = delete(old, ReplicaIdentity::Default, &["id"]);
+        assert_eq!(ev.value_at(&db, RowKind::Old, 1).unwrap(), Value::Int(3));
+        assert_eq!(ev.value_at(&db, RowKind::Old, 2).unwrap(), Value::Missing);
+        assert_eq!(
+            ev.value_at(&db, RowKind::Old, 3).unwrap(),
+            Value::String("paid".into())
+        );
+    }
+
+    #[test]
+    fn full_old_image_keeps_null() {
+        let db = orders();
+        let ev = delete(
+            padded_old_image("9"),
+            ReplicaIdentity::Full,
+            &["id", "customer", "amount", "status"],
+        );
+        for col in 1..=3 {
+            assert_eq!(ev.value_at(&db, RowKind::Old, col).unwrap(), Value::Null);
+        }
+    }
+
+    /// Grants the row to the watcher its `customer` column names.
+    struct CustomerPolicy;
+
+    impl VisibilityPolicy for CustomerPolicy {
+        type Watcher = i64;
+        type Error = Infallible;
+        type Backend = Postgres;
+
+        fn may_see<R>(
+            &self,
+            row: &R,
+            watchers: &[i64],
+            verdicts: &mut [Verdict],
+        ) -> impl Future<Output = Result<(), Infallible>> + Send
+        where
+            R: RowView<Backend = Postgres> + Sync + ?Sized,
+        {
+            let customer = row.value_at(1);
+            for (watcher, verdict) in watchers.iter().zip(verdicts.iter_mut()) {
+                if matches!(customer, Ok(Value::Int(id)) if id == *watcher) {
+                    *verdict = Verdict::Allow;
+                }
+            }
+            ready(Ok(()))
+        }
+
+        fn may_write<R>(
+            &self,
+            _write: RowWrite<'_, R>,
+            _watcher: &i64,
+        ) -> impl Future<Output = Result<Verdict, Infallible>> + Send
+        where
+            R: RowView<Backend = Postgres> + Sync + ?Sized,
+        {
+            ready(Ok(Verdict::Deny))
+        }
+    }
+
+    /// What `ev` does to watcher 3's copy of the row.
+    fn transitions_of(
+        ev: &PgChangeEvent,
+        db: &ParserDB,
+    ) -> Result<Vec<Transition>, TransitionError<Infallible>> {
+        let mut buffers = Transitions::new();
+        crate::testing::block_on(transitions(&CustomerPolicy, ev, db, &[3], &mut buffers))?;
+        Ok(buffers.get().to_vec())
+    }
+
+    #[test]
+    fn key_only_delete_refuses_transitions() {
+        let db = orders();
+        let ev = delete(padded_old_image("9"), ReplicaIdentity::Default, &["id"]);
+        assert_eq!(
+            transitions_of(&ev, &db),
+            Err(TransitionError::IncompletePreviousImage)
+        );
+    }
+
+    #[test]
+    fn key_tuple_with_real_values_is_judged() {
+        let db = orders();
+        let old = row(vec![
+            ("id", ColumnValue::text("9")),
+            ("customer", ColumnValue::text("3")),
+            ("amount", ColumnValue::Null),
+            ("status", ColumnValue::Null),
+        ]);
+        let ev = delete(old, ReplicaIdentity::Default, &["id"]);
+        assert_eq!(transitions_of(&ev, &db), Ok(vec![Transition::Withdraw]));
     }
 
     #[test]
