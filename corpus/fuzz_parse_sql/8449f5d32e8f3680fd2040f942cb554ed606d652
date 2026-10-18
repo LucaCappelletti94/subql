@@ -1,1 +1,0 @@
-SELECT id, amount FROM orders WHERE (amount + +2) * c3

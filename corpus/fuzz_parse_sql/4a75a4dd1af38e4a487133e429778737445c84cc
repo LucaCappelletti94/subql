@@ -1,1 +1,0 @@
-SELECT s FROM orders GROUP BY stat.us

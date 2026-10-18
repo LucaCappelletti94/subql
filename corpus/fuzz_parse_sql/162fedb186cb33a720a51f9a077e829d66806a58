@@ -1,1 +1,0 @@
-SELECT s,g GROUP BY 	stattus, id, UP BY iS

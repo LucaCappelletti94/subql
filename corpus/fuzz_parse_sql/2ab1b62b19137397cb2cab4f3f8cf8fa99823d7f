@@ -1,1 +1,0 @@
-SELECT * FROM orders WHERE (SELECT *tttttttttttttttttttttttttttttttttttttttttt FROM orders WHERE (status = 'paid') IS NOT DISTINCT FROM tstatus = 'paid') IS NOT DISTINCT FROM t@rue
