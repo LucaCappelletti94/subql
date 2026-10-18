@@ -626,6 +626,21 @@ fn shared_predicate_match_benchmark(c: &mut Criterion) {
         );
 
         group.bench_with_input(
+            BenchmarkId::new("rows", subscriber_count),
+            &subscriber_count,
+            |b, &_count| {
+                b.iter(|| {
+                    let reached = engine
+                        .match_rows(black_box(&event))
+                        .unwrap()
+                        .inserted()
+                        .contains(&target);
+                    black_box(reached);
+                });
+            },
+        );
+
+        group.bench_with_input(
             BenchmarkId::new("selected", subscriber_count),
             &subscriber_count,
             |b, &_count| {
@@ -656,6 +671,16 @@ fn shared_predicate_match_benchmark(c: &mut Criterion) {
                 .matches_consumer(black_box(&event), target)
                 .unwrap()
                 .inserted();
+            black_box(reached);
+        });
+    });
+    group.bench_function("rows_many_unrelated", |b| {
+        b.iter(|| {
+            let reached = engine
+                .match_rows(black_box(&event))
+                .unwrap()
+                .inserted()
+                .contains(&target);
             black_box(reached);
         });
     });

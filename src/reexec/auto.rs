@@ -936,17 +936,7 @@ where
         self.inner.drop_cursor(session_id, sub_id)
     }
 
-    /// Match `event` against the registered subscriptions without reading or
-    /// folding, for catchup replay of an event the caller already dispatched.
-    ///
-    /// Delegates straight to
-    /// [`SubscriptionEngine::consumers`](crate::SubscriptionEngine::consumers),
-    /// so no connector call is made and no aggregate fold advances. The return
-    /// carries more than its name suggests: alongside the row verdicts it
-    /// reports term-membership narrowings, which a replay announces a second
-    /// time. Re-applying them is a set union or difference that does not move
-    /// the stored state, but a caller acting on the announcement itself must
-    /// treat a replay's narrowings as possibly-stale repeats.
+    /// Match every consumer's row subscriptions without connector reads, folds, membership movement or activity stamps, for catchup replay in any order.
     ///
     /// # Errors
     ///
@@ -956,7 +946,7 @@ where
         event: &E,
     ) -> Result<crate::ConsumerNotifications<I, E::Checkpoint, E::Backend>, crate::DispatchError>
     {
-        self.inner.consumers(event)
+        self.inner.match_rows(event)
     }
 
     /// Match one consumer's row subscriptions without connector reads, folds, membership movement or activity stamps.

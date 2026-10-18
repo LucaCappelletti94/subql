@@ -4154,7 +4154,7 @@ where
     ///
     /// Membership sets and the eviction clock move here either way, so
     /// this applies part of the event rather than asking a question about
-    /// it.
+    /// it. [`match_rows`](Self::match_rows) asks the question.
     ///
     /// # Examples
     /// ```
@@ -4235,12 +4235,25 @@ where
         )
     }
 
+    /// Match every consumer's row subscriptions against current admissions without moving memberships or activity, so a replay in any order leaves the engine as it found it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DispatchError`] for an unknown table or a cell or predicate evaluation error.
+    pub fn match_rows(
+        &mut self,
+        event: &E,
+    ) -> Result<crate::ConsumerNotifications<I, E::Checkpoint, E::Backend>, DispatchError> {
+        let event = crate::backend::ResolvedEvent::new(event, &self.database);
+        self.row_consumers(&event, false)
+    }
+
     fn consumers_resolved(
         &mut self,
         event: &crate::backend::ResolvedEvent<'_, E>,
     ) -> Result<crate::ConsumerNotifications<I, E::Checkpoint, E::Backend>, DispatchError> {
         let table_id = event.table_id();
-        let notifs = self.row_consumers(event, table_id)?;
+        let notifs = self.row_consumers(event, self.eviction_strategy.needs_activity_tracking())?;
         // After the row dispatch rather than before it. A table can be both the
         // one a subscription reads and the one carrying its memberships, and then
         // both row versions are judged against the set as it stood when the event
@@ -4251,12 +4264,13 @@ where
         Ok(notifs.with_narrowings(narrowings))
     }
 
-    /// The view-relative notifications for subscriptions reading `table_id`.
+    /// The view-relative notifications for subscriptions reading the event's table.
     fn row_consumers(
         &mut self,
         event: &crate::backend::ResolvedEvent<'_, E>,
-        table_id: TableId,
+        track_activity: bool,
     ) -> Result<crate::ConsumerNotifications<I, E::Checkpoint, E::Backend>, DispatchError> {
+        let table_id = event.table_id();
         // An event for a table that is in the catalog but has no
         // subscription affects nobody: report empty rather than
         // erroring. Reserve `UnknownTableId` for ids not in the schema
@@ -4269,18 +4283,12 @@ where
             };
         }
 
-        // Activity-aware policies stamp matched subscriptions through
-        // the `_with_stamps` dispatch variant. Default (no activity
-        // tracking) takes the cheaper path that allocates no stamp
-        // vector.
-        let needs_stamps = self.eviction_strategy.needs_activity_tracking();
-
         let arity = catalog_helpers::table_arity(&self.database, table_id)?;
 
         let (partition, consumer_dict) =
             table_context(&self.partitions, &self.consumer_dictionaries, table_id)?;
 
-        if needs_stamps {
+        if track_activity {
             let (notifs, stamps) = dispatch_consumers_with_stamps(
                 event,
                 partition,
@@ -5740,16 +5748,18 @@ mod tests {
 
     type Engine = SubscriptionEngine<TestEvent<Postgres>, DefaultIds, ParserDB>;
 
-    #[test]
-    fn replay_matching_does_not_protect_a_subscription_from_activity_eviction() {
+    fn assert_replay_leaves_activity_unstamped(replay: impl Fn(&mut Engine, &TestEvent<Postgres>)) {
         let database = ParserDB::parse::<PostgreSqlDialect>(DDL).expect("DDL parses");
         let table =
             catalog_helpers::table_id::<Postgres, _>(&database, "orders").expect("orders resolves");
         let mut engine: Engine = SubscriptionEngine::new(database, PostgreSqlDialect {})
             .with_max_subscriptions(2, EvictionPolicy::EvictLeastActive);
-        for consumer in [1, 2] {
+        for (consumer, sql) in [
+            (1, "SELECT * FROM orders WHERE amount > 5"),
+            (2, "SELECT * FROM orders WHERE amount < 5"),
+        ] {
             engine
-                .register(SubscriptionRequest::new(consumer, "SELECT * FROM orders"))
+                .register(SubscriptionRequest::new(consumer, sql))
                 .expect("subscription registers");
         }
         let event = TestEvent::insert(
@@ -5757,18 +5767,37 @@ mod tests {
             vec![Value::Int(1), Value::Int(10), Value::String("paid".into())],
         );
         for _ in 0..3 {
-            assert!(engine
-                .matches_consumer(&event, 1)
-                .expect("replay matches")
-                .inserted());
+            replay(&mut engine, &event);
         }
         engine
             .register(SubscriptionRequest::new(3, "SELECT * FROM orders"))
             .expect("a cold subscription is evicted");
         let notifications = engine.consumers(&event).expect("live dispatch matches");
-        let mut inserted = notifications.inserted().to_vec();
-        inserted.sort_unstable();
-        assert_eq!(inserted, [2, 3]);
+        assert_eq!(
+            notifications.inserted(),
+            [3],
+            "consumer 1 stays the cold one"
+        );
+    }
+
+    #[test]
+    fn replay_matching_does_not_protect_a_subscription_from_activity_eviction() {
+        assert_replay_leaves_activity_unstamped(|engine, event| {
+            assert!(engine
+                .matches_consumer(event, 1)
+                .expect("replay matches")
+                .inserted());
+        });
+    }
+
+    #[test]
+    fn match_rows_does_not_protect_a_subscription_from_activity_eviction() {
+        assert_replay_leaves_activity_unstamped(|engine, event| {
+            assert_eq!(
+                engine.match_rows(event).expect("replay matches").inserted(),
+                [1]
+            );
+        });
     }
 
     /// A consumer that holds nothing on a table loses its name there.
