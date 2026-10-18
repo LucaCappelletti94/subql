@@ -34,12 +34,14 @@
 //!
 //! # What this cannot see
 //!
-//! Under Postgres `REPLICA IDENTITY DEFAULT` an update carries no old
-//! image, and nothing in the event distinguishes that from an old image
-//! whose values the policy genuinely refuses. Such a row is reported as
-//! [`Transition::Nothing`] and the watcher is never told it lost access.
-//! Only `REPLICA IDENTITY FULL` closes that, which is why subql ships
-//! [`REPLICA_IDENTITY_AUDIT_SQL`](crate::REPLICA_IDENTITY_AUDIT_SQL).
+//! Under `publish_via_partition_root`, a partitioned root whose replica
+//! identity is `FULL` marks every old image it sends as complete. A
+//! partition whose own replica identity is not `FULL` still sends its key
+//! with `NULL` in every other column, and nothing in the event distinguishes
+//! that padding from values. Such a row is judged on cells the source never
+//! sent. Only the source closes that, which is why
+//! [`REPLICA_IDENTITY_AUDIT_SQL`](crate::REPLICA_IDENTITY_AUDIT_SQL) covers
+//! partitions as well as tables.
 
 use alloc::vec::Vec;
 
@@ -216,10 +218,11 @@ where
 
 /// Whether `row` carries its key and nothing else.
 ///
-/// Postgres under `REPLICA IDENTITY DEFAULT` emits exactly that for an
-/// update or a delete, and it is indistinguishable from a complete image
-/// only if you ignore [`Value::Missing`], which means "the source did not
-/// carry this cell" and is a different variant from SQL NULL.
+/// Postgres under any replica identity but `FULL` sends an update's or a
+/// delete's old image as its key with `NULL` padding in every other column,
+/// and the Postgres adaptor reads that padding as [`Value::Missing`], which
+/// means "the source did not carry this cell" and is a different variant
+/// from SQL NULL.
 ///
 /// One absent column beside a present one is not key-only: a single
 /// unchanged large value can go unsent under `FULL`, and refusing that
