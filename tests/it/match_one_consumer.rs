@@ -1,4 +1,5 @@
-//! Single-consumer row transitions and read-only replay.
+//! Read-only replay matching against live dispatch, one consumer through
+//! `matches_consumer` and every consumer through `match_rows`.
 #![expect(clippy::unwrap_used, reason = "Fixture failures must abort the test.")]
 
 use sql_traits::structs::ParserDB;
@@ -35,10 +36,24 @@ const fn flags(answer: &Match) -> (bool, bool, bool) {
     (answer.inserted(), answer.deleted(), answer.updated())
 }
 
+fn sorted(list: &[u64]) -> Vec<u64> {
+    let mut sorted = list.to_vec();
+    sorted.sort_unstable();
+    sorted
+}
+
 // Query first so live dispatch still observes any state a replay must leave untouched.
 fn parity(engine: &mut Engine, event: &TestEvent<Postgres>, consumer: u64) -> Match {
     let selected = engine.matches_consumer(event, consumer).unwrap();
+    let rows = engine.match_rows(event).unwrap();
     let whole = engine.consumers(event).unwrap();
+    assert_eq!(sorted(rows.inserted()), sorted(whole.inserted()));
+    assert_eq!(sorted(rows.deleted()), sorted(whole.deleted()));
+    assert_eq!(sorted(rows.updated()), sorted(whole.updated()));
+    assert_eq!(rows.unanswered(), whole.unanswered());
+    assert_eq!(rows.evaluation_failures(), whole.evaluation_failures());
+    assert_eq!(rows.checkpoint(), whole.checkpoint());
+    assert_eq!(rows.narrowings(), []);
     assert_eq!(
         flags(&selected),
         (
@@ -452,6 +467,25 @@ mod membership {
             flags(&parity(&mut engine, &departure, 1)),
             (false, true, false)
         );
+    }
+
+    #[test]
+    fn match_rows_replays_a_withdrawn_admission_without_restoring_it() {
+        let (mut engine, docs, membership, _) = members(TERM);
+        let alice_on_9 = || vec![Value::Int(9), Value::String("alice".into())];
+        let admission = TestEvent::insert(membership, alice_on_9());
+        let withdrawal = TestEvent::delete(membership, alice_on_9());
+        let probe = TestEvent::insert(docs, row(Value::Int(9), 3));
+        let _ = engine.consumers(&admission).unwrap();
+        let _ = engine.consumers(&withdrawal).unwrap();
+        let replayed = engine.match_rows(&admission).unwrap();
+        assert_eq!(replayed.narrowings(), []);
+        assert_eq!(
+            flags(&parity(&mut engine, &probe, 1)),
+            (false, false, false),
+            "alice left project 9 after the admission being replayed"
+        );
+        assert_eq!(engine.match_rows(&probe).unwrap().inserted(), [2]);
     }
 
     #[test]

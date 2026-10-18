@@ -6,6 +6,7 @@ All notable changes to subql are recorded here. The format follows [Keep a Chang
 
 ### Changed
 
+- `AutoResolvingEngine::match_rows` matches without moving memberships or stamping activity, through the new `SubscriptionEngine::match_rows`, and its result carries no narrowings. It ran `consumers`, so replaying a membership insert after the later delete admitted the subject again, and every replay counted as activity for eviction. Per consumer it answers as `matches_consumer` does, in one evaluation of the event for every consumer it reaches.
 - `visibility` follows `rls2fga` main, where each membership source states its own relation and condition names are `ConditionName`. A condition read back from an OpenFGA store whose name is not a valid condition name is read as no context, like a context value that is not a string.
 - subql follows `sqlparser` main past ClickHouse `GLOBAL IN`. The compiler does not serve a `GLOBAL` membership test, `x GLOBAL IN (...)` or `x GLOBAL IN (SELECT ...)`, and refuses it as it refuses any unsupported condition, because the distributed read it asks for exists only in ClickHouse.
 - Live dispatch resolves each matched predicate's binding record once before enumerating its consumers' subscription ids.

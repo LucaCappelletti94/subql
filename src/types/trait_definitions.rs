@@ -300,7 +300,7 @@ impl<B: Backend> PartialEq for TermNarrowing<B> {
     }
 }
 
-/// Per-consumer notification classification from `consumers()`.
+/// Per-consumer notification classification from `consumers()` and `match_rows()`.
 ///
 /// Each consumer sees events **relative to their own result set** (view-relative
 /// deltas), not the base-table operation.  A single base-table UPDATE may
