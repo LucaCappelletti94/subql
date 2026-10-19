@@ -1,1 +1,0 @@
-SELECT nd_pid()::bigint AS n
