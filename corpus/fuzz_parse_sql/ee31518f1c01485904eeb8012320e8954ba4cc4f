@@ -1,0 +1,1 @@
+SELECT id,notap, b,g FROM orders

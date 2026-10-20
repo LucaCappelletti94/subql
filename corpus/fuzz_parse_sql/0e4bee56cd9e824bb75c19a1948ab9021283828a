@@ -1,0 +1,1 @@
+SELECT * FROM orders WHERE lo NOT IN (s) =0IN (ma~agers)

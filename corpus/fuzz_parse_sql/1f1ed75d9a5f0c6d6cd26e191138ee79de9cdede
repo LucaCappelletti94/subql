@@ -1,0 +1,1 @@
+SELECT id,sl() IS NULL AS d

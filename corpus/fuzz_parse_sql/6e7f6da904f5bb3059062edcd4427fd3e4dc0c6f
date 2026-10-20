@@ -1,0 +1,1 @@
+SELECT *FROM orders WHERE status -IKE<= 'p%' AND NT (c1 = 3)

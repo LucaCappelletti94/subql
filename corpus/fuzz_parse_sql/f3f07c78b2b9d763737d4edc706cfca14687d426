@@ -1,0 +1,1 @@
+SELECT* FROM orders WHERE lwer(st) = $2 AND id IN (SELECT)

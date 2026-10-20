@@ -1,0 +1,1 @@
+SELECT * FROM orders WHERE not<->s >n*05

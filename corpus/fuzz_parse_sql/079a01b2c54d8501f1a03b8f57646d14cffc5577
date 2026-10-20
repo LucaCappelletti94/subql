@@ -1,0 +1,1 @@
+SELECT * FROM orders WHERE lo NOT IN (c15sanagers)

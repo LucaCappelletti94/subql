@@ -1,0 +1,1 @@
+SELECT id,np, b,g FROM orders
