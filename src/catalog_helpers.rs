@@ -514,7 +514,26 @@ pub fn fold_rule<B: crate::backend::Backend, DB: DatabaseLike>(
     table_id: crate::TableId,
     increment: Option<crate::backend::DivisionPrecisionIncrement>,
 ) -> crate::runtime::aggregate::FoldRule {
-    let total = total_rule::<B, DB>(spec, database, table_id);
+    fold_rule_with_total::<B>(total_rule::<B, DB>(spec, database, table_id), increment)
+}
+
+pub(crate) fn grouped_fold_rule<B: crate::backend::Backend, DB: DatabaseLike>(
+    spec: &crate::compiler::AggSpec,
+    having: Option<&crate::AggHaving>,
+    database: &DB,
+    table_id: crate::TableId,
+    increment: Option<crate::backend::DivisionPrecisionIncrement>,
+) -> crate::runtime::aggregate::FoldRule {
+    fold_rule_with_total::<B>(
+        grouped_total_rule::<B, DB>(spec, having, database, table_id),
+        increment,
+    )
+}
+
+fn fold_rule_with_total<B: crate::backend::Backend>(
+    total: crate::backend::SumRule,
+    increment: Option<crate::backend::DivisionPrecisionIncrement>,
+) -> crate::runtime::aggregate::FoldRule {
     crate::runtime::aggregate::FoldRule {
         total,
         mean: B::MEAN,
@@ -527,6 +546,26 @@ pub fn fold_rule<B: crate::backend::Backend, DB: DatabaseLike>(
         quotient: crate::compiler::bytecode::Quotient::resolve::<B>(increment)
             .unwrap_or(crate::compiler::bytecode::Quotient::FromTheOperands),
     }
+}
+
+pub(crate) fn grouped_total_rule<B: crate::backend::Backend, DB: DatabaseLike>(
+    spec: &crate::compiler::AggSpec,
+    having: Option<&crate::AggHaving>,
+    database: &DB,
+    table_id: crate::TableId,
+) -> crate::backend::SumRule {
+    if having.is_some_and(|having| {
+        having.subject == crate::HavingSubject::Aggregate(crate::HavingFunction::Sum)
+    }) {
+        if let Some(column) = spec.column() {
+            return total_rule::<B, DB>(
+                &crate::compiler::AggSpec::Sum { column },
+                database,
+                table_id,
+            );
+        }
+    }
+    total_rule::<B, DB>(spec, database, table_id)
 }
 
 /// What a total over `spec`'s column accumulates in, which is the half of

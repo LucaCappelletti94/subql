@@ -294,6 +294,14 @@ impl<V: postgres_jsonb_canonical::PgVersion + 'static> Backend for Postgres<V> {
         super::scalar_value::standard_numeric_widening(left, right)
     }
 
+    fn numeric_literal_family(text: &str) -> ScalarFamily {
+        if sql_scalar_text::parse_i64(text).is_some() {
+            ScalarFamily::Int
+        } else {
+            ScalarFamily::Decimal
+        }
+    }
+
     fn compare_cross_kind_numeric(
         left: &Value<Self>,
         right: &Value<Self>,
@@ -636,6 +644,16 @@ impl<C: MySqlTableNameCase> Backend for MySql<C> {
         super::scalar_value::standard_numeric_widening(left, right)
     }
 
+    fn numeric_literal_family(text: &str) -> ScalarFamily {
+        if text.contains(['e', 'E']) {
+            ScalarFamily::Float
+        } else if sql_scalar_text::parse_i64(text).is_some() {
+            ScalarFamily::Int
+        } else {
+            ScalarFamily::Decimal
+        }
+    }
+
     fn compare_cross_kind_numeric(
         left: &Value<Self>,
         right: &Value<Self>,
@@ -899,6 +917,14 @@ impl Backend for SQLite {
                 Some(NumericWidening::Exact)
             }
             _ => None,
+        }
+    }
+
+    fn numeric_literal_family(text: &str) -> ScalarFamily {
+        if sql_scalar_text::parse_i64(text).is_some() {
+            ScalarFamily::Int
+        } else {
+            ScalarFamily::Float
         }
     }
 

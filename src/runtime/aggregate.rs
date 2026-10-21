@@ -10,9 +10,13 @@ use crate::checkpoint::{Checkpoint, ReadFence, Seen, UnseenLog};
 use crate::compiler::AggSpec;
 use crate::reexec::maintain::LatestFence;
 use crate::{AggValue, AggregateInstallError, IdTypes, SubscriptionId};
-use alloc::string::ToString;
+use alloc::string::{String, ToString};
 use alloc::vec::Vec;
+use core::str::FromStr;
 use hashbrown::HashMap;
+
+mod having;
+pub use having::GroupHaving;
 
 /// Typed signed change to one aggregate subscription's running value.
 ///
@@ -239,7 +243,7 @@ impl TotalDelta {
 /// Summarised rather than kept row by row so that several rows at one
 /// stream position merge into one delta without allocating, which is what
 /// [`Spread::combine`] is for.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Spread {
     /// Rows in this set whose value is finite.
     pub rows: i64,
@@ -769,19 +773,6 @@ impl Total {
     }
 }
 
-/// A reported total or mean as `f64`, for the one comparison that still needs
-/// one. Lossy above `2^53`, which Phase D2 removes.
-#[allow(clippy::cast_precision_loss)]
-fn numeric_as_f64(total: &crate::NumericValue) -> Option<f64> {
-    match total {
-        crate::NumericValue::Integer(value) => Some(*value as f64),
-        crate::NumericValue::Decimal(value) => {
-            <bigdecimal::BigDecimal as bigdecimal::ToPrimitive>::to_f64(value)
-        }
-        crate::NumericValue::Double(value) => Some(*value),
-    }
-}
-
 /// Digits `value` carries ahead of the decimal point.
 fn integer_digits_of(value: &bigdecimal::BigDecimal) -> u64 {
     let (digits, scale) = value.as_bigint_and_exponent();
@@ -895,9 +886,7 @@ impl AggAccumulator {
         acc
     }
 
-    /// Seed from the complete component layout (`sum`, `sum_sq`, `count`),
-    /// used when a sibling `HAVING` widens the seed regardless of the
-    /// projected function.
+    /// Seed full statistics, including a double sum after the count for a single-precision total.
     pub fn seed_stats_row<B: Backend>(spec: &AggSpec, rule: FoldRule, row: &[Value<B>]) -> Self {
         let mut acc = Self::from_spec(spec, rule);
         if let Some(cell) = row.first() {
@@ -907,16 +896,18 @@ impl AggAccumulator {
         acc
     }
 
-    /// Seed the variance family's state from `[sum, squared_deviations,
-    /// count]`.
-    ///
-    /// The middle component is the engine's own sum of squared
-    /// deviations, which it computes stably, rather than a sum of
-    /// squares: re-deriving the deviations from squares would put the
-    /// cancellation this phase removed back at seed time.
+    /// Seed spread components from the accumulator's typed bootstrap layout.
     #[allow(clippy::cast_precision_loss)]
     fn seed_spread<B: Backend>(&mut self, row: &[Value<B>]) {
-        self.sum = row.first().and_then(|v| Self::seed_f64(v)).unwrap_or(0.0);
+        let sum_index = if matches!(self.total, Total::Single(..)) {
+            3
+        } else {
+            0
+        };
+        self.sum = row
+            .get(sum_index)
+            .and_then(|v| Self::seed_f64(v))
+            .unwrap_or(0.0);
         self.contributions = row.get(2).and_then(|v| Self::seed_i64(v)).unwrap_or(0);
         let component = row.get(1).and_then(|v| Self::seed_f64(v)).unwrap_or(0.0);
         let squared_deviations = match self.variance_seed {
@@ -1089,15 +1080,17 @@ impl AggAccumulator {
         }
         let double = || crate::NumericValue::Double(self.sum / self.contributions as f64);
         match (&self.total, self.mean_rule) {
-            // A mean never holds a single-precision total, because
-            // `catalog_helpers::total_rule` gives one only to a `SUM`:
-            // measured, PostgreSQL's `avg(real)` is `double precision`
-            // and answers the double quotient of the double sum. Read
-            // through the widened total, which is what that quotient is,
-            // so both widths answer alike here.
-            (Total::Double(total, _) | Total::Single(total, _), _) => Some(
-                crate::NumericValue::Double(total.value() / self.contributions as f64),
-            ),
+            // The full-statistics spread retains the double sum beside `SUM(real)`.
+            (Total::Single(total, _), _) => {
+                let mut wide = *total;
+                wide.finite = self.spread.sum;
+                Some(crate::NumericValue::Double(
+                    wide.value() / self.contributions as f64,
+                ))
+            }
+            (Total::Double(total, _), _) => Some(crate::NumericValue::Double(
+                total.value() / self.contributions as f64,
+            )),
             // SQLite divides its exact integer sum once while no real value
             // is among the rows, where a running double loses what cancels.
             (
@@ -1196,6 +1189,196 @@ impl AggAccumulator {
             deviations
         }
     }
+    /// Snapshot native accumulator state without reseeding it.
+    pub(crate) fn snapshot(&self) -> FoldSnapshot {
+        FoldSnapshot {
+            kind: match self.kind {
+                AggKind::CountStar => 0,
+                AggKind::CountColumn => 1,
+                AggKind::Sum => 2,
+                AggKind::Avg => 3,
+                AggKind::VarPop => 4,
+                AggKind::VarSamp => 5,
+                AggKind::StddevPop => 6,
+                AggKind::StddevSamp => 7,
+            },
+            rows_matched: self.rows_matched,
+            contributions: self.contributions,
+            sum: self.sum,
+            spread: self.spread,
+            total: fold_total_to_ck(&self.total),
+        }
+    }
+
+    /// Restore an accumulator under its compiled fold rule.
+    pub(crate) fn from_snapshot(
+        s: &FoldSnapshot,
+        spec: &AggSpec,
+        rule: FoldRule,
+    ) -> Result<Self, &'static str> {
+        let expected = Self::from_spec(spec, rule);
+        let kind = match s.kind {
+            0 => AggKind::CountStar,
+            1 => AggKind::CountColumn,
+            2 => AggKind::Sum,
+            3 => AggKind::Avg,
+            4 => AggKind::VarPop,
+            5 => AggKind::VarSamp,
+            6 => AggKind::StddevPop,
+            7 => AggKind::StddevSamp,
+            _ => return Err("unknown fold function"),
+        };
+        if kind != expected.kind
+            || s.rows_matched < 0
+            || s.contributions < 0
+            || s.spread.rows < 0
+            || s.spread.non_finite < 0
+        {
+            return Err("invalid fold function or counters");
+        }
+        let total = fold_ck_to_total(&s.total, rule)?;
+        let compatible = match (&total, &expected.total) {
+            (Total::Integer { promotes: a, .. }, Total::Integer { promotes: b, .. }) => a == b,
+            (
+                Total::Decimal {
+                    integer_digits: a, ..
+                },
+                Total::Decimal {
+                    integer_digits: b, ..
+                },
+            ) => a == b,
+            (Total::Single(..), Total::Single(..)) | (Total::Double(..), Total::Double(..)) => true,
+            _ => false,
+        };
+        if !compatible {
+            return Err("the total does not match its compiled fold rule");
+        }
+        Ok(Self {
+            kind,
+            rows_matched: s.rows_matched,
+            contributions: s.contributions,
+            sum: s.sum,
+            spread: s.spread,
+            total,
+            mean_rule: rule.mean,
+            variance_seed: rule.variance_seed,
+            quotient_rule: rule.quotient,
+        })
+    }
+
+    pub(crate) const fn counts_match(&self, rows: i64, contributions: i64) -> bool {
+        match self.kind {
+            AggKind::CountStar => self.rows_matched == rows && self.contributions == 0,
+            _ => self.rows_matched == 0 && self.contributions == contributions,
+        }
+    }
+}
+
+/// Persisted floating components of a running total.
+#[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
+pub struct FloatPartsCk {
+    finite: f64,
+    positive_infinities: i64,
+    negative_infinities: i64,
+    nans: i64,
+}
+
+/// A running total as a portable snapshot.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub enum TotalCk {
+    Integer {
+        value: i64,
+        promotes: bool,
+        reals: FloatPartsCk,
+    },
+    Decimal {
+        value: String,
+        integer_digits: Option<u32>,
+    },
+    Single(FloatPartsCk),
+    Double(FloatPartsCk),
+}
+
+/// An exact, portable snapshot of one aggregate subscription's running value.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct FoldSnapshot {
+    kind: u8,
+    rows_matched: i64,
+    contributions: i64,
+    sum: f64,
+    spread: Spread,
+    total: TotalCk,
+}
+
+const fn fold_fp_to_ck(fp: FloatParts) -> FloatPartsCk {
+    FloatPartsCk {
+        finite: fp.finite,
+        positive_infinities: fp.positive_infinities,
+        negative_infinities: fp.negative_infinities,
+        nans: fp.nans,
+    }
+}
+
+const fn fold_ck_to_fp(ck: FloatPartsCk) -> FloatParts {
+    FloatParts {
+        finite: ck.finite,
+        positive_infinities: ck.positive_infinities,
+        negative_infinities: ck.negative_infinities,
+        nans: ck.nans,
+    }
+}
+
+fn fold_total_to_ck(t: &Total) -> TotalCk {
+    match t {
+        Total::Integer {
+            value,
+            promotes,
+            reals,
+        } => TotalCk::Integer {
+            value: *value,
+            promotes: *promotes,
+            reals: fold_fp_to_ck(*reals),
+        },
+        Total::Decimal {
+            value,
+            integer_digits,
+        } => TotalCk::Decimal {
+            value: value.to_string(),
+            integer_digits: *integer_digits,
+        },
+        Total::Single(parts, _) => TotalCk::Single(fold_fp_to_ck(*parts)),
+        Total::Double(parts, _) => TotalCk::Double(fold_fp_to_ck(*parts)),
+    }
+}
+
+fn fold_ck_to_total(ck: &TotalCk, rule: FoldRule) -> Result<Total, &'static str> {
+    const fn parts(ck: FloatPartsCk) -> Result<FloatParts, &'static str> {
+        if ck.positive_infinities < 0 || ck.negative_infinities < 0 || ck.nans < 0 {
+            return Err("negative non-finite contribution count");
+        }
+        Ok(fold_ck_to_fp(ck))
+    }
+    let boundary = FloatBoundary(rule.float_overflow);
+    Ok(match ck {
+        TotalCk::Integer {
+            value,
+            promotes,
+            reals,
+        } => Total::Integer {
+            value: *value,
+            promotes: *promotes,
+            reals: parts(*reals)?,
+        },
+        TotalCk::Decimal {
+            value,
+            integer_digits,
+        } => Total::Decimal {
+            value: bigdecimal::BigDecimal::from_str(value).map_err(|_| "invalid decimal total")?,
+            integer_digits: *integer_digits,
+        },
+        TotalCk::Single(fp) => Total::Single(parts(*fp)?, boundary),
+        TotalCk::Double(fp) => Total::Double(parts(*fp)?, boundary),
+    })
 }
 
 /// Default ceiling on the changes one aggregate subscription holds while its
@@ -1598,49 +1781,6 @@ impl<B: Backend> GroupValue<B> {
     }
 }
 
-/// A fold's `HAVING`, compiled once at registration: the subject to read
-/// and the parsed numeric threshold.
-struct GroupHaving {
-    subject: crate::HavingSubject,
-    op: crate::HavingOp,
-    threshold: f64,
-}
-
-impl GroupHaving {
-    /// Whether the group currently belongs to the announced result. An
-    /// unknown value (an empty average) never passes, matching SQL's
-    /// UNKNOWN.
-    #[allow(
-        clippy::cast_precision_loss,
-        reason = "counts beyond 2^53 accept the same loss the delta path does"
-    )]
-    fn passes<B: Backend>(&self, group: &GroupValue<B>) -> bool {
-        let value = match self.subject {
-            crate::HavingSubject::RowCount => Some(group.rows as f64),
-            // A `SUM` over zero contributions is NULL and a comparison
-            // over NULL is UNKNOWN, which the value itself now says: this
-            // used to re-derive it here from the contribution count.
-            crate::HavingSubject::Aggregate(function) => {
-                match group.accumulator.value_as(function) {
-                    AggValue::CountStar(count) | AggValue::CountColumn(count) => Some(count as f64),
-                    // A `HAVING` compares in `f64`, which Phase D2 makes
-                    // exact along with `AVG`.
-                    AggValue::Sum(value) | AggValue::Avg(value) => {
-                        value.as_ref().and_then(numeric_as_f64)
-                    }
-                    AggValue::VarPop(real)
-                    | AggValue::VarSamp(real)
-                    | AggValue::StddevPop(real)
-                    | AggValue::StddevSamp(real) => real,
-                }
-            }
-        };
-        value
-            .and_then(|value| value.partial_cmp(&self.threshold))
-            .is_some_and(|ordering| self.op.admits(ordering))
-    }
-}
-
 /// One grouped change held until all seed rows arrive.
 #[derive(Clone, Debug)]
 enum PendingGroupChange<B: Backend> {
@@ -1733,16 +1873,8 @@ impl<I: IdTypes, B: Backend, C: Checkpoint> GroupedAggregateTotal<I, B, C> {
         rule: FoldRule,
     ) -> Self {
         let widened = having.is_some_and(|having| having.widens(&spec));
-        debug_assert!(
-            having.is_none_or(|having| sql_scalar_text::parse_f64(&having.threshold).is_some()),
-            "a HAVING threshold parses at registration, so this one is corrupt"
-        );
-        let having = having.map(|having| GroupHaving {
-            subject: having.subject,
-            op: having.op,
-            // Validated at registration. An unparseable threshold would
-            // compare as NaN and never pass, failing closed.
-            threshold: sql_scalar_text::parse_f64(&having.threshold).unwrap_or(f64::NAN),
+        let having = having.map(|having| {
+            GroupHaving::new::<B>(having).expect("a registered HAVING threshold is numeric")
         });
         Self {
             consumer,
@@ -1857,7 +1989,10 @@ impl<I: IdTypes, B: Backend, C: Checkpoint> GroupedAggregateTotal<I, B, C> {
             }));
         }
         let after = group.accumulator.value();
-        let passes = fold.having.is_none_or(|having| having.passes(group));
+        let passes = match fold.having {
+            Some(having) => having.passes::<B>(group.rows, &group.accumulator)?,
+            None => true,
+        };
         group.announced = passes;
         let change = if passes && (!was_announced || before != after) {
             Some(crate::AggregateValueChange::Set(
@@ -1969,7 +2104,7 @@ impl<I: IdTypes, B: Backend, C: Checkpoint> GroupedAggregateTotal<I, B, C> {
         // missing its count column would hide the group forever), so the
         // arity is exact: group values, the component set, the row count.
         let components_len = if self.widened {
-            3
+            3 + usize::from(matches!(self.rule.total, crate::backend::SumRule::Single))
         } else {
             crate::compiler::sql_shape::aggregate_bootstrap_kinds(&self.spec, self.rule.total).len()
         };
@@ -2023,25 +2158,23 @@ impl<I: IdTypes, B: Backend, C: Checkpoint> GroupedAggregateTotal<I, B, C> {
             }
         }
 
-        // Announce only the groups that pass the condition. The rest install
-        // silently and are already current the moment they cross in.
-        let mut opening: Vec<_> = groups
-            .iter_mut()
-            .filter_map(|(key, group)| {
-                group.announced = self
-                    .having
-                    .as_ref()
-                    .is_none_or(|having| having.passes(group));
-                group.announced.then(|| {
-                    (
-                        group.identity(key),
-                        crate::AggregateValueChange::Set(crate::AggregateResultValue::Folded(
-                            group.accumulator.value(),
-                        )),
-                    )
-                })
-            })
-            .collect();
+        let mut opening = Vec::new();
+        for (key, group) in &mut groups {
+            group.announced = match &self.having {
+                Some(having) => having
+                    .passes::<B>(group.rows, &group.accumulator)
+                    .map_err(|_| AggregateInstallError::SumOutOfRange(subscription))?,
+                None => true,
+            };
+            if group.announced {
+                opening.push((
+                    group.identity(key),
+                    crate::AggregateValueChange::Set(crate::AggregateResultValue::Folded(
+                        group.accumulator.value(),
+                    )),
+                ));
+            }
+        }
         opening.sort_unstable_by(|a, b| a.0.key.cmp(&b.0.key));
         self.groups = groups;
         self.seed.installed(kept_by.as_ref(), judge);

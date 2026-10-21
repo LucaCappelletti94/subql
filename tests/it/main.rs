@@ -11,6 +11,8 @@ mod common;
 
 mod differential;
 
+mod replay_detector;
+
 mod agg_avg_exactness;
 
 mod agg_non_finite;

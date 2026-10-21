@@ -78,6 +78,10 @@ macro_rules! postgres_like_backend {
                 None
             }
 
+            fn numeric_literal_family(text: &str) -> subql::backend::ScalarFamily {
+                <subql::backend::Postgres as subql::backend::Backend>::numeric_literal_family(text)
+            }
+
             /// And raises when a floating total leaves range, as PostgreSQL
             /// does.
             const FLOAT_SUM_OVERFLOW: subql::backend::FloatSumOverflow =

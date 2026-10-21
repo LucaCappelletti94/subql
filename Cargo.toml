@@ -122,13 +122,15 @@ arc-swap = "1.7"
 hashbrown = { version = "0.16", default-features = false, features = ["default-hasher", "serde", "inline-more", "allocator-api2"] }
 
 # Persistent maps keep snapshot mutations local to the changed paths.
-rpds = { version = "1.2", default-features = false }
+rpds = { version = "1.2", default-features = false, features = ["serde"] }
 
 sqlparser-canonicalize = { git = "https://github.com/LucaCappelletti94/sqlparser-canonicalize", branch = "main", default-features = false }
 
 # Serialization. All no_std + alloc capable. Std features propagated below.
 serde = { version = "1.0", default-features = false, features = ["derive", "rc", "alloc"] }
 serde_json = { version = "1", default-features = false, features = ["alloc", "arbitrary_precision"] }
+ciborium = { version = "0.2", default-features = false }
+ciborium-io = { version = "0.2", default-features = false }
 postcard = { version = "1.1", default-features = false, features = ["alloc"] }
 
 # PostgreSQL `jsonb` canonical equality and group-key bytes. A git revision rather than a

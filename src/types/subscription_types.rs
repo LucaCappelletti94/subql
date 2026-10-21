@@ -11,7 +11,8 @@ use alloc::vec::Vec;
 ///
 /// `Eq` is not derived: `binds` holds [`crate::backend::Value<B>`]s,
 /// which may carry `f64` and are only `PartialEq`.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(bound = "")]
 pub struct SubscriptionRequest<I: IdTypes, B: Backend = crate::backend::Postgres> {
     /// Consumer who owns this subscription.
     pub(crate) consumer_id: I::ConsumerId,
@@ -74,6 +75,21 @@ pub struct SubscriptionRequest<I: IdTypes, B: Backend = crate::backend::Postgres
     /// row adds it, and a row the subscriber does not match keeps admitting rows
     /// to it, with no row to withdraw values whose membership never existed.
     pub(crate) term_values: StatedTermValues<B>,
+}
+
+impl<I: IdTypes, B: Backend> Clone for SubscriptionRequest<I, B> {
+    fn clone(&self) -> Self {
+        Self {
+            consumer_id: self.consumer_id,
+            scope: self.scope,
+            sql: self.sql.clone(),
+            updated_at_unix_ms: self.updated_at_unix_ms,
+            binds: self.binds.clone(),
+            subscriber: self.subscriber.clone(),
+            subjects: self.subjects.clone(),
+            term_values: self.term_values.clone(),
+        }
+    }
 }
 
 /// Value rows stated per membership term: the compared column names, then the
@@ -655,24 +671,7 @@ impl<'a, I: IdTypes> IntoIterator for &'a SubscriptionsView<'_, I> {
     }
 }
 
-/// Runnable component-seed query for an aggregate registration, bundling
-/// the SQL with its per-column decode kinds so the two cannot drift apart.
-///
-/// [`query`](Self::query) projects [`group_columns`](Self::group_columns) group
-/// values first, then the seed components aliased positionally (`c0`, `c1`,
-/// ...) in the order
-/// [`Install::install`](crate::Install::install) with [`AggregateSeedInstall`](crate::AggregateSeedInstall)
-/// consumes them, and
-/// [`kinds`](Self::kinds) gives the decode kind for every column in that same
-/// order. `COUNT` components are
-/// [`ScalarFamily::Int`](crate::backend::ScalarFamily::Int); `SUM` and `SUM(x*x)`
-/// components are [`ScalarFamily::Float`](crate::backend::ScalarFamily::Float),
-/// decoded as double to match the `f64` accumulator (since `SUM` promotes to
-/// `bigint`/`numeric`/`DECIMAL` depending on the backend).
-///
-/// An ungrouped seed returns exactly one row. A grouped one returns a row per
-/// group, and returns none at all over an empty table, where the ungrouped
-/// spelling still returns its empty-aggregate row.
+/// Runnable seed query whose decode kinds order group values, native components, an optional double sum for widened single-precision totals, and the grouped source-row count.
 #[derive(Debug, PartialEq)]
 pub struct AggregateBootstrap<B: Backend = crate::backend::Postgres> {
     /// Runnable seed query with positionally-aliased component columns.

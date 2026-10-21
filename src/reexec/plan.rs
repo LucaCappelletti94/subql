@@ -105,6 +105,8 @@ pub struct GroupedMinMaxPlan<B: Backend> {
 
 /// A grouped extreme's `HAVING` comparison, its threshold parsed at plan
 /// time so each event evaluates without touching SQL text.
+#[derive(serde::Serialize)]
+#[serde(bound = "")]
 pub enum GroupedHavingCheck<B: Backend> {
     /// Compare the group's current extreme against a constant.
     Extreme {

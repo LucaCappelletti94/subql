@@ -1382,6 +1382,20 @@ pub(crate) fn render_aggregate_bootstrap<B: crate::backend::Backend, DB: Databas
     // A sibling condition reads components the projected function alone does
     // not maintain, so its seed carries the complete set.
     let widened = having.is_some_and(|having| having.widens(spec));
+    let total_rule = catalog_helpers::grouped_total_rule::<B, DB>(spec, having, database, table_id);
+    let single_total = matches!(total_rule, crate::backend::SumRule::Single);
+    let single_input = single_total
+        || (matches!(total_rule, crate::backend::SumRule::Double)
+            && spec.column().is_some_and(|column| {
+                matches!(
+                    catalog_helpers::total_rule::<B, DB>(
+                        &AggSpec::Sum { column },
+                        database,
+                        table_id,
+                    ),
+                    crate::backend::SumRule::Single
+                )
+            }));
     let mut stmt = parse_single_statement(sql, dialect).ok()?;
     // The seed fetches every group. Groups failing the condition install
     // silently and are needed the moment they cross into the result.
@@ -1389,13 +1403,19 @@ pub(crate) fn render_aggregate_bootstrap<B: crate::backend::Backend, DB: Databas
         select.having = None;
     }
     let arg = aggregate_arg(&stmt)?;
-    let sum = || agg_call("SUM", arg.clone());
+    let sum = || {
+        if single_input && !single_total {
+            sum_at_double_width(&arg)
+        } else {
+            Some(agg_call("SUM", arg.clone()))
+        }
+    };
     let count = || agg_call("COUNT", arg.clone());
     // Group columns lead, in `GROUP BY` order rather than projection order, so
     // a seeded group's values line up with the order its key encodes in. Built
     // as `Ident`s carrying the dialect's quote style, so an embedded delimiter
     // is escaped by the same renderer that parsed it.
-    let mut items = Vec::with_capacity(groups.len() + 4);
+    let mut items = Vec::with_capacity(groups.len() + if widened && single_total { 5 } else { 4 });
     let mut group_kinds = Vec::with_capacity(groups.len());
     for (slot, column) in groups.iter().enumerate() {
         let name = catalog_helpers::column_name(database, table_id, *column)?;
@@ -1407,21 +1427,24 @@ pub(crate) fn render_aggregate_bootstrap<B: crate::backend::Backend, DB: Databas
             database, table_id, *column,
         )?);
     }
-    let components: Vec<Expr> = match spec {
-        _ if widened => alloc::vec![sum(), sum_of_squared_deviations::<B>(&arg)?, count()],
+    let mut components: Vec<Expr> = match spec {
+        _ if widened => alloc::vec![sum()?, sum_of_squared_deviations::<B>(&arg)?, count()],
         AggSpec::CountStar => alloc::vec![agg_call("COUNT", FunctionArgExpr::Wildcard)],
         AggSpec::CountColumn { .. } => alloc::vec![count()],
         // `SUM` and `AVG` read the same pair: the total and how many rows
         // contributed to it. `AVG` divides by that count and `SUM` reports
         // NULL when it is zero.
-        AggSpec::Sum { .. } | AggSpec::Avg { .. } => alloc::vec![sum(), count()],
+        AggSpec::Sum { .. } | AggSpec::Avg { .. } => alloc::vec![sum()?, count()],
         AggSpec::VarPop { .. }
         | AggSpec::VarSamp { .. }
         | AggSpec::StddevPop { .. }
         | AggSpec::StddevSamp { .. } => {
-            alloc::vec![sum(), sum_of_squared_deviations::<B>(&arg)?, count()]
+            alloc::vec![sum()?, sum_of_squared_deviations::<B>(&arg)?, count()]
         }
     };
+    if widened && single_total {
+        components.push(sum_at_double_width(&arg)?);
+    }
     let component_count = components.len();
     items.extend(
         components
@@ -1440,24 +1463,16 @@ pub(crate) fn render_aggregate_bootstrap<B: crate::backend::Backend, DB: Databas
     *select_projection_mut(&mut stmt)? = items;
     let mut kinds = group_kinds;
     if widened {
-        // A widened seed reads `SUM(arg)` first whatever the projected
-        // function is, so the kind is the total's own and not the spec's.
-        // Reading it off the spec's list gave a `COUNT` the count's `Int`
-        // and the variance family a `Float`, either of which a total that
-        // accumulates otherwise silently ignores. Only the middle
-        // component is a double, being nobody's exact answer.
         kinds.extend([
-            bootstrap_total_kind(crate::catalog_helpers::total_rule::<B, DB>(
-                spec, database, table_id,
-            )),
+            bootstrap_total_kind(total_rule),
             crate::backend::ScalarFamily::Float,
             crate::backend::ScalarFamily::Int,
         ]);
+        if single_total {
+            kinds.push(crate::backend::ScalarFamily::Float);
+        }
     } else {
-        kinds.extend(aggregate_bootstrap_kinds(
-            spec,
-            crate::catalog_helpers::total_rule::<B, DB>(spec, database, table_id),
-        ));
+        kinds.extend(aggregate_bootstrap_kinds(spec, total_rule));
     }
     if !groups.is_empty() {
         kinds.push(crate::backend::ScalarFamily::Int);
@@ -1586,6 +1601,21 @@ fn agg_call(name: &str, arg: FunctionArgExpr) -> Expr {
         over: None,
         within_group: Vec::new(),
     })
+}
+
+fn sum_at_double_width(arg: &FunctionArgExpr) -> Option<Expr> {
+    let FunctionArgExpr::Expr(column) = arg else {
+        return None;
+    };
+    Some(agg_call(
+        "SUM",
+        FunctionArgExpr::Expr(Expr::Cast {
+            kind: sqlparser::ast::CastKind::Cast,
+            expr: alloc::boxed::Box::new(column.clone()),
+            data_type: sqlparser::ast::DataType::DoublePrecision,
+            format: None,
+        }),
+    ))
 }
 
 /// `expr AS cN`, the alias a seed component is read back by.
