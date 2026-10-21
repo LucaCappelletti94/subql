@@ -1,1 +1,0 @@
-SELECT * FROM orders WHERE COALESFE(c2,-p2,-p) 

@@ -1,1 +1,0 @@
-SELECT * FROM orders WHERE lo NOT IN (s) =0 AND id IN (ma~agers)

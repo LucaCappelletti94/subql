@@ -1,1 +1,0 @@
-SELECT  FRE (g('app_erid', true)) IS TRUE) E
