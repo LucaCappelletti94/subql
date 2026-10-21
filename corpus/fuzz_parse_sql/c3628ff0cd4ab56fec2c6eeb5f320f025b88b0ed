@@ -1,0 +1,1 @@
+SELECT * FROM orders WHERE lowerd IN (dec2CYYXYYYYYgers)

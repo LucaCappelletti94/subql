@@ -1,0 +1,1 @@
+SELECT id,status FROM orders WHERE stus = 'oment!0$ܼ' AND a@o >!= 3

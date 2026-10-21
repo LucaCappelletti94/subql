@@ -1,0 +1,1 @@
+SELECT * FROM orders WHERE noon+en%NOT ste^5
