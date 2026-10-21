@@ -415,6 +415,12 @@ pub trait Backend: 'static {
     where
         Self: Sized;
 
+    /// The numeric family of an untyped SQL number token.
+    #[must_use]
+    fn numeric_literal_family(text: &str) -> super::scalar_value::ScalarFamily
+    where
+        Self: Sized;
+
     /// How a numeric pair of two different scalars orders under this
     /// backend's widening, or `None` when there is none.
     ///

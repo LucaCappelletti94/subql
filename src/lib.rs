@@ -17,6 +17,9 @@ pub use polling::{PollingPgCdcConfig, PollingPgCdcError, PollingPgCdcSource};
 pub use runtime::aggregate::{
     AggKind, DEFAULT_MAX_CHANGES_DURING_AGGREGATE_READ, DEFAULT_MAX_GROUPS_PER_AGGREGATE,
 };
+pub use runtime::engine::replay::{
+    ReplayAnswer, ReplayDetector, ReplayError, ReplayTable, ReplayValue,
+};
 #[cfg(feature = "std")]
 pub use runtime::Restored;
 pub use runtime::SubscriptionEngine;

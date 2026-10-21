@@ -3,6 +3,8 @@
 
 mod agg_maintenance;
 mod install;
+pub mod replay;
+mod state_codec;
 #[cfg(feature = "std")]
 mod term_persistence;
 

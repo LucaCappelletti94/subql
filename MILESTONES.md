@@ -8,22 +8,22 @@ Deferred work tracked here, with the decisions and design context that have alre
 
 ### Status
 
-Deferred from v1. v1 delivers row-level patchsets: each subscription emits `Inserted` / `Updated` / `Deleted` notifications that the materializer assembles into a SQLite patchset. Per-group aggregate IVM (`GROUP BY`, `DISTINCT`, per-group `MIN` / `MAX`, `HAVING`) sits on per-group accumulator state and re-enters the queue once the row path is solid.
+Live folding aggregates use in-process scalar and per-group accumulators. Scalar and grouped `MIN` and `MAX` use targeted source reads. [`ReplayDetector`](REPLAY_STATE.md) maintains its admitted single-table results from retained inputs and checkpoints the native fold and candidate state needed for recovery.
 
 ### Shape
 
-Opt-in at engine construction. Without opt-in, a `GROUP BY` subscription registers but emits `NeedsReexecution { query_id }` on every relevant event (the same fallback used for unsupported `WHERE` predicates). With opt-in, it takes an in-process per-group accumulator path with a configurable per-subscription group cap that promotes a single over-cap subscription back to re-exec rather than failing the engine. `UPDATE` events that move a row across group keys produce two deltas (delete-from-old plus insert-into-new), driven by the existing dual-eval of `old_row` and `new_row`.
+Live folds seed their accumulators from source reads and apply admitted row deltas, including group creation, removal and existing `HAVING` visibility. An `UPDATE` that changes a group key contributes to the old and new groups.
 
-Scalar (no-`GROUP BY`) aggregate IVM for `SUM` / `AVG` / `COUNT` already ships. `MIN` / `MAX` and `COUNT(DISTINCT)` are rejected at registration today (see `src/compiler/sql_shape.rs`): both need per-group accumulator state, and `MIN` / `MAX` additionally needs targeted re-query on extremum removal.
+Replay operators retain complete dependency input bags, native fold accumulators and extrema candidates. Their versioned `CBOR` checkpoints bind this state to the compiled plan and dependent catalog fingerprints.
 
 ### Architecturally excluded (do not add)
 
 Captured so they do not drift back in by accident.
 
-- Flink / RisingWave-style ordered per-group state for `MIN` / `MAX`. Overkill. Use pg_ivm-style targeted re-query instead.
-- In-process IVM for `JOIN`s (Materialize-style differential dataflow). Multi-table joins route to re-exec, always.
-- HLL-style approximate `COUNT(DISTINCT)`. Different semantics (append-only, no retractions). Would muddle the deterministic contract subql owes the materializer.
-- Accumulator persistence to disk. Currently in-memory, rebuilt via re-execution on restart. A future optimisation, not a v1 concern.
+- Ordered extrema candidate trees. Live extrema use targeted reads, and replay extrema use retained candidate bags.
+- In-process `JOIN` maintenance. Multi-table joins require database re-execution.
+- Approximate distinct counting. Its semantics require a separate contract.
+- Persistence of live-only accumulators. The replay operator's persistence contract is defined in [REPLAY_STATE.md](REPLAY_STATE.md).
 
 ---
 

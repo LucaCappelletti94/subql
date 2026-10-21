@@ -158,3 +158,33 @@ fn a_promoted_integer_the_backend_cannot_widen_beside_is_refused() {
         assert!(notifications.inserted().is_empty(), "{predicate}");
     }
 }
+
+#[test]
+fn replay_refuses_unserved_having_coercions_before_reading_inputs() {
+    let db = ParserDB::parse::<PostgreSqlDialect>(
+        "CREATE TABLE t (id INT PRIMARY KEY, g INT, n BIGINT)",
+    )
+    .expect("DDL parses");
+    let table = catalog_helpers::table_id::<Unconverting, _>(&db, "t").expect("t resolves");
+    let mut engine: SubscriptionEngine<TestEvent<Unconverting>, DefaultIds, ParserDB> =
+        SubscriptionEngine::new(db, PostgreSqlDialect {});
+    let sql = "SELECT g, SUM(n) FROM t GROUP BY g HAVING SUM(n) > 1";
+    engine
+        .register(SubscriptionRequest::new(1, sql))
+        .expect("ordinary live admission remains available");
+    for rows in [
+        Vec::new(),
+        vec![vec![Value::Int(1), Value::Int(1), Value::Int(2)]],
+    ] {
+        assert!(matches!(
+            engine.replay_detector(
+                &SubscriptionRequest::new(1, sql),
+                vec![subql::ReplayTable {
+                    table_id: table,
+                    rows
+                }]
+            ),
+            Err(subql::ReplayError::Unsupported(_))
+        ));
+    }
+}

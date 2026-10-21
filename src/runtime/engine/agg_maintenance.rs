@@ -529,8 +529,9 @@ where
                         groups.len(),
                         having.as_ref(),
                         group_key_encoder,
-                        crate::catalog_helpers::fold_rule::<E::Backend, _>(
+                        crate::catalog_helpers::grouped_fold_rule::<E::Backend, _>(
                             agg,
+                            having.as_ref(),
                             &self.database,
                             table_id,
                             self.division_increment,

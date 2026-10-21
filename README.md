@@ -218,3 +218,7 @@ assert!(rows.not_served_because.is_some());
 ```
 
 This example is text on purpose, because it is the case the typed path cannot produce. Diesel rejects `sum` over a `Text` column, so a caller on `register_select_typed` learns of the mistake from the compiler before `subql` is ever involved.
+
+## Replay
+
+`ReplayDetector` maintains one single-table selected result exactly from retained inputs and committed source transactions. See [REPLAY_STATE.md](REPLAY_STATE.md) for admission, checkpoint and restore contracts.

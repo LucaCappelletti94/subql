@@ -6,6 +6,7 @@ All notable changes to subql are recorded here. The format follows [Keep a Chang
 
 ### Changed
 
+- Grouped aggregate `HAVING` follows backend numeric literal typing and coercion, preserving exact integer and decimal boundaries.
 - `AutoResolvingEngine::match_rows` matches without moving memberships or stamping activity, through the new `SubscriptionEngine::match_rows`, and its result carries no narrowings. It ran `consumers`, so replaying a membership insert after the later delete admitted the subject again, and every replay counted as activity for eviction. Per consumer it answers as `matches_consumer` does, in one evaluation of the event for every consumer it reaches.
 - `visibility` follows `rls2fga` main, where each membership source states its own relation and condition names are `ConditionName`. A condition read back from an OpenFGA store whose name is not a valid condition name is read as no context, like a context value that is not a string.
 - subql follows `sqlparser` main past ClickHouse `GLOBAL IN`. The compiler does not serve a `GLOBAL` membership test, `x GLOBAL IN (...)` or `x GLOBAL IN (SELECT ...)`, and refuses it as it refuses any unsupported condition, because the distributed read it asks for exists only in ClickHouse.
@@ -44,6 +45,7 @@ All notable changes to subql are recorded here. The format follows [Keep a Chang
 
 ### Added
 
+- [`ReplayDetector`](REPLAY_STATE.md) maintains exact single-table row, fold, grouped and extreme results from retained inputs and committed source events, with versioned operator checkpoints.
 - A relation `rls2fga` reports as `RowDecision::Request`, a gate over values the caller's request carries that every row of a table shares, such as a bot list, is answered from the changed row and the watcher's request values. It grants a watcher named by the gate's subject type on a row that yields its link to the gate, when the watcher's values satisfy the predicate, and refuses a userset or a watcher of another type whatever it sent. A watcher that cannot state a value the predicate reads is delegated. `visibility` builds against the `rls2fga` commit that introduces the variant.
 - A relation `rls2fga` reports as `RowDecision::Everyone`, which a `USING (true)` policy yields, is answered from the changed row. It grants every watcher known by a name of the wildcard's type on a row whose shapes yield a record, and nobody on a row they do not. A table open to everyone and capped by a request-only gate, such as a bot list, is therefore answered without a round trip.
 - `testing::relation_pool::RelationPool` restates one membership source's relation as another's across shapes and enumerating SQL, so a test can give two producers one region, which no `rls2fga` translation produces.
