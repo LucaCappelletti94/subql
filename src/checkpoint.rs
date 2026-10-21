@@ -61,6 +61,11 @@ pub trait Checkpoint:
     /// never produces.
     #[must_use]
     fn from_opaque(opaque: &OpaqueCheckpoint) -> Option<Self>;
+
+    /// The complete transaction boundary containing this position, or `None` without one.
+    fn transaction_boundary(&self) -> Option<Self> {
+        Some(self.clone())
+    }
 }
 
 /// How a change stands against the fence of a database read.
@@ -285,6 +290,14 @@ pub struct PgCommitPosition {
 
 impl Checkpoint for PgCommitPosition {
     type Fence = PgSnapshotFence;
+
+    fn transaction_boundary(&self) -> Option<Self> {
+        Some(if self.xid == PgXid::INVALID {
+            *self
+        } else {
+            Self::at_commit(self.commit_lsn, self.xid)
+        })
+    }
 
     fn seen_by(&self, fence: &PgSnapshotFence) -> Seen {
         if self.commit_lsn >= fence.insert_lsn {
@@ -582,6 +595,10 @@ pub struct NoCheckpoint;
 
 impl Checkpoint for NoCheckpoint {
     type Fence = core::convert::Infallible;
+
+    fn transaction_boundary(&self) -> Option<Self> {
+        None
+    }
 
     /// Never called, since no fence of this type exists.
     fn seen_by(&self, _: &core::convert::Infallible) -> Seen {

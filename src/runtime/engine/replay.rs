@@ -1738,6 +1738,10 @@ impl<B: Backend> ReplayDetector<B> {
         self.wire_bytes()
     }
 
+    pub(crate) fn checkpoint_limited(&self, budget: usize) -> Result<Vec<u8>, ReplayError> {
+        self.wire_bytes_limited(budget)
+    }
+
     /// Apply one complete source transaction.
     ///
     /// # Errors

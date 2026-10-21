@@ -17,6 +17,10 @@ pub use polling::{PollingPgCdcConfig, PollingPgCdcError, PollingPgCdcSource};
 pub use runtime::aggregate::{
     AggKind, DEFAULT_MAX_CHANGES_DURING_AGGREGATE_READ, DEFAULT_MAX_GROUPS_PER_AGGREGATE,
 };
+pub use runtime::engine::durable::{
+    DurableAuthorizationError, DurableChange, DurableCommit, DurableContext, DurableEngine,
+    DurableError, DurableFailure, DurableOperation, DurablePersistError, PreparedDurable,
+};
 pub use runtime::engine::replay::{
     ReplayAnswer, ReplayDetector, ReplayError, ReplayTable, ReplayValue,
 };

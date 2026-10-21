@@ -221,4 +221,4 @@ This example is text on purpose, because it is the case the typed path cannot pr
 
 ## Replay
 
-`ReplayDetector` maintains one single-table selected result exactly from retained inputs and committed source transactions. See [REPLAY_STATE.md](REPLAY_STATE.md) for admission, checkpoint and restore contracts.
+`ReplayDetector` maintains one single-table selected result exactly across complete source transactions from retained state, with no database read, and `DurableEngine` runs it per instance behind a quota, an acknowledgement ledger, and caller-owned atomic persistence. The contracts are in [REPLAY_STATE.md](REPLAY_STATE.md) and [DURABLE_REPLAY.md](DURABLE_REPLAY.md).
