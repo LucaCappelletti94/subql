@@ -11,6 +11,11 @@ mod common;
 
 mod differential;
 
+mod durable_evidence;
+
+#[cfg(feature = "executor-diesel-postgres")]
+mod durable_postgres;
+
 mod replay_detector;
 
 mod agg_avg_exactness;

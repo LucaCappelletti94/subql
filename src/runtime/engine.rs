@@ -2,6 +2,7 @@
 //! Subscription engine - main public API
 
 mod agg_maintenance;
+pub mod durable;
 mod install;
 pub mod replay;
 mod state_codec;

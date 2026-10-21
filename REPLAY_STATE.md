@@ -1,6 +1,6 @@
 # Replay state
 
-`ReplayDetector` maintains the selected result of one single-table subscription exactly across complete source transactions and restarts, with no database read.
+`ReplayDetector` maintains the selected result of one single-table subscription exactly, across complete source transactions and across a restart, with no database read. It is the operator behind `DurableEngine`, which adds a per-instance quota, an acknowledgement ledger, terminal failure records, and caller-owned atomic persistence around it. The wrapper contract is in [DURABLE_REPLAY.md](DURABLE_REPLAY.md).
 
 ## Query surface
 
