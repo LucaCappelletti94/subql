@@ -397,7 +397,7 @@ source = "git+https://github.com/LucaCappelletti94/diesel-sqlite-session#3a2e7f7
 dependencies = [
  "diesel",
  "libsqlite3-sys",
- "sqlite-wasm-rs 0.6.1",
+ "sqlite-wasm-rs 0.6.2",
  "thiserror",
 ]
 
@@ -910,7 +910,7 @@ checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
 [[package]]
 name = "pg2sqlite"
 version = "0.1.0"
-source = "git+https://github.com/LucaCappelletti94/pg2sqlite?branch=main#8d2ade7702613374f7af51ff95b56adc33810c03"
+source = "git+https://github.com/LucaCappelletti94/pg2sqlite?branch=main#624a06c0b0217d3338b58d06fed2cf5e33f87732"
 dependencies = [
  "sql-traits",
  "sqlparser",
@@ -1094,7 +1094,7 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 [[package]]
 name = "rls2fga"
 version = "0.1.0"
-source = "git+https://github.com/LucaCappelletti94/rls2fga?branch=main#a9e20e116658bd56f4c16af209a3edac3d324d4c"
+source = "git+https://github.com/LucaCappelletti94/rls2fga?branch=main#74a97af5a186ebfc330cb337797ca768961c1cd0"
 dependencies = [
  "rls2fga-types",
  "serde",
@@ -1107,7 +1107,7 @@ dependencies = [
 [[package]]
 name = "rls2fga-types"
 version = "0.1.0"
-source = "git+https://github.com/LucaCappelletti94/rls2fga?branch=main#a9e20e116658bd56f4c16af209a3edac3d324d4c"
+source = "git+https://github.com/LucaCappelletti94/rls2fga?branch=main#74a97af5a186ebfc330cb337797ca768961c1cd0"
 dependencies = [
  "serde",
  "thiserror",
@@ -1283,23 +1283,14 @@ dependencies = [
 [[package]]
 name = "sql-traits"
 version = "0.1.0"
-source = "git+https://github.com/earth-metabolome-initiative/sql-traits?branch=main#aa397b53ef10effa1a5c5b4ff9e402ac9954fe0f"
+source = "git+https://github.com/earth-metabolome-initiative/sql-traits?branch=main#8fcca5b78d1d1723c5c7e54074e49bb5a50a7bbd"
 dependencies = [
  "geometric-traits",
  "serde",
  "sha2",
- "sql_docs",
  "sqlparser",
  "thiserror",
  "unicode-normalization",
-]
-
-[[package]]
-name = "sql_docs"
-version = "1.3.2"
-source = "git+https://github.com/LucaCappelletti94/sql-docs?branch=main#1f3170175b0860ba586c73f655e914bdfde7d4a1"
-dependencies = [
- "sqlparser",
 ]
 
 [[package]]
@@ -1334,9 +1325,9 @@ dependencies = [
 
 [[package]]
 name = "sqlite-wasm-rs"
-version = "0.6.1"
+version = "0.6.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "717e14271e332de37b8f7793913d53e2f952b3d21f96efd5880aea42a3c32d18"
+checksum = "36bd8e29bf08189a005b2df1df99823aa0861cabe9044e5f31ed54ca292ee618"
 dependencies = [
  "cc",
  "rsqlite-vfs",
@@ -1345,7 +1336,7 @@ dependencies = [
 [[package]]
 name = "sqlparser"
 version = "0.63.0"
-source = "git+https://github.com/apache/datafusion-sqlparser-rs?branch=main#1ea2488a632762e85f2cdb1c8bbe08f80800338e"
+source = "git+https://github.com/apache/datafusion-sqlparser-rs?branch=main#d9eec6e06bc53d629600be40851c5443b4ffaa13"
 dependencies = [
  "log",
  "recursive",
@@ -1356,7 +1347,7 @@ dependencies = [
 [[package]]
 name = "sqlparser-canonicalize"
 version = "0.2.1"
-source = "git+https://github.com/LucaCappelletti94/sqlparser-canonicalize?branch=main#6a0cd75941c6c776d2fb00b51d16acca4f45d510"
+source = "git+https://github.com/LucaCappelletti94/sqlparser-canonicalize?branch=main#3d16944424d7da67e78a8ce804c3c1fc7f0db500"
 dependencies = [
  "seahash",
  "sqlparser",
@@ -1366,7 +1357,7 @@ dependencies = [
 [[package]]
 name = "sqlparser-plpgsql"
 version = "0.1.0"
-source = "git+https://github.com/LucaCappelletti94/sqlparser-plpgsql?branch=main#427ebea5f7caa0cb2540db03a117a059050de860"
+source = "git+https://github.com/LucaCappelletti94/sqlparser-plpgsql?branch=main#016542bb7f7975a00769fd1574a52c70b0ec58f7"
 dependencies = [
  "sqlparser",
  "thiserror",
@@ -1375,7 +1366,7 @@ dependencies = [
 [[package]]
 name = "sqlparser_derive"
 version = "0.6.0"
-source = "git+https://github.com/apache/datafusion-sqlparser-rs?branch=main#1ea2488a632762e85f2cdb1c8bbe08f80800338e"
+source = "git+https://github.com/apache/datafusion-sqlparser-rs?branch=main#d9eec6e06bc53d629600be40851c5443b4ffaa13"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1550,9 +1541,9 @@ checksum = "fd3ca314f692efd6c868f8408f53fe444634a845f96c028b97d35f6a1f79f0ee"
 
 [[package]]
 name = "tokio"
-version = "1.54.0"
+version = "1.54.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a0c168a474b95bfecfe908a65d4bdffc523144b649a74c09c286afb35d53e0bc"
+checksum = "b52fd3255258d26fac7264ab5a76b53c13367136dc011d3d6ad4f8ed070396a3"
 dependencies = [
  "pin-project-lite",
 ]
