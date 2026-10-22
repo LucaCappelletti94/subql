@@ -1,0 +1,2 @@
+SELECT							FROM t WINDOW w AS (PARTITION BY s																
+ N@@@)

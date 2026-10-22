@@ -1,0 +1,1 @@
+SELECT * FROM orders WHERE (SELECT * FROM o c8rds WHERE 'paid') IS NOT DISTINCT FROM true
