@@ -1,1 +1,0 @@
-SELECT * FROM orders WHERE COALNULL(c2,-p2,-p) 

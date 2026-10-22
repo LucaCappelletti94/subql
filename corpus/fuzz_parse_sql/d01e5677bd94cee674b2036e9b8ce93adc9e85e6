@@ -1,1 +1,0 @@
-SELECT * FROM orders WHERE nt_settinagTp(p'R OR 'dorders)[3] @oOn05
