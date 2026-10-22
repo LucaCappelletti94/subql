@@ -7,9 +7,9 @@ use sql_traits::{
 };
 use sqlparser::ast::{
     BinaryOperator, Distinct, DuplicateTreatment, Expr, Function, FunctionArg, FunctionArgExpr,
-    FunctionArgumentList, FunctionArguments, GroupByExpr, Ident, LimitClause, ObjectName, Query,
-    Select, SelectItem, SelectItemQualifiedWildcardKind, SelectModifiers, SetExpr, Statement,
-    TableFactor, Visit, Visitor,
+    FunctionArgumentList, FunctionArguments, GroupByExpr, Ident, InTarget, LimitClause, ObjectName,
+    Query, Select, SelectItem, SelectItemQualifiedWildcardKind, SelectModifiers, SetExpr,
+    Statement, TableFactor, Visit, Visitor,
 };
 use sqlparser::tokenizer::{Token, TokenWithSpan, Tokenizer};
 
@@ -2164,7 +2164,11 @@ fn contains_matching(expr: &Expr, matches: fn(&Expr) -> bool) -> bool {
                 || contains_matching(low, matches)
                 || contains_matching(high, matches)
         }
-        Expr::InList { expr, list, .. } => {
+        Expr::In {
+            expr,
+            target: InTarget::List(list),
+            ..
+        } => {
             contains_matching(expr, matches)
                 || list.iter().any(|item| contains_matching(item, matches))
         }
@@ -2180,7 +2184,11 @@ fn contains_subquery(expr: &Expr) -> bool {
     contains_matching(expr, |inner| {
         matches!(
             inner,
-            Expr::InSubquery { .. } | Expr::Exists { .. } | Expr::Subquery(_)
+            Expr::In {
+                target: InTarget::Subquery(_),
+                ..
+            } | Expr::Exists { .. }
+                | Expr::Subquery(_)
         )
     })
 }
@@ -2193,7 +2201,13 @@ fn contains_subquery(expr: &Expr) -> bool {
 /// membership `EXISTS` is a term and its negation is the same subtraction.
 pub(super) fn contains_membership_subquery(expr: &Expr) -> bool {
     contains_matching(expr, |inner| {
-        matches!(inner, Expr::InSubquery { .. } | Expr::Exists { .. })
+        matches!(
+            inner,
+            Expr::In {
+                target: InTarget::Subquery(_),
+                ..
+            } | Expr::Exists { .. }
+        )
     })
 }
 

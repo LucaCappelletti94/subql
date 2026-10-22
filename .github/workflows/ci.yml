@@ -142,7 +142,28 @@ jobs:
       - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
         with:
           tool: nextest
-      - run: cargo nextest archive --workspace --all-features --release --locked --archive-file nextest.tar.zst
+      - name: Resources before archive build
+        run: |
+          free -h
+          df -h . "$RUNNER_TEMP"
+          ulimit -a
+          cat /proc/self/cgroup
+          cat /proc/pressure/memory
+          cgroup=$(cut -d: -f3 /proc/self/cgroup)
+          cat /sys/fs/cgroup"$cgroup"/memory.{current,peak,max,events} || true
+      - name: Build test archive
+        run: /usr/bin/time -v cargo nextest archive --workspace --all-features --release --locked --archive-file nextest.tar.zst
+      - name: Resources and termination diagnostics
+        if: always()
+        run: |
+          free -h
+          df -h . "$RUNNER_TEMP"
+          cat /proc/pressure/memory
+          cgroup=$(cut -d: -f3 /proc/self/cgroup)
+          cat /sys/fs/cgroup"$cgroup"/memory.{current,peak,max,events} || true
+          ps -eo pid,ppid,comm,rss --sort=-rss
+          sudo -n journalctl --no-pager -k --since "-90 minutes" || true
+          sudo -n journalctl --no-pager -u systemd-oomd --since "-90 minutes" || true
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: nextest-archive

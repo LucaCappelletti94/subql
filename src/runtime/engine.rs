@@ -6127,7 +6127,7 @@ mod tests {
             "the refusal should name the negation, got {message:?}"
         );
         assert!(
-            !message.contains("InSubquery"),
+            !message.contains("target: Subquery"),
             "the refusal should not print the parsed expression, got {message:?}"
         );
     }
@@ -6300,7 +6300,7 @@ mod tests {
             "a bounded term is within the language, got {message:?}"
         );
         assert!(
-            !message.contains("InSubquery"),
+            !message.contains("target: Subquery"),
             "the refusal should not print the parsed expression, got {message:?}"
         );
     }

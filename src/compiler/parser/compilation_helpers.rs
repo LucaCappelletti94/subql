@@ -12,7 +12,9 @@ use crate::{RegisterError, TableId};
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use sql_traits::prelude::DatabaseLike;
-use sqlparser::ast::{BinaryOperator, Expr, UnaryOperator, Value as SqlValue, ValueWithSpan};
+use sqlparser::ast::{
+    BinaryOperator, Expr, InTarget, UnaryOperator, Value as SqlValue, ValueWithSpan,
+};
 use sqlparser_canonicalize::Canonicalizer;
 
 /// If `expr` is a bare column reference, return what a value of that column
@@ -757,14 +759,14 @@ where
         // `GLOBAL` makes a distributed ClickHouse query evaluate the right-hand
         // side once on the initiator and broadcast it, a meaning no backend
         // here has.
-        Expr::InList { global: true, .. } | Expr::InSubquery { global: true, .. } => {
+        Expr::In { global: true, .. } => {
             return Err(unsupported_expression(expr));
         }
 
         // IN Lists
-        Expr::InList {
+        Expr::In {
             expr,
-            list,
+            target: InTarget::List(list),
             negated,
             global: false,
         } => {
@@ -810,20 +812,10 @@ where
             }
         }
 
-        // Membership subqueries
-        // `IN (SELECT ...)` parses to `InSubquery`, which the literal-list arm
-        // above never sees. Requirement 1 of the membership term: recognise the
-        // bounded form here, in every build, and let the bound itself say what
-        // is wrong with anything outside it.
-        //
-        // A term is not a row test, so it compiles to a slot rather than to a
-        // comparison: dispatch reads the compared column off the changed row,
-        // looks up which subscribers that value admits, and hands the VM one
-        // truth per assignment. Whether the relationship can be served at all is
-        // registration's question, since answering it needs `rls2fga`.
-        Expr::InSubquery {
+        // A term compiles to a slot, since dispatch answers it per subscriber from the changed row.
+        Expr::In {
             expr: tested,
-            subquery,
+            target: InTarget::Subquery(subquery),
             negated,
             global: false,
         } => {
@@ -1553,8 +1545,10 @@ fn refuse_condition_operand(operand: &Expr) -> Result<(), RegisterError> {
                 | Expr::IsNotDistinctFrom(..)
                 | Expr::Like { .. }
                 | Expr::ILike { .. }
-                | Expr::InList { .. }
-                | Expr::InSubquery { .. }
+                | Expr::In {
+                    target: InTarget::List(_) | InTarget::Subquery(_),
+                    ..
+                }
                 | Expr::Between { .. }
                 | Expr::Exists { .. }
         ),

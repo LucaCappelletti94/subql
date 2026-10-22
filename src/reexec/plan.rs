@@ -17,7 +17,7 @@ use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use sql_traits::prelude::{ColumnLike, DatabaseLike, TableLike};
-use sqlparser::ast::{BinaryOperator, Expr, Ident, SelectItem, SetExpr, Statement};
+use sqlparser::ast::{BinaryOperator, Expr, Ident, InTarget, SelectItem, SetExpr, Statement};
 use sqlparser::dialect::Dialect;
 
 /// Column alias the re-execution query projects its scalar result under, so the
@@ -1037,7 +1037,10 @@ impl ScopedRead {
             whole => whole,
         };
         match predicate {
-            Expr::InList { list, .. } => Some(list),
+            Expr::In {
+                target: InTarget::List(list),
+                ..
+            } => Some(list),
             _ => None,
         }
         .expect("the renderer installs an IN-list key predicate when it is built")
@@ -1074,9 +1077,9 @@ fn key_predicate(plan: &KeyedPlan) -> Expr {
                 .collect(),
         )
     };
-    Expr::InList {
+    Expr::In {
         expr: alloc::boxed::Box::new(key_expr),
-        list: Vec::new(),
+        target: InTarget::List(Vec::new()),
         negated: false,
         global: false,
     }
