@@ -725,6 +725,7 @@ fn an_unfolded_read_policy_refuses_replay_admission() {
     for sql in [
         "SELECT id FROM rls_items",
         "SELECT MAX(price) FROM rls_items",
+        "SELECT id, MAX(price) FROM rls_items GROUP BY id",
     ] {
         let error = engine
             .replay_detector(
@@ -1464,4 +1465,1669 @@ fn grouped_having_uses_each_real_aggregate_width() {
         .apply_transaction(&[insert(table, row(3))], &db)
         .expect("the double precision mean stays below the threshold"));
     assert!(matches!(sum.answer(), ReplayAnswer::Grouped(groups) if groups.is_empty()));
+}
+
+#[test]
+fn grouped_extremes_hide_null_candidates_at_the_having_boundary() {
+    let db = parse("CREATE TABLE readings (id INT PRIMARY KEY, grp INT, qty INT);");
+    let table = table_of(&db, "readings");
+    let engine = engine_of(db.clone());
+    let sql = "SELECT grp, MAX(qty) FROM readings WHERE id > 0 \
+               GROUP BY grp HAVING MAX(qty) > 5";
+    let row = |id, group, qty| vec![Value::Int(id), Value::Int(group), qty];
+    let low = row(2, 1, Value::Int(4));
+    let high = row(3, 2, Value::Int(10));
+    let mut detector = detector_of(
+        &engine,
+        sql,
+        table,
+        vec![
+            row(-1, 1, Value::Int(99)),
+            row(1, 1, Value::Null),
+            low.clone(),
+            high.clone(),
+            row(4, 2, Value::Null),
+        ],
+    );
+    let groups = |answer: &ReplayAnswer<Postgres>| {
+        grouped_of(answer, |value| match value {
+            ReplayValue::Scalar(Value::Int(value)) => *value,
+            _ => panic!("the selected extreme is an integer"),
+        })
+    };
+    assert_eq!(groups(detector.answer()), vec![(2, 10)]);
+
+    let admitted = row(2, 1, Value::Int(6));
+    assert!(detector
+        .apply_transaction(&[update(table, low, admitted.clone())], &db)
+        .expect("the first group crosses its threshold"));
+    assert_eq!(groups(detector.answer()), vec![(1, 6), (2, 10)]);
+
+    let mut restored = restored_of(
+        &engine,
+        sql,
+        &detector.checkpoint().expect("the candidates encode"),
+    );
+    assert!(restored
+        .apply_transaction(&[delete(table, high)], &db)
+        .expect("the second group retains only NULL"));
+    assert_eq!(groups(restored.answer()), vec![(1, 6)]);
+    assert!(restored
+        .apply_transaction(&[update(table, admitted, row(2, 1, Value::Null))], &db,)
+        .expect("the first group retains only NULL"));
+    assert_eq!(groups(restored.answer()), []);
+
+    let transient = row(5, 1, Value::Int(7));
+    assert!(!restored
+        .apply_transaction(
+            &[insert(table, transient.clone()), delete(table, transient)],
+            &db,
+        )
+        .expect("the transaction preserves its selected answer"));
+    assert_eq!(groups(restored.answer()), []);
+}
+
+#[test]
+fn unkeyed_events_require_complete_retained_old_images() {
+    let db = parse("CREATE TABLE samples (price DOUBLE PRECISION, note TEXT);");
+    let table = table_of(&db, "samples");
+    let engine = engine_of(db.clone());
+    let original = vec![Value::Float(f64::NAN), Value::String("kept".into())];
+    let mut detector = detector_of(&engine, "SELECT * FROM samples", table, vec![original]);
+    let checkpoint = detector.checkpoint().expect("the original row encodes");
+    let staged = vec![Value::Float(5.0), Value::String("staged".into())];
+    assert!(matches!(
+        detector.apply_transaction(
+            &[
+                Event::insert(table, staged),
+                Event::delete(table, vec![Value::Missing, Value::String("kept".into())]),
+            ],
+            &db,
+        ),
+        Err(ReplayError::IncompleteInput(_))
+    ));
+    assert_eq!(
+        detector.checkpoint().expect("the transaction was rejected"),
+        checkpoint
+    );
+    assert!(matches!(
+        detector.apply_transaction(
+            &[Event::delete(
+                table,
+                vec![Value::Float(42.0), Value::String("kept".into())],
+            )],
+            &db,
+        ),
+        Err(ReplayError::InputConflict(_))
+    ));
+    assert_eq!(
+        detector.checkpoint().expect("the stale row was rejected"),
+        checkpoint
+    );
+
+    let equivalent = vec![
+        Value::Float(f64::from_bits(0x7ff8_0000_0000_0001)),
+        Value::String("kept".into()),
+    ];
+    assert!(detector
+        .apply_transaction(
+            &[Event::update(
+                table,
+                equivalent,
+                vec![Value::Float(-0.0), Value::Missing],
+            )],
+            &db,
+        )
+        .expect("the complete old NaN locates its retained row"));
+    let zero = vec![Value::Float(0.0), Value::String("kept".into())];
+    assert_eq!(rows_of(detector.answer()), vec![(zero.clone(), 1)]);
+    assert!(detector
+        .apply_transaction(&[Event::delete(table, zero)], &db)
+        .expect("either zero sign identifies the retained row"));
+    assert_eq!(rows_of(detector.answer()), []);
+}
+
+#[test]
+fn replay_admission_refuses_database_reread_only_shapes() {
+    let db = parse(READINGS_DDL);
+    let table = table_of(&db, "readings");
+    let engine = engine_of(db);
+    for sql in [
+        "SELECT AVG(qty) FROM readings",
+        "SELECT grp, AVG(qty) FROM readings GROUP BY grp",
+        "SELECT id FROM readings ORDER BY qty LIMIT 1",
+    ] {
+        assert!(matches!(
+            engine.replay_detector(
+                &SubscriptionRequest::new(1, sql),
+                vec![ReplayTable {
+                    table_id: table,
+                    rows: readings_seed(),
+                }],
+            ),
+            Err(ReplayError::Unsupported(_))
+        ));
+    }
+}
+
+#[cfg(feature = "membership-term")]
+const MEMBER_DDL: &str = "CREATE TABLE projects (id INTEGER PRIMARY KEY, name TEXT);
+    CREATE TABLE project_members (project_id INTEGER REFERENCES projects(id), user_id TEXT, \
+    PRIMARY KEY (project_id, user_id));
+    CREATE TABLE docs (id INTEGER PRIMARY KEY, project_id INTEGER, title TEXT);";
+
+#[cfg(feature = "membership-term")]
+const IDENTITY_MEMBER_SQL: &str = "SELECT * FROM docs WHERE project_id IN \
+     (SELECT project_id FROM project_members WHERE user_id = current_setting('app.user_id', true))";
+
+#[cfg(feature = "membership-term")]
+const SUBJECTS_MEMBER_SQL: &str = "SELECT * FROM docs WHERE project_id IN \
+     (SELECT project_id FROM project_members \
+      WHERE user_id = ANY(string_to_array(current_setting('app.subjects', true), ',')))";
+
+#[cfg(feature = "membership-term")]
+const AGGREGATE_MEMBER_SQL: &str = "SELECT COUNT(*) FROM docs WHERE project_id IN \
+     (SELECT project_id FROM project_members WHERE user_id = current_setting('app.user_id', true))";
+
+#[cfg(feature = "membership-term")]
+fn membership_engine_of(db: ParserDB) -> Engine {
+    use rls2fga::classifier::function_registry::{SessionAttribute, SessionAttributeKind};
+    use rls2fga::translator::TranslatorBuilder;
+    use rls2fga::types::ConfidenceLevel;
+    engine_of(db).with_translator(
+        TranslatorBuilder::new()
+            .with_min_confidence(ConfidenceLevel::B)
+            .with_session_attributes([SessionAttribute::setting(
+                "app.subjects",
+                SessionAttributeKind::SetAttribute,
+            )])
+            .build(),
+    )
+}
+
+#[cfg(feature = "membership-term")]
+fn identity_spec_of(sql: &str, subscriber: &str) -> SubscriptionRequest<DefaultIds, Postgres> {
+    SubscriptionRequest::new(1, sql).subscriber(Value::String(subscriber.into()))
+}
+
+#[cfg(feature = "membership-term")]
+fn subjects_spec_of(sql: &str, subjects: &[&str]) -> SubscriptionRequest<DefaultIds, Postgres> {
+    let subjects: Vec<Value<Postgres>> = subjects
+        .iter()
+        .map(|subject| Value::String((*subject).into()))
+        .collect();
+    SubscriptionRequest::new(1, sql).subjects(subjects)
+}
+
+#[cfg(feature = "membership-term")]
+fn term_detector_of(
+    engine: &Engine,
+    spec: &SubscriptionRequest<DefaultIds, Postgres>,
+    tables: Vec<ReplayTable<Postgres>>,
+) -> ReplayDetector<Postgres> {
+    engine
+        .replay_detector(spec, tables)
+        .expect("the statement replays in process")
+}
+
+#[cfg(feature = "membership-term")]
+fn restored_spec_of(
+    engine: &Engine,
+    spec: &SubscriptionRequest<DefaultIds, Postgres>,
+    bytes: &[u8],
+) -> ReplayDetector<Postgres> {
+    engine
+        .restore_replay_detector(spec, bytes)
+        .expect("the checkpoint verifies against the same plan and catalog")
+}
+
+#[cfg(feature = "membership-term")]
+fn sorted_rows_of(answer: &ReplayAnswer<Postgres>) -> Vec<(Vec<Value<Postgres>>, u64)> {
+    let mut rows = rows_of(answer);
+    rows.sort_by_key(|(row, _)| match &row[0] {
+        Value::Int(id) => *id,
+        other => panic!("the key is an int, got {other:?}"),
+    });
+    rows
+}
+
+#[cfg(feature = "membership-term")]
+fn doc_row(id: i64, project: Value<Postgres>, title: &str) -> Vec<Value<Postgres>> {
+    vec![Value::Int(id), project, Value::String(title.into())]
+}
+
+#[cfg(feature = "membership-term")]
+fn member_row(project: Value<Postgres>, user: Value<Postgres>) -> Vec<Value<Postgres>> {
+    vec![project, user]
+}
+
+#[cfg(feature = "membership-term")]
+fn alice() -> Value<Postgres> {
+    Value::String("alice".into())
+}
+
+#[cfg(feature = "membership-term")]
+#[test]
+fn identity_membership_admits_only_the_stated_grants() {
+    let db = parse(MEMBER_DDL);
+    let docs = table_of(&db, "docs");
+    let members = table_of(&db, "project_members");
+    let engine = membership_engine_of(db);
+    let detector = term_detector_of(
+        &engine,
+        &identity_spec_of(IDENTITY_MEMBER_SQL, "alice"),
+        vec![
+            ReplayTable {
+                table_id: docs,
+                rows: vec![
+                    doc_row(1, Value::Int(1), "spec"),
+                    doc_row(2, Value::Int(2), "draft"),
+                    doc_row(3, Value::Null, "orphan"),
+                    doc_row(4, Value::Int(3), "other"),
+                ],
+            },
+            ReplayTable {
+                table_id: members,
+                rows: vec![
+                    member_row(Value::Int(1), alice()),
+                    member_row(Value::Int(2), Value::String("bob".into())),
+                    member_row(Value::Null, alice()),
+                    member_row(Value::Int(3), alice()),
+                ],
+            },
+        ],
+    );
+    assert_eq!(detector.dependencies(), &[docs, members]);
+    assert_eq!(
+        sorted_rows_of(detector.answer()),
+        vec![
+            (doc_row(1, Value::Int(1), "spec"), 1),
+            (doc_row(4, Value::Int(3), "other"), 1),
+        ]
+    );
+}
+
+#[cfg(feature = "membership-term")]
+#[test]
+fn subjects_membership_moves_the_admitted_rows() {
+    let db = parse(MEMBER_DDL);
+    let docs = table_of(&db, "docs");
+    let members = table_of(&db, "project_members");
+    let engine = membership_engine_of(db.clone());
+    let tables = || {
+        vec![
+            ReplayTable {
+                table_id: docs,
+                rows: vec![
+                    doc_row(1, Value::Int(1), "spec"),
+                    doc_row(2, Value::Int(2), "draft"),
+                    doc_row(3, Value::Int(3), "late"),
+                ],
+            },
+            ReplayTable {
+                table_id: members,
+                rows: vec![
+                    member_row(Value::Int(1), alice()),
+                    member_row(Value::Int(2), Value::String("bob".into())),
+                ],
+            },
+        ]
+    };
+
+    let empty = term_detector_of(
+        &engine,
+        &subjects_spec_of(SUBJECTS_MEMBER_SQL, &[]),
+        tables(),
+    );
+    assert_eq!(rows_of(empty.answer()), []);
+
+    let mut detector = term_detector_of(
+        &engine,
+        &subjects_spec_of(SUBJECTS_MEMBER_SQL, &["alice", "bob"]),
+        tables(),
+    );
+    assert_eq!(
+        sorted_rows_of(detector.answer()),
+        vec![
+            (doc_row(1, Value::Int(1), "spec"), 1),
+            (doc_row(2, Value::Int(2), "draft"), 1),
+        ]
+    );
+
+    assert!(detector
+        .apply_transaction(
+            &[insert(
+                members,
+                member_row(Value::Int(3), Value::String("bob".into()))
+            )],
+            &db
+        )
+        .expect("the membership insert applies"));
+    assert_eq!(
+        sorted_rows_of(detector.answer()),
+        vec![
+            (doc_row(1, Value::Int(1), "spec"), 1),
+            (doc_row(2, Value::Int(2), "draft"), 1),
+            (doc_row(3, Value::Int(3), "late"), 1),
+        ]
+    );
+
+    assert!(!detector
+        .apply_transaction(
+            &[insert(
+                members,
+                member_row(Value::Int(4), Value::String("carol".into()))
+            )],
+            &db
+        )
+        .expect("the membership insert applies"));
+    assert_eq!(
+        sorted_rows_of(detector.answer()),
+        vec![
+            (doc_row(1, Value::Int(1), "spec"), 1),
+            (doc_row(2, Value::Int(2), "draft"), 1),
+            (doc_row(3, Value::Int(3), "late"), 1),
+        ]
+    );
+}
+
+#[cfg(feature = "membership-term")]
+#[test]
+fn membership_insert_update_delete_recompute_the_grants() {
+    let db = parse(MEMBER_DDL);
+    let docs = table_of(&db, "docs");
+    let members = table_of(&db, "project_members");
+    let engine = membership_engine_of(db.clone());
+    let mut detector = term_detector_of(
+        &engine,
+        &identity_spec_of(IDENTITY_MEMBER_SQL, "alice"),
+        vec![
+            ReplayTable {
+                table_id: docs,
+                rows: vec![
+                    doc_row(1, Value::Int(1), "a"),
+                    doc_row(2, Value::Int(2), "b"),
+                ],
+            },
+            ReplayTable {
+                table_id: members,
+                rows: vec![member_row(Value::Int(1), alice())],
+            },
+        ],
+    );
+    assert_eq!(
+        sorted_rows_of(detector.answer()),
+        vec![(doc_row(1, Value::Int(1), "a"), 1)]
+    );
+
+    assert!(detector
+        .apply_transaction(&[insert(members, member_row(Value::Int(2), alice()))], &db)
+        .expect("the membership insert applies"));
+    assert_eq!(
+        sorted_rows_of(detector.answer()),
+        vec![
+            (doc_row(1, Value::Int(1), "a"), 1),
+            (doc_row(2, Value::Int(2), "b"), 1),
+        ]
+    );
+
+    assert!(detector
+        .apply_transaction(
+            &[update(
+                members,
+                member_row(Value::Int(1), alice()),
+                member_row(Value::Int(9), alice()),
+            )],
+            &db
+        )
+        .expect("the membership update applies"));
+    assert_eq!(
+        sorted_rows_of(detector.answer()),
+        vec![(doc_row(2, Value::Int(2), "b"), 1)]
+    );
+
+    assert!(detector
+        .apply_transaction(&[delete(members, member_row(Value::Int(2), alice()))], &db)
+        .expect("the membership delete applies"));
+    assert_eq!(rows_of(detector.answer()), []);
+
+    assert!(!detector
+        .apply_transaction(&[insert(members, member_row(Value::Int(10), alice()))], &db)
+        .expect("the membership insert applies without admitted docs"));
+}
+
+#[cfg(feature = "membership-term")]
+#[test]
+fn membership_and_docs_truncates_empty_the_answer() {
+    let db = parse(MEMBER_DDL);
+    let docs = table_of(&db, "docs");
+    let members = table_of(&db, "project_members");
+    let engine = membership_engine_of(db.clone());
+    let mut detector = term_detector_of(
+        &engine,
+        &identity_spec_of(IDENTITY_MEMBER_SQL, "alice"),
+        vec![
+            ReplayTable {
+                table_id: docs,
+                rows: vec![
+                    doc_row(1, Value::Int(1), "spec"),
+                    doc_row(2, Value::Int(2), "draft"),
+                ],
+            },
+            ReplayTable {
+                table_id: members,
+                rows: vec![
+                    member_row(Value::Int(1), alice()),
+                    member_row(Value::Int(2), alice()),
+                ],
+            },
+        ],
+    );
+    assert_eq!(
+        sorted_rows_of(detector.answer()),
+        vec![
+            (doc_row(1, Value::Int(1), "spec"), 1),
+            (doc_row(2, Value::Int(2), "draft"), 1),
+        ]
+    );
+
+    assert!(detector
+        .apply_transaction(&[Event::truncate(members)], &db)
+        .expect("the membership truncate applies"));
+    assert_eq!(rows_of(detector.answer()), []);
+
+    assert!(detector
+        .apply_transaction(&[insert(members, member_row(Value::Int(1), alice()))], &db)
+        .expect("the membership insert applies"));
+    assert_eq!(
+        sorted_rows_of(detector.answer()),
+        vec![(doc_row(1, Value::Int(1), "spec"), 1)]
+    );
+
+    assert!(detector
+        .apply_transaction(&[Event::truncate(docs)], &db)
+        .expect("the docs truncate applies"));
+    assert_eq!(rows_of(detector.answer()), []);
+}
+
+#[cfg(feature = "membership-term")]
+#[test]
+fn membership_transactions_apply_atomically_across_the_boundary() {
+    let db = parse(MEMBER_DDL);
+    let docs = table_of(&db, "docs");
+    let members = table_of(&db, "project_members");
+    let engine = membership_engine_of(db.clone());
+    let mut detector = term_detector_of(
+        &engine,
+        &identity_spec_of(IDENTITY_MEMBER_SQL, "alice"),
+        vec![
+            ReplayTable {
+                table_id: docs,
+                rows: vec![
+                    doc_row(1, Value::Int(1), "a"),
+                    doc_row(2, Value::Int(2), "b"),
+                ],
+            },
+            ReplayTable {
+                table_id: members,
+                rows: vec![member_row(Value::Int(1), alice())],
+            },
+        ],
+    );
+    assert_eq!(
+        sorted_rows_of(detector.answer()),
+        vec![(doc_row(1, Value::Int(1), "a"), 1)]
+    );
+
+    let events = [
+        insert(docs, doc_row(3, Value::Int(1), "c")),
+        insert(members, member_row(Value::Int(2), alice())),
+    ];
+    assert!(detector
+        .apply_transaction(&events, &db)
+        .expect("the transaction applies"));
+    assert_eq!(
+        sorted_rows_of(detector.answer()),
+        vec![
+            (doc_row(1, Value::Int(1), "a"), 1),
+            (doc_row(2, Value::Int(2), "b"), 1),
+            (doc_row(3, Value::Int(1), "c"), 1),
+        ]
+    );
+
+    let before = detector.checkpoint().expect("the state encodes");
+    let refused = [
+        update(
+            docs,
+            doc_row(1, Value::Int(1), "a"),
+            doc_row(1, Value::Int(1), "a2"),
+        ),
+        delete(
+            members,
+            member_row(Value::Int(8), Value::String("bob".into())),
+        ),
+    ];
+    assert!(matches!(
+        detector.apply_transaction(&refused, &db),
+        Err(ReplayError::InputConflict(_))
+    ));
+    assert_eq!(
+        sorted_rows_of(detector.answer()),
+        vec![
+            (doc_row(1, Value::Int(1), "a"), 1),
+            (doc_row(2, Value::Int(2), "b"), 1),
+            (doc_row(3, Value::Int(1), "c"), 1),
+        ]
+    );
+    assert_eq!(
+        detector.checkpoint().expect("the rejected state encodes"),
+        before
+    );
+
+    assert!(detector
+        .apply_transaction(
+            &[update(
+                docs,
+                doc_row(1, Value::Int(1), "a"),
+                doc_row(1, Value::Int(1), "a2"),
+            )],
+            &db
+        )
+        .expect("the retry applies"));
+    assert_eq!(
+        sorted_rows_of(detector.answer()),
+        vec![
+            (doc_row(1, Value::Int(1), "a2"), 1),
+            (doc_row(2, Value::Int(2), "b"), 1),
+            (doc_row(3, Value::Int(1), "c"), 1),
+        ]
+    );
+}
+
+#[cfg(feature = "membership-term")]
+#[test]
+fn membership_checkpoint_restores_and_keeps_moving() {
+    let db = parse(MEMBER_DDL);
+    let docs = table_of(&db, "docs");
+    let members = table_of(&db, "project_members");
+    let engine = membership_engine_of(db.clone());
+    let spec = identity_spec_of(IDENTITY_MEMBER_SQL, "alice");
+    let detector = term_detector_of(
+        &engine,
+        &spec,
+        vec![
+            ReplayTable {
+                table_id: docs,
+                rows: vec![
+                    doc_row(1, Value::Int(1), "spec"),
+                    doc_row(2, Value::Int(2), "draft"),
+                ],
+            },
+            ReplayTable {
+                table_id: members,
+                rows: vec![member_row(Value::Int(1), alice())],
+            },
+        ],
+    );
+    let bytes = detector.checkpoint().expect("the checkpoint encodes");
+    let restored = restored_spec_of(&engine, &spec, &bytes);
+    assert_eq!(restored.answer(), detector.answer());
+
+    let events = [insert(members, member_row(Value::Int(2), alice()))];
+    let mut twin = detector;
+    twin.apply_transaction(&events, &db)
+        .expect("the membership applies to the twin");
+    let mut restored = restored;
+    restored
+        .apply_transaction(&events, &db)
+        .expect("the membership applies to the restored detector");
+    assert_eq!(restored.answer(), twin.answer());
+    assert_eq!(
+        sorted_rows_of(restored.answer()),
+        vec![
+            (doc_row(1, Value::Int(1), "spec"), 1),
+            (doc_row(2, Value::Int(2), "draft"), 1),
+        ]
+    );
+
+    let other = identity_spec_of(IDENTITY_MEMBER_SQL, "bob");
+    let refused = engine
+        .restore_replay_detector(&other, &bytes)
+        .expect_err("another subscriber's state carries a different plan signature");
+    assert!(matches!(refused, ReplayError::Restore(_)));
+}
+
+#[cfg(feature = "membership-term")]
+#[test]
+fn membership_admission_refuses_null_and_missing_caller_values() {
+    let db = parse(MEMBER_DDL);
+    let docs = table_of(&db, "docs");
+    let members = table_of(&db, "project_members");
+    let engine = membership_engine_of(db);
+    let tables = || {
+        vec![
+            ReplayTable {
+                table_id: docs,
+                rows: vec![doc_row(1, Value::Int(1), "spec")],
+            },
+            ReplayTable {
+                table_id: members,
+                rows: vec![member_row(Value::Int(1), alice())],
+            },
+        ]
+    };
+
+    let refused = engine
+        .replay_detector(
+            &SubscriptionRequest::new(1, IDENTITY_MEMBER_SQL).subscriber(Value::Null),
+            tables(),
+        )
+        .expect_err("a null subscriber cannot be looked up");
+    assert!(matches!(refused, ReplayError::InvalidState(_)));
+
+    let refused = engine
+        .replay_detector(&SubscriptionRequest::new(1, IDENTITY_MEMBER_SQL), tables())
+        .expect_err("an unstated subscriber admits nothing");
+    assert!(matches!(refused, ReplayError::InvalidState(_)));
+
+    let refused = engine
+        .replay_detector(
+            &SubscriptionRequest::new(1, SUBJECTS_MEMBER_SQL).subjects(vec![Value::Null]),
+            tables(),
+        )
+        .expect_err("a null subject cannot be looked up");
+    assert!(matches!(refused, ReplayError::InvalidState(_)));
+
+    let refused = engine
+        .replay_detector(
+            &SubscriptionRequest::new(1, AGGREGATE_MEMBER_SQL).subscriber(alice()),
+            tables(),
+        )
+        .expect_err("an aggregate keeps one accumulator shared between consumers");
+    assert!(matches!(refused, ReplayError::InvalidState(_)));
+}
+
+#[cfg(feature = "membership-term")]
+#[test]
+fn caller_terms_admit_the_identity_and_the_subject_set() {
+    const NOTES_DDL: &str =
+        "CREATE TABLE notes(id INTEGER PRIMARY KEY, owner TEXT, project_id INTEGER, title TEXT);";
+    const IDENTITY_SQL: &str =
+        "SELECT * FROM notes WHERE owner = current_setting('app.user_id', true)";
+    const SUBJECTS_SQL: &str = "SELECT * FROM notes \
+         WHERE owner = ANY(string_to_array(current_setting('app.subjects', true), ','))";
+    let db = parse(NOTES_DDL);
+    let notes = table_of(&db, "notes");
+    let engine = membership_engine_of(db.clone());
+    let note = |id: i64, owner: Value<Postgres>| {
+        vec![
+            Value::Int(id),
+            owner,
+            Value::Int(id),
+            Value::String("note".into()),
+        ]
+    };
+    let tables = || {
+        vec![ReplayTable {
+            table_id: notes,
+            rows: vec![
+                note(1, alice()),
+                note(2, Value::String("bob".into())),
+                note(3, Value::Null),
+            ],
+        }]
+    };
+
+    let mut identity =
+        term_detector_of(&engine, &identity_spec_of(IDENTITY_SQL, "alice"), tables());
+    assert_eq!(identity.dependencies(), &[notes]);
+    assert_eq!(
+        sorted_rows_of(identity.answer()),
+        vec![(note(1, alice()), 1)]
+    );
+
+    assert!(identity
+        .apply_transaction(&[insert(notes, note(4, alice()))], &db)
+        .expect("the insert applies"));
+    assert_eq!(
+        sorted_rows_of(identity.answer()),
+        vec![(note(1, alice()), 1), (note(4, alice()), 1)]
+    );
+
+    assert!(!identity
+        .apply_transaction(
+            &[insert(notes, note(5, Value::String("carol".into())))],
+            &db
+        )
+        .expect("the insert applies"));
+    assert_eq!(
+        sorted_rows_of(identity.answer()),
+        vec![(note(1, alice()), 1), (note(4, alice()), 1)]
+    );
+
+    let subjects = term_detector_of(
+        &engine,
+        &subjects_spec_of(SUBJECTS_SQL, &["alice", "bob"]),
+        tables(),
+    );
+    assert_eq!(
+        sorted_rows_of(subjects.answer()),
+        vec![
+            (note(1, alice()), 1),
+            (note(2, Value::String("bob".into())), 1)
+        ]
+    );
+}
+
+#[cfg(feature = "membership-term")]
+#[test]
+fn composite_membership_pairs_admit_together_or_not_at_all() {
+    const DDL: &str = "CREATE TABLE tenants(id INTEGER PRIMARY KEY);
+         CREATE TABLE shares(tenant_id INTEGER NOT NULL, doc_id INTEGER NOT NULL, viewer TEXT NOT NULL, \
+         PRIMARY KEY(tenant_id, doc_id, viewer));
+         CREATE TABLE docs(tenant_id INTEGER NOT NULL, id INTEGER NOT NULL, title TEXT, \
+         PRIMARY KEY(tenant_id, id));";
+    const SQL: &str = "SELECT * FROM docs WHERE EXISTS (SELECT 1 FROM shares s \
+         WHERE s.tenant_id = docs.tenant_id AND s.doc_id = docs.id \
+           AND s.viewer = current_setting('app.user_id', true))";
+    let db = parse(DDL);
+    let docs = table_of(&db, "docs");
+    let shares = table_of(&db, "shares");
+    let engine = membership_engine_of(db.clone());
+    let share = |tenant: i64, document: i64, viewer: &str| {
+        vec![
+            Value::Int(tenant),
+            Value::Int(document),
+            Value::String(viewer.into()),
+        ]
+    };
+    let doc = |tenant: i64, document: i64| {
+        vec![
+            Value::Int(tenant),
+            Value::Int(document),
+            Value::String("d".into()),
+        ]
+    };
+    let mut detector = term_detector_of(
+        &engine,
+        &identity_spec_of(SQL, "alice"),
+        vec![
+            ReplayTable {
+                table_id: docs,
+                rows: vec![doc(1, 5), doc(2, 6), doc(1, 6), doc(2, 5)],
+            },
+            ReplayTable {
+                table_id: shares,
+                rows: vec![
+                    share(1, 5, "alice"),
+                    share(2, 6, "alice"),
+                    share(1, 6, "bob"),
+                    share(2, 5, "bob"),
+                ],
+            },
+        ],
+    );
+    assert_eq!(detector.dependencies(), &[docs, shares]);
+    let mut got = rows_of(detector.answer());
+    got.sort_by_key(|(row, _)| match (&row[0], &row[1]) {
+        (Value::Int(tenant), Value::Int(id)) => (*tenant, *id),
+        other => panic!("the key is a pair of ints, got {other:?}"),
+    });
+    assert_eq!(got, vec![(doc(1, 5), 1), (doc(2, 6), 1)]);
+
+    assert!(detector
+        .apply_transaction(
+            &[update(shares, share(1, 5, "alice"), share(1, 5, "bob"))],
+            &db
+        )
+        .expect("the share update applies"));
+    assert_eq!(rows_of(detector.answer()), vec![(doc(2, 6), 1)]);
+
+    assert!(detector
+        .apply_transaction(&[delete(shares, share(2, 6, "alice"))], &db)
+        .expect("the share delete applies"));
+    assert_eq!(rows_of(detector.answer()), []);
+
+    assert!(detector
+        .apply_transaction(&[insert(shares, share(2, 6, "alice"))], &db)
+        .expect("the share insert applies"));
+    assert_eq!(rows_of(detector.answer()), vec![(doc(2, 6), 1)]);
+}
+fn int_cell(value: i64) -> ciborium::Value {
+    ciborium::Value::Map(vec![(
+        ciborium::Value::Text("Int".into()),
+        ciborium::Value::Integer(value.into()),
+    )])
+}
+
+fn float_cell(value: f64) -> ciborium::Value {
+    ciborium::Value::Map(vec![(
+        ciborium::Value::Text("Float".into()),
+        ciborium::Value::Float(value),
+    )])
+}
+
+fn state_variant<'a>(state: &'a mut ciborium::Value, variant: &str) -> &'a mut ciborium::Value {
+    let state = wire_field(state, "state");
+    let ciborium::Value::Map(entries) = state else {
+        panic!("the state decodes to a map, got {state:?}")
+    };
+    entries
+        .iter_mut()
+        .find(|(key, _)| matches!(key, ciborium::Value::Text(key) if key == variant))
+        .map_or_else(
+            || panic!("the checkpoint carries a {variant} state"),
+            |(_, value)| value,
+        )
+}
+
+fn checkpoint_input_rows(state: &mut ciborium::Value) -> &mut ciborium::Value {
+    let inputs = wire_field(state, "inputs");
+    let ciborium::Value::Array(inputs) = inputs else {
+        panic!("the inputs decode to an array, got {inputs:?}")
+    };
+    let input = inputs.first_mut().expect("the plan reads one table");
+    let ciborium::Value::Map(entries) = input else {
+        panic!("an input decodes to a map, got {input:?}")
+    };
+    entries
+        .iter_mut()
+        .find(|(key, _)| matches!(key, ciborium::Value::Text(key) if key == "rows"))
+        .map_or_else(
+            || panic!("the input carries a rows field"),
+            |(_, rows)| rows,
+        )
+}
+
+fn group_with_key_cell(groups: &mut ciborium::Value, grp: i64) -> &mut ciborium::Value {
+    let ciborium::Value::Array(groups) = groups else {
+        panic!("the groups decode to an array, got {groups:?}")
+    };
+    groups
+        .iter_mut()
+        .find(|group| {
+            let ciborium::Value::Map(entries) = group else {
+                panic!("a group decodes to a map, got {group:?}")
+            };
+            let Some((_, values)) = entries
+                .iter()
+                .find(|(key, _)| matches!(key, ciborium::Value::Text(key) if key == "values"))
+            else {
+                panic!("the group carries a values field")
+            };
+            let ciborium::Value::Array(cells) = values else {
+                panic!("the group values decode to an array, got {values:?}")
+            };
+            cells.first() == Some(&int_cell(grp))
+        })
+        .expect("the seed carries the group")
+}
+
+fn row_carries_group(row: &ciborium::Value, grp: i64) -> bool {
+    let ciborium::Value::Array(cells) = row else {
+        return false;
+    };
+    cells.get(1) == Some(&int_cell(grp))
+}
+
+fn projected_entry<'a>(
+    rows: &'a mut ciborium::Value,
+    cells: &[ciborium::Value],
+) -> &'a mut ciborium::Value {
+    let ciborium::Value::Array(rows) = rows else {
+        panic!("the projected rows decode to an array, got {rows:?}")
+    };
+    rows.iter_mut()
+        .find(|entry| {
+            let ciborium::Value::Array(entry) = entry else {
+                panic!("a projected row decodes to an array, got {entry:?}")
+            };
+            entry.first() == Some(&ciborium::Value::Array(cells.to_vec()))
+        })
+        .expect("the checkpoint carries the projected row")
+}
+
+#[test]
+fn replay_admission_refuses_malformed_dependency_inputs() {
+    let db = parse(NAN_DDL);
+    let readings = table_of(&db, "readings");
+    let unrelated = table_of(&db, "unrelated");
+    let engine = engine_of(db);
+    let spec = SubscriptionRequest::new(1, "SELECT qty FROM readings");
+
+    let duplicated = engine
+        .replay_detector(
+            &spec,
+            vec![
+                ReplayTable {
+                    table_id: readings,
+                    rows: vec![reading(1, 1, Value::Int(100), 1.5, "a", "0.30")],
+                },
+                ReplayTable {
+                    table_id: readings,
+                    rows: vec![reading(2, 1, Value::Int(7), 4.5, "d", "0.50")],
+                },
+            ],
+        )
+        .expect_err("one dependency is supplied twice");
+    assert!(
+        matches!(duplicated, ReplayError::InvalidState(_)),
+        "the duplicate input is an invalid state, got {duplicated:?}"
+    );
+
+    let foreign = engine
+        .replay_detector(
+            &spec,
+            vec![ReplayTable {
+                table_id: unrelated,
+                rows: vec![vec![Value::Int(9), Value::Int(7)]],
+            }],
+        )
+        .expect_err("an input that is not a dependency");
+    assert!(
+        matches!(foreign, ReplayError::InvalidState(_)),
+        "the foreign input is an invalid state, got {foreign:?}"
+    );
+
+    let missing = engine
+        .replay_detector(&spec, Vec::new())
+        .expect_err("the dependency has no input");
+    assert!(
+        matches!(missing, ReplayError::InvalidState(_)),
+        "the missing input is an invalid state, got {missing:?}"
+    );
+
+    let narrow = engine
+        .replay_detector(
+            &spec,
+            vec![ReplayTable {
+                table_id: readings,
+                rows: vec![vec![
+                    Value::Int(1),
+                    Value::Int(1),
+                    Value::Int(100),
+                    Value::Float(1.5),
+                    Value::String("a".into()),
+                ]],
+            }],
+        )
+        .expect_err("a row shorter than the table");
+    assert!(
+        matches!(narrow, ReplayError::IncompleteInput(_)),
+        "the short row is an incomplete input, got {narrow:?}"
+    );
+
+    let absent = engine
+        .replay_detector(
+            &spec,
+            vec![ReplayTable {
+                table_id: readings,
+                rows: vec![vec![
+                    Value::Int(1),
+                    Value::Int(1),
+                    Value::Missing,
+                    Value::Float(1.5),
+                    Value::String("a".into()),
+                    Value::Decimal(BigDecimal::from_str("0.30").expect("a fixed decimal")),
+                ]],
+            }],
+        )
+        .expect_err("a row that omits a cell");
+    assert!(
+        matches!(absent, ReplayError::IncompleteInput(_)),
+        "the open row is an incomplete input, got {absent:?}"
+    );
+}
+
+#[test]
+fn replay_admission_refuses_a_duplicate_captured_primary_key() {
+    let db = parse(READINGS_DDL);
+    let readings = table_of(&db, "readings");
+    let engine = engine_of(db);
+    let rows = vec![
+        reading(1, 1, Value::Int(100), 1.5, "a", "0.30"),
+        reading(1, 2, Value::Int(7), 4.5, "d", "0.50"),
+    ];
+    let error = engine
+        .replay_detector(
+            &SubscriptionRequest::new(1, "SELECT qty FROM readings"),
+            vec![ReplayTable {
+                table_id: readings,
+                rows,
+            }],
+        )
+        .expect_err("one captured key is supplied twice");
+    assert!(
+        matches!(error, ReplayError::InputConflict(_)),
+        "the duplicate key is an input conflict, got {error:?}"
+    );
+}
+
+#[test]
+fn restore_refuses_checkpointed_inputs_the_plan_rejects() {
+    let db = parse(NAN_DDL);
+    let readings = table_of(&db, "readings");
+    let unrelated = table_of(&db, "unrelated");
+    let sql = "SELECT qty FROM readings";
+    let engine = engine_of(db);
+    let detector = detector_of(&engine, sql, readings, readings_seed());
+    let bytes = detector.checkpoint().expect("the checkpoint encodes");
+    assert_eq!(
+        restored_of(&engine, sql, &bytes).answer(),
+        detector.answer(),
+        "the unmutated checkpoint restores"
+    );
+
+    let mut state = decoded_state(&bytes);
+    *wire_field(&mut state, "inputs") = ciborium::Value::Array(Vec::new());
+    let empty = engine
+        .restore_replay_detector(&SubscriptionRequest::new(1, sql), &reencoded_state(&state))
+        .expect_err("the checkpoint carries no inputs");
+    assert!(
+        matches!(empty, ReplayError::Restore(_)),
+        "the empty inputs are a restore failure, got {empty:?}"
+    );
+
+    let mut state = decoded_state(&bytes);
+    let inputs = wire_field(&mut state, "inputs");
+    let ciborium::Value::Array(inputs) = inputs else {
+        panic!("the inputs decode to an array, got {inputs:?}")
+    };
+    let input = inputs.first_mut().expect("the plan reads one table");
+    let ciborium::Value::Map(entries) = input else {
+        panic!("the input decodes to a map, got {input:?}")
+    };
+    let table = entries
+        .iter_mut()
+        .find(|(key, _)| matches!(key, ciborium::Value::Text(key) if key == "table"))
+        .expect("the input carries a table field");
+    table.1 = ciborium::Value::Integer(unrelated.into());
+    let misordered = engine
+        .restore_replay_detector(&SubscriptionRequest::new(1, sql), &reencoded_state(&state))
+        .expect_err("the input names the wrong table");
+    assert!(
+        matches!(misordered, ReplayError::Restore(_)),
+        "the foreign table is a restore failure, got {misordered:?}"
+    );
+
+    let mut state = decoded_state(&bytes);
+    let rows = checkpoint_input_rows(&mut state);
+    let ciborium::Value::Array(rows) = rows else {
+        panic!("the input rows decode to an array, got {rows:?}")
+    };
+    let cells = rows.first_mut().expect("the seed carries rows");
+    let ciborium::Value::Array(cells) = cells else {
+        panic!("an input row decodes to an array, got {cells:?}")
+    };
+    cells.pop();
+    let narrow = engine
+        .restore_replay_detector(&SubscriptionRequest::new(1, sql), &reencoded_state(&state))
+        .expect_err("an input row lost a cell");
+    assert!(
+        matches!(narrow, ReplayError::Restore(_)),
+        "the short row is a restore failure, got {narrow:?}"
+    );
+
+    let mut state = decoded_state(&bytes);
+    let rows = checkpoint_input_rows(&mut state);
+    let ciborium::Value::Array(rows) = rows else {
+        panic!("the input rows decode to an array, got {rows:?}")
+    };
+    let cells = rows.first_mut().expect("the seed carries rows");
+    let ciborium::Value::Array(cells) = cells else {
+        panic!("an input row decodes to an array, got {cells:?}")
+    };
+    cells[2] = ciborium::Value::Text("Missing".into());
+    let absent = engine
+        .restore_replay_detector(&SubscriptionRequest::new(1, sql), &reencoded_state(&state))
+        .expect_err("an input row omits a cell");
+    assert!(
+        matches!(absent, ReplayError::Restore(_)),
+        "the open row is a restore failure, got {absent:?}"
+    );
+
+    let mut state = decoded_state(&bytes);
+    let rows = checkpoint_input_rows(&mut state);
+    let ciborium::Value::Array(rows) = rows else {
+        panic!("the input rows decode to an array, got {rows:?}")
+    };
+    rows.push(rows[0].clone());
+    let duplicated = engine
+        .restore_replay_detector(&SubscriptionRequest::new(1, sql), &reencoded_state(&state))
+        .expect_err("one captured key is held twice");
+    assert!(
+        matches!(duplicated, ReplayError::InputConflict(_)),
+        "the duplicate key is an input conflict, got {duplicated:?}"
+    );
+}
+
+#[test]
+fn restore_refuses_a_projected_bag_that_contradicts_its_inputs() {
+    let db = parse(READINGS_DDL);
+    let readings = table_of(&db, "readings");
+    let sql = "SELECT qty FROM readings";
+    let engine = engine_of(db);
+    let detector = detector_of(&engine, sql, readings, readings_seed());
+    let bytes = detector.checkpoint().expect("the bag encodes");
+    assert_eq!(
+        restored_of(&engine, sql, &bytes).answer(),
+        detector.answer(),
+        "the unmutated checkpoint restores"
+    );
+
+    let mut state = decoded_state(&bytes);
+    let entry = projected_entry(state_variant(&mut state, "Rows"), &[int_cell(100)]);
+    let ciborium::Value::Array(entry) = entry else {
+        panic!("a projected row decodes to an array, got {entry:?}")
+    };
+    entry[1] = ciborium::Value::Integer(0.into());
+    let vanished = engine
+        .restore_replay_detector(&SubscriptionRequest::new(1, sql), &reencoded_state(&state))
+        .expect_err("a projected row holds no copies");
+    assert!(
+        matches!(vanished, ReplayError::Restore(_)),
+        "the zero multiplicity is a restore failure, got {vanished:?}"
+    );
+
+    let mut state = decoded_state(&bytes);
+    let entry = projected_entry(state_variant(&mut state, "Rows"), &[int_cell(100)]);
+    let ciborium::Value::Array(entry) = entry else {
+        panic!("a projected row decodes to an array, got {entry:?}")
+    };
+    entry[1] = ciborium::Value::Integer(2.into());
+    let doubled = engine
+        .restore_replay_detector(&SubscriptionRequest::new(1, sql), &reencoded_state(&state))
+        .expect_err("a projected row holds more copies than its inputs");
+    assert!(
+        matches!(doubled, ReplayError::Restore(_)),
+        "the doubled multiplicity is a restore failure, got {doubled:?}"
+    );
+
+    let mut state = decoded_state(&bytes);
+    let entry = projected_entry(state_variant(&mut state, "Rows"), &[int_cell(100)]);
+    let ciborium::Value::Array(entry) = entry else {
+        panic!("a projected row decodes to an array, got {entry:?}")
+    };
+    entry[0] = ciborium::Value::Array(vec![int_cell(999)]);
+    let forged = engine
+        .restore_replay_detector(&SubscriptionRequest::new(1, sql), &reencoded_state(&state))
+        .expect_err("a projected cell the inputs never carried");
+    assert!(
+        matches!(forged, ReplayError::Restore(_)),
+        "the forged cell is a restore failure, got {forged:?}"
+    );
+
+    let mut state = decoded_state(&bytes);
+    let rows = state_variant(&mut state, "Rows");
+    let ciborium::Value::Array(rows) = rows else {
+        panic!("the projected rows decode to an array, got {rows:?}")
+    };
+    rows.push(ciborium::Value::Array(vec![
+        ciborium::Value::Array(vec![int_cell(42)]),
+        ciborium::Value::Integer(1.into()),
+    ]));
+    let extra = engine
+        .restore_replay_detector(&SubscriptionRequest::new(1, sql), &reencoded_state(&state))
+        .expect_err("a projected row the inputs never carried");
+    assert!(
+        matches!(extra, ReplayError::Restore(_)),
+        "the extra row is a restore failure, got {extra:?}"
+    );
+
+    let mut state = decoded_state(&bytes);
+    let rows = state_variant(&mut state, "Rows");
+    let ciborium::Value::Array(rows) = rows else {
+        panic!("the projected rows decode to an array, got {rows:?}")
+    };
+    let index = rows
+        .iter()
+        .position(|entry| {
+            let ciborium::Value::Array(entry) = entry else {
+                panic!("a projected row decodes to an array, got {entry:?}")
+            };
+            entry.first() == Some(&ciborium::Value::Array(vec![int_cell(100)]))
+        })
+        .expect("the checkpoint carries the projected row");
+    rows.remove(index);
+    let missing = engine
+        .restore_replay_detector(&SubscriptionRequest::new(1, sql), &reencoded_state(&state))
+        .expect_err("a projected row the inputs still carry");
+    assert!(
+        matches!(missing, ReplayError::Restore(_)),
+        "the missing row is a restore failure, got {missing:?}"
+    );
+}
+
+#[test]
+fn restore_refuses_an_extreme_that_contradicts_its_retained_candidates() {
+    let db = parse(READINGS_DDL);
+    let readings = table_of(&db, "readings");
+    let engine = engine_of(db);
+    let seed = vec![
+        reading(1, 1, Value::Null, 1.5, "a", "0.0"),
+        reading(2, 1, Value::Null, 2.5, "b", "0.0"),
+    ];
+
+    let max_sql = "SELECT MAX(price) FROM readings";
+    let max_bytes = detector_of(&engine, max_sql, readings, seed.clone())
+        .checkpoint()
+        .expect("the extreme encodes");
+    assert_eq!(
+        extreme_of(restored_of(&engine, max_sql, &max_bytes).answer()),
+        Value::Float(2.5),
+        "the unmutated extreme restores"
+    );
+
+    for forged in [99.0, 1.5] {
+        let mut state = decoded_state(&max_bytes);
+        *state_variant(&mut state, "ScalarExtreme") = float_cell(forged);
+        let refused = engine
+            .restore_replay_detector(
+                &SubscriptionRequest::new(1, max_sql),
+                &reencoded_state(&state),
+            )
+            .expect_err("the extreme is not the maximum of the retained rows");
+        assert!(
+            matches!(refused, ReplayError::Restore(_)),
+            "the forged maximum is a restore failure, got {refused:?}"
+        );
+    }
+
+    let min_sql = "SELECT MIN(price) FROM readings";
+    let min_bytes = detector_of(&engine, min_sql, readings, seed)
+        .checkpoint()
+        .expect("the minimum encodes");
+    let mut state = decoded_state(&min_bytes);
+    *state_variant(&mut state, "ScalarExtreme") = float_cell(0.5);
+    let refused = engine
+        .restore_replay_detector(
+            &SubscriptionRequest::new(1, min_sql),
+            &reencoded_state(&state),
+        )
+        .expect_err("the extreme is not the minimum of the retained rows");
+    assert!(
+        matches!(refused, ReplayError::Restore(_)),
+        "the forged minimum is a restore failure, got {refused:?}"
+    );
+}
+
+#[test]
+fn restore_refuses_grouped_extremes_that_contradict_their_inputs() {
+    let db = parse(READINGS_DDL);
+    let readings = table_of(&db, "readings");
+    let sql = "SELECT grp, MAX(price) FROM readings GROUP BY grp";
+    let engine = engine_of(db);
+    let detector = detector_of(&engine, sql, readings, readings_seed());
+    assert_eq!(
+        grouped_extreme_of(detector.answer()),
+        vec![(1, 2.5), (2, 3.5)],
+        "the seed answers its group extremes"
+    );
+    let bytes = detector.checkpoint().expect("the grouped extreme encodes");
+    assert_eq!(
+        grouped_extreme_of(restored_of(&engine, sql, &bytes).answer()),
+        vec![(1, 2.5), (2, 3.5)],
+        "the unmutated checkpoint restores"
+    );
+
+    let mut state = decoded_state(&bytes);
+    let group = group_with_key_cell(state_variant(&mut state, "GroupedExtreme"), 1);
+    *wire_field(group, "extreme") = float_cell(99.0);
+    let forged = engine
+        .restore_replay_detector(&SubscriptionRequest::new(1, sql), &reencoded_state(&state))
+        .expect_err("the group extreme is not the group maximum");
+    assert!(
+        matches!(forged, ReplayError::Restore(_)),
+        "the forged group extreme is a restore failure, got {forged:?}"
+    );
+
+    let mut state = decoded_state(&bytes);
+    let group = group_with_key_cell(state_variant(&mut state, "GroupedExtreme"), 2);
+    *wire_field(group, "rows") = ciborium::Value::Integer(99.into());
+    let counted = engine
+        .restore_replay_detector(&SubscriptionRequest::new(1, sql), &reencoded_state(&state))
+        .expect_err("the group count is not the group row count");
+    assert!(
+        matches!(counted, ReplayError::Restore(_)),
+        "the forged group count is a restore failure, got {counted:?}"
+    );
+
+    let mut state = decoded_state(&bytes);
+    let group = group_with_key_cell(state_variant(&mut state, "GroupedExtreme"), 2);
+    *wire_field(group, "values") = ciborium::Value::Array(vec![int_cell(5)]);
+    let rekeyed = engine
+        .restore_replay_detector(&SubscriptionRequest::new(1, sql), &reencoded_state(&state))
+        .expect_err("the values no longer encode their key");
+    assert!(
+        matches!(rekeyed, ReplayError::Restore(_)),
+        "the rekeyed group is a restore failure, got {rekeyed:?}"
+    );
+
+    let mut state = decoded_state(&bytes);
+    let groups = state_variant(&mut state, "GroupedExtreme");
+    let ciborium::Value::Array(groups) = groups else {
+        panic!("the groups decode to an array, got {groups:?}")
+    };
+    groups.push(groups.first().cloned().expect("the seed carries groups"));
+    let duplicated = engine
+        .restore_replay_detector(&SubscriptionRequest::new(1, sql), &reencoded_state(&state))
+        .expect_err("one group is held twice");
+    assert!(
+        matches!(duplicated, ReplayError::Restore(_)),
+        "the duplicate group is a restore failure, got {duplicated:?}"
+    );
+
+    let mut state = decoded_state(&bytes);
+    let rows = checkpoint_input_rows(&mut state);
+    let ciborium::Value::Array(rows) = rows else {
+        panic!("the input rows decode to an array, got {rows:?}")
+    };
+    let index = rows
+        .iter()
+        .position(|row| row_carries_group(row, 2))
+        .expect("the seed carries group 2");
+    rows.remove(index);
+    let emptied = engine
+        .restore_replay_detector(&SubscriptionRequest::new(1, sql), &reencoded_state(&state))
+        .expect_err("the inputs no longer carry the group");
+    assert!(
+        matches!(emptied, ReplayError::Restore(_)),
+        "the emptied group is a restore failure, got {emptied:?}"
+    );
+
+    let mut state = decoded_state(&bytes);
+    let rows = checkpoint_input_rows(&mut state);
+    let ciborium::Value::Array(rows) = rows else {
+        panic!("the input rows decode to an array")
+    };
+    let row = rows
+        .iter_mut()
+        .find(|row| row_carries_group(row, 2))
+        .expect("the seed carries group 2");
+    let ciborium::Value::Array(cells) = row else {
+        panic!("an input row decodes to an array")
+    };
+    cells[1] = int_cell(3);
+    assert!(matches!(
+        engine
+            .restore_replay_detector(&SubscriptionRequest::new(1, sql), &reencoded_state(&state),),
+        Err(ReplayError::Restore(_))
+    ));
+}
+
+#[test]
+fn restore_refuses_fold_groups_that_contradict_their_inputs() {
+    let db = parse(READINGS_DDL);
+    let readings = table_of(&db, "readings");
+    let sql = "SELECT grp, SUM(qty) FROM readings GROUP BY grp";
+    let engine = engine_of(db);
+    let detector = detector_of(&engine, sql, readings, readings_seed());
+    assert_eq!(
+        grouped_fold_of(detector.answer()),
+        vec![(1, 100), (2, 9_007_199_254_740_991)],
+        "the seed answers its group totals"
+    );
+    let bytes = detector.checkpoint().expect("the grouped fold encodes");
+    assert_eq!(
+        grouped_fold_of(restored_of(&engine, sql, &bytes).answer()),
+        vec![(1, 100), (2, 9_007_199_254_740_991)],
+        "the unmutated checkpoint restores"
+    );
+
+    let mut state = decoded_state(&bytes);
+    let group = group_with_key_cell(wire_field(&mut state, "groups"), 2);
+    *wire_field(group, "rows") = ciborium::Value::Integer(99.into());
+    let counted = engine
+        .restore_replay_detector(&SubscriptionRequest::new(1, sql), &reencoded_state(&state))
+        .expect_err("the group counter no longer matches its inputs");
+    assert!(
+        matches!(counted, ReplayError::Restore(_)),
+        "the forged group counter is a restore failure, got {counted:?}"
+    );
+
+    let mut state = decoded_state(&bytes);
+    let rows = checkpoint_input_rows(&mut state);
+    let ciborium::Value::Array(rows) = rows else {
+        panic!("the input rows decode to an array, got {rows:?}")
+    };
+    let row = rows
+        .iter_mut()
+        .find(|row| row_carries_group(row, 2))
+        .expect("the seed carries group 2");
+    let ciborium::Value::Array(cells) = row else {
+        panic!("an input row decodes to an array, got {row:?}")
+    };
+    cells[1] = int_cell(1);
+    let merged = engine
+        .restore_replay_detector(&SubscriptionRequest::new(1, sql), &reencoded_state(&state))
+        .expect_err("the inputs no longer hold the group set");
+    assert!(
+        matches!(merged, ReplayError::Restore(_)),
+        "the merged group set is a restore failure, got {merged:?}"
+    );
+
+    let mut state = decoded_state(&bytes);
+    let rows = checkpoint_input_rows(&mut state);
+    let ciborium::Value::Array(rows) = rows else {
+        panic!("the input rows decode to an array, got {rows:?}")
+    };
+    let row = rows
+        .iter_mut()
+        .find(|row| row_carries_group(row, 2))
+        .expect("the seed carries group 2");
+    let ciborium::Value::Array(cells) = row else {
+        panic!("an input row decodes to an array, got {row:?}")
+    };
+    cells[1] = int_cell(3);
+    let moved = engine
+        .restore_replay_detector(&SubscriptionRequest::new(1, sql), &reencoded_state(&state))
+        .expect_err("the inputs moved the group to an unheld key");
+    assert!(
+        matches!(moved, ReplayError::Restore(_)),
+        "the moved group is a restore failure, got {moved:?}"
+    );
+}
+
+#[test]
+fn restore_refuses_a_fold_tier_with_a_missing_fold_snapshot() {
+    let db = parse(READINGS_DDL);
+    let readings = table_of(&db, "readings");
+    let sql = "SELECT COUNT(*) FROM readings";
+    let engine = engine_of(db);
+    let bytes = detector_of(&engine, sql, readings, readings_seed())
+        .checkpoint()
+        .expect("the fold encodes");
+    assert_eq!(
+        count_star_of(restored_of(&engine, sql, &bytes).answer()),
+        3,
+        "the unmutated checkpoint restores"
+    );
+    let mut state = decoded_state(&bytes);
+    *wire_field(&mut state, "fold") = ciborium::Value::Null;
+    let refused = engine
+        .restore_replay_detector(&SubscriptionRequest::new(1, sql), &reencoded_state(&state))
+        .expect_err("the fold state carries no snapshot");
+    assert!(
+        matches!(refused, ReplayError::Restore(_)),
+        "the missing snapshot is a restore failure, got {refused:?}"
+    );
+}
+
+#[test]
+fn keyed_updates_recover_the_key_without_a_previous_image() {
+    let db = parse("CREATE TABLE samples (id INT PRIMARY KEY, qty INT);");
+    let table = table_of(&db, "samples");
+    let engine = engine_of(db.clone());
+    let sql = "SELECT SUM(qty) FROM samples";
+    let mut detector = detector_of(
+        &engine,
+        sql,
+        table,
+        vec![vec![Value::Int(1), Value::Int(5)]],
+    );
+    assert!(detector
+        .apply_transaction(
+            &[update(
+                table,
+                vec![Value::Missing, Value::Missing],
+                vec![Value::Int(1), Value::Int(7)],
+            )],
+            &db,
+        )
+        .expect("the key view locates the retained row"));
+    assert_eq!(sum_integer_of(detector.answer()), 7);
+    let bytes = detector.checkpoint().expect("the updated state encodes");
+    let mut restored = restored_of(&engine, sql, &bytes);
+    assert!(matches!(
+        restored.apply_transaction(
+            &[update(
+                table,
+                vec![Value::Missing, Value::Missing],
+                vec![Value::Missing, Value::Int(9)],
+            )],
+            &db,
+        ),
+        Err(ReplayError::IncompleteInput(_))
+    ));
+    assert_eq!(
+        restored
+            .checkpoint()
+            .expect("the refused key preserves state"),
+        bytes
+    );
+    assert_eq!(sum_integer_of(restored.answer()), 7);
+}
+
+#[test]
+fn nonnumeric_fold_inputs_preserve_the_committed_operator() {
+    let db = parse("CREATE TABLE samples (id INT PRIMARY KEY, grp INT, qty INT);");
+    let table = table_of(&db, "samples");
+    let engine = engine_of(db.clone());
+    let row = |id, grp, qty| vec![Value::Int(id), Value::Int(grp), qty];
+    for sql in [
+        "SELECT SUM(qty) FROM samples",
+        "SELECT grp, SUM(qty) FROM samples GROUP BY grp",
+    ] {
+        assert!(matches!(
+            engine.replay_detector(
+                &SubscriptionRequest::new(1, sql),
+                vec![ReplayTable {
+                    table_id: table,
+                    rows: vec![row(1, 1, Value::String("invalid".into()))],
+                }],
+            ),
+            Err(ReplayError::IncompleteInput(_))
+        ));
+        let original = row(1, 1, Value::Int(5));
+        let mut detector = detector_of(&engine, sql, table, vec![original.clone()]);
+        let bytes = detector.checkpoint().expect("the committed state encodes");
+        assert!(matches!(
+            detector.apply_transaction(
+                &[
+                    insert(table, row(2, 2, Value::Int(10))),
+                    update(table, original, row(1, 1, Value::String("invalid".into()))),
+                ],
+                &db,
+            ),
+            Err(ReplayError::IncompleteInput(_))
+        ));
+        assert_eq!(
+            detector
+                .checkpoint()
+                .expect("the refused fold preserves state"),
+            bytes
+        );
+    }
+}
+
+#[test]
+fn grouped_operators_remove_empty_groups_and_recreate_them_after_restore() {
+    let db = parse("CREATE TABLE samples (id INT PRIMARY KEY, grp INT, qty INT);");
+    let table = table_of(&db, "samples");
+    let engine = engine_of(db.clone());
+    let row = |id, grp, qty| vec![Value::Int(id), Value::Int(grp), Value::Int(qty)];
+    let groups = |answer: &ReplayAnswer<Postgres>| {
+        grouped_of(answer, |value| match value {
+            ReplayValue::Folded(AggValue::Sum(Some(NumericValue::Integer(value))))
+            | ReplayValue::Scalar(Value::Int(value)) => *value,
+            _ => panic!("the selected group value is an integer"),
+        })
+    };
+    for sql in [
+        "SELECT grp, SUM(qty) FROM samples GROUP BY grp",
+        "SELECT grp, MAX(qty) FROM samples GROUP BY grp",
+    ] {
+        let first = row(1, 1, 5);
+        let second = row(2, 2, 10);
+        let mut detector = detector_of(&engine, sql, table, vec![first.clone(), second.clone()]);
+        assert!(detector
+            .apply_transaction(&[delete(table, first)], &db)
+            .expect("the last row leaves its group"));
+        assert_eq!(groups(detector.answer()), [(2, 10)]);
+        let mut restored = restored_of(
+            &engine,
+            sql,
+            &detector.checkpoint().expect("the remaining group encodes"),
+        );
+        assert!(restored
+            .apply_transaction(&[delete(table, second), insert(table, row(3, 1, 7))], &db,)
+            .expect("the committed transaction replaces the surviving group"));
+        assert_eq!(groups(restored.answer()), [(1, 7)]);
+    }
+}
+
+#[test]
+fn extreme_admission_refuses_non_orderable_columns() {
+    let db = parse(WIDE_DDL);
+    let table = table_of(&db, "wide");
+    let engine = engine_of(db);
+    for sql in [
+        "SELECT MAX(j) FROM wide",
+        "SELECT MIN(jb) FROM wide",
+        "SELECT id, MAX(j) FROM wide GROUP BY id",
+    ] {
+        assert!(matches!(
+            engine.replay_detector(
+                &SubscriptionRequest::new(1, sql),
+                vec![ReplayTable {
+                    table_id: table,
+                    rows: vec![wide_row_a()],
+                }],
+            ),
+            Err(ReplayError::Unsupported(_))
+        ));
+    }
+}
+
+#[cfg(feature = "membership-term")]
+#[test]
+fn membership_extremes_remain_refused() {
+    let db = parse(MEMBER_DDL);
+    let docs = table_of(&db, "docs");
+    let members = table_of(&db, "project_members");
+    let engine = membership_engine_of(db);
+    for sql in [
+        "SELECT MAX(id) FROM docs WHERE project_id IN \
+         (SELECT project_id FROM project_members WHERE user_id = current_setting('app.user_id', true))",
+        "SELECT project_id, MAX(id) FROM docs WHERE project_id IN \
+         (SELECT project_id FROM project_members WHERE user_id = current_setting('app.user_id', true)) \
+         GROUP BY project_id",
+    ] {
+        assert!(matches!(
+            engine.replay_detector(
+                &identity_spec_of(sql, "alice"),
+                vec![
+                    ReplayTable {
+                        table_id: docs,
+                        rows: vec![doc_row(1, Value::Int(1), "visible")],
+                    },
+                    ReplayTable {
+                        table_id: members,
+                        rows: vec![member_row(Value::Int(1), alice())],
+                    },
+                ],
+            ),
+            Err(ReplayError::Unsupported(_))
+        ));
+    }
 }
