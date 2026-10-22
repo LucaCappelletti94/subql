@@ -165,7 +165,7 @@ impl PgSqliteEmuSource {
             .map_err(|e| PgSqliteEmuError::Translate(alloc::format!("{e:?}")))?;
         // DDL from the pg2sqlite translator: diesel cannot express CREATE TABLE
         // DDL through its query DSL, so raw sql_query is correct here.
-        for stmt in &sqlite_ddl {
+        for stmt in sqlite_ddl.iter() {
             sql_query(stmt).execute(&mut connection)?;
         }
 

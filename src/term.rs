@@ -18,7 +18,7 @@ use alloc::vec::Vec;
 use core::hash::{Hash, Hasher};
 use core::mem::discriminant;
 use sql_traits::prelude::DatabaseLike;
-use sqlparser::ast::Expr;
+use sqlparser::ast::{Expr, InTarget};
 
 use crate::backend::{Backend, CustomScalars, ScalarFamily, ScalarKind, ScalarKindOf, Value};
 use crate::{catalog_helpers, ColumnId, RegisterError, TableId};
@@ -279,7 +279,10 @@ impl TermDescription {
         // since an unseeded term admits nobody in silence.
         let member_subject = name(database, movement.member_table, movement.member_subject)?;
         let seed_sql = match &term.expr {
-            Expr::InSubquery { subquery, .. } => {
+            Expr::In {
+                target: InTarget::Subquery(subquery),
+                ..
+            } => {
                 crate::compiler::sql_shape::subquery_seed_select(subquery, &member_subject, dialect)
                     .ok_or_else(|| {
                         RegisterError::MembershipTermRefused(

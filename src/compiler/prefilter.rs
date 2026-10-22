@@ -16,7 +16,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use serde::{Deserialize, Serialize};
 use sql_traits::prelude::DatabaseLike;
-use sqlparser::ast::{BinaryOperator, Expr, UnaryOperator, Value as SqlValue};
+use sqlparser::ast::{BinaryOperator, Expr, InTarget, UnaryOperator, Value as SqlValue};
 
 /// A normalized prefilter plan used by runtime dispatch.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -222,9 +222,9 @@ fn analyze_expr<B: SqlLiteralParse, DB: DatabaseLike>(
         Expr::Nested(expr) => analyze_expr::<B, DB>(expr, table_id, database, negated),
 
         // A `GLOBAL` list never compiles, so it falls through to unknown.
-        Expr::InList {
+        Expr::In {
             expr,
-            list,
+            target: InTarget::List(list),
             negated: list_negated,
             global: false,
         } => analyze_in_list::<B, DB>(expr, list, *list_negated ^ negated, table_id, database),
