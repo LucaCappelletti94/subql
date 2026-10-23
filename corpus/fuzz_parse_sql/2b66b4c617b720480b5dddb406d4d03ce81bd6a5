@@ -1,1 +1,0 @@
-SELECT * FROM orders WHERE lo NOT IN (c15s) =0 AND id IN (managers)

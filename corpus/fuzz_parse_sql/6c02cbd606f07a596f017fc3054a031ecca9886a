@@ -1,1 +1,0 @@
-SELECT * FROM orders WHERE (SELECT orderatus = 'p%id') IS NOT DISTINCT FROM true
