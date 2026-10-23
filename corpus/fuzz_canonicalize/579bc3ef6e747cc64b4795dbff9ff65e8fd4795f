@@ -1,0 +1,1 @@
+ status LIKE 'caC.ALast5' AND NOT  status LIKE 'caC.ALast5' AND NOT (c1 =c3)
