@@ -2,7 +2,7 @@ name: ClusterFuzzLite corpus pruning
 
 on:
   schedule:
-    - cron: "0 4 * * *" # 04:00 UTC, so the build plus the whole prune budget ends before batch fuzzing at 06:00
+    - cron: "0 4 * * 1" # 04:00 UTC Mondays, so the build plus the whole prune budget ends before batch fuzzing at 06:00
   workflow_dispatch:
 
 permissions:
