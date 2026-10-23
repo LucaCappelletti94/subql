@@ -52,7 +52,7 @@ impl SqliteHarness {
             .translate(&Pg2SqliteOptions::default())
             .map_err(|e| HarnessError::Translate(format!("{e}")))?;
 
-        for stmt in &sqlite_statements {
+        for stmt in sqlite_statements.iter() {
             conn.batch_execute(&stmt.to_string())?;
         }
 
