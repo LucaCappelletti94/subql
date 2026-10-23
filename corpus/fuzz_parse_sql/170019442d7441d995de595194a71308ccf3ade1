@@ -1,0 +1,1 @@
+SELECT FROMT_LOCK(COCAT(DAT/BASE(),AS '_park_seed_', id), 17) = 1

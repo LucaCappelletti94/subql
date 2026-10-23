@@ -1,0 +1,1 @@
+SELECT count(*) AS c1 FROM orders WHERE GE_LObK(CONCAT(D$R$BAE(), NULL'_park_seed_', id), @2) +1

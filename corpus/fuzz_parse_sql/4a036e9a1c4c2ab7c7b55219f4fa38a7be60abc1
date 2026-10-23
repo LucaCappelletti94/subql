@@ -1,0 +1,1 @@
+SELECT * FROM orders WHERE n.on NOT LIKE dddd LIKE ddst&en02

@@ -1,0 +1,1 @@
+SELECT * FROM orders WHERE st/us LIKE'%' ESCAPE'!e'

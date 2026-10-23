@@ -1,0 +1,1 @@
+SELECT SUM(amou AS c0, COUTN(SUM(amot) AS c0, UNT(a AS c) AS FROM) amougt) TM) AS

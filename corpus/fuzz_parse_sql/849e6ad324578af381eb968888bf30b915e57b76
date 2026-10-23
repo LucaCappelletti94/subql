@@ -1,0 +1,1 @@
+SELECT * FROM  I t WHERE Mid IN(SELECT t_id FROM mts, mtus,actcUEO$1)

@@ -1,0 +1,1 @@
+SELECT * FROM ((SELECT *GROUP BY F:ce) +c2)gMTdsdcCP BY FR
