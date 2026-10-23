@@ -40,7 +40,7 @@ rust-version = "1.88"
 authors = ["Luca"]
 license = "MIT"
 description = "SQL subscription dispatch engine for CDC event fanout"
-repository = "https://github.com/luca/subql"
+repository = "https://github.com/connetto-rs/subql"
 readme = "README.md"
 keywords = ["sql", "cdc", "subscription", "postgres", "streaming"]
 categories = ["database", "parser-implementations"]
@@ -103,7 +103,7 @@ sqlparser = { version = "0.63", default-features = false, features = ["visitor"]
 # `default-features = false` follows sql-traits' own gating. The `std`
 # feature is propagated below. `serde` derives the names and collation facts
 # a compiled program persists, which is why subql carries no copy of them.
-sql-traits = { git = "https://github.com/earth-metabolome-initiative/sql-traits", branch = "main", default-features = false, features = ["serde"] }
+sql-traits = { git = "https://github.com/connetto-rs/sql-traits", branch = "main", default-features = false, features = ["serde"] }
 
 sql-scalar-text = { version = "0.2.0", features = ["decimal"] }
 
@@ -124,7 +124,7 @@ hashbrown = { version = "0.16", default-features = false, features = ["default-h
 # Persistent maps keep snapshot mutations local to the changed paths.
 rpds = { version = "1.2", default-features = false, features = ["serde"] }
 
-sqlparser-canonicalize = { git = "https://github.com/LucaCappelletti94/sqlparser-canonicalize", branch = "main", default-features = false }
+sqlparser-canonicalize = { git = "https://github.com/connetto-rs/sqlparser-canonicalize", branch = "main", default-features = false }
 
 # Serialization. All no_std + alloc capable. Std features propagated below.
 serde = { version = "1.0", default-features = false, features = ["derive", "rc", "alloc"] }
@@ -208,7 +208,7 @@ maxwell-cdc = { version = "0.1.0", default-features = false }
 # to a session, and calls `.changeset()` to surface accumulated change
 # bytes for `SqliteChangesetParser` to decode. Requires the diesel
 # `future` branch already pinned via the top-level `[patch]` blocks.
-diesel-sqlite-session = { git = "https://github.com/LucaCappelletti94/diesel-sqlite-session", optional = true }
+diesel-sqlite-session = { git = "https://github.com/connetto-rs/diesel-sqlite-session", optional = true }
 
 # Runtime-named tables and columns through diesel's own query builder, used by
 # the `pg-sqlite-emu` row-lookup read. That read names a table and a column set
@@ -230,13 +230,13 @@ diesel-dynamic-schema = { version = "0.2", default-features = false, optional = 
 # (a fake Postgres CDC source layered on SQLite for doctests and fuzz).
 # `default-features = false` drops the git2 + libssh2 + libz native
 # deps so the emulator stays a pure-Rust addition.
-pg2sqlite = { git = "https://github.com/LucaCappelletti94/pg2sqlite", branch = "main", default-features = false, optional = true }
+pg2sqlite = { git = "https://github.com/connetto-rs/pg2sqlite", branch = "main", default-features = false, optional = true }
 
 # Output contracts and row evaluation for `visibility-records`.
-rls2fga-types = { git = "https://github.com/LucaCappelletti94/rls2fga", branch = "main", default-features = false, optional = true }
+rls2fga-types = { git = "https://github.com/connetto-rs/rls2fga", branch = "main", default-features = false, optional = true }
 
 # Full translation for `membership-term`.
-rls2fga = { git = "https://github.com/LucaCappelletti94/rls2fga", branch = "main", default-features = false, optional = true }
+rls2fga = { git = "https://github.com/connetto-rs/rls2fga", branch = "main", default-features = false, optional = true }
 
 # OpenFGA gRPC client, behind `visibility-openfga`. The only maintained Rust
 # client for it: OpenFGA publishes no official Rust SDK and never has. No
@@ -335,7 +335,7 @@ proptest = "1"
 # Default features on, since the translator is `std`-only, plus `client` so
 # `tests/visibility_openfga_e2e.rs` writes the emitted model to the server
 # through rls2fga rather than converting it here.
-rls2fga = { git = "https://github.com/LucaCappelletti94/rls2fga", branch = "main", features = ["client"] }
+rls2fga = { git = "https://github.com/connetto-rs/rls2fga", branch = "main", features = ["client"] }
 
 # Multi-task async runtime for tests that need real concurrency (e.g.
 # `tests/reexec_throttle.rs`, which observes peak in-flight connector

@@ -42,5 +42,5 @@ allow-git = [
     # diesel sqlite hooks (PR #4969). subql-demo uses hook-driven WAL emulation.
     "https://github.com/LucaCappelletti94/diesel",
     # pg2sqlite, the PG-DDL -> SQLite-DDL translator the demo uses for preset schemas.
-    "https://github.com/LucaCappelletti94/pg2sqlite",
+    "https://github.com/connetto-rs/pg2sqlite",
 ]
