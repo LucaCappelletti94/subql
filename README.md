@@ -1,11 +1,11 @@
 # subql
 
-[![CI](https://github.com/LucaCappelletti94/subql/actions/workflows/ci.yml/badge.svg)](https://github.com/LucaCappelletti94/subql/actions/workflows/ci.yml)
-[![codecov](https://codecov.io/gh/LucaCappelletti94/subql/graph/badge.svg)](https://codecov.io/gh/LucaCappelletti94/subql)
+[![CI](https://github.com/connetto-rs/subql/actions/workflows/ci.yml/badge.svg)](https://github.com/connetto-rs/subql/actions/workflows/ci.yml)
+[![codecov](https://codecov.io/gh/connetto-rs/subql/graph/badge.svg)](https://codecov.io/gh/connetto-rs/subql)
 [![crates.io](https://img.shields.io/crates/v/subql.svg)](https://crates.io/crates/subql)
 [![docs.rs](https://docs.rs/subql/badge.svg)](https://docs.rs/subql)
 [![MSRV](https://img.shields.io/badge/rust-1.88%2B-orange.svg)](https://www.rust-lang.org/)
-[![License](https://img.shields.io/badge/license-MIT-blue.svg)](https://raw.githubusercontent.com/LucaCappelletti94/subql/refs/heads/main/LICENSE)
+[![License](https://img.shields.io/badge/license-MIT-blue.svg)](https://raw.githubusercontent.com/connetto-rs/subql/refs/heads/main/LICENSE)
 
 SQL subscription dispatch engine for Change Data Capture fanout.
 

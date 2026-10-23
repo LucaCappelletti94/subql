@@ -15,7 +15,7 @@ workspace = true
 subql = { path = "..", default-features = false }
 
 # Generic SQL schema traits, same git pin as subql.
-sql-traits = { git = "https://github.com/earth-metabolome-initiative/sql-traits", branch = "main", default-features = false }
+sql-traits = { git = "https://github.com/connetto-rs/sql-traits", branch = "main", default-features = false }
 
 # PG dialect parser. The workspace [patch.crates-io] redirects this to the
 # visitor-wasm fork.
@@ -28,7 +28,7 @@ sqlparser = { version = "0.63", default-features = false }
 # `default-features = false` keeps git2 (which transitively pulls in
 # libssh2-sys + libz-sys C code) out of the dep tree so the demo can
 # cross-compile to `wasm32-unknown-unknown`.
-pg2sqlite = { git = "https://github.com/LucaCappelletti94/pg2sqlite", branch = "main", default-features = false }
+pg2sqlite = { git = "https://github.com/connetto-rs/pg2sqlite", branch = "main", default-features = false }
 
 # Diesel SQLite (workspace patch redirects to the sqlite3_update_hook fork
 # providing on_insert / on_update / on_delete hooks).
