@@ -5,7 +5,7 @@ use rls2fga_types::{
     records_from_row, ColumnKind, ColumnRead, Guard, Record, RecordDerivation, RecordDescription,
     TypeName, ValueSource,
 };
-use rls2fga_types::{AttributeLiteral, AttributeOperator, AttributePredicate};
+use rls2fga_types::{AttributeLiteral, AttributeOperator, AttributePredicate, AttributeTest};
 use sql_traits::prelude::DatabaseLike;
 
 use crate::backend::{ScalarFamily, ScalarKindOf};
@@ -161,14 +161,37 @@ fn comparison_read<B: crate::backend::Backend, DB: DatabaseLike>(
         Ok(kind) => kind,
         Err(refusal) => return Some(refusal),
     };
-    match (&predicate.value, kind) {
+    match &predicate.test {
+        AttributeTest::Compare { operator, value } => {
+            literal_comparison_read(column, kind, *operator, value)
+        }
+        AttributeTest::In(values)
+            if matches!(
+                kind,
+                ColumnKind::Bool | ColumnKind::Integer | ColumnKind::Decimal | ColumnKind::Text
+            ) =>
+        {
+            values.iter().find_map(|value| {
+                literal_comparison_read(column, kind, AttributeOperator::Eq, value)
+            })
+        }
+        AttributeTest::In(_) => Some(RowRecordError::UnreadableColumn(alloc::format!(
+            "membership over column {column} needs a query"
+        ))),
+    }
+}
+
+fn literal_comparison_read(
+    column: &ColumnRead,
+    kind: ColumnKind,
+    operator: AttributeOperator,
+    value: &AttributeLiteral,
+) -> Option<RowRecordError> {
+    match (value, kind) {
         (AttributeLiteral::Boolean(_), ColumnKind::Bool)
         | (AttributeLiteral::Number(_), ColumnKind::Integer | ColumnKind::Decimal) => None,
         (AttributeLiteral::Text(_), ColumnKind::Text)
-            if matches!(
-                predicate.operator,
-                AttributeOperator::Eq | AttributeOperator::NotEq
-            ) =>
+            if matches!(operator, AttributeOperator::Eq | AttributeOperator::NotEq) =>
         {
             None
         }
@@ -179,8 +202,7 @@ fn comparison_read<B: crate::backend::Backend, DB: DatabaseLike>(
             AttributeLiteral::Boolean(_) | AttributeLiteral::Number(_) | AttributeLiteral::Text(_),
             _,
         ) => Some(RowRecordError::UnreadableColumn(alloc::format!(
-            "column {column} cannot be compared as {:?}",
-            predicate.value
+            "column {column} cannot be compared as {value:?}"
         ))),
         _ => Some(RowRecordError::UnsupportedValueSource(
             "unrecognised comparison",

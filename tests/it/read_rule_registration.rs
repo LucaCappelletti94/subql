@@ -112,7 +112,7 @@ const ABAC_DDL: &str =
        EXISTS (SELECT 1 FROM team_members
                WHERE team_members.team_id = docs.team_id
                  AND team_members.user_id = current_setting('app.user_id', true))
-       AND docs.status IN ('active', 'pending'));";
+       AND docs.status LIKE 'active%');";
 
 const FLOAT_RULE_DDL: &str = "CREATE TABLE items(id INTEGER PRIMARY KEY, score REAL);
      ALTER TABLE items ENABLE ROW LEVEL SECURITY;
