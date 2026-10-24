@@ -393,7 +393,7 @@ dependencies = [
 [[package]]
 name = "diesel-sqlite-session"
 version = "0.1.0"
-source = "git+https://github.com/connetto-rs/diesel-sqlite-session#4bc74da66fdf7d5fcdda38335030c9d9aacebc74"
+source = "git+https://github.com/connetto-rs/diesel-sqlite-session#4ae9adfcc90200fcd3cd4231f7c633d75e2d8c3f"
 dependencies = [
  "diesel",
  "libsqlite3-sys",
@@ -910,7 +910,7 @@ checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
 [[package]]
 name = "pg2sqlite"
 version = "0.1.0"
-source = "git+https://github.com/connetto-rs/pg2sqlite?branch=main#ed881482991a52b21836afb895c0975a0670b0b7"
+source = "git+https://github.com/connetto-rs/pg2sqlite?branch=main#0ff918cbeb4e83ce6613034aae4234448a7fac52"
 dependencies = [
  "sql-traits",
  "sqlparser",
@@ -1283,7 +1283,7 @@ dependencies = [
 [[package]]
 name = "sql-traits"
 version = "0.1.0"
-source = "git+https://github.com/connetto-rs/sql-traits?branch=main#13a012e778cbda0ebc5dcf62e76a84f45ecc3696"
+source = "git+https://github.com/connetto-rs/sql-traits?branch=main#b22af79df1378c469fb6cfa5cd2a66f793ed73b6"
 dependencies = [
  "geometric-traits",
  "serde",
@@ -1336,7 +1336,7 @@ dependencies = [
 [[package]]
 name = "sqlparser"
 version = "0.63.0"
-source = "git+https://github.com/apache/datafusion-sqlparser-rs?branch=main#9119ec6bef4acadea510bb6e7bd89eb30b904b6b"
+source = "git+https://github.com/apache/datafusion-sqlparser-rs?branch=main#594bb046b03ccf9463b00a5906b4ed8e2f2978a6"
 dependencies = [
  "log",
  "recursive",
@@ -1347,7 +1347,7 @@ dependencies = [
 [[package]]
 name = "sqlparser-canonicalize"
 version = "0.2.1"
-source = "git+https://github.com/connetto-rs/sqlparser-canonicalize?branch=main#869bb2ccc7d441b0b4bfaecae341cc705201783c"
+source = "git+https://github.com/connetto-rs/sqlparser-canonicalize?branch=main#26e1ecfd37a6de4cadc7a870b99917e919b4630f"
 dependencies = [
  "seahash",
  "sqlparser",
@@ -1357,7 +1357,7 @@ dependencies = [
 [[package]]
 name = "sqlparser-plpgsql"
 version = "0.1.0"
-source = "git+https://github.com/connetto-rs/sqlparser-plpgsql?branch=main#aab619465b7edaae99b647015df82f2b76764c58"
+source = "git+https://github.com/connetto-rs/sqlparser-plpgsql?branch=main#a5701445bd359187a055cdb079579617137e6292"
 dependencies = [
  "sqlparser",
  "thiserror",
@@ -1366,7 +1366,7 @@ dependencies = [
 [[package]]
 name = "sqlparser_derive"
 version = "0.6.0"
-source = "git+https://github.com/apache/datafusion-sqlparser-rs?branch=main#9119ec6bef4acadea510bb6e7bd89eb30b904b6b"
+source = "git+https://github.com/apache/datafusion-sqlparser-rs?branch=main#594bb046b03ccf9463b00a5906b4ed8e2f2978a6"
 dependencies = [
  "proc-macro2",
  "quote",

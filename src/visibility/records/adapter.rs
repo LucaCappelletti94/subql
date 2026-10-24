@@ -216,8 +216,8 @@ mod tests {
     use sqlparser::dialect::PostgreSqlDialect;
 
     use rls2fga_types::{
-        AttributeLiteral, ColumnKind, Guard, Record, RecordDerivation, RecordDescription,
-        RecordError, RowCell, RowList, ValueSource,
+        AttributeLiteral, AttributeTest, ColumnKind, Guard, Record, RecordDerivation,
+        RecordDescription, RecordError, RowCell, RowList, ValueSource,
     };
 
     use super::super::entry_point::{column_kind_from_scalar, direct_kind};
@@ -325,6 +325,171 @@ CREATE POLICY docs_owner ON docs USING (owner = current_user);";
         let event = event(row);
         let view = EventRow::current(&event, &db).unwrap();
         records_from_row_view(description, &view, &db)
+    }
+
+    fn guarded(column: ColumnRead, test: AttributeTest) -> RecordDescription {
+        let predicate = rls2fga_types::AttributePredicate {
+            column: name(column.as_str()),
+            test,
+        };
+        description(
+            ValueSource::column("owner"),
+            vec![Guard::Compare { column, predicate }],
+        )
+    }
+
+    #[test]
+    fn literal_membership_guards_match_typed_row_values() {
+        let db = ParserDB::parse::<PostgreSqlDialect>(
+            "CREATE TABLE docs (id INT PRIMARY KEY, owner TEXT, public BOOL, count BIGINT, amount NUMERIC);",
+        )
+        .unwrap();
+        let table = catalog_helpers::table_id::<Postgres, _>(&db, "docs").unwrap();
+        let cases = [
+            (
+                1,
+                column("owner"),
+                vec![
+                    AttributeLiteral::Text("alice".into()),
+                    AttributeLiteral::Text("bob".into()),
+                ],
+                Value::String("bob".into()),
+                Value::String("carol".into()),
+                "user:bob",
+            ),
+            (
+                2,
+                typed_column("public", ColumnKind::Bool),
+                vec![AttributeLiteral::Boolean(true)],
+                Value::Bool(true),
+                Value::Bool(false),
+                "user:alice",
+            ),
+            (
+                3,
+                typed_column("count", ColumnKind::Integer),
+                vec![AttributeLiteral::Number("9007199254740993".into())],
+                Value::Int(9_007_199_254_740_993),
+                Value::Int(9_007_199_254_740_992),
+                "user:alice",
+            ),
+            (
+                4,
+                typed_column("amount", ColumnKind::Decimal),
+                vec![AttributeLiteral::Number("12.500".into())],
+                Value::Decimal("12.5".parse().unwrap()),
+                Value::Decimal("12.5000000000000001".parse().unwrap()),
+                "user:alice",
+            ),
+        ];
+        for (index, column, values, admitted, denied, subject) in cases {
+            let described = guarded(column, AttributeTest::In(values));
+            assert!(is_evaluable::<Postgres, _>(&described, &db));
+            let derive = |value| {
+                let mut row = vec![
+                    Value::Int(4),
+                    Value::String("alice".into()),
+                    Value::Bool(false),
+                    Value::Int(0),
+                    Value::Decimal("0".parse().unwrap()),
+                ];
+                row[index] = value;
+                let event = TestEvent::<Postgres>::insert(table, row).with_pk_columns([0]);
+                let view = EventRow::current(&event, &db).unwrap();
+                records_from_row_view(&described, &view, &db).unwrap()
+            };
+            assert_eq!(
+                derive(admitted),
+                vec![Record {
+                    object: "docs:4".into(),
+                    relation: relation_of(&described),
+                    subject: subject.into(),
+                    context: None,
+                }]
+            );
+            assert_eq!(derive(denied), vec![]);
+        }
+    }
+
+    #[test]
+    fn literal_membership_guards_preserve_null_absence_and_empty_lists() {
+        let described = guarded(
+            typed_column("public", ColumnKind::Bool),
+            AttributeTest::In(vec![AttributeLiteral::Boolean(true)]),
+        );
+        let mut row = row_of(Value::String("alice".into()));
+        row[2] = Value::Null;
+        assert_eq!(records(&described, row.clone()).unwrap(), vec![]);
+        row[2] = Value::Missing;
+        assert_eq!(
+            records(&described, row),
+            Err(RowRecordError::Refused(RecordError::ColumnAbsent(
+                "public".into()
+            )))
+        );
+        let empty = guarded(column("owner"), AttributeTest::In(vec![]));
+        assert_eq!(
+            records(&empty, row_of(Value::String("alice".into()))).unwrap(),
+            vec![]
+        );
+    }
+
+    #[test]
+    fn literal_membership_guards_refuse_incompatible_literals_before_matching() {
+        let db = catalog();
+        for (column, values) in [
+            (
+                column("owner"),
+                vec![
+                    AttributeLiteral::Text("alice".into()),
+                    AttributeLiteral::Number("1".into()),
+                ],
+            ),
+            (
+                typed_column("at", ColumnKind::TimestampTz),
+                vec![AttributeLiteral::Text("2026-01-01".into())],
+            ),
+            (typed_column("score", ColumnKind::Unsupported), vec![]),
+        ] {
+            let described = guarded(column, AttributeTest::In(values));
+            assert!(!is_evaluable::<Postgres, _>(&described, &db));
+            assert!(matches!(
+                records(&described, row_of(Value::String("alice".into()))),
+                Err(RowRecordError::UnreadableColumn(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn text_comparison_guards_keep_equality_and_ordering_boundaries() {
+        use rls2fga_types::AttributeOperator;
+
+        let equal = guarded(
+            column("owner"),
+            AttributeTest::Compare {
+                operator: AttributeOperator::Eq,
+                value: AttributeLiteral::Text("alice".into()),
+            },
+        );
+        assert_eq!(
+            records(&equal, row_of(Value::String("bob".into()))).unwrap(),
+            vec![]
+        );
+        assert_eq!(
+            records(&equal, row_of(Value::String("alice".into()))).unwrap()[0].subject,
+            "user:alice"
+        );
+        let ordered = guarded(
+            column("owner"),
+            AttributeTest::Compare {
+                operator: AttributeOperator::Lt,
+                value: AttributeLiteral::Text("bob".into()),
+            },
+        );
+        assert!(matches!(
+            records(&ordered, row_of(Value::String("alice".into()))),
+            Err(RowRecordError::UnreadableColumn(_))
+        ));
     }
 
     #[test]
@@ -485,8 +650,10 @@ CREATE POLICY docs_owner ON docs USING (owner = current_user);";
                 column: typed_column("at", ColumnKind::TimestampTz),
                 predicate: AttributePredicate {
                     column: name("at"),
-                    operator: AttributeOperator::LtEq,
-                    value: AttributeLiteral::Text("2026-01-01".into()),
+                    test: AttributeTest::Compare {
+                        operator: AttributeOperator::LtEq,
+                        value: AttributeLiteral::Text("2026-01-01".into()),
+                    },
                 },
             }],
         );
@@ -547,8 +714,10 @@ CREATE POLICY docs_owner ON docs USING (owner = current_user);";
                     column: typed_column("score", ColumnKind::Unsupported),
                     predicate: AttributePredicate {
                         column: name("score"),
-                        operator: AttributeOperator::Gt,
-                        value: AttributeLiteral::Number("0".into()),
+                        test: AttributeTest::Compare {
+                            operator: AttributeOperator::Gt,
+                            value: AttributeLiteral::Number("0".into()),
+                        },
                     },
                 },
                 "compared",
